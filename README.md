@@ -67,6 +67,12 @@ Windows PowerShell：
 
 irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1 | iex
 
+Windows PowerShell（带参数，支持更新/升级/降级）：
+
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action upgrade -Version v0.1.2
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.1
+
 安装脚本会：
 
 - 下载平台二进制
@@ -74,6 +80,15 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 - 自动安装 Deno（缺失时）
 - 执行 proxysss init
 - 执行 proxysss service install（默认开机自启动）
+
+install.ps1 支持参数：
+
+- `-Action install|update|upgrade|downgrade`
+- `-Version latest|vX.Y.Z`
+- `-AllowDowngrade`
+- `-NoServiceRestart`
+- `-SkipInit`
+- `-DryRun`
 
 ## 3. 现代化配置（YAML 推荐）
 
