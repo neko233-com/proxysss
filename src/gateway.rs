@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use h3::server::Connection as H3Connection;
 use http::header::{AUTHORIZATION, COOKIE, HOST};
@@ -601,13 +601,31 @@ impl Gateway {
 
                 loop {
                     match h3_connection.accept().await {
-                        Ok(Some((request, mut stream))) => {
+                        Ok(Some(request_resolver)) => {
+                            let (request, mut stream) = match request_resolver.resolve_request().await {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    tracing::warn!(?error, %remote_addr, "failed resolving h3 request");
+                                    continue;
+                                }
+                            };
+
                             let (parts, _) = request.into_parts();
                             let mut body = BytesMut::new();
 
                             loop {
                                 match stream.recv_data().await {
-                                    Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                                    Ok(Some(mut chunk)) => {
+                                        while chunk.has_remaining() {
+                                            let data = chunk.chunk();
+                                            if data.is_empty() {
+                                                break;
+                                            }
+                                            body.extend_from_slice(data);
+                                            let advance = data.len();
+                                            chunk.advance(advance);
+                                        }
+                                    }
                                     Ok(None) => break,
                                     Err(error) => {
                                         tracing::warn!(?error, %remote_addr, "failed reading h3 body");

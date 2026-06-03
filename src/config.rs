@@ -11,8 +11,6 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "proxysss.yaml";
 pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
-pub const LEGACY_DEFAULT_ADMIN_USERNAME: &str = "admin";
-pub const LEGACY_DEFAULT_ADMIN_PASSWORD: &str = "proxysss-admin-233";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -454,9 +452,8 @@ impl GatewayConfig {
         let mut warnings = Vec::new();
 
         if self.admin.enabled
-            && ((self.admin.username == DEFAULT_ADMIN_USERNAME && self.admin.password == DEFAULT_ADMIN_PASSWORD)
-                || (self.admin.username == LEGACY_DEFAULT_ADMIN_USERNAME
-                    && self.admin.password == LEGACY_DEFAULT_ADMIN_PASSWORD))
+            && self.admin.username == DEFAULT_ADMIN_USERNAME
+            && self.admin.password == DEFAULT_ADMIN_PASSWORD
         {
             warnings.push("admin credentials are still default; change admin.username/admin.password before production".to_string());
         }
@@ -938,16 +935,6 @@ mod tests {
     #[test]
     fn warnings_include_default_admin_credentials() {
         let config = GatewayConfig::default();
-        let warnings = config.warnings();
-        assert!(warnings.iter().any(|item| item.contains("admin credentials are still default")));
-    }
-
-    #[test]
-    fn warnings_include_legacy_default_admin_credentials() {
-        let mut config = GatewayConfig::default();
-        config.admin.username = LEGACY_DEFAULT_ADMIN_USERNAME.to_string();
-        config.admin.password = LEGACY_DEFAULT_ADMIN_PASSWORD.to_string();
-
         let warnings = config.warnings();
         assert!(warnings.iter().any(|item| item.contains("admin credentials are still default")));
     }

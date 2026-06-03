@@ -89,7 +89,7 @@ pub fn ensure_cert_pair(cert_path: &Path, key_path: &Path, server_name: &str, ov
     .context("failed generating self-signed certificate")?;
 
     fs::write(cert_path, cert.cert.pem()).with_context(|| format!("failed writing {}", cert_path.display()))?;
-    fs::write(key_path, cert.signing_key.serialize_pem()).with_context(|| format!("failed writing {}", key_path.display()))?;
+    fs::write(key_path, cert.key_pair.serialize_pem()).with_context(|| format!("failed writing {}", key_path.display()))?;
 
     println!("generated certificate pair at {} and {}", cert_path.display(), key_path.display());
     Ok(())

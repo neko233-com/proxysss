@@ -216,7 +216,15 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
                 let started = Instant::now();
                 let result = async {
                     socket.send(&payload).await?;
-                    let size = socket.recv(&mut buffer).await?;
+                    let size = match tokio::time::timeout(Duration::from_millis(1000), socket.recv(&mut buffer)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "udp recv timeout",
+                            ));
+                        }
+                    };
                     Ok::<usize, std::io::Error>(size)
                 }
                 .await;
