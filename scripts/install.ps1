@@ -74,6 +74,21 @@ function Add-ToUserPath([string]$Dir) {
     return $true
 }
 
+function Add-BinaryLink([string]$Source, [string]$TargetDir) {
+    $linkPath = Join-Path $TargetDir "$BinaryName.exe"
+    if (Test-Path -LiteralPath $linkPath) {
+        Remove-Item -LiteralPath $linkPath -Force
+    }
+
+    try {
+        New-Item -ItemType HardLink -Path $linkPath -Target $Source -Force | Out-Null
+        return $linkPath
+    } catch {
+        Copy-Item -LiteralPath $Source -Destination $linkPath -Force
+        return $linkPath
+    }
+}
+
 function Notify-PathChanged {
     $signature = @'
 [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
@@ -146,19 +161,6 @@ function Get-InstalledVersion([string]$ExePath) {
     return $null
 }
 
-function Get-LatestReleaseVersion {
-    $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    try {
-        $response = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "proxysss-install-script" }
-        if ($null -ne $response.tag_name) {
-            return (Get-NormalizedVersion $response.tag_name)
-        }
-    } catch {
-        Write-Host "warning: failed to query latest release version from GitHub API" -ForegroundColor Yellow
-    }
-    return $null
-}
-
 function Compare-VersionNullable([string]$Left, [string]$Right) {
     if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
         return $null
@@ -227,7 +229,7 @@ function Start-ServiceIfPresent([string]$ExePath) {
 
 function Resolve-TargetVersion([string]$RequestedVersion) {
     if ($RequestedVersion -eq "latest" -or [string]::IsNullOrWhiteSpace($RequestedVersion)) {
-        return @{ Label = "latest"; Version = (Get-LatestReleaseVersion) }
+        return @{ Label = "latest"; Version = $null }
     }
 
     $normalized = Get-NormalizedVersion $RequestedVersion
@@ -347,8 +349,29 @@ $tmp = Join-Path $InstallDir ("$BinaryName.tmp.exe")
 Download-FileWithFallback -Url $url -OutFile $tmp
 Move-Item -Force $tmp $Dest
 
-if (Add-ToUserPath $InstallDir) {
-    Write-Host "Added $InstallDir to user PATH."
+$pathCandidates = @(
+    (Join-Path $env:USERPROFILE ".local\bin"),
+    (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"),
+    (Join-Path $env:USERPROFILE "go\bin")
+)
+
+$linked = $false
+foreach ($candidate in $pathCandidates) {
+    if (-not (Test-Path -LiteralPath $candidate)) { continue }
+    if (-not (Test-PathInUserPath $candidate)) { continue }
+
+    $linkPath = Add-BinaryLink -Source $Dest -TargetDir $candidate
+    Write-Host "Linked $linkPath -> $Dest"
+    $linked = $true
+    break
+}
+
+if (-not $linked) {
+    if (Add-ToUserPath $InstallDir) {
+        Write-Host "Added $InstallDir to user PATH."
+    } else {
+        Write-Host "$InstallDir is already in user PATH."
+    }
 }
 
 Notify-PathChanged
