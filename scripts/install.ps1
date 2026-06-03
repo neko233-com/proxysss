@@ -148,7 +148,16 @@ function Compare-VersionNullable([string]$Left, [string]$Right) {
 }
 
 function Test-ServiceTaskExists {
-    schtasks /Query /TN $BinaryName *> $null
+    $getScheduledTask = Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue
+    if ($null -ne $getScheduledTask) {
+        try {
+            $task = Get-ScheduledTask -TaskName $BinaryName -ErrorAction SilentlyContinue
+            return ($null -ne $task)
+        } catch {
+        }
+    }
+
+    cmd /c "schtasks /Query /TN \"$BinaryName\" >nul 2>&1"
     return ($LASTEXITCODE -eq 0)
 }
 
