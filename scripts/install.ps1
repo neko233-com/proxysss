@@ -13,6 +13,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+try {
+    $tls12 = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $tls12
+} catch {
+}
+
 $BinaryName = "proxysss"
 $Repo = "neko233-com/proxysss"
 $InstallDir = Join-Path $env:LOCALAPPDATA $BinaryName
@@ -91,15 +97,28 @@ function Install-DenoIfMissing {
 
     Write-Host "Deno not found, installing Deno for TypeScript script runtime..."
     if ($DryRun) {
-        Write-Host "[dry-run] irm https://deno.land/install.ps1 | iex"
+        Write-Host "[dry-run] winget install --id DenoLand.Deno -e --accept-source-agreements --accept-package-agreements"
         return
     }
 
-    irm https://deno.land/install.ps1 | iex
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($null -ne $winget) {
+        & winget install --id DenoLand.Deno -e --accept-source-agreements --accept-package-agreements
+    } else {
+        irm https://deno.land/install.ps1 | iex
+    }
 
     $denoBin = Join-Path $env:USERPROFILE ".deno\bin"
     if (Test-Path $denoBin) {
         Add-ToUserPath $denoBin | Out-Null
+        $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                    [Environment]::GetEnvironmentVariable("Path", "User")
+        return
+    }
+
+    $wingetDeno = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\deno.exe"
+    if (Test-Path $wingetDeno) {
+        Add-ToUserPath (Split-Path -Parent $wingetDeno) | Out-Null
         $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                     [Environment]::GetEnvironmentVariable("Path", "User")
     }
@@ -215,6 +234,53 @@ function Resolve-TargetVersion([string]$RequestedVersion) {
     return @{ Label = "v$normalized"; Version = $normalized }
 }
 
+function Download-FileWithFallback([string]$Url, [string]$OutFile) {
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile
+            if (Test-ValidDownloadedBinary $OutFile) {
+                return
+            }
+            throw "downloaded file is not a valid Windows executable"
+        } catch {
+            $lastError = $_
+            Write-Host "warning: download attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($null -ne $curl) {
+        & curl.exe -L --retry 3 --connect-timeout 20 -o $OutFile $Url
+        if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedBinary $OutFile)) {
+            return
+        }
+    }
+
+    throw "download failed after retries: $($lastError.Exception.Message)"
+}
+
+function Test-ValidDownloadedBinary([string]$Path) {
+    if (!(Test-Path $Path)) {
+        return $false
+    }
+
+    $file = Get-Item $Path
+    if ($file.Length -lt 1024) {
+        return $false
+    }
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $buffer = New-Object byte[] 2
+        $bytesRead = $stream.Read($buffer, 0, 2)
+        return ($bytesRead -eq 2 -and $buffer[0] -eq 0x4D -and $buffer[1] -eq 0x5A)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 $arch = Get-ArchName
 $asset = "${BinaryName}-windows-${arch}.exe"
 $target = Resolve-TargetVersion $Version
@@ -278,7 +344,7 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Stop-ServiceIfPresent $Dest
 
 $tmp = Join-Path $InstallDir ("$BinaryName.tmp.exe")
-Invoke-WebRequest -Uri $url -OutFile $tmp
+Download-FileWithFallback -Url $url -OutFile $tmp
 Move-Item -Force $tmp $Dest
 
 if (Add-ToUserPath $InstallDir) {
@@ -299,7 +365,12 @@ if (!$SkipInit) {
 if (Test-ServiceTaskExists) {
     Start-ServiceIfPresent $Dest
 } else {
-    & $Dest service install
+    try {
+        & $Dest service install
+    } catch {
+        Write-Host "warning: service install failed (likely requires administrator). Binary installation is complete." -ForegroundColor Yellow
+        Write-Host "warning: run PowerShell as Administrator and execute '$Dest service install' to enable startup service." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""

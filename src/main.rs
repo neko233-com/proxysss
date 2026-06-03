@@ -119,6 +119,7 @@ struct AdminClientContext {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
 
     match cli.command {

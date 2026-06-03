@@ -42,7 +42,11 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     fs::create_dir_all(&plugin_dir).with_context(|| format!("failed to create {}", plugin_dir.display()))?;
 
     let script_command = detect_script_command().unwrap_or_else(|| "deno".to_string());
-    write_if_needed(&config_path, &GatewayConfig::render_default_yaml(&script_command), overwrite)?;
+    let config_yaml = GatewayConfig::render_default_yaml(&script_command).replace(
+        "\n  cwd: .\n",
+        &format!("\n  cwd: {}\n", base_dir.display().to_string().replace('\\', "/")),
+    );
+    write_if_needed(&config_path, &config_yaml, overwrite)?;
     write_if_needed(&script_path, DEFAULT_GATEWAY_SCRIPT, overwrite)?;
     write_if_needed(&plugin_path, DEFAULT_PLUGIN_PLAYER_AFFINITY, overwrite)?;
 
@@ -110,7 +114,7 @@ pub fn install_service(config: Option<PathBuf>) -> Result<()> {
 
 pub fn uninstall_service() -> Result<()> {
     match env::consts::OS {
-        "windows" => run_command(Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]), "delete windows scheduled task"),
+        "windows" => uninstall_windows_service(),
         "linux" => {
             let unit_path = linux_service_path()?;
             if unit_path.exists() {
@@ -133,7 +137,7 @@ pub fn uninstall_service() -> Result<()> {
 
 pub fn start_service() -> Result<()> {
     match env::consts::OS {
-        "windows" => run_command(Command::new("schtasks").args(["/Run", "/TN", SERVICE_NAME]), "run windows scheduled task"),
+        "windows" => start_windows_service(),
         "linux" => run_command(Command::new("systemctl").args(["--user", "start", "proxysss.service"]), "start systemd user service"),
         "macos" => run_command(Command::new("launchctl").args(["load", "-w", macos_launch_agent_path()?.to_string_lossy().as_ref()]), "load launch agent"),
         os => Err(anyhow!("unsupported service start os {os}")),
@@ -158,7 +162,7 @@ pub fn stop_service() -> Result<()> {
 
 pub fn service_status() -> Result<()> {
     match env::consts::OS {
-        "windows" => run_command(Command::new("schtasks").args(["/Query", "/TN", SERVICE_NAME]), "query windows scheduled task"),
+        "windows" => windows_service_status(),
         "linux" => run_command(Command::new("systemctl").args(["--user", "status", "proxysss.service", "--no-pager"]), "show systemd user service status"),
         "macos" => run_command(Command::new("launchctl").args(["list", LAUNCH_AGENT_LABEL]), "show launch agent status"),
         os => Err(anyhow!("unsupported service status os {os}")),
@@ -167,7 +171,7 @@ pub fn service_status() -> Result<()> {
 
 fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> {
     let task_command = format!("\"{}\" run --config \"{}\"", executable.display(), config_path.display());
-    run_command(
+    let scheduled_task = run_command(
         Command::new("schtasks").args([
             "/Create",
             "/F",
@@ -181,8 +185,107 @@ fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> 
             &task_command,
         ]),
         "create windows scheduled task",
-    )?;
-    start_service()
+    );
+
+    if scheduled_task.is_ok() {
+        return start_windows_service();
+    }
+
+    install_windows_run_key(&task_command)?;
+    start_windows_command(executable, config_path)
+}
+
+fn uninstall_windows_service() -> Result<()> {
+    let mut removed_any = false;
+
+    if run_command(Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]), "delete windows scheduled task").is_ok() {
+        removed_any = true;
+    }
+
+    if delete_windows_run_key().is_ok() {
+        removed_any = true;
+    }
+
+    if removed_any {
+        return Ok(());
+    }
+
+    Err(anyhow!("no windows auto-start entry found for proxysss"))
+}
+
+fn start_windows_service() -> Result<()> {
+    if run_command(Command::new("schtasks").args(["/Run", "/TN", SERVICE_NAME]), "run windows scheduled task").is_ok() {
+        return Ok(());
+    }
+
+    let current_exe = env::current_exe().context("failed to resolve current executable")?;
+    let config_path = resolve_run_config_path(None)?;
+    start_windows_command(&current_exe, &config_path)
+}
+
+fn windows_service_status() -> Result<()> {
+    if run_command(Command::new("schtasks").args(["/Query", "/TN", SERVICE_NAME]), "query windows scheduled task").is_ok() {
+        return Ok(());
+    }
+
+    let output = Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            SERVICE_NAME,
+        ])
+        .output()
+        .context("failed to query windows run registry entry")?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            println!("startup mode: HKCU Run");
+            println!("{stdout}");
+        }
+        return Ok(());
+    }
+
+    Err(anyhow!("query windows auto-start failed: no scheduled task or HKCU Run entry found"))
+}
+
+fn install_windows_run_key(task_command: &str) -> Result<()> {
+    run_command(
+        Command::new("reg").args([
+            "add",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            SERVICE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            task_command,
+            "/f",
+        ]),
+        "create windows HKCU run entry",
+    )
+}
+
+fn delete_windows_run_key() -> Result<()> {
+    run_command(
+        Command::new("reg").args([
+            "delete",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            SERVICE_NAME,
+            "/f",
+        ]),
+        "delete windows HKCU run entry",
+    )
+}
+
+fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
+    Command::new(executable)
+        .args(["run", "--config", &config_path.display().to_string()])
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    Ok(())
 }
 
 fn install_linux_service(executable: &Path, config_path: &Path, working_dir: &Path) -> Result<()> {
