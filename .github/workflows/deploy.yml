@@ -1,0 +1,84 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Deployment profile name
+        required: true
+        default: production
+  push:
+    branches:
+      - main
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: proxysss.exe
+            artifact: deploy-windows-amd64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: proxysss
+            artifact: deploy-linux-amd64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            binary: proxysss
+            artifact: deploy-darwin-amd64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package bundle (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p bundle
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
+          cp -R scripts bundle/scripts
+          cp README.md bundle/
+          if [ -d templates ]; then cp -R templates bundle/templates; fi
+          if [ -f proxysss.yaml ]; then cp proxysss.yaml bundle/; fi
+          tar -czf ${{ matrix.artifact }}.tar.gz -C bundle .
+
+      - name: Package bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path bundle -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
+          Copy-Item scripts "bundle/scripts" -Recurse -Force
+          Copy-Item README.md "bundle/" -Force
+          if (Test-Path templates) { Copy-Item templates "bundle/templates" -Recurse -Force }
+          if (Test-Path proxysss.yaml) { Copy-Item proxysss.yaml "bundle/" -Force }
+          Compress-Archive -Path bundle/* -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+
+  deploy-summary:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit deployment summary
+        run: |
+          echo "Deploy profile: ${{ github.event.inputs.profile || 'production' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Build artifacts are ready in workflow artifacts." >> "$GITHUB_STEP_SUMMARY"

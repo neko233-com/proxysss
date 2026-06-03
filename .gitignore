@@ -1,0 +1,5 @@
+target/
+dist/
+certs/
+.DS_Store
+Thumbs.db

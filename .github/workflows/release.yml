@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: proxysss-windows-amd64.exe
+            binary: proxysss.exe
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            asset: proxysss-windows-arm64.exe
+            binary: proxysss.exe
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: proxysss-linux-amd64
+            binary: proxysss
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset: proxysss-linux-arm64
+            binary: proxysss
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            asset: proxysss-darwin-amd64
+            binary: proxysss
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: proxysss-darwin-arm64
+            binary: proxysss
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename asset
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
