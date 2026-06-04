@@ -2,7 +2,7 @@
 
 proxysss 是一个可编程 Rust 网关，目标是完全替代 Nginx + Caddy：安装 proxysss 不会安装 Nginx，也不依赖 Nginx。它统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合 Web 反代、游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.9
+当前版本：v0.1.10
 
 ## 核心能力
 
@@ -71,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v0.1.9
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v0.1.10
 ```
 
 ### Windows PowerShell
@@ -84,7 +84,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.9
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.10
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.4
 ```
 
@@ -103,7 +103,7 @@ install.ps1 支持参数：
 - 安装到 PATH 可访问位置
 - 自动安装 Deno（若缺失）
 - 执行 init/check-config
-- 安装并启用服务（开机自启动）
+- 安装并启用服务（开机自启动；Windows 使用隐藏启动器，避免额外 cmd 窗口）
 - 更新时优先停止服务、原子替换二进制、再启动服务；Windows 不能对运行中 exe 做真正原地替换，所以默认走快速冷重启
 
 ## 升级与降级
@@ -112,7 +112,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.1.9
+proxysss update --version v0.1.10
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -123,7 +123,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.9
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.10
 ```
 
 降级到指定版本：
@@ -135,7 +135,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.9 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.10 -DryRun
 ```
 
 ### Linux / macOS
@@ -143,7 +143,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 install.sh 支持显式 action/version：
 
 ```bash
-bash ./scripts/install.sh --action upgrade --version v0.1.9
+bash ./scripts/install.sh --action upgrade --version v0.1.10
 bash ./scripts/install.sh --action downgrade --version v0.1.4
 ```
 
@@ -305,7 +305,7 @@ release.yml 会在推送 v* tag 时构建并发布多平台二进制。
 本地发布后验证：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.9 -PreviousVersion v0.1.8
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.10 -PreviousVersion v0.1.9
 ```
 
 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。

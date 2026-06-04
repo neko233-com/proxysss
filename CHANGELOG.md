@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.10 - 2026-06-04
+
+- Fixed Windows `proxysss start` fallback launching a visible console window.
+- Changed Windows auto-start install to use a hidden `wscript.exe` launcher through HKCU Run by default.
+- Made running `proxysss.exe` without arguments start the gateway instead of printing help and exiting immediately.
+
 ## v0.1.9 - 2026-06-04
 
 - Hardened Windows installer downloads with a GitHub CLI release-download fallback when direct asset HTTPS downloads time out.
