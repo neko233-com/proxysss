@@ -1,4 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
@@ -34,7 +34,7 @@ use serde::Deserialize;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 use uuid::Uuid;
@@ -101,6 +101,26 @@ struct GatewayStats {
 struct UpstreamLease {
     runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
     key: String,
+}
+
+#[derive(Clone, Debug)]
+enum ListenerSpec {
+    PlainHttp {
+        bind: String,
+    },
+    TlsHttp {
+        bind: String,
+        tls_fingerprint: String,
+    },
+    Http3 {
+        bind: String,
+        tls_fingerprint: String,
+    },
+    Tcp(TcpListenerConfig),
+    Udp(UdpListenerConfig),
+    Admin {
+        bind: String,
+    },
 }
 
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -198,35 +218,8 @@ impl Gateway {
             tasks.spawn(async move { gateway.run_acme_renew_loop().await });
         }
 
-        if !self.bootstrap_config.http.plain_bind.trim().is_empty() {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_plain_http().await });
-        }
-
-        if !self.bootstrap_config.http.tls_bind.trim().is_empty() {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_tls_http().await });
-        }
-
-        if !self.bootstrap_config.http.h3_bind.trim().is_empty() {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_http3().await });
-        }
-
-        for listener in self.bootstrap_config.tcp.listeners.clone() {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_tcp_listener(listener).await });
-        }
-
-        for listener in self.bootstrap_config.udp.listeners.clone() {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_udp_listener(listener).await });
-        }
-
-        if self.bootstrap_config.admin.enabled {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_admin_server().await });
-        }
+        let gateway = self.clone();
+        tasks.spawn(async move { gateway.run_listener_supervisor().await });
 
         while let Some(result) = tasks.join_next().await {
             result??;
@@ -244,6 +237,7 @@ impl Gateway {
                 state.config.runtime.hot_reload.interval_ms.max(200)
             };
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            self.prune_sticky_affinity();
 
             let hash = match read_file_hash(&self.config_path) {
                 Ok(value) => value,
@@ -295,13 +289,80 @@ impl Gateway {
         }
     }
 
-    async fn run_admin_server(self: Arc<Self>) -> Result<()> {
-        let bind_addr: SocketAddr = self
-            .bootstrap_config
-            .admin
-            .bind
-            .parse()
-            .context("invalid admin.bind address")?;
+    async fn run_listener_supervisor(self: Arc<Self>) -> Result<()> {
+        let mut active = BTreeMap::<String, JoinHandle<Result<()>>>::new();
+
+        loop {
+            let state = self.current_state().await;
+            let desired = listener_specs(&state.config);
+            let desired_keys = desired
+                .iter()
+                .map(ListenerSpec::key)
+                .collect::<BTreeSet<_>>();
+
+            let stale = active
+                .keys()
+                .filter(|key| !desired_keys.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in stale {
+                if let Some(handle) = active.remove(&key) {
+                    handle.abort();
+                    tracing::info!(listener = %key, "listener stopped after hot reload");
+                }
+            }
+
+            for spec in desired {
+                let key = spec.key();
+                if active.contains_key(&key) {
+                    continue;
+                }
+
+                let gateway = self.clone();
+                let spawn_key = key.clone();
+                let handle = tokio::spawn(async move { gateway.run_listener_spec(spec).await });
+                active.insert(key, handle);
+                tracing::info!(listener = %spawn_key, "listener started");
+            }
+
+            let finished = active
+                .iter()
+                .filter(|(_, handle)| handle.is_finished())
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in finished {
+                let Some(handle) = active.remove(&key) else {
+                    continue;
+                };
+                match handle.await {
+                    Ok(Ok(())) => tracing::info!(listener = %key, "listener finished"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(?error, listener = %key, "listener failed; supervisor will retry")
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        tracing::warn!(?error, listener = %key, "listener task join failed")
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn run_listener_spec(self: Arc<Self>, spec: ListenerSpec) -> Result<()> {
+        match spec {
+            ListenerSpec::PlainHttp { bind } => self.run_plain_http(bind).await,
+            ListenerSpec::TlsHttp { bind, .. } => self.run_tls_http(bind).await,
+            ListenerSpec::Http3 { bind, .. } => self.run_http3(bind).await,
+            ListenerSpec::Tcp(listener) => self.run_tcp_listener(listener).await,
+            ListenerSpec::Udp(listener) => self.run_udp_listener(listener).await,
+            ListenerSpec::Admin { bind } => self.run_admin_server(bind).await,
+        }
+    }
+
+    async fn run_admin_server(self: Arc<Self>, bind: String) -> Result<()> {
+        let bind_addr: SocketAddr = bind.parse().context("invalid admin.bind address")?;
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind admin listener {}", bind_addr))?;
@@ -552,7 +613,6 @@ impl Gateway {
 
     async fn reload_from_disk(&self) -> Result<()> {
         let new_config = GatewayConfig::load(&self.config_path)?;
-        ensure_reload_compatible(&self.bootstrap_config, &new_config)?;
         prepare_tls_material(&new_config)?;
 
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
@@ -569,13 +629,8 @@ impl Gateway {
         Ok(())
     }
 
-    async fn run_plain_http(self: Arc<Self>) -> Result<()> {
-        let bind_addr: SocketAddr = self
-            .bootstrap_config
-            .http
-            .plain_bind
-            .parse()
-            .context("invalid http.plain_bind address")?;
+    async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
+        let bind_addr: SocketAddr = bind.parse().context("invalid http.plain_bind address")?;
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind plain http listener {}", bind_addr))?;
@@ -610,16 +665,13 @@ impl Gateway {
         }
     }
 
-    async fn run_tls_http(self: Arc<Self>) -> Result<()> {
-        let bind_addr: SocketAddr = self
-            .bootstrap_config
-            .http
-            .tls_bind
-            .parse()
-            .context("invalid http.tls_bind address")?;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(
-            self.build_rustls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()])?,
-        ));
+    async fn run_tls_http(self: Arc<Self>, bind: String) -> Result<()> {
+        let bind_addr: SocketAddr = bind.parse().context("invalid http.tls_bind address")?;
+        let state = self.current_state().await;
+        let tls_acceptor = TlsAcceptor::from(Arc::new(build_rustls_server_config(
+            &state.config,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )?));
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind tls http listener {}", bind_addr))?;
@@ -661,17 +713,14 @@ impl Gateway {
         }
     }
 
-    async fn run_http3(self: Arc<Self>) -> Result<()> {
-        let bind_addr: SocketAddr = self
-            .bootstrap_config
-            .http
-            .h3_bind
-            .parse()
-            .context("invalid http.h3_bind address")?;
+    async fn run_http3(self: Arc<Self>, bind: String) -> Result<()> {
+        let bind_addr: SocketAddr = bind.parse().context("invalid http.h3_bind address")?;
 
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(self.build_rustls_server_config(vec![b"h3".to_vec()])?)?,
-        ));
+        let state = self.current_state().await;
+        let mut server_config =
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
+                build_rustls_server_config(&state.config, vec![b"h3".to_vec()])?,
+            )?));
         let transport = Arc::get_mut(&mut server_config.transport)
             .context("failed to configure quic transport")?;
         transport.keep_alive_interval(Some(Duration::from_secs(15)));
@@ -1224,6 +1273,14 @@ impl Gateway {
         let player_id = extract_http_player_id(&uri, &headers, &state.config.affinity.http);
         let request_id = Uuid::new_v4().to_string();
 
+        if monitoring_path_matches(&state.config.monitoring, uri.path()) {
+            return Ok(json_gateway_response(
+                StatusCode::OK,
+                self.stats.snapshot_json(),
+                "proxysss://metrics",
+            ));
+        }
+
         let route = state
             .script
             .route_http(HttpContext {
@@ -1704,19 +1761,10 @@ impl Gateway {
         result
     }
 
-    fn build_rustls_server_config(
-        &self,
-        alpn_protocols: Vec<Vec<u8>>,
-    ) -> Result<rustls::ServerConfig> {
-        let certs = load_certs(&self.bootstrap_config.http.tls.cert_path)?;
-        let key = load_private_key(&self.bootstrap_config.http.tls.key_path)?;
-
-        let mut server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("failed building rustls server config")?;
-        server_config.alpn_protocols = alpn_protocols;
-        Ok(server_config)
+    fn prune_sticky_affinity(&self) {
+        let now = Instant::now();
+        self.sticky_affinity
+            .retain(|_, entry| entry.expires_at > now);
     }
 }
 
@@ -1904,57 +1952,74 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
     Ok(())
 }
 
-fn ensure_reload_compatible(old: &GatewayConfig, new: &GatewayConfig) -> Result<()> {
-    if old.logging.format != new.logging.format || old.logging.filter != new.logging.filter {
-        return Err(anyhow!(
-            "logging.format/logging.filter changes require restart"
-        ));
+fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
+    let mut specs = Vec::new();
+
+    if !config.http.plain_bind.trim().is_empty() {
+        specs.push(ListenerSpec::PlainHttp {
+            bind: config.http.plain_bind.clone(),
+        });
+    }
+    if !config.http.tls_bind.trim().is_empty() {
+        specs.push(ListenerSpec::TlsHttp {
+            bind: config.http.tls_bind.clone(),
+            tls_fingerprint: tls_fingerprint(config),
+        });
+    }
+    if !config.http.h3_bind.trim().is_empty() {
+        specs.push(ListenerSpec::Http3 {
+            bind: config.http.h3_bind.clone(),
+            tls_fingerprint: tls_fingerprint(config),
+        });
+    }
+    for listener in &config.tcp.listeners {
+        specs.push(ListenerSpec::Tcp(listener.clone()));
+    }
+    for listener in &config.udp.listeners {
+        specs.push(ListenerSpec::Udp(listener.clone()));
+    }
+    if config.admin.enabled {
+        specs.push(ListenerSpec::Admin {
+            bind: config.admin.bind.clone(),
+        });
     }
 
-    if old.http.plain_bind != new.http.plain_bind
-        || old.http.tls_bind != new.http.tls_bind
-        || old.http.h3_bind != new.http.h3_bind
-    {
-        return Err(anyhow!(
-            "listener bind changes require restart (http.plain_bind/http.tls_bind/http.h3_bind)"
-        ));
-    }
-
-    if old.admin.enabled != new.admin.enabled {
-        return Err(anyhow!("admin.enabled change requires restart"));
-    }
-
-    if old.admin.enabled && old.admin.bind != new.admin.bind {
-        return Err(anyhow!("admin.bind change requires restart"));
-    }
-
-    if listener_signature_tcp(&old.tcp.listeners) != listener_signature_tcp(&new.tcp.listeners) {
-        return Err(anyhow!("tcp listener set changed; restart required"));
-    }
-
-    if listener_signature_udp(&old.udp.listeners) != listener_signature_udp(&new.udp.listeners) {
-        return Err(anyhow!("udp listener set changed; restart required"));
-    }
-
-    if old.http.tls.mode != new.http.tls.mode {
-        return Err(anyhow!("tls mode changes require restart"));
-    }
-
-    Ok(())
+    specs
 }
 
-fn listener_signature_tcp(listeners: &[TcpListenerConfig]) -> HashSet<(String, String)> {
-    listeners
-        .iter()
-        .map(|listener| (listener.name.clone(), listener.bind.clone()))
-        .collect()
+impl ListenerSpec {
+    fn key(&self) -> String {
+        match self {
+            ListenerSpec::PlainHttp { bind } => format!("http:{bind}"),
+            ListenerSpec::TlsHttp {
+                bind,
+                tls_fingerprint,
+            } => {
+                format!("https:{bind}:{tls_fingerprint}")
+            }
+            ListenerSpec::Http3 {
+                bind,
+                tls_fingerprint,
+            } => {
+                format!("h3:{bind}:{tls_fingerprint}")
+            }
+            ListenerSpec::Tcp(listener) => format!("tcp:{}:{}", listener.name, listener.bind),
+            ListenerSpec::Udp(listener) => format!("udp:{}:{}", listener.name, listener.bind),
+            ListenerSpec::Admin { bind } => format!("admin:{bind}"),
+        }
+    }
 }
 
-fn listener_signature_udp(listeners: &[UdpListenerConfig]) -> HashSet<(String, String)> {
-    listeners
-        .iter()
-        .map(|listener| (listener.name.clone(), listener.bind.clone()))
-        .collect()
+fn tls_fingerprint(config: &GatewayConfig) -> String {
+    let cert_hash = read_file_hash(&config.http.tls.cert_path).unwrap_or(0);
+    let key_hash = read_file_hash(&config.http.tls.key_path).unwrap_or(0);
+    format!(
+        "{}:{}:{}:{}",
+        config.http.tls.mode as u8,
+        config.http.tls.cert_path.display(),
+        cert_hash,
+        key_hash
+    )
 }
 
 fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
@@ -2001,6 +2066,21 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_rustls_server_config(
+    config: &GatewayConfig,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<rustls::ServerConfig> {
+    let certs = load_certs(&config.http.tls.cert_path)?;
+    let key = load_private_key(&config.http.tls.key_path)?;
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("failed building rustls server config")?;
+    server_config.alpn_protocols = alpn_protocols;
+    Ok(server_config)
 }
 
 fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<()> {
@@ -2411,6 +2491,23 @@ fn text_response(status: StatusCode, body: impl Into<String>) -> Response<Full<B
         })
 }
 
+fn json_gateway_response(
+    status: StatusCode,
+    payload: serde_json::Value,
+    upstream: impl Into<String>,
+) -> GatewayHttpResponse {
+    GatewayHttpResponse::bytes(
+        status,
+        Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())),
+        "application/json",
+        upstream,
+    )
+}
+
+fn monitoring_path_matches(config: &crate::config::MonitoringConfig, path: &str) -> bool {
+    config.enabled && path == config.path
+}
+
 fn is_hop_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -2683,7 +2780,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>默认监听</h3>
                     <p>HTTP/TLS/HTTP3 入口由配置决定，后台管理默认绑定到 <code>__ADMIN_URL__</code>。</p>
                     <ul>
-                        <li>欢迎页：<code>http://localhost:23380/</code></li>
+                        <li>欢迎页：<code>http://localhost:7777/</code></li>
                         <li>后台页：<code>http://__ADMIN_URL__/</code></li>
                         <li>健康检查：<code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>
@@ -2692,7 +2789,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>Default Endpoints</h3>
                     <p>HTTP/TLS/HTTP3 listeners come from config, while the admin console is bound to <code>__ADMIN_URL__</code> by default.</p>
                     <ul>
-                        <li>Welcome page: <code>http://localhost:23380/</code></li>
+                        <li>Welcome page: <code>http://localhost:7777/</code></li>
                         <li>Admin page: <code>http://__ADMIN_URL__/</code></li>
                         <li>Health check: <code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>
@@ -3146,5 +3243,34 @@ mod tests {
         );
 
         assert!(websocket_upgrade_requested(&headers));
+    }
+
+    #[test]
+    fn listener_specs_reflect_hot_reloadable_binds() {
+        let mut config = GatewayConfig::default();
+        config.http.plain_bind = "127.0.0.1:7000".to_string();
+        config.http.tls_bind.clear();
+        config.http.h3_bind.clear();
+        config.admin.bind = "127.0.0.1:7001".to_string();
+
+        let keys = listener_specs(&config)
+            .into_iter()
+            .map(|spec| spec.key())
+            .collect::<Vec<_>>();
+
+        assert!(keys.contains(&"http:127.0.0.1:7000".to_string()));
+        assert!(keys.contains(&"admin:127.0.0.1:7001".to_string()));
+    }
+
+    #[test]
+    fn monitoring_path_match_respects_enabled_flag() {
+        let mut config = crate::config::MonitoringConfig {
+            path: "/internal-metrics".to_string(),
+            ..Default::default()
+        };
+        assert!(monitoring_path_matches(&config, "/internal-metrics"));
+        assert!(!monitoring_path_matches(&config, "/metrics"));
+        config.enabled = false;
+        assert!(!monitoring_path_matches(&config, "/internal-metrics"));
     }
 }

@@ -218,7 +218,7 @@ main() {
 
     echo ""
     echo "Installed successfully."
-    echo "Gateway port: 23380 (TCP for HTTP/1.1 + HTTP/2, UDP for HTTP/3)"
+    echo "Gateway port: 7777 (TCP for HTTP/1.1 + HTTP/2, UDP for HTTP/3)"
 }
 
 main "$@"

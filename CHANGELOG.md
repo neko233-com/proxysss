@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.7 - 2026-06-04
+
+- Changed default gateway port to `7777` and admin port to `7778`.
+- Added configurable public monitoring API with `monitoring.enabled` and `monitoring.path`.
+- Added hot reload supervisor for listener changes, including HTTP/TLS/H3, TCP/UDP listeners, and admin bind changes.
+- Added GitHub Actions `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` to remove Node.js 20 deprecation risk.
+- Updated docs to position proxysss as a high-performance Web reverse proxy competitor to Nginx and to document ACME/Caddy-style certificate automation.
+- Expanded memory-safety and monitoring documentation.
+
 ## v0.1.6 - 2026-06-04
 
 - Fixed release verification compatibility when downgrading to older builds that do not support `proxysss --version`.
