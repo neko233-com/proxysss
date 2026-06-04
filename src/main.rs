@@ -6,6 +6,7 @@ mod install;
 mod script;
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -17,6 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Parser, Debug)]
 #[command(name = "proxysss")]
 #[command(about = "Programmable Rust gateway with TS/JS routing scripts")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -27,6 +29,23 @@ enum Commands {
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    Update {
+        #[arg(long, default_value = "latest")]
+        version: String,
+        #[arg(long, default_value_t = false)]
+        no_service_restart: bool,
+        #[arg(long, default_value_t = false)]
+        skip_init: bool,
+    },
+    SwitchVersion {
+        version: String,
+        #[arg(long, default_value_t = false)]
+        allow_downgrade: bool,
+        #[arg(long, default_value_t = false)]
+        no_service_restart: bool,
+        #[arg(long, default_value_t = false)]
+        skip_init: bool,
     },
     CheckConfig {
         #[arg(long)]
@@ -142,6 +161,23 @@ async fn main() -> Result<()> {
                 .run()
                 .await
         }
+        Commands::Update {
+            version,
+            no_service_restart,
+            skip_init,
+        } => run_installer_command("update", &version, false, no_service_restart, skip_init),
+        Commands::SwitchVersion {
+            version,
+            allow_downgrade,
+            no_service_restart,
+            skip_init,
+        } => run_installer_command(
+            "install",
+            &version,
+            allow_downgrade,
+            no_service_restart,
+            skip_init,
+        ),
         Commands::CheckConfig { config } => {
             init_logging("info,proxysss=info", LogFormat::Plain);
 
@@ -261,6 +297,106 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+fn run_installer_command(
+    action: &str,
+    version: &str,
+    allow_downgrade: bool,
+    no_service_restart: bool,
+    skip_init: bool,
+) -> Result<()> {
+    init_logging("info,proxysss=info", LogFormat::Plain);
+    let script_url = match std::env::consts::OS {
+        "windows" => {
+            "https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1"
+        }
+        "linux" | "macos" => {
+            "https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh"
+        }
+        os => return Err(anyhow::anyhow!("unsupported update os {os}")),
+    };
+
+    if std::env::consts::OS == "windows" {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!(
+                "& ([ScriptBlock]::Create((irm '{}'))) -Action {} -Version {}{}{}{}",
+                script_url,
+                powershell_escape_arg(action),
+                powershell_escape_arg(version),
+                if allow_downgrade {
+                    " -AllowDowngrade"
+                } else {
+                    ""
+                },
+                if no_service_restart {
+                    " -NoServiceRestart"
+                } else {
+                    ""
+                },
+                if skip_init { " -SkipInit" } else { "" },
+            ),
+        ]);
+        return run_inherited(command, "run Windows installer");
+    }
+
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(format!(
+        "curl -fsSL '{}' | bash -s -- --action {} --version {}{}{}{}",
+        script_url,
+        sh_escape_arg(action),
+        sh_escape_arg(version),
+        if allow_downgrade {
+            " --allow-downgrade"
+        } else {
+            ""
+        },
+        if no_service_restart {
+            " --no-service-restart"
+        } else {
+            ""
+        },
+        if skip_init { " --skip-init" } else { "" },
+    ));
+    run_inherited(command, "run Unix installer")
+}
+
+fn powershell_escape_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+fn sh_escape_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn run_inherited(mut command: Command, description: &str) -> Result<()> {
+    let status = command
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed to {description}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{description} failed with {status}"))
     }
 }
 

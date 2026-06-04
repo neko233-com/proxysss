@@ -2,7 +2,7 @@
 
 proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.4
+当前版本：v0.1.5
 
 ## 核心能力
 
@@ -16,6 +16,7 @@ proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/
 - 管理端：内置 admin API（可关闭）
 - 配置热重载：配置文件变更后自动校验并重载
 - TLS 模式：self_signed / manual / acme_external
+- Nginx 常用内建能力：反代、负载均衡、TLS、HTTP/2、HTTP/3、WebSocket、TCP/UDP、热重载、静态文件、redirect、healthz
 
 ## 运行环境
 
@@ -67,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.4
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v0.1.5
 ```
 
 ### Windows PowerShell
@@ -80,8 +81,8 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.4
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.5
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.4
 ```
 
 install.ps1 支持参数：
@@ -100,36 +101,47 @@ install.ps1 支持参数：
 - 自动安装 Deno（若缺失）
 - 执行 init/check-config
 - 安装并启用服务（开机自启动）
+- 更新时优先停止服务、原子替换二进制、再启动服务；Windows 不能对运行中 exe 做真正原地替换，所以默认走快速冷重启
 
 ## 升级与降级
+
+### CLI 一键升级/切版
+
+```bash
+proxysss update --version latest
+proxysss update --version v0.1.5
+proxysss switch-version v0.1.4 --allow-downgrade
+```
+
+配置变更可热重载。二进制更新按平台限制处理：能热更新则热更新；不能无感替换时走“停服务 -> 替换 -> 启服务”的快速冷启动。
 
 ### Windows
 
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.4
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.5
 ```
 
 降级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action downgrade -Version v0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action downgrade -Version v0.1.4
 ```
 
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.4 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.5 -DryRun
 ```
 
 ### Linux / macOS
 
-当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
+install.sh 支持显式 action/version：
 
 ```bash
-bash ./scripts/install.sh v0.1.4
-bash ./scripts/install.sh v0.1.0
+bash ./scripts/install.sh --action upgrade --version v0.1.5
+bash ./scripts/install.sh --action downgrade --version v0.1.4
 ```
 
 ## 主流 Proxy 对比
@@ -151,6 +163,14 @@ bash ./scripts/install.sh v0.1.0
 - 如果你主要做通用 Web 反代，且希望生态成熟、运维习惯稳定，Nginx 或 Caddy 更省心。
 - 如果你已经在 Kubernetes 或 Service Mesh 体系里，Traefik 或 Envoy 更贴合现有控制面。
 - 如果核心诉求是极强的 L4/L7 性能与成熟负载均衡规则，HAProxy 仍然是强项。
+
+## Nginx 功能覆盖策略
+
+proxysss 当前不是 Nginx 逐指令复刻。它按现有架构覆盖入口网关高频能力，并把细粒度规则放进 TS/JS 脚本和插件：
+
+- 已内建：HTTP/TLS/HTTP2/HTTP3、WebSocket、TCP/UDP stream、反向代理、负载均衡、重试、被动健康检查、热重载、静态文件、redirect、healthz、access log、admin API、ACME 外部证书。
+- 用脚本/插件实现：按 host/path/header/cookie/query 路由、rewrite、header 改写、鉴权、限流、灰度、会话亲和、业务级 upstream 选择。
+- 不承诺逐条兼容：Nginx rewrite DSL、module ABI、mail proxy、SSI、autoindex、复杂 cache 等；这些可按需求逐项插件化。
 
 ## 配置与安全
 
@@ -178,6 +198,18 @@ proxysss print-default-config --format json
 - POST /v1/plugins/unload
 
 说明：除 healthz 外，其余接口默认需要 Basic Auth。
+
+## 内建内部路由
+
+脚本可返回：
+
+```ts
+{ upstream: "proxysss://healthz" }
+{ upstream: "proxysss://redirect/https://example.com", status: 301 }
+{ upstream: "proxysss://static/public/index.html", content_type: "text/html; charset=utf-8" }
+```
+
+静态文件路径被限制在配置目录内，防止 `..` 越界。
 
 ## 插件与脚本
 
@@ -233,6 +265,14 @@ proxysss bench udp --addr 127.0.0.1:2053 --connections 512 --duration-secs 30 --
 - .github/workflows/release.yml
 
 release.yml 会在推送 v* tag 时构建并发布多平台二进制。
+
+本地发布后验证：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.5 -PreviousVersion v0.1.4
+```
+
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## Windows 快捷脚本
 

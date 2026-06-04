@@ -1,7 +1,12 @@
 #!/bin/bash
 set -e
 
-VERSION="${1:-latest}"
+VERSION="latest"
+ACTION="install"
+ALLOW_DOWNGRADE="false"
+NO_SERVICE_RESTART="false"
+SKIP_INIT="false"
+DRY_RUN="false"
 BINARY_NAME="proxysss"
 REPO="neko233-com/proxysss"
 
@@ -28,6 +33,68 @@ normalize_version() {
     echo "$v"
 }
 
+installed_version() {
+    if ! command -v "${BINARY_NAME}" >/dev/null 2>&1; then
+        return
+    fi
+    "${BINARY_NAME}" --version 2>/dev/null | sed -nE 's/.*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+}
+
+compare_versions() {
+    local left="$1"
+    local right="$2"
+    if [ -z "$left" ] || [ -z "$right" ]; then
+        echo "unknown"
+        return
+    fi
+    if [ "$left" = "$right" ]; then
+        echo "0"
+    elif [ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)" = "$left" ]; then
+        echo "-1"
+    else
+        echo "1"
+    fi
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --action)
+                ACTION="$2"
+                shift 2
+                ;;
+            --version)
+                VERSION="$2"
+                shift 2
+                ;;
+            --allow-downgrade)
+                ALLOW_DOWNGRADE="true"
+                shift
+                ;;
+            --no-service-restart)
+                NO_SERVICE_RESTART="true"
+                shift
+                ;;
+            --skip-init)
+                SKIP_INIT="true"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            install|update|upgrade|downgrade)
+                ACTION="$1"
+                shift
+                ;;
+            *)
+                VERSION="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
 install_binary() {
     local os="$1"
     local arch="$2"
@@ -47,6 +114,10 @@ install_binary() {
     tmpdir=$(mktemp -d)
 
     echo "Downloading ${url}..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[dry-run] install ${asset} to ${target}"
+        return
+    fi
     curl -fsSL "$url" -o "${tmpdir}/${BINARY_NAME}"
 
     if [ -w "$install_dir" ]; then
@@ -61,6 +132,30 @@ install_binary() {
     echo "Installed ${BINARY_NAME} to ${target}"
 }
 
+stop_service_if_present() {
+    if [ "$NO_SERVICE_RESTART" = "true" ]; then
+        return
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user list-unit-files proxysss.service >/dev/null 2>&1; then
+        systemctl --user stop proxysss.service >/dev/null 2>&1 || true
+    fi
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl unload "$HOME/Library/LaunchAgents/com.neko233.proxysss.plist" >/dev/null 2>&1 || true
+    fi
+}
+
+start_service_if_present() {
+    if [ "$NO_SERVICE_RESTART" = "true" ]; then
+        return
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -f "$HOME/.config/systemd/user/proxysss.service" ]; then
+        systemctl --user start proxysss.service >/dev/null 2>&1 || true
+    fi
+    if command -v launchctl >/dev/null 2>&1 && [ -f "$HOME/Library/LaunchAgents/com.neko233.proxysss.plist" ]; then
+        launchctl load -w "$HOME/Library/LaunchAgents/com.neko233.proxysss.plist" >/dev/null 2>&1 || true
+    fi
+}
+
 install_deno_if_missing() {
     if command -v deno >/dev/null 2>&1; then
         return
@@ -72,6 +167,7 @@ install_deno_if_missing() {
 }
 
 main() {
+    parse_args "$@"
     local os
     local arch
 
@@ -90,13 +186,35 @@ main() {
         VERSION="latest"
     fi
 
-    echo "Detected ${os}/${arch}"
+    local current
+    current=$(installed_version || true)
+    local cmp="unknown"
+    if [ "$VERSION" != "latest" ] && [ -n "$current" ]; then
+        cmp=$(compare_versions "$VERSION" "$current")
+        if [ "$cmp" = "0" ]; then
+            echo "Target version ${VERSION} already installed."
+            exit 0
+        fi
+        if [ "$cmp" = "-1" ] && [ "$ALLOW_DOWNGRADE" != "true" ] && [ "$ACTION" != "downgrade" ]; then
+            echo "Requested version ${VERSION} is lower than installed ${current}. Use --action downgrade or --allow-downgrade." >&2
+            exit 1
+        fi
+        if [ "$cmp" = "1" ] && [ "$ACTION" = "downgrade" ]; then
+            echo "Action downgrade requires lower target than current ${current}." >&2
+            exit 1
+        fi
+    fi
+
+    echo "Detected ${os}/${arch}; action=${ACTION}; current=${current:-none}; target=${VERSION}"
+    stop_service_if_present
     install_binary "$os" "$arch" "$VERSION"
     install_deno_if_missing
 
-    ${BINARY_NAME} init
-    ${BINARY_NAME} check-config
-    ${BINARY_NAME} service install
+    if [ "$SKIP_INIT" != "true" ]; then
+        ${BINARY_NAME} init
+        ${BINARY_NAME} check-config
+    fi
+    ${BINARY_NAME} service install || start_service_if_present
 
     echo ""
     echo "Installed successfully."

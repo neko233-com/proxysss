@@ -32,6 +32,8 @@ type RouteDecision = {
   rewrite_path?: string;
   set_headers?: Record<string, string>;
   strip_headers?: string[];
+  status?: number;
+  content_type?: string;
 };
 
 type GatewayMessage = {
@@ -93,6 +95,18 @@ function fallbackHttpRoute(message: GatewayMessage): RouteDecision {
   if (path === "/" || path === "/index.html" || path === "/docs") {
     return {
       upstream: "proxysss://welcome",
+    };
+  }
+
+  if (path === "/healthz") {
+    return {
+      upstream: "proxysss://healthz",
+    };
+  }
+
+  if (path.startsWith("/static/")) {
+    return {
+      upstream: `proxysss://static/${path.slice("/static/".length)}`,
     };
   }
 

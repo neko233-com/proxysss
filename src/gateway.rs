@@ -1747,13 +1747,37 @@ impl GatewayHttpResponse {
     }
 
     fn redirect(location: impl Into<String>, upstream: impl Into<String>) -> Self {
+        Self::redirect_with_status(StatusCode::TEMPORARY_REDIRECT, location, upstream)
+    }
+
+    fn redirect_with_status(
+        status: StatusCode,
+        location: impl Into<String>,
+        upstream: impl Into<String>,
+    ) -> Self {
         let location = location.into();
         let header =
             HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/"));
         Self {
-            status: StatusCode::TEMPORARY_REDIRECT,
+            status,
             headers: vec![(LOCATION, header)],
             body: Bytes::new(),
+            upstream: upstream.into(),
+        }
+    }
+
+    fn bytes(
+        status: StatusCode,
+        body: Bytes,
+        content_type: impl Into<String>,
+        upstream: impl Into<String>,
+    ) -> Self {
+        let content_type = HeaderValue::from_str(&content_type.into())
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+        Self {
+            status,
+            headers: vec![(CONTENT_TYPE, content_type)],
+            body,
             upstream: upstream.into(),
         }
     }
@@ -2426,15 +2450,115 @@ fn websocket_upstream_requested(route: &RouteDecision) -> bool {
 }
 
 fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> GatewayHttpResponse {
-    match route.upstream.as_str() {
+    let upstream = route.upstream.as_str();
+    match upstream {
         "proxysss://welcome" => {
             GatewayHttpResponse::html(render_welcome_html(config), "proxysss://welcome")
         }
+        "proxysss://healthz" => GatewayHttpResponse::bytes(
+            StatusCode::OK,
+            Bytes::from_static(br#"{"ok":true,"service":"proxysss"}"#),
+            "application/json",
+            "proxysss://healthz",
+        ),
         "proxysss://admin" => GatewayHttpResponse::redirect(
             format!("http://{}/", config.admin.bind),
             "proxysss://admin",
         ),
+        _ if upstream.starts_with("proxysss://redirect/") => {
+            let location = upstream.trim_start_matches("proxysss://redirect/");
+            let status = route
+                .status
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .filter(|value| value.is_redirection())
+                .unwrap_or(StatusCode::MOVED_PERMANENTLY);
+            GatewayHttpResponse::redirect_with_status(status, location, upstream)
+        }
+        _ if upstream.starts_with("proxysss://static/") => {
+            let relative = upstream.trim_start_matches("proxysss://static/");
+            match resolve_static_file(&config.root_dir, relative) {
+                Ok(path) => match std::fs::read(&path) {
+                    Ok(bytes) => GatewayHttpResponse::bytes(
+                        StatusCode::OK,
+                        Bytes::from(bytes),
+                        route
+                            .content_type
+                            .clone()
+                            .unwrap_or_else(|| guess_content_type(&path).to_string()),
+                        upstream,
+                    ),
+                    Err(error) => GatewayHttpResponse::error(
+                        StatusCode::NOT_FOUND,
+                        format!("static file not found: {error}"),
+                    ),
+                },
+                Err(error) => GatewayHttpResponse::error(StatusCode::FORBIDDEN, error.to_string()),
+            }
+        }
         _ => GatewayHttpResponse::error(StatusCode::NOT_FOUND, "unknown internal route"),
+    }
+}
+
+fn resolve_static_file(root_dir: &Path, relative: &str) -> Result<PathBuf> {
+    let decoded = percent_decode_path(relative)?;
+    let relative_path = PathBuf::from(decoded.trim_start_matches('/'));
+    if relative_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!("static path cannot contain parent directory"));
+    }
+
+    let root = root_dir
+        .canonicalize()
+        .unwrap_or_else(|_| root_dir.to_path_buf());
+    let candidate = root.join(relative_path);
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve static path {}", candidate.display()))?;
+    if !canonical.starts_with(&root) {
+        return Err(anyhow!("static path escaped config root"));
+    }
+    Ok(canonical)
+}
+
+fn percent_decode_path(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .context("invalid percent encoding")?;
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).context("static path is not utf-8")
+}
+
+fn guess_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
@@ -2981,6 +3105,8 @@ mod tests {
             rewrite_path: None,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
         };
 
         let candidates = normalize_candidates(&route);
@@ -2999,6 +3125,8 @@ mod tests {
             rewrite_path: None,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
         };
 
         let uri: Uri = "/room?id=42".parse().expect("valid uri");
