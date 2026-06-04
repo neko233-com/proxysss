@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_PORT: u16 = 7777;
+pub const DEFAULT_HTTP_PORT: u16 = 80;
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "proxysss.yaml";
 pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
@@ -72,9 +73,9 @@ pub enum LogFormat {
 pub struct HttpConfig {
     #[serde(default)]
     pub plain_bind: String,
-    #[serde(default = "default_gateway_bind")]
+    #[serde(default = "default_tls_gateway_bind")]
     pub tls_bind: String,
-    #[serde(default = "default_gateway_bind")]
+    #[serde(default = "default_tls_gateway_bind")]
     pub h3_bind: String,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -595,9 +596,9 @@ impl Default for LoggingConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            plain_bind: String::new(),
-            tls_bind: default_gateway_bind(),
-            h3_bind: default_gateway_bind(),
+            plain_bind: default_plain_gateway_bind(),
+            tls_bind: default_tls_gateway_bind(),
+            h3_bind: default_tls_gateway_bind(),
             request_timeout_ms: default_request_timeout_ms(),
             allow_insecure_upstreams: false,
             tls: TlsConfig::default(),
@@ -789,8 +790,12 @@ fn default_log_filter() -> String {
     "info,proxysss=info".to_string()
 }
 
-fn default_gateway_bind() -> String {
-    format!("0.0.0.0:{DEFAULT_PORT}")
+fn default_plain_gateway_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_HTTP_PORT}")
+}
+
+fn default_tls_gateway_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_HTTPS_PORT}")
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -1022,10 +1027,11 @@ mod tests {
     }
 
     #[test]
-    fn default_ports_are_four_digits() {
+    fn default_ports_are_nginx_and_caddy_replacement_ports() {
         let config = GatewayConfig::default();
-        assert_eq!(config.http.tls_bind, "0.0.0.0:7777");
-        assert_eq!(config.http.h3_bind, "0.0.0.0:7777");
+        assert_eq!(config.http.plain_bind, "0.0.0.0:80");
+        assert_eq!(config.http.tls_bind, "0.0.0.0:443");
+        assert_eq!(config.http.h3_bind, "0.0.0.0:443");
         assert_eq!(config.admin.bind, "127.0.0.1:7778");
     }
 

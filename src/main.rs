@@ -47,6 +47,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         skip_init: bool,
     },
+    Start,
+    Stop,
+    Enable {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Disable,
+    Status,
     CheckConfig {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -178,6 +186,26 @@ async fn main() -> Result<()> {
             no_service_restart,
             skip_init,
         ),
+        Commands::Start => {
+            init_logging("info,proxysss=info", LogFormat::Plain);
+            install::start_service()
+        }
+        Commands::Stop => {
+            init_logging("info,proxysss=info", LogFormat::Plain);
+            install::stop_service()
+        }
+        Commands::Enable { config } => {
+            init_logging("info,proxysss=info", LogFormat::Plain);
+            install::install_service(config)
+        }
+        Commands::Disable => {
+            init_logging("info,proxysss=info", LogFormat::Plain);
+            install::uninstall_service()
+        }
+        Commands::Status => {
+            init_logging("info,proxysss=info", LogFormat::Plain);
+            install::service_status()
+        }
         Commands::CheckConfig { config } => {
             init_logging("info,proxysss=info", LogFormat::Plain);
 

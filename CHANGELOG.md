@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.8 - 2026-06-04
+
+- Changed default public gateway ports to `80` for HTTP and `443` for HTTPS/HTTP3 so proxysss can directly replace Nginx and Caddy.
+- Enabled `http.plain_bind` by default on `0.0.0.0:80`.
+- Added top-level service commands: `proxysss start`, `proxysss stop`, `proxysss enable`, `proxysss disable`, and `proxysss status`.
+- Updated installer and docs to state proxysss installs standalone and does not install Nginx.
+- Kept admin on `127.0.0.1:7778` to avoid exposing admin on public ports.
+
 ## v0.1.7 - 2026-06-04
 
 - Changed default gateway port to `7777` and admin port to `7778`.

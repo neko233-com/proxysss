@@ -1,8 +1,8 @@
 # proxysss
 
-proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
+proxysss 是一个可编程 Rust 网关，目标是完全替代 Nginx + Caddy：安装 proxysss 不会安装 Nginx，也不依赖 Nginx。它统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合 Web 反代、游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.7
+当前版本：v0.1.8
 
 ## 核心能力
 
@@ -17,7 +17,7 @@ proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/
 - 配置热重载：配置文件变更后自动校验并重载，监听端口、TCP/UDP listener、管理端口、监控路径都可热切换
 - TLS 模式：self_signed / manual / acme_external
 - Nginx 常用内建能力：反代、负载均衡、TLS、HTTP/2、HTTP/3、WebSocket、TCP/UDP、热重载、静态文件、redirect、healthz
-- Caddy 级证书体验：支持 ACME 外部客户端自动申请、安装、续期和热加载证书
+- Caddy 级证书体验：支持 ACME 外部客户端自动申请、安装、续期和热加载证书，目标是一装即有 HTTPS
 - 监控 API：默认 `/metrics`，可开关，可改路由
 
 ## 运行环境
@@ -54,10 +54,11 @@ proxysss check-config --config ./proxysss.yaml
 proxysss run --config ./proxysss.yaml
 ```
 
-默认网关端口：7777
+默认网关端口：
 
-- TCP: HTTP/1.1 + HTTP/2
-- UDP: HTTP/3
+- HTTP：80
+- HTTPS：443
+- HTTP/3：443/UDP
 
 ## 一键安装
 
@@ -70,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v0.1.5
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v0.1.8
 ```
 
 ### Windows PowerShell
@@ -83,7 +84,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.5
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.8
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.4
 ```
 
@@ -111,7 +112,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.1.7
+proxysss update --version v0.1.8
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -122,7 +123,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.7
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.8
 ```
 
 降级到指定版本：
@@ -134,7 +135,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.7 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.8 -DryRun
 ```
 
 ### Linux / macOS
@@ -142,7 +143,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 install.sh 支持显式 action/version：
 
 ```bash
-bash ./scripts/install.sh --action upgrade --version v0.1.7
+bash ./scripts/install.sh --action upgrade --version v0.1.8
 bash ./scripts/install.sh --action downgrade --version v0.1.4
 ```
 
@@ -152,7 +153,7 @@ bash ./scripts/install.sh --action downgrade --version v0.1.4
 
 | 产品 | 可编程路由 | HTTP/3 | 原生 TCP/UDP | 服务发现/控制面 | 配置复杂度 | 更适合的场景 |
 | --- | --- | --- | --- | --- | --- | --- |
-| proxysss | TS/JS 脚本 + 插件，偏业务路由 | 是 | 是 | 内置管理面 + 监控 API，可外接 Prometheus/Grafana/自研控制面 | 中 | 游戏网关、聊天网关、通用 Web 反代、按 playerId/uid 做亲和与脚本路由 |
+| proxysss | TS/JS 脚本 + 插件，偏业务路由 | 是 | 是 | 内置管理面 + 监控 API，可外接 Prometheus/Grafana/自研控制面 | 中 | 完全替代 Nginx + Caddy，Web 反代、游戏网关、聊天网关、按 playerId/uid 做亲和与脚本路由 |
 | Nginx | 有限，主要靠指令与模块 | 部分支持，依赖构建与配置 | TCP/UDP 依赖 stream 模块 | 弱，通常接外部服务注册 | 中 | 稳定 Web 入口、静态资源、传统反向代理 |
 | Caddy | 中，偏声明式与插件 | 是 | 以 HTTP 为主，L4 需插件或扩展 | 弱到中 | 低 | 快速 HTTPS 接入、简单网站和 API 代理 |
 | HAProxy | 中，规则强但业务脚本弱 | 有限且偏前沿 | 是，L4/L7 很强 | 中 | 中到高 | 高性能四层/七层负载均衡、传统流量调度 |
@@ -168,7 +169,7 @@ bash ./scripts/install.sh --action downgrade --version v0.1.4
 
 ## Nginx 功能覆盖策略
 
-proxysss 目标不是逐指令复刻 Nginx，而是在 Web 反代这个核心战场干过 Nginx：Rust async I/O、连接池、HTTP/2 adaptive window、被动健康检查、业务可编程路由、热重载、内置监控。逐指令兼容不是目标，高性能反代和业务网关能力才是目标。
+proxysss 是 Nginx 的替代品，不是 Nginx 的前置依赖。默认直接占用 80/443，安装脚本不会安装 Nginx。目标是在 Web 反代这个核心战场干过 Nginx：Rust async I/O、连接池、HTTP/2 adaptive window、被动健康检查、业务可编程路由、热重载、内置监控。逐指令兼容不是目标，高性能反代和业务网关能力才是目标。
 
 - 已内建：HTTP/TLS/HTTP2/HTTP3、WebSocket、TCP/UDP stream、反向代理、负载均衡、重试、被动健康检查、全量配置热重载、静态文件、redirect、healthz、access log、admin API、监控 API、ACME 外部证书自动申请/续期/热加载。
 - 用脚本/插件实现：按 host/path/header/cookie/query 路由、rewrite、header 改写、鉴权、限流、灰度、会话亲和、业务级 upstream 选择。
@@ -177,7 +178,7 @@ proxysss 目标不是逐指令复刻 Nginx，而是在 Web 反代这个核心战
 
 ## Caddy 能力覆盖策略
 
-proxysss 将 Caddy 的“一上来就有 HTTPS”作为卖点补齐：`tls.mode=acme_external` 可调用 `acme.sh` 等 ACME 客户端，自动申请证书、安装到配置路径、定期续期，并由网关热加载证书文件。生产环境可用 HTTP-01/TLS-ALPN-01，证书缓存目录可配置。
+proxysss 将 Caddy 的“一上来就有 HTTPS”作为卖点补齐：`tls.mode=acme_external` 可调用 `acme.sh` 等 ACME 客户端，自动申请证书、安装到配置路径、定期续期，并由网关热加载证书文件。生产环境可用 HTTP-01/TLS-ALPN-01，证书缓存目录可配置。安装 proxysss 不会安装 Caddy。
 
 ## 配置与安全
 
@@ -211,7 +212,7 @@ proxysss print-default-config --format json
 默认网关端暴露：
 
 ```bash
-curl http://127.0.0.1:7777/metrics
+curl http://127.0.0.1/metrics
 ```
 
 配置：
@@ -263,6 +264,16 @@ proxysss service stop
 proxysss service status
 ```
 
+等价顶层命令：
+
+```bash
+proxysss enable
+proxysss disable
+proxysss start
+proxysss stop
+proxysss status
+```
+
 ## 压测与示例
 
 示例回环服务：
@@ -276,7 +287,7 @@ proxysss demo udp-echo --listen 127.0.0.1:8101
 压测命令：
 
 ```bash
-proxysss bench http --url https://127.0.0.1:7777/ --concurrency 512 --duration-secs 30 --insecure
+proxysss bench http --url https://127.0.0.1/ --concurrency 512 --duration-secs 30 --insecure
 proxysss bench tcp --addr 127.0.0.1:26379 --connections 512 --duration-secs 30 --payload-bytes 512
 proxysss bench udp --addr 127.0.0.1:2053 --connections 512 --duration-secs 30 --payload-bytes 256
 ```
@@ -294,7 +305,7 @@ release.yml 会在推送 v* tag 时构建并发布多平台二进制。
 本地发布后验证：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.7 -PreviousVersion v0.1.6
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.8 -PreviousVersion v0.1.7
 ```
 
 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。

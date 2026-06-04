@@ -2780,7 +2780,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>默认监听</h3>
                     <p>HTTP/TLS/HTTP3 入口由配置决定，后台管理默认绑定到 <code>__ADMIN_URL__</code>。</p>
                     <ul>
-                        <li>欢迎页：<code>http://localhost:7777/</code></li>
+                        <li>欢迎页：<code>http://localhost/</code></li>
                         <li>后台页：<code>http://__ADMIN_URL__/</code></li>
                         <li>健康检查：<code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>
@@ -2789,7 +2789,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>Default Endpoints</h3>
                     <p>HTTP/TLS/HTTP3 listeners come from config, while the admin console is bound to <code>__ADMIN_URL__</code> by default.</p>
                     <ul>
-                        <li>Welcome page: <code>http://localhost:7777/</code></li>
+                        <li>Welcome page: <code>http://localhost/</code></li>
                         <li>Admin page: <code>http://__ADMIN_URL__/</code></li>
                         <li>Health check: <code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>

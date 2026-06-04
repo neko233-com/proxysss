@@ -398,7 +398,7 @@ if (Test-ServiceTaskExists) {
 
 Write-Host ""
 Write-Host "Installed to $Dest"
-Write-Host "Gateway port: 7777 (TCP for HTTP/1.1 + HTTP/2, UDP for HTTP/3)"
+Write-Host "Gateway ports: 80 (HTTP), 443 (HTTPS + HTTP/3)"
 if ($null -ne $targetVersion) {
     Write-Host "Applied version: $targetVersion"
 } else {
