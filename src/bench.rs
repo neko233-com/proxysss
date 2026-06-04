@@ -68,7 +68,10 @@ impl BenchStats {
     fn record_success(&self, latency: Duration, bytes: usize) {
         self.success.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.latencies_us.lock().expect("latency lock poisoned").push(latency.as_micros() as u64);
+        self.latencies_us
+            .lock()
+            .expect("latency lock poisoned")
+            .push(latency.as_micros() as u64);
     }
 
     fn record_error(&self) {
@@ -108,7 +111,12 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
         tasks.spawn(async move {
             while Instant::now() < deadline {
                 let started = Instant::now();
-                match client.request(method.clone(), url.as_str()).body(payload.as_ref().clone()).send().await {
+                match client
+                    .request(method.clone(), url.as_str())
+                    .body(payload.as_ref().clone())
+                    .send()
+                    .await
+                {
                     Ok(response) => match response.bytes().await {
                         Ok(bytes) => stats.record_success(started.elapsed(), bytes.len()),
                         Err(_) => stats.record_error(),
@@ -197,7 +205,11 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
         let addr = addr.clone();
 
         tasks.spawn(async move {
-            let bind_any = if addr.contains(':') && !addr.contains('.') { "[::]:0" } else { "0.0.0.0:0" };
+            let bind_any = if addr.contains(':') && !addr.contains('.') {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             let socket = match UdpSocket::bind(bind_any).await {
                 Ok(socket) => socket,
                 Err(_) => {
@@ -216,7 +228,12 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
                 let started = Instant::now();
                 let result = async {
                     socket.send(&payload).await?;
-                    let size = match tokio::time::timeout(Duration::from_millis(1000), socket.recv(&mut buffer)).await {
+                    let size = match tokio::time::timeout(
+                        Duration::from_millis(1000),
+                        socket.recv(&mut buffer),
+                    )
+                    .await
+                    {
                         Ok(result) => result?,
                         Err(_) => {
                             return Err(std::io::Error::new(
@@ -249,7 +266,11 @@ fn print_summary(protocol: &str, duration_secs: u64, stats: &BenchStats) {
     let success = stats.success.load(Ordering::Relaxed);
     let errors = stats.errors.load(Ordering::Relaxed);
     let bytes = stats.bytes.load(Ordering::Relaxed);
-    let mut latencies = stats.latencies_us.lock().expect("latency lock poisoned").clone();
+    let mut latencies = stats
+        .latencies_us
+        .lock()
+        .expect("latency lock poisoned")
+        .clone();
     latencies.sort_unstable();
 
     let seconds = duration_secs.max(1) as f64;
@@ -263,9 +284,18 @@ fn print_summary(protocol: &str, duration_secs: u64, stats: &BenchStats) {
     println!("ops/sec       : {:.2}", rps);
 
     if !latencies.is_empty() {
-        println!("latency p50   : {:.3} ms", percentile(&latencies, 0.50) as f64 / 1000.0);
-        println!("latency p95   : {:.3} ms", percentile(&latencies, 0.95) as f64 / 1000.0);
-        println!("latency p99   : {:.3} ms", percentile(&latencies, 0.99) as f64 / 1000.0);
+        println!(
+            "latency p50   : {:.3} ms",
+            percentile(&latencies, 0.50) as f64 / 1000.0
+        );
+        println!(
+            "latency p95   : {:.3} ms",
+            percentile(&latencies, 0.95) as f64 / 1000.0
+        );
+        println!(
+            "latency p99   : {:.3} ms",
+            percentile(&latencies, 0.99) as f64 / 1000.0
+        );
     }
 }
 

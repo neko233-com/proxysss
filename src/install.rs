@@ -38,13 +38,18 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     let script_path = base_dir.join(DEFAULT_SCRIPT_FILE_NAME);
     let plugin_path = plugin_dir.join("player-affinity.ts");
 
-    fs::create_dir_all(&cert_dir).with_context(|| format!("failed to create {}", cert_dir.display()))?;
-    fs::create_dir_all(&plugin_dir).with_context(|| format!("failed to create {}", plugin_dir.display()))?;
+    fs::create_dir_all(&cert_dir)
+        .with_context(|| format!("failed to create {}", cert_dir.display()))?;
+    fs::create_dir_all(&plugin_dir)
+        .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
 
     let script_command = detect_script_command().unwrap_or_else(|| "deno".to_string());
     let config_yaml = GatewayConfig::render_default_yaml(&script_command).replace(
         "\n  cwd: .\n",
-        &format!("\n  cwd: {}\n", base_dir.display().to_string().replace('\\', "/")),
+        &format!(
+            "\n  cwd: {}\n",
+            base_dir.display().to_string().replace('\\', "/")
+        ),
     );
     write_if_needed(&config_path, &config_yaml, overwrite)?;
     write_if_needed(&script_path, DEFAULT_GATEWAY_SCRIPT, overwrite)?;
@@ -64,7 +69,8 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
 pub fn bootstrap_certs_in_dir(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     let base_dir = resolve_base_dir(dir)?;
     let cert_dir = base_dir.join("certs");
-    fs::create_dir_all(&cert_dir).with_context(|| format!("failed to create {}", cert_dir.display()))?;
+    fs::create_dir_all(&cert_dir)
+        .with_context(|| format!("failed to create {}", cert_dir.display()))?;
     ensure_cert_pair(
         &cert_dir.join("proxysss-cert.pem"),
         &cert_dir.join("proxysss-key.pem"),
@@ -73,16 +79,23 @@ pub fn bootstrap_certs_in_dir(dir: Option<PathBuf>, overwrite: bool) -> Result<(
     )
 }
 
-pub fn ensure_cert_pair(cert_path: &Path, key_path: &Path, server_name: &str, overwrite: bool) -> Result<()> {
+pub fn ensure_cert_pair(
+    cert_path: &Path,
+    key_path: &Path,
+    server_name: &str,
+    overwrite: bool,
+) -> Result<()> {
     if !overwrite && cert_path.exists() && key_path.exists() {
         return Ok(());
     }
 
     if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     if let Some(parent) = key_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
     let cert = generate_simple_self_signed(vec![
@@ -92,17 +105,26 @@ pub fn ensure_cert_pair(cert_path: &Path, key_path: &Path, server_name: &str, ov
     ])
     .context("failed generating self-signed certificate")?;
 
-    fs::write(cert_path, cert.cert.pem()).with_context(|| format!("failed writing {}", cert_path.display()))?;
-    fs::write(key_path, cert.key_pair.serialize_pem()).with_context(|| format!("failed writing {}", key_path.display()))?;
+    fs::write(cert_path, cert.cert.pem())
+        .with_context(|| format!("failed writing {}", cert_path.display()))?;
+    fs::write(key_path, cert.key_pair.serialize_pem())
+        .with_context(|| format!("failed writing {}", key_path.display()))?;
 
-    println!("generated certificate pair at {} and {}", cert_path.display(), key_path.display());
+    println!(
+        "generated certificate pair at {} and {}",
+        cert_path.display(),
+        key_path.display()
+    );
     Ok(())
 }
 
 pub fn install_service(config: Option<PathBuf>) -> Result<()> {
     let executable = env::current_exe().context("failed to resolve current executable")?;
     let config_path = resolve_run_config_path(config)?;
-    let working_dir = config_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let working_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
 
     match env::consts::OS {
         "windows" => install_windows_service(&executable, &config_path),
@@ -118,16 +140,27 @@ pub fn uninstall_service() -> Result<()> {
         "linux" => {
             let unit_path = linux_service_path()?;
             if unit_path.exists() {
-                fs::remove_file(&unit_path).with_context(|| format!("failed to remove {}", unit_path.display()))?;
+                fs::remove_file(&unit_path)
+                    .with_context(|| format!("failed to remove {}", unit_path.display()))?;
             }
-            run_command(Command::new("systemctl").args(["--user", "disable", "--now", "proxysss.service"]), "disable systemd user service")?;
-            run_command(Command::new("systemctl").args(["--user", "daemon-reload"]), "reload systemd user daemon")
+            run_command(
+                Command::new("systemctl").args(["--user", "disable", "--now", "proxysss.service"]),
+                "disable systemd user service",
+            )?;
+            run_command(
+                Command::new("systemctl").args(["--user", "daemon-reload"]),
+                "reload systemd user daemon",
+            )
         }
         "macos" => {
             let plist_path = macos_launch_agent_path()?;
-            let _ = run_command(Command::new("launchctl").args(["unload", plist_path.to_string_lossy().as_ref()]), "unload launch agent");
+            let _ = run_command(
+                Command::new("launchctl").args(["unload", plist_path.to_string_lossy().as_ref()]),
+                "unload launch agent",
+            );
             if plist_path.exists() {
-                fs::remove_file(&plist_path).with_context(|| format!("failed to remove {}", plist_path.display()))?;
+                fs::remove_file(&plist_path)
+                    .with_context(|| format!("failed to remove {}", plist_path.display()))?;
             }
             Ok(())
         }
@@ -138,8 +171,18 @@ pub fn uninstall_service() -> Result<()> {
 pub fn start_service() -> Result<()> {
     match env::consts::OS {
         "windows" => start_windows_service(),
-        "linux" => run_command(Command::new("systemctl").args(["--user", "start", "proxysss.service"]), "start systemd user service"),
-        "macos" => run_command(Command::new("launchctl").args(["load", "-w", macos_launch_agent_path()?.to_string_lossy().as_ref()]), "load launch agent"),
+        "linux" => run_command(
+            Command::new("systemctl").args(["--user", "start", "proxysss.service"]),
+            "start systemd user service",
+        ),
+        "macos" => run_command(
+            Command::new("launchctl").args([
+                "load",
+                "-w",
+                macos_launch_agent_path()?.to_string_lossy().as_ref(),
+            ]),
+            "load launch agent",
+        ),
         os => Err(anyhow!("unsupported service start os {os}")),
     }
 }
@@ -163,14 +206,24 @@ pub fn stop_service() -> Result<()> {
 pub fn service_status() -> Result<()> {
     match env::consts::OS {
         "windows" => windows_service_status(),
-        "linux" => run_command(Command::new("systemctl").args(["--user", "status", "proxysss.service", "--no-pager"]), "show systemd user service status"),
-        "macos" => run_command(Command::new("launchctl").args(["list", LAUNCH_AGENT_LABEL]), "show launch agent status"),
+        "linux" => run_command(
+            Command::new("systemctl").args(["--user", "status", "proxysss.service", "--no-pager"]),
+            "show systemd user service status",
+        ),
+        "macos" => run_command(
+            Command::new("launchctl").args(["list", LAUNCH_AGENT_LABEL]),
+            "show launch agent status",
+        ),
         os => Err(anyhow!("unsupported service status os {os}")),
     }
 }
 
 fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> {
-    let task_command = format!("\"{}\" run --config \"{}\"", executable.display(), config_path.display());
+    let task_command = format!(
+        "\"{}\" run --config \"{}\"",
+        executable.display(),
+        config_path.display()
+    );
     let scheduled_task = run_command(
         Command::new("schtasks").args([
             "/Create",
@@ -198,7 +251,12 @@ fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> 
 fn uninstall_windows_service() -> Result<()> {
     let mut removed_any = false;
 
-    if run_command(Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]), "delete windows scheduled task").is_ok() {
+    if run_command(
+        Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]),
+        "delete windows scheduled task",
+    )
+    .is_ok()
+    {
         removed_any = true;
     }
 
@@ -214,7 +272,12 @@ fn uninstall_windows_service() -> Result<()> {
 }
 
 fn start_windows_service() -> Result<()> {
-    if run_command(Command::new("schtasks").args(["/Run", "/TN", SERVICE_NAME]), "run windows scheduled task").is_ok() {
+    if run_command(
+        Command::new("schtasks").args(["/Run", "/TN", SERVICE_NAME]),
+        "run windows scheduled task",
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
@@ -224,7 +287,12 @@ fn start_windows_service() -> Result<()> {
 }
 
 fn windows_service_status() -> Result<()> {
-    if run_command(Command::new("schtasks").args(["/Query", "/TN", SERVICE_NAME]), "query windows scheduled task").is_ok() {
+    if run_command(
+        Command::new("schtasks").args(["/Query", "/TN", SERVICE_NAME]),
+        "query windows scheduled task",
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
@@ -247,7 +315,9 @@ fn windows_service_status() -> Result<()> {
         return Ok(());
     }
 
-    Err(anyhow!("query windows auto-start failed: no scheduled task or HKCU Run entry found"))
+    Err(anyhow!(
+        "query windows auto-start failed: no scheduled task or HKCU Run entry found"
+    ))
 }
 
 fn install_windows_run_key(task_command: &str) -> Result<()> {
@@ -291,7 +361,8 @@ fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
 fn install_linux_service(executable: &Path, config_path: &Path, working_dir: &Path) -> Result<()> {
     let unit_path = linux_service_path()?;
     if let Some(parent) = unit_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
     let content = format!(
@@ -301,15 +372,23 @@ fn install_linux_service(executable: &Path, config_path: &Path, working_dir: &Pa
         systemd_quote(config_path),
     );
 
-    fs::write(&unit_path, content).with_context(|| format!("failed writing {}", unit_path.display()))?;
-    run_command(Command::new("systemctl").args(["--user", "daemon-reload"]), "reload systemd user daemon")?;
-    run_command(Command::new("systemctl").args(["--user", "enable", "--now", "proxysss.service"]), "enable and start systemd user service")
+    fs::write(&unit_path, content)
+        .with_context(|| format!("failed writing {}", unit_path.display()))?;
+    run_command(
+        Command::new("systemctl").args(["--user", "daemon-reload"]),
+        "reload systemd user daemon",
+    )?;
+    run_command(
+        Command::new("systemctl").args(["--user", "enable", "--now", "proxysss.service"]),
+        "enable and start systemd user service",
+    )
 }
 
 fn install_macos_service(executable: &Path, config_path: &Path, working_dir: &Path) -> Result<()> {
     let plist_path = macos_launch_agent_path()?;
     if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
     let plist = format!(
@@ -320,9 +399,16 @@ fn install_macos_service(executable: &Path, config_path: &Path, working_dir: &Pa
         cwd = xml_escape(&working_dir.display().to_string()),
     );
 
-    fs::write(&plist_path, plist).with_context(|| format!("failed writing {}", plist_path.display()))?;
-    let _ = run_command(Command::new("launchctl").args(["unload", plist_path.to_string_lossy().as_ref()]), "unload existing launch agent");
-    run_command(Command::new("launchctl").args(["load", "-w", plist_path.to_string_lossy().as_ref()]), "load launch agent")
+    fs::write(&plist_path, plist)
+        .with_context(|| format!("failed writing {}", plist_path.display()))?;
+    let _ = run_command(
+        Command::new("launchctl").args(["unload", plist_path.to_string_lossy().as_ref()]),
+        "unload existing launch agent",
+    );
+    run_command(
+        Command::new("launchctl").args(["load", "-w", plist_path.to_string_lossy().as_ref()]),
+        "load launch agent",
+    )
 }
 
 fn resolve_base_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -333,7 +419,8 @@ fn resolve_base_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir().ok_or_else(|| anyhow!("failed to resolve user config directory"))?;
+    let dir =
+        dirs::config_dir().ok_or_else(|| anyhow!("failed to resolve user config directory"))?;
     Ok(dir.join(SERVICE_NAME))
 }
 
@@ -343,10 +430,12 @@ fn write_if_needed(path: &Path, content: &str, overwrite: bool) -> Result<()> {
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut file = fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(content.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
@@ -400,8 +489,9 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn systemd_quote(path: &Path) -> String {
-        format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
+    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
 const DEFAULT_GATEWAY_SCRIPT: &str = include_str!("../templates/gateway.ts");
-const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str = include_str!("../templates/plugins/player-affinity.ts");
+const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
+    include_str!("../templates/plugins/player-affinity.ts");

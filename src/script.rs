@@ -125,8 +125,14 @@ impl ScriptRuntime {
             .spawn()
             .with_context(|| format!("failed to spawn script runtime {}", config.command))?;
 
-        let stdin = child.stdin.take().context("script runtime stdin unavailable")?;
-        let stdout = child.stdout.take().context("script runtime stdout unavailable")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("script runtime stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("script runtime stdout unavailable")?;
         let pending = Arc::new(DashMap::<String, oneshot::Sender<Result<ScriptResponse>>>::new());
         let pending_reader = pending.clone();
 
@@ -161,7 +167,10 @@ impl ScriptRuntime {
                 }
             }
 
-            let pending_ids: Vec<String> = pending_reader.iter().map(|entry| entry.key().clone()).collect();
+            let pending_ids: Vec<String> = pending_reader
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
             for id in pending_ids {
                 if let Some((_, sender)) = pending_reader.remove(&id) {
                     let _ = sender.send(Err(anyhow!("script runtime closed before responding")));
@@ -206,7 +215,9 @@ impl ScriptRuntime {
     }
 
     pub async fn load_plugin(&self, spec: ScriptPluginSpec) -> Result<Value> {
-        self.call("plugin_load", None, spec).await?.into_data_result()
+        self.call("plugin_load", None, spec)
+            .await?
+            .into_data_result()
     }
 
     pub async fn unload_plugin(&self, name: &str) -> Result<Value> {
@@ -226,7 +237,8 @@ impl ScriptRuntime {
             listener,
             ctx,
         };
-        let payload = serde_json::to_string(&request).context("failed to serialize script request")?;
+        let payload =
+            serde_json::to_string(&request).context("failed to serialize script request")?;
         let (sender, receiver) = oneshot::channel();
         self.pending.insert(id.clone(), sender);
 
@@ -240,7 +252,10 @@ impl ScriptRuntime {
                 .write_all(b"\n")
                 .await
                 .context("failed to write script newline")?;
-            writer.flush().await.context("failed to flush script request")?;
+            writer
+                .flush()
+                .await
+                .context("failed to flush script request")?;
         }
 
         match tokio::time::timeout(self.timeout, receiver).await {
@@ -269,8 +284,9 @@ impl ScriptResponse {
 
         if let Some(data) = self.data {
             if let Some(plugins_value) = data.get("plugins") {
-                let plugins = serde_json::from_value::<Vec<ScriptPluginInfo>>(plugins_value.clone())
-                    .context("failed to decode plugin list from script data")?;
+                let plugins =
+                    serde_json::from_value::<Vec<ScriptPluginInfo>>(plugins_value.clone())
+                        .context("failed to decode plugin list from script data")?;
                 return Ok(plugins);
             }
         }
@@ -287,11 +303,10 @@ impl ScriptResponse {
         if self.ok {
             Ok(())
         } else {
-            Err(anyhow!(
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "script rejected request".to_string())
-            ))
+            Err(anyhow!(self
+                .error
+                .clone()
+                .unwrap_or_else(|| "script rejected request".to_string())))
         }
     }
 }
