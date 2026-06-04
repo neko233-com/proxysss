@@ -13,6 +13,7 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum DemoCommand {
     HttpEcho(HttpEchoArgs),
@@ -65,7 +66,12 @@ async fn run_http_echo(args: HttpEchoArgs) -> Result<()> {
                 let headers = request
                     .headers()
                     .iter()
-                    .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string())))
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
                     .collect::<BTreeMap<_, _>>();
                 let payload = serde_json::json!({
                     "ok": true,
@@ -81,7 +87,12 @@ async fn run_http_echo(args: HttpEchoArgs) -> Result<()> {
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(payload.to_string())))
-                    .unwrap_or_else(|_| Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Full::new(Bytes::from_static(b"build error"))).expect("static response build should never fail"));
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Full::new(Bytes::from_static(b"build error")))
+                            .expect("static response build should never fail")
+                    });
                 Ok::<_, Infallible>(response)
             });
 
@@ -103,7 +114,8 @@ async fn run_tcp_echo(args: TcpEchoArgs) -> Result<()> {
     tracing::info!(bind = %args.listen, "tcp echo demo ready");
 
     loop {
-        let (mut stream, remote_addr) = listener.accept().await.context("tcp echo accept failed")?;
+        let (mut stream, remote_addr) =
+            listener.accept().await.context("tcp echo accept failed")?;
         tokio::spawn(async move {
             let mut buffer = vec![0_u8; 16 * 1024];
             loop {
@@ -134,7 +146,10 @@ async fn run_udp_echo(args: UdpEchoArgs) -> Result<()> {
 
     let mut buffer = vec![0_u8; 65_536];
     loop {
-        let (size, peer_addr) = socket.recv_from(&mut buffer).await.context("udp echo recv failed")?;
+        let (size, peer_addr) = socket
+            .recv_from(&mut buffer)
+            .await
+            .context("udp echo recv failed")?;
         socket
             .send_to(&buffer[..size], peer_addr)
             .await

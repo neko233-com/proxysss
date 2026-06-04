@@ -127,13 +127,19 @@ async fn main() -> Result<()> {
             let config_path = install::resolve_run_config_path(config)?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
-            init_logging(&gateway_config.logging.filter, gateway_config.logging.format);
+            init_logging(
+                &gateway_config.logging.filter,
+                gateway_config.logging.format,
+            );
             for warning in gateway_config.warnings() {
                 tracing::warn!(warning, "configuration warning");
             }
 
             tracing::info!(config = %config_path.display(), "starting gateway");
-            gateway::Gateway::from_config(config_path, gateway_config).await?.run().await
+            gateway::Gateway::from_config(config_path, gateway_config)
+                .await?
+                .run()
+                .await
         }
         Commands::CheckConfig { config } => {
             init_logging("info,proxysss=info", LogFormat::Plain);
@@ -186,8 +192,12 @@ async fn main() -> Result<()> {
         }
         Commands::PrintDefaultConfig { format } => {
             match format {
-                ConfigOutputFormat::Yaml => print!("{}", config::GatewayConfig::render_default_yaml("deno")),
-                ConfigOutputFormat::Json => print!("{}", config::GatewayConfig::render_default_json("deno")),
+                ConfigOutputFormat::Yaml => {
+                    print!("{}", config::GatewayConfig::render_default_yaml("deno"))
+                }
+                ConfigOutputFormat::Json => {
+                    print!("{}", config::GatewayConfig::render_default_json("deno"))
+                }
             }
             Ok(())
         }
@@ -204,7 +214,9 @@ async fn main() -> Result<()> {
 
             match action {
                 PluginCommands::List => {
-                    let payload = admin_request_json(&client, &admin, Method::GET, "/v1/plugins", None).await?;
+                    let payload =
+                        admin_request_json(&client, &admin, Method::GET, "/v1/plugins", None)
+                            .await?;
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                     Ok(())
                 }
@@ -260,7 +272,10 @@ fn normalize_plugin_module_path(value: &str) -> Result<String> {
     if input.is_absolute() {
         Ok(input.to_string_lossy().to_string())
     } else {
-        Ok(std::env::current_dir()?.join(input).to_string_lossy().to_string())
+        Ok(std::env::current_dir()?
+            .join(input)
+            .to_string_lossy()
+            .to_string())
     }
 }
 
@@ -278,7 +293,11 @@ fn resolve_admin_context(
     };
 
     let base_url = admin_url
-        .or_else(|| loaded_config.as_ref().map(|cfg| format!("http://{}", cfg.admin.bind)))
+        .or_else(|| {
+            loaded_config
+                .as_ref()
+                .map(|cfg| format!("http://{}", cfg.admin.bind))
+        })
         .ok_or_else(|| anyhow::anyhow!("admin url not provided and config unavailable"))?;
 
     let username = username
@@ -324,10 +343,15 @@ async fn admin_request_json(
     let response = request.send().await?;
     let status = response.status();
     let text = response.text().await?;
-    let payload: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+    let payload: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("admin request failed with {}: {}", status, payload));
+        return Err(anyhow::anyhow!(
+            "admin request failed with {}: {}",
+            status,
+            payload
+        ));
     }
 
     Ok(payload)
@@ -337,7 +361,7 @@ fn init_logging(filter: &str, format: LogFormat) {
     match format {
         LogFormat::Plain => {
             let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter.to_string()));
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
 
             tracing_subscriber::registry()
                 .with(env_filter)
@@ -346,7 +370,7 @@ fn init_logging(filter: &str, format: LogFormat) {
         }
         LogFormat::Json => {
             let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter.to_string()));
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
 
             tracing_subscriber::registry()
                 .with(env_filter)

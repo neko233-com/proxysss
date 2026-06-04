@@ -15,7 +15,9 @@ use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use h3::server::Connection as H3Connection;
 use http::header::{AUTHORIZATION, COOKIE, HOST};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -23,6 +25,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::Deserialize;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
@@ -30,7 +33,6 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 use uuid::Uuid;
-use serde::Deserialize;
 
 use crate::config::{
     AcmeChallengeType, AdminConfig, GatewayConfig, HttpAffinityConfig, LoadBalanceAlgorithm,
@@ -69,7 +71,7 @@ struct StickyEntry {
     expires_at: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct UpstreamRuntimeState {
     consecutive_failures: u32,
     quarantined_until: Option<Instant>,
@@ -89,16 +91,6 @@ struct GatewayStats {
     admin_requests_total: AtomicU64,
     admin_auth_fail_total: AtomicU64,
     script_fail_total: AtomicU64,
-}
-
-impl Default for UpstreamRuntimeState {
-    fn default() -> Self {
-        Self {
-            consecutive_failures: 0,
-            quarantined_until: None,
-            active_connections: 0,
-        }
-    }
 }
 
 struct UpstreamLease {
@@ -205,7 +197,9 @@ impl Gateway {
             let hash = match read_file_hash(&self.config_path) {
                 Ok(value) => value,
                 Err(error) => {
-                    self.stats.reload_failure_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .reload_failure_total
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(?error, path = %self.config_path.display(), "hot reload failed to read config hash");
                     continue;
                 }
@@ -218,10 +212,14 @@ impl Gateway {
             match self.reload_from_disk().await {
                 Ok(()) => {
                     last_hash = hash;
-                    self.stats.reload_success_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .reload_success_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error) => {
-                    self.stats.reload_failure_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .reload_failure_total
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(?error, path = %self.config_path.display(), "hot reload rejected new config");
                 }
             }
@@ -235,7 +233,8 @@ impl Gateway {
         loop {
             tokio::time::sleep(renew_every).await;
             let tls = tls.clone();
-            let renew_result = tokio::task::spawn_blocking(move || run_acme_command(&tls, true)).await;
+            let renew_result =
+                tokio::task::spawn_blocking(move || run_acme_command(&tls, true)).await;
 
             match renew_result {
                 Ok(Ok(())) => tracing::info!("acme renewal succeeded"),
@@ -284,7 +283,9 @@ impl Gateway {
         mut request: Request<Incoming>,
         remote_addr: SocketAddr,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
-        self.stats.admin_requests_total.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .admin_requests_total
+            .fetch_add(1, Ordering::Relaxed);
 
         let method = request.method().clone();
         let path = request.uri().path().to_string();
@@ -298,7 +299,9 @@ impl Gateway {
 
         let state = self.current_state().await;
         if !is_authorized(request.headers().get(AUTHORIZATION), &state.config.admin) {
-            self.stats.admin_auth_fail_total.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .admin_auth_fail_total
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized"));
         }
 
@@ -315,17 +318,29 @@ impl Gateway {
 
         if method == Method::GET && path == "/v1/config" {
             if !state.config.admin.expose_config {
-                return Ok(text_response(StatusCode::FORBIDDEN, "config endpoint disabled"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "config endpoint disabled",
+                ));
             }
-            return Ok(json_response(StatusCode::OK, sanitize_config(&state.config)));
+            return Ok(json_response(
+                StatusCode::OK,
+                sanitize_config(&state.config),
+            ));
         }
 
         if method == Method::GET && path == "/v1/plugins" {
             if !state.config.plugins.enabled {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugins are disabled by config"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugins are disabled by config",
+                ));
             }
             if !state.config.plugins.allow_admin_manage {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugin management disabled"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugin management disabled",
+                ));
             }
 
             match state.script.list_plugins().await {
@@ -346,10 +361,16 @@ impl Gateway {
 
         if method == Method::POST && path == "/v1/plugins/load" {
             if !state.config.plugins.enabled {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugins are disabled by config"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugins are disabled by config",
+                ));
             }
             if !state.config.admin.enable_write_ops || !state.config.plugins.allow_admin_manage {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugin write operations disabled"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugin write operations disabled",
+                ));
             }
 
             let body = match request.body_mut().collect().await {
@@ -390,10 +411,16 @@ impl Gateway {
 
         if method == Method::POST && path == "/v1/plugins/unload" {
             if !state.config.plugins.enabled {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugins are disabled by config"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugins are disabled by config",
+                ));
             }
             if !state.config.admin.enable_write_ops || !state.config.plugins.allow_admin_manage {
-                return Ok(text_response(StatusCode::FORBIDDEN, "plugin write operations disabled"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "plugin write operations disabled",
+                ));
             }
 
             let body = match request.body_mut().collect().await {
@@ -434,19 +461,26 @@ impl Gateway {
 
         if method == Method::POST && path == "/v1/reload" {
             if !state.config.admin.enable_write_ops {
-                return Ok(text_response(StatusCode::FORBIDDEN, "write operations disabled"));
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
             }
 
             match self.reload_from_disk().await {
                 Ok(()) => {
-                    self.stats.reload_success_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .reload_success_total
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(json_response(
                         StatusCode::OK,
                         serde_json::json!({"ok": true, "message": "reloaded"}),
                     ));
                 }
                 Err(error) => {
-                    self.stats.reload_failure_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .reload_failure_total
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(json_response(
                         StatusCode::BAD_REQUEST,
                         serde_json::json!({"ok": false, "error": error.to_string()}),
@@ -491,13 +525,20 @@ impl Gateway {
         tracing::info!(bind = %bind_addr, "plain http listener ready");
 
         loop {
-            let (stream, remote_addr) = listener.accept().await.context("plain http accept failed")?;
+            let (stream, remote_addr) = listener
+                .accept()
+                .await
+                .context("plain http accept failed")?;
             let gateway = self.clone();
 
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let gateway = gateway.clone();
-                    async move { gateway.handle_hyper_request(request, remote_addr, "http").await }
+                    async move {
+                        gateway
+                            .handle_hyper_request(request, remote_addr, "http")
+                            .await
+                    }
                 });
 
                 let result = AutoBuilder::new(TokioExecutor::new())
@@ -518,7 +559,9 @@ impl Gateway {
             .tls_bind
             .parse()
             .context("invalid http.tls_bind address")?;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(self.build_rustls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()])?));
+        let tls_acceptor = TlsAcceptor::from(Arc::new(
+            self.build_rustls_server_config(vec![b"h2".to_vec(), b"http/1.1".to_vec()])?,
+        ));
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind tls http listener {}", bind_addr))?;
@@ -526,7 +569,8 @@ impl Gateway {
         tracing::info!(bind = %bind_addr, "tls http listener ready");
 
         loop {
-            let (stream, remote_addr) = listener.accept().await.context("tls http accept failed")?;
+            let (stream, remote_addr) =
+                listener.accept().await.context("tls http accept failed")?;
             let acceptor = tls_acceptor.clone();
             let gateway = self.clone();
 
@@ -541,7 +585,11 @@ impl Gateway {
 
                 let service = service_fn(move |request| {
                     let gateway = gateway.clone();
-                    async move { gateway.handle_hyper_request(request, remote_addr, "https").await }
+                    async move {
+                        gateway
+                            .handle_hyper_request(request, remote_addr, "https")
+                            .await
+                    }
                 });
 
                 let result = AutoBuilder::new(TokioExecutor::new())
@@ -563,10 +611,11 @@ impl Gateway {
             .parse()
             .context("invalid http.h3_bind address")?;
 
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
-            self.build_rustls_server_config(vec![b"h3".to_vec()])?,
-        )?));
-        let transport = Arc::get_mut(&mut server_config.transport).context("failed to configure quic transport")?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(self.build_rustls_server_config(vec![b"h3".to_vec()])?)?,
+        ));
+        let transport = Arc::get_mut(&mut server_config.transport)
+            .context("failed to configure quic transport")?;
         transport.keep_alive_interval(Some(Duration::from_secs(15)));
 
         let endpoint = quinn::Endpoint::server(server_config, bind_addr)
@@ -602,7 +651,10 @@ impl Gateway {
                 loop {
                     match h3_connection.accept().await {
                         Ok(Some(request_resolver)) => {
-                            let (request, mut stream) = match request_resolver.resolve_request().await {
+                            let (request, mut stream) = match request_resolver
+                                .resolve_request()
+                                .await
+                            {
                                 Ok(value) => value,
                                 Err(error) => {
                                     tracing::warn!(?error, %remote_addr, "failed resolving h3 request");
@@ -650,7 +702,10 @@ impl Gateway {
                                 Err(error) => {
                                     gateway.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!(?error, %remote_addr, "http3 request dispatch failed");
-                                    GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
+                                    GatewayHttpResponse::error(
+                                        StatusCode::BAD_GATEWAY,
+                                        error.to_string(),
+                                    )
                                 }
                             };
 
@@ -706,11 +761,16 @@ impl Gateway {
         tracing::info!(listener = %listener_config.name, bind = %bind_addr, "tcp listener ready");
 
         loop {
-            let (mut inbound, remote_addr) = listener.accept().await.context("tcp accept failed")?;
+            let (mut inbound, remote_addr) =
+                listener.accept().await.context("tcp accept failed")?;
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
-            self.stats.tcp_sessions_total.fetch_add(1, Ordering::Relaxed);
-            self.stats.tcp_sessions_active.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .tcp_sessions_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .tcp_sessions_active
+                .fetch_add(1, Ordering::Relaxed);
 
             tokio::spawn(async move {
                 let request_id = Uuid::new_v4().to_string();
@@ -753,9 +813,11 @@ impl Gateway {
                             payload_len: first_payload.len(),
                         })
                         .await
-                        .map_err(|error| {
-                            gateway.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                            error
+                        .inspect_err(|_| {
+                            gateway
+                                .stats
+                                .script_fail_total
+                                .fetch_add(1, Ordering::Relaxed);
                         })?;
 
                     let upstream_plan = gateway.select_upstream_plan(
@@ -778,7 +840,8 @@ impl Gateway {
                     let mut last_error: Option<anyhow::Error> = None;
 
                     for upstream in upstream_plan.iter().take(max_attempts) {
-                        let lease = gateway.acquire_upstream_lease("tcp", Some(&listener_name), upstream);
+                        let lease =
+                            gateway.acquire_upstream_lease("tcp", Some(&listener_name), upstream);
                         match TcpStream::connect(upstream).await {
                             Ok(stream) => {
                                 gateway.on_upstream_success("tcp", Some(&listener_name), upstream);
@@ -786,14 +849,22 @@ impl Gateway {
                                 break;
                             }
                             Err(error) => {
-                                gateway.on_upstream_failure(&state.config, "tcp", Some(&listener_name), upstream);
-                                last_error = Some(anyhow!("failed to connect tcp upstream {upstream}: {error}"));
+                                gateway.on_upstream_failure(
+                                    &state.config,
+                                    "tcp",
+                                    Some(&listener_name),
+                                    upstream,
+                                );
+                                last_error = Some(anyhow!(
+                                    "failed to connect tcp upstream {upstream}: {error}"
+                                ));
                             }
                         }
                     }
 
-                    let (mut outbound, _lease, upstream) = selected
-                        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("failed to connect any tcp upstream")))?;
+                    let (mut outbound, _lease, upstream) = selected.ok_or_else(|| {
+                        last_error.unwrap_or_else(|| anyhow!("failed to connect any tcp upstream"))
+                    })?;
 
                     if !first_payload.is_empty() {
                         outbound
@@ -815,7 +886,10 @@ impl Gateway {
                     tracing::warn!(?error, request_id, listener = %listener_name, %remote_addr, "tcp session failed");
                 }
 
-                gateway.stats.tcp_sessions_active.fetch_sub(1, Ordering::Relaxed);
+                gateway
+                    .stats
+                    .tcp_sessions_active
+                    .fetch_sub(1, Ordering::Relaxed);
             });
         }
     }
@@ -836,7 +910,10 @@ impl Gateway {
 
         loop {
             let mut buffer = vec![0_u8; 65_536];
-            let (received, client_addr) = listener_socket.recv_from(&mut buffer).await.context("udp recv failed")?;
+            let (received, client_addr) = listener_socket
+                .recv_from(&mut buffer)
+                .await
+                .context("udp recv failed")?;
             self.stats.udp_packets_total.fetch_add(1, Ordering::Relaxed);
             self.stats
                 .udp_bytes_total
@@ -870,9 +947,8 @@ impl Gateway {
                                 payload_len: payload.len(),
                             })
                             .await
-                            .map_err(|error| {
+                            .inspect_err(|_| {
                                 gateway.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                                error
                             })?;
 
                         let upstream_plan = gateway.select_upstream_plan(
@@ -990,7 +1066,11 @@ impl Gateway {
             Err(error) => {
                 self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(?error, %remote_addr, "failed collecting request body");
-                return Ok(GatewayHttpResponse::error(StatusCode::BAD_REQUEST, "invalid request body").into_hyper());
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                )
+                .into_hyper());
             }
         };
 
@@ -1047,6 +1127,7 @@ impl Gateway {
         Ok(response.into_hyper())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_http(
         &self,
         method: Method,
@@ -1063,7 +1144,10 @@ impl Gateway {
             .get(HOST)
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_string())
-            .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
+            .or_else(|| {
+                uri.authority()
+                    .map(|authority| authority.as_str().to_string())
+            })
             .unwrap_or_else(|| "localhost".to_string());
 
         let player_id = extract_http_player_id(&uri, &headers, &state.config.affinity.http);
@@ -1085,9 +1169,8 @@ impl Gateway {
                 body_len: body.len(),
             })
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                error
             })?;
 
         let upstream_plan = self.select_upstream_plan(
@@ -1110,7 +1193,8 @@ impl Gateway {
 
         for (attempt, upstream) in upstream_plan.iter().take(max_attempts).enumerate() {
             let upstream_url = build_upstream_url(upstream, &route, &uri)?;
-            let upstream_headers = build_upstream_headers(&headers, &route, &host, remote_addr, scheme)?;
+            let upstream_headers =
+                build_upstream_headers(&headers, &route, &host, remote_addr, scheme)?;
             let _lease = self.acquire_upstream_lease("http", None, upstream);
 
             let send_result = state
@@ -1148,7 +1232,10 @@ impl Gateway {
 
             if status.is_server_error() && attempt + 1 < max_attempts {
                 self.on_upstream_failure(&state.config, "http", None, upstream);
-                last_error = Some(anyhow!("upstream {upstream} returned server error {}", status.as_u16()));
+                last_error = Some(anyhow!(
+                    "upstream {upstream} returned server error {}",
+                    status.as_u16()
+                ));
                 continue;
             }
 
@@ -1166,21 +1253,6 @@ impl Gateway {
 
     async fn current_state(&self) -> Arc<DynamicState> {
         self.dynamic.read().await.clone()
-    }
-
-    fn select_upstream(
-        &self,
-        config: &GatewayConfig,
-        route: &RouteDecision,
-        protocol: &str,
-        listener: Option<&str>,
-        affinity_key: Option<&str>,
-        remote_addr: Option<&str>,
-    ) -> String {
-        self.select_upstream_plan(config, route, protocol, listener, affinity_key, remote_addr)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| route.upstream.clone())
     }
 
     fn select_upstream_plan(
@@ -1204,28 +1276,33 @@ impl Gateway {
 
         let scope_base = format!("{}:{}", protocol, listener.unwrap_or("default"));
         let selected_key = if config.affinity.enabled {
-            affinity_key
-                .map(|value| value.to_string())
-                .or_else(|| {
-                    if config.affinity.fallback_to_remote_addr {
-                        remote_addr.map(|value| value.to_string())
-                    } else {
-                        None
-                    }
-                })
+            affinity_key.map(|value| value.to_string()).or_else(|| {
+                if config.affinity.fallback_to_remote_addr {
+                    remote_addr.map(|value| value.to_string())
+                } else {
+                    None
+                }
+            })
         } else {
             None
         };
 
         match config.load_balance.algorithm {
-            LoadBalanceAlgorithm::RoundRobin => self.select_round_robin_plan(&scope_base, candidates),
+            LoadBalanceAlgorithm::RoundRobin => {
+                self.select_round_robin_plan(&scope_base, candidates)
+            }
             LoadBalanceAlgorithm::LeastConnections => {
                 self.select_least_connections_plan(protocol, listener, candidates)
             }
-            LoadBalanceAlgorithm::SourceHash => self.select_source_hash_plan(selected_key.as_deref(), candidates),
-            LoadBalanceAlgorithm::Rendezvous => {
-                self.select_rendezvous_plan(config, &scope_base, selected_key.as_deref(), candidates)
+            LoadBalanceAlgorithm::SourceHash => {
+                self.select_source_hash_plan(selected_key.as_deref(), candidates)
             }
+            LoadBalanceAlgorithm::Rendezvous => self.select_rendezvous_plan(
+                config,
+                &scope_base,
+                selected_key.as_deref(),
+                candidates,
+            ),
         }
     }
 
@@ -1270,7 +1347,11 @@ impl Gateway {
         ranked
     }
 
-    fn select_source_hash_plan(&self, selected_key: Option<&str>, candidates: Vec<String>) -> Vec<String> {
+    fn select_source_hash_plan(
+        &self,
+        selected_key: Option<&str>,
+        candidates: Vec<String>,
+    ) -> Vec<String> {
         let Some(key) = selected_key else {
             return candidates;
         };
@@ -1295,7 +1376,10 @@ impl Gateway {
         }
 
         let start = {
-            let mut entry = self.round_robin_state.entry(scope_base.to_string()).or_insert(0);
+            let mut entry = self
+                .round_robin_state
+                .entry(scope_base.to_string())
+                .or_insert(0);
             let start = (*entry as usize) % candidates.len();
             *entry = entry.saturating_add(1);
             start
@@ -1383,7 +1467,8 @@ impl Gateway {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         if entry.consecutive_failures >= config.load_balance.passive_health.fail_threshold {
             entry.quarantined_until = Some(
-                Instant::now() + Duration::from_secs(config.load_balance.passive_health.quarantine_secs),
+                Instant::now()
+                    + Duration::from_secs(config.load_balance.passive_health.quarantine_secs),
             );
         }
     }
@@ -1398,7 +1483,12 @@ impl Gateway {
         UpstreamLease::acquire(self.upstream_runtime.clone(), key)
     }
 
-    fn upstream_active_connections(&self, protocol: &str, listener: Option<&str>, upstream: &str) -> u64 {
+    fn upstream_active_connections(
+        &self,
+        protocol: &str,
+        listener: Option<&str>,
+        upstream: &str,
+    ) -> u64 {
         let key = runtime_scope_key(protocol, listener, upstream);
         self.upstream_runtime
             .get(&key)
@@ -1435,7 +1525,10 @@ impl Gateway {
         result
     }
 
-    fn build_rustls_server_config(&self, alpn_protocols: Vec<Vec<u8>>) -> Result<rustls::ServerConfig> {
+    fn build_rustls_server_config(
+        &self,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<rustls::ServerConfig> {
         let certs = load_certs(&self.bootstrap_config.http.tls.cert_path)?;
         let key = load_private_key(&self.bootstrap_config.http.tls.key_path)?;
 
@@ -1467,14 +1560,12 @@ impl GatewayHttpResponse {
         for (name, value) in self.headers {
             builder = builder.header(name, value);
         }
-        builder
-            .body(Full::new(self.body))
-            .unwrap_or_else(|_| {
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from_static(b"response build failure")))
-                    .expect("static response build should never fail")
-            })
+        builder.body(Full::new(self.body)).unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from_static(b"response build failure")))
+                .expect("static response build should never fail")
+        })
     }
 }
 
@@ -1542,7 +1633,8 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to scan plugin directory {}", dir.display()))?
     {
-        let entry = entry.with_context(|| format!("failed to read plugin entry under {}", dir.display()))?;
+        let entry = entry
+            .with_context(|| format!("failed to read plugin entry under {}", dir.display()))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1587,7 +1679,9 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
 
 fn ensure_reload_compatible(old: &GatewayConfig, new: &GatewayConfig) -> Result<()> {
     if old.logging.format != new.logging.format || old.logging.filter != new.logging.filter {
-        return Err(anyhow!("logging.format/logging.filter changes require restart"));
+        return Err(anyhow!(
+            "logging.format/logging.filter changes require restart"
+        ));
     }
 
     if old.http.plain_bind != new.http.plain_bind
@@ -1765,21 +1859,20 @@ fn run_command_checked(mut command: Command, description: &str) -> Result<()> {
 }
 
 fn build_upstream_url(base_upstream: &str, route: &RouteDecision, uri: &Uri) -> Result<Url> {
-    let upstream = if base_upstream.starts_with("http://") || base_upstream.starts_with("https://") {
+    let upstream = if base_upstream.starts_with("http://") || base_upstream.starts_with("https://")
+    {
         base_upstream.to_string()
     } else {
         format!("http://{}", base_upstream)
     };
-    let mut url = Url::parse(&upstream).with_context(|| format!("invalid upstream url {}", base_upstream))?;
+    let mut url =
+        Url::parse(&upstream).with_context(|| format!("invalid upstream url {}", base_upstream))?;
 
-    let rewritten = route
-        .rewrite_path
-        .clone()
-        .unwrap_or_else(|| {
-            uri.path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| uri.path().to_string())
-        });
+    let rewritten = route.rewrite_path.clone().unwrap_or_else(|| {
+        uri.path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string())
+    });
 
     let (path, query) = match rewritten.split_once('?') {
         Some((path, query)) => (path.to_string(), Some(query.to_string())),
@@ -1823,7 +1916,8 @@ fn build_upstream_headers(
 
     headers.insert(
         HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_str(&remote_addr.ip().to_string()).context("invalid x-forwarded-for header")?,
+        HeaderValue::from_str(&remote_addr.ip().to_string())
+            .context("invalid x-forwarded-for header")?,
     );
     headers.insert(
         HeaderName::from_static("x-forwarded-host"),
@@ -1840,7 +1934,12 @@ fn build_upstream_headers(
 fn header_map_to_btree(headers: &HeaderMap) -> BTreeMap<String, String> {
     headers
         .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string())))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
         .collect()
 }
 
@@ -1862,7 +1961,12 @@ fn normalize_candidates(route: &RouteDecision) -> Vec<String> {
 }
 
 fn runtime_scope_key(protocol: &str, listener: Option<&str>, upstream: &str) -> String {
-    format!("{}:{}:{}", protocol, listener.unwrap_or("default"), upstream)
+    format!(
+        "{}:{}:{}",
+        protocol,
+        listener.unwrap_or("default"),
+        upstream
+    )
 }
 
 fn rendezvous_rank(key: &str, candidates: &[String]) -> Vec<String> {
@@ -1880,9 +1984,17 @@ fn rendezvous_rank(key: &str, candidates: &[String]) -> Vec<String> {
     scored.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
-fn extract_http_player_id(uri: &Uri, headers: &HeaderMap, cfg: &HttpAffinityConfig) -> Option<String> {
+fn extract_http_player_id(
+    uri: &Uri,
+    headers: &HeaderMap,
+    cfg: &HttpAffinityConfig,
+) -> Option<String> {
     if let Some(query) = uri.query() {
-        let target_keys: HashSet<String> = cfg.query_keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+        let target_keys: HashSet<String> = cfg
+            .query_keys
+            .iter()
+            .map(|key| key.to_ascii_lowercase())
+            .collect();
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             if target_keys.contains(&key.to_ascii_lowercase()) {
                 let value = value.trim();
@@ -1905,7 +2017,11 @@ fn extract_http_player_id(uri: &Uri, headers: &HeaderMap, cfg: &HttpAffinityConf
     }
 
     if let Some(cookie) = headers.get(COOKIE).and_then(|value| value.to_str().ok()) {
-        let target_keys: HashSet<String> = cfg.cookie_keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+        let target_keys: HashSet<String> = cfg
+            .cookie_keys
+            .iter()
+            .map(|key| key.to_ascii_lowercase())
+            .collect();
         for chunk in cookie.split(';') {
             let trimmed = chunk.trim();
             if let Some((name, value)) = trimmed.split_once('=') {
@@ -1957,7 +2073,9 @@ fn extract_stream_player_id(payload: &[u8], cfg: &StreamAffinityConfig) -> Optio
 
 fn first_packet_preview(payload: &[u8]) -> String {
     let limit = payload.len().min(96);
-    String::from_utf8_lossy(&payload[..limit]).replace('\n', "\\n").replace('\r', "\\r")
+    String::from_utf8_lossy(&payload[..limit])
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn should_sample(sample_rate: f64, seed: &str) -> bool {
@@ -2013,7 +2131,10 @@ fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
 
     if let Some(admin) = value.get_mut("admin").and_then(|item| item.as_object_mut()) {
-        admin.insert("password".to_string(), serde_json::Value::String("***".to_string()));
+        admin.insert(
+            "password".to_string(),
+            serde_json::Value::String("***".to_string()),
+        );
     }
 
     value
@@ -2024,7 +2145,12 @@ fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Ful
         .status(status)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(payload.to_string())))
-        .unwrap_or_else(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to build json response"))
+        .unwrap_or_else(|_| {
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build json response",
+            )
+        })
 }
 
 fn text_response(status: StatusCode, body: impl Into<String>) -> Response<Full<Bytes>> {
@@ -2035,7 +2161,9 @@ fn text_response(status: StatusCode, body: impl Into<String>) -> Response<Full<B
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from_static(b"failed to build text response")))
+                .body(Full::new(Bytes::from_static(
+                    b"failed to build text response",
+                )))
                 .expect("static response build should never fail")
         })
 }
@@ -2067,7 +2195,8 @@ fn version_label(version: Version) -> &'static str {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path).with_context(|| format!("failed to open certificate {}", path.display()))?;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open certificate {}", path.display()))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -2075,7 +2204,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path).with_context(|| format!("failed to open private key {}", path.display()))?;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open private key {}", path.display()))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
         .context("failed to parse private key pem")?
@@ -2083,7 +2213,8 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 fn read_file_hash(path: &Path) -> Result<u64> {
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     Ok(hasher.finish())
@@ -2155,6 +2286,9 @@ mod tests {
         };
 
         let candidates = normalize_candidates(&route);
-        assert_eq!(candidates, vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()]);
+        assert_eq!(
+            candidates,
+            vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()]
+        );
     }
 }

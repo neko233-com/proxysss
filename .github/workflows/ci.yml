@@ -12,7 +12,18 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          curl -sSL -o actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          chmod +x actionlint
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Lint GitHub Actions workflows
+        run: actionlint
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,7 +50,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -58,10 +58,11 @@ pub struct LoggingConfig {
     pub redact_headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
     Plain,
+    #[default]
     Json,
 }
 
@@ -97,9 +98,10 @@ pub struct TlsConfig {
     pub acme: AcmeExternalConfig,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
+    #[default]
     SelfSigned,
     Manual,
     AcmeExternal,
@@ -125,9 +127,10 @@ pub struct AcmeExternalConfig {
     pub extra_args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcmeChallengeType {
+    #[default]
     TlsAlpn01,
     Http01,
 }
@@ -180,7 +183,7 @@ pub struct PluginsConfig {
     pub allow_admin_manage: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoadBalanceConfig {
     #[serde(default)]
     pub algorithm: LoadBalanceAlgorithm,
@@ -190,9 +193,10 @@ pub struct LoadBalanceConfig {
     pub passive_health: PassiveHealthConfig,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalanceAlgorithm {
+    #[default]
     Rendezvous,
     RoundRobin,
     LeastConnections,
@@ -269,7 +273,7 @@ pub struct AdminConfig {
     pub enable_write_ops: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub hot_reload: HotReloadConfig,
@@ -311,7 +315,10 @@ impl GatewayConfig {
             && self.http.tls_bind.trim().is_empty()
             && self.http.h3_bind.trim().is_empty()
         {
-            errors.push("at least one of http.plain_bind/http.tls_bind/http.h3_bind must be set".to_string());
+            errors.push(
+                "at least one of http.plain_bind/http.tls_bind/http.h3_bind must be set"
+                    .to_string(),
+            );
         }
 
         validate_bind_optional("http.plain_bind", &self.http.plain_bind, &mut errors);
@@ -344,19 +351,28 @@ impl GatewayConfig {
 
         if self.load_balance.passive_health.enabled {
             if self.load_balance.passive_health.fail_threshold == 0 {
-                errors.push("load_balance.passive_health.fail_threshold must be greater than 0".to_string());
+                errors.push(
+                    "load_balance.passive_health.fail_threshold must be greater than 0".to_string(),
+                );
             }
             if self.load_balance.passive_health.quarantine_secs == 0 {
-                errors.push("load_balance.passive_health.quarantine_secs must be greater than 0".to_string());
+                errors.push(
+                    "load_balance.passive_health.quarantine_secs must be greater than 0"
+                        .to_string(),
+                );
             }
         }
 
         if self.plugins.enabled {
             if self.plugins.extensions.is_empty() {
-                errors.push("plugins.extensions cannot be empty when plugins are enabled".to_string());
+                errors.push(
+                    "plugins.extensions cannot be empty when plugins are enabled".to_string(),
+                );
             }
             if self.plugins.auto_load_dir.as_os_str().is_empty() {
-                errors.push("plugins.auto_load_dir cannot be empty when plugins are enabled".to_string());
+                errors.push(
+                    "plugins.auto_load_dir cannot be empty when plugins are enabled".to_string(),
+                );
             }
         }
 
@@ -366,7 +382,10 @@ impl GatewayConfig {
                 errors.push("admin.username cannot be empty when admin is enabled".to_string());
             }
             if self.admin.password.len() < 4 {
-                errors.push("admin.password must be at least 4 characters when admin is enabled".to_string());
+                errors.push(
+                    "admin.password must be at least 4 characters when admin is enabled"
+                        .to_string(),
+                );
             }
         }
 
@@ -388,7 +407,11 @@ impl GatewayConfig {
             if listener.name.trim().is_empty() {
                 errors.push("tcp listener name cannot be empty".to_string());
             }
-            validate_bind_required(&format!("tcp.listeners.{}.bind", listener.name), &listener.bind, &mut errors);
+            validate_bind_required(
+                &format!("tcp.listeners.{}.bind", listener.name),
+                &listener.bind,
+                &mut errors,
+            );
             if !tcp_names.insert(listener.name.clone()) {
                 errors.push(format!("duplicate tcp listener name {}", listener.name));
             }
@@ -403,7 +426,11 @@ impl GatewayConfig {
             if listener.name.trim().is_empty() {
                 errors.push("udp listener name cannot be empty".to_string());
             }
-            validate_bind_required(&format!("udp.listeners.{}.bind", listener.name), &listener.bind, &mut errors);
+            validate_bind_required(
+                &format!("udp.listeners.{}.bind", listener.name),
+                &listener.bind,
+                &mut errors,
+            );
             if !udp_names.insert(listener.name.clone()) {
                 errors.push(format!("duplicate udp listener name {}", listener.name));
             }
@@ -415,24 +442,41 @@ impl GatewayConfig {
         match self.http.tls.mode {
             TlsMode::Manual => {
                 if !self.http.tls.cert_path.exists() {
-                    errors.push(format!("http.tls.cert_path does not exist: {}", self.http.tls.cert_path.display()));
+                    errors.push(format!(
+                        "http.tls.cert_path does not exist: {}",
+                        self.http.tls.cert_path.display()
+                    ));
                 }
                 if !self.http.tls.key_path.exists() {
-                    errors.push(format!("http.tls.key_path does not exist: {}", self.http.tls.key_path.display()));
+                    errors.push(format!(
+                        "http.tls.key_path does not exist: {}",
+                        self.http.tls.key_path.display()
+                    ));
                 }
             }
             TlsMode::AcmeExternal => {
                 if self.http.tls.acme.domains.is_empty() {
-                    errors.push("http.tls.acme.domains cannot be empty when mode is acme_external".to_string());
+                    errors.push(
+                        "http.tls.acme.domains cannot be empty when mode is acme_external"
+                            .to_string(),
+                    );
                 }
                 if self.http.tls.acme.email.trim().is_empty() {
-                    errors.push("http.tls.acme.email cannot be empty when mode is acme_external".to_string());
+                    errors.push(
+                        "http.tls.acme.email cannot be empty when mode is acme_external"
+                            .to_string(),
+                    );
                 }
                 if self.http.tls.acme.client.trim().is_empty() {
-                    errors.push("http.tls.acme.client cannot be empty when mode is acme_external".to_string());
+                    errors.push(
+                        "http.tls.acme.client cannot be empty when mode is acme_external"
+                            .to_string(),
+                    );
                 }
                 if self.http.tls.acme.renew_interval_hours == 0 {
-                    errors.push("http.tls.acme.renew_interval_hours must be greater than 0".to_string());
+                    errors.push(
+                        "http.tls.acme.renew_interval_hours must be greater than 0".to_string(),
+                    );
                 }
             }
             TlsMode::SelfSigned => {}
@@ -533,12 +577,6 @@ impl Default for LoggingConfig {
     }
 }
 
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Json
-    }
-}
-
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -565,12 +603,6 @@ impl Default for TlsConfig {
     }
 }
 
-impl Default for TlsMode {
-    fn default() -> Self {
-        Self::SelfSigned
-    }
-}
-
 impl Default for AcmeExternalConfig {
     fn default() -> Self {
         Self {
@@ -583,12 +615,6 @@ impl Default for AcmeExternalConfig {
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
         }
-    }
-}
-
-impl Default for AcmeChallengeType {
-    fn default() -> Self {
-        Self::TlsAlpn01
     }
 }
 
@@ -611,22 +637,6 @@ impl Default for PluginsConfig {
             extensions: default_plugin_extensions(),
             allow_admin_manage: default_true(),
         }
-    }
-}
-
-impl Default for LoadBalanceConfig {
-    fn default() -> Self {
-        Self {
-            algorithm: LoadBalanceAlgorithm::default(),
-            retries: RetryPolicyConfig::default(),
-            passive_health: PassiveHealthConfig::default(),
-        }
-    }
-}
-
-impl Default for LoadBalanceAlgorithm {
-    fn default() -> Self {
-        Self::Rendezvous
     }
 }
 
@@ -691,14 +701,6 @@ impl Default for AdminConfig {
             password: default_admin_password(),
             expose_config: default_true(),
             enable_write_ops: default_true(),
-        }
-    }
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            hot_reload: HotReloadConfig::default(),
         }
     }
 }
@@ -834,7 +836,11 @@ fn default_script_command() -> String {
 }
 
 fn default_script_args() -> Vec<String> {
-    vec!["run".to_string(), "-A".to_string(), DEFAULT_SCRIPT_FILE_NAME.to_string()]
+    vec![
+        "run".to_string(),
+        "-A".to_string(),
+        DEFAULT_SCRIPT_FILE_NAME.to_string(),
+    ]
 }
 
 fn default_script_timeout_ms() -> u64 {
@@ -871,7 +877,11 @@ fn default_http_affinity_cookie_keys() -> Vec<String> {
 }
 
 fn default_stream_affinity_prefixes() -> Vec<String> {
-    vec!["playerId=".to_string(), "pid=".to_string(), "uid=".to_string()]
+    vec![
+        "playerId=".to_string(),
+        "pid=".to_string(),
+        "uid=".to_string(),
+    ]
 }
 
 fn default_stream_affinity_delimiters() -> Vec<String> {
@@ -936,7 +946,9 @@ mod tests {
     fn warnings_include_default_admin_credentials() {
         let config = GatewayConfig::default();
         let warnings = config.warnings();
-        assert!(warnings.iter().any(|item| item.contains("admin credentials are still default")));
+        assert!(warnings
+            .iter()
+            .any(|item| item.contains("admin credentials are still default")));
     }
 
     #[test]
@@ -956,7 +968,9 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.load_balance.retries.max_retries = 32;
         let error = config.validate().expect_err("expected invalid retries");
-        assert!(error.to_string().contains("load_balance.retries.max_retries"));
+        assert!(error
+            .to_string()
+            .contains("load_balance.retries.max_retries"));
     }
 
     #[test]
@@ -966,7 +980,9 @@ mod tests {
         let error = config
             .validate()
             .expect_err("expected invalid passive health threshold");
-        assert!(error.to_string().contains("load_balance.passive_health.fail_threshold"));
+        assert!(error
+            .to_string()
+            .contains("load_balance.passive_health.fail_threshold"));
     }
 
     #[test]

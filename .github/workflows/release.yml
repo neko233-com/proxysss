@@ -28,7 +28,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset: proxysss-linux-arm64
             binary: proxysss
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: proxysss-darwin-amd64
             binary: proxysss
@@ -40,7 +40,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
