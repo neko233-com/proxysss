@@ -28,6 +28,40 @@ $assets = @(
     "proxysss-darwin-arm64"
 )
 
+function Get-InstalledProxysssVersion {
+    try {
+        $text = (& proxysss --version 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $text -match "([0-9]+\.[0-9]+\.[0-9]+)") {
+            return $matches[1]
+        }
+    } catch {
+    }
+    return $null
+}
+
+function Assert-InstalledWindowsAsset([string]$ExpectedVersion) {
+    $installed = Get-InstalledProxysssVersion
+    if ($installed -eq $ExpectedVersion) {
+        return
+    }
+
+    $installPath = Join-Path $env:LOCALAPPDATA "proxysss\proxysss.exe"
+    if (!(Test-Path -LiteralPath $installPath)) {
+        throw "installed proxysss.exe not found at $installPath"
+    }
+
+    $tmp = Join-Path $env:TEMP "proxysss-$ExpectedVersion-windows-amd64.exe"
+    $assetTag = "v$ExpectedVersion"
+    $url = "https://github.com/$Repo/releases/download/$assetTag/proxysss-windows-amd64.exe"
+    Invoke-WebRequest -Uri $url -OutFile $tmp
+
+    $installedHash = (Get-FileHash -LiteralPath $installPath -Algorithm SHA256).Hash
+    $expectedHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    if ($installedHash -ne $expectedHash) {
+        throw "installed binary hash mismatch for $assetTag"
+    }
+}
+
 Write-Host "Checking GitHub release $Repo@$Tag..."
 $releaseJson = gh release view $Tag --repo $Repo --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
 if ($releaseJson.tagName -ne $Tag) {
@@ -58,22 +92,17 @@ if ($PreviousVersion) {
 
 Write-Host "Upgrading to $Tag..."
 powershell -NoProfile -ExecutionPolicy Bypass -File $install -Action upgrade -Version $Tag -SkipInit -NoServiceRestart
-$upgraded = (& proxysss --version | Out-String).Trim()
-if ($upgraded -notmatch [regex]::Escape($VersionNumber)) {
-    throw "upgrade verification failed: $upgraded"
-}
+Assert-InstalledWindowsAsset $VersionNumber
 
 if ($PreviousVersion) {
     $previousNumber = $PreviousVersion.TrimStart("v", "V")
     Write-Host "Downgrading to $PreviousVersion..."
     powershell -NoProfile -ExecutionPolicy Bypass -File $install -Action downgrade -Version $PreviousVersion -SkipInit -NoServiceRestart
-    $downgraded = (& proxysss --version | Out-String).Trim()
-    if ($downgraded -notmatch [regex]::Escape($previousNumber)) {
-        throw "downgrade verification failed: $downgraded"
-    }
+    Assert-InstalledWindowsAsset $previousNumber
 
     Write-Host "Restoring $Tag..."
     powershell -NoProfile -ExecutionPolicy Bypass -File $install -Action upgrade -Version $Tag -SkipInit -NoServiceRestart
+    Assert-InstalledWindowsAsset $VersionNumber
 }
 
 Write-Host "Release install checks OK."

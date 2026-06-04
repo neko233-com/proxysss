@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.6 - 2026-06-04
+
+- Fixed release verification compatibility when downgrading to older builds that do not support `proxysss --version`.
+- Verification now falls back to installed binary SHA256 comparison against the expected GitHub release asset.
+
 ## v0.1.5 - 2026-06-04
 
 - Added `proxysss update --version <latest|vX.Y.Z>` for one-command upgrades.

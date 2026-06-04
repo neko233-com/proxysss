@@ -2,7 +2,7 @@
 
 proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.5
+当前版本：v0.1.6
 
 ## 核心能力
 
@@ -109,7 +109,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.1.5
+proxysss update --version v0.1.6
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -120,7 +120,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.5
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.6
 ```
 
 降级到指定版本：
@@ -132,7 +132,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.5 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.6 -DryRun
 ```
 
 ### Linux / macOS
@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 install.sh 支持显式 action/version：
 
 ```bash
-bash ./scripts/install.sh --action upgrade --version v0.1.5
+bash ./scripts/install.sh --action upgrade --version v0.1.6
 bash ./scripts/install.sh --action downgrade --version v0.1.4
 ```
 
@@ -269,7 +269,7 @@ release.yml 会在推送 v* tag 时构建并发布多平台二进制。
 本地发布后验证：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.5 -PreviousVersion v0.1.4
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-release.ps1 -Version v0.1.6 -PreviousVersion v0.1.5
 ```
 
 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
