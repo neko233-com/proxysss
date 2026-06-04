@@ -2,7 +2,7 @@
 
 proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.1
+当前版本：v0.1.2
 
 ## 核心能力
 
@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.1
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.2
 ```
 
 ### Windows PowerShell
@@ -80,7 +80,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.1
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.2
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -108,7 +108,7 @@ install.ps1 支持参数：
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.2
 ```
 
 降级到指定版本：
@@ -120,7 +120,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.2 -DryRun
 ```
 
 ### Linux / macOS
@@ -128,9 +128,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.1.1
+bash ./scripts/install.sh v0.1.2
 bash ./scripts/install.sh v0.1.0
 ```
+
+## 主流 Proxy 对比
+
+下表覆盖当前最常见、最容易和 proxysss 放在一起评估的几类代理/网关。它不是“所有代理软件”的穷举，但已经覆盖大多数通用接入层选型场景。
+
+| 产品 | 可编程路由 | HTTP/3 | 原生 TCP/UDP | 服务发现/控制面 | 配置复杂度 | 更适合的场景 |
+| --- | --- | --- | --- | --- | --- | --- |
+| proxysss | TS/JS 脚本 + 插件，偏业务路由 | 是 | 是 | 内置轻量管理面，偏单体网关 | 中 | 游戏网关、聊天网关、按 playerId/uid 做亲和与脚本路由 |
+| Nginx | 有限，主要靠指令与模块 | 部分支持，依赖构建与配置 | TCP/UDP 依赖 stream 模块 | 弱，通常接外部服务注册 | 中 | 稳定 Web 入口、静态资源、传统反向代理 |
+| Caddy | 中，偏声明式与插件 | 是 | 以 HTTP 为主，L4 需插件或扩展 | 弱到中 | 低 | 快速 HTTPS 接入、简单网站和 API 代理 |
+| HAProxy | 中，规则强但业务脚本弱 | 有限且偏前沿 | 是，L4/L7 很强 | 中 | 中到高 | 高性能四层/七层负载均衡、传统流量调度 |
+| Envoy | 强，过滤器体系完整 | 是 | 是 | 强，适合配合 xDS/mesh | 高 | Service Mesh、云原生边车、复杂多集群治理 |
+| Traefik | 中，偏声明式与自动发现 | 是 | HTTP 强，TCP/UDP 可用 | 强，擅长 Docker/K8s 自动发现 | 低到中 | 容器平台入口、Kubernetes Ingress、自动发现路由 |
+
+快速选型建议：
+
+- 如果你要按玩家、会话、设备 ID 做稳定选路，并且希望把业务路由逻辑直接写在脚本里，优先选 proxysss。
+- 如果你主要做通用 Web 反代，且希望生态成熟、运维习惯稳定，Nginx 或 Caddy 更省心。
+- 如果你已经在 Kubernetes 或 Service Mesh 体系里，Traefik 或 Envoy 更贴合现有控制面。
+- 如果核心诉求是极强的 L4/L7 性能与成熟负载均衡规则，HAProxy 仍然是强项。
 
 ## 配置与安全
 
