@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.9 - 2026-06-04
+
+- Hardened Windows installer downloads with a GitHub CLI release-download fallback when direct asset HTTPS downloads time out.
+- Hardened release verification hash checks with the same GitHub CLI fallback.
+
 ## v0.1.8 - 2026-06-04
 
 - Changed default public gateway ports to `80` for HTTP and `443` for HTTPS/HTTP3 so proxysss can directly replace Nginx and Caddy.

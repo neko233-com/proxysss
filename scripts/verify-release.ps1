@@ -53,7 +53,14 @@ function Assert-InstalledWindowsAsset([string]$ExpectedVersion) {
     $tmp = Join-Path $env:TEMP "proxysss-$ExpectedVersion-windows-amd64.exe"
     $assetTag = "v$ExpectedVersion"
     $url = "https://github.com/$Repo/releases/download/$assetTag/proxysss-windows-amd64.exe"
-    Invoke-WebRequest -Uri $url -OutFile $tmp
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp
+    } catch {
+        $assetName = "proxysss-windows-amd64.exe"
+        gh release download $assetTag --repo $Repo --pattern $assetName --dir $env:TEMP --clobber
+        $downloaded = Join-Path $env:TEMP $assetName
+        Move-Item -Force $downloaded $tmp
+    }
 
     $installedHash = (Get-FileHash -LiteralPath $installPath -Algorithm SHA256).Hash
     $expectedHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
