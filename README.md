@@ -2,7 +2,7 @@
 
 proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.3
+当前版本：v0.1.4
 
 ## 核心能力
 
@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.3
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.4
 ```
 
 ### Windows PowerShell
@@ -80,7 +80,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.3
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.4
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -108,7 +108,7 @@ install.ps1 支持参数：
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.3
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.4
 ```
 
 降级到指定版本：
@@ -120,7 +120,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.3 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.4 -DryRun
 ```
 
 ### Linux / macOS
@@ -128,7 +128,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.1.3
+bash ./scripts/install.sh v0.1.4
 bash ./scripts/install.sh v0.1.0
 ```
 
