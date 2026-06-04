@@ -1005,6 +1005,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "quinn",

@@ -14,23 +14,28 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use h3::server::Connection as H3Connection;
-use http::header::{AUTHORIZATION, COOKIE, HOST};
+use http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, LOCATION};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ClientConfig;
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::Deserialize;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 use uuid::Uuid;
 
@@ -96,6 +101,52 @@ struct GatewayStats {
 struct UpstreamLease {
     runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
     key: String,
+}
+
+trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ProxyIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedProxyIo = Box<dyn ProxyIo>;
+
+#[derive(Debug)]
+struct InsecureUpstreamVerifier;
+
+impl ServerCertVerifier for InsecureUpstreamVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 impl UpstreamLease {
@@ -298,6 +349,13 @@ impl Gateway {
         }
 
         let state = self.current_state().await;
+        if method == Method::GET && (path == "/" || path == "/index.html") {
+            return Ok(html_response(
+                StatusCode::OK,
+                render_admin_console_html(&state.config),
+            ));
+        }
+
         if !is_authorized(request.headers().get(AUTHORIZATION), &state.config.admin) {
             self.stats
                 .admin_auth_fail_total
@@ -695,6 +753,7 @@ impl Gateway {
                                     remote_addr,
                                     "https",
                                     "HTTP/3",
+                                    None,
                                 )
                                 .await
                             {
@@ -1057,6 +1116,8 @@ impl Gateway {
         self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
 
         let started = Instant::now();
+        let on_upgrade = websocket_upgrade_requested(request.headers())
+            .then(|| hyper::upgrade::on(&mut request));
         let version = version_label(request.version());
         let method = request.method().clone();
         let uri = request.uri().clone();
@@ -1075,7 +1136,16 @@ impl Gateway {
         };
 
         let response = match self
-            .dispatch_http(method, uri, headers, body, remote_addr, scheme, version)
+            .dispatch_http(
+                method,
+                uri,
+                headers,
+                body,
+                remote_addr,
+                scheme,
+                version,
+                on_upgrade,
+            )
             .await
         {
             Ok(response) => response,
@@ -1137,6 +1207,7 @@ impl Gateway {
         remote_addr: SocketAddr,
         scheme: &str,
         version: &str,
+        on_upgrade: Option<OnUpgrade>,
     ) -> Result<GatewayHttpResponse> {
         let state = self.current_state().await;
 
@@ -1172,6 +1243,29 @@ impl Gateway {
             .inspect_err(|_| {
                 self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
             })?;
+
+        if route.upstream.starts_with("proxysss://") {
+            return Ok(dispatch_internal_http(&state.config, &route));
+        }
+
+        if websocket_upgrade_requested(&headers) || websocket_upstream_requested(&route) {
+            let on_upgrade = on_upgrade.ok_or_else(|| {
+                anyhow!("websocket route requires an HTTP/1.1 upgrade-capable request")
+            })?;
+            return self
+                .dispatch_websocket(
+                    method,
+                    uri,
+                    headers,
+                    body,
+                    remote_addr,
+                    scheme,
+                    &host,
+                    &route,
+                    on_upgrade,
+                )
+                .await;
+        }
 
         let upstream_plan = self.select_upstream_plan(
             &state.config,
@@ -1249,6 +1343,91 @@ impl Gateway {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("upstream request failed after retries")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_websocket(
+        &self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        host: &str,
+        route: &RouteDecision,
+        on_upgrade: OnUpgrade,
+    ) -> Result<GatewayHttpResponse> {
+        let state = self.current_state().await;
+        let upstream_url = build_upstream_url(&route.upstream, route, &uri)?;
+        let upstream_host = upstream_host_header(&upstream_url)?;
+        let upstream_headers = build_websocket_upstream_headers(
+            &headers,
+            route,
+            &upstream_host,
+            remote_addr,
+            scheme,
+            host,
+        )?;
+        let upstream = upstream_url.to_string();
+        let mut upstream_io =
+            connect_upgrade_upstream(&upstream_url, state.config.http.allow_insecure_upstreams)
+                .await
+                .with_context(|| format!("failed connecting websocket upstream {upstream}"))?;
+
+        let request_bytes =
+            serialize_http_request(&method, &upstream_url, &upstream_headers, &body)?;
+        upstream_io
+            .write_all(&request_bytes)
+            .await
+            .with_context(|| format!("failed sending websocket handshake to {upstream}"))?;
+
+        let (status, response_headers, leftover) = read_http_response_head(&mut upstream_io)
+            .await
+            .with_context(|| format!("failed reading websocket handshake from {upstream}"))?;
+
+        if status != StatusCode::SWITCHING_PROTOCOLS {
+            return Ok(GatewayHttpResponse {
+                status,
+                headers: response_headers,
+                body: leftover.unwrap_or_default(),
+                upstream,
+            });
+        }
+
+        let tunnel_upstream = upstream.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let upgraded = on_upgrade
+                    .await
+                    .context("downstream websocket upgrade failed")?;
+                let mut client = TokioIo::new(upgraded);
+                if let Some(initial_bytes) = leftover {
+                    if !initial_bytes.is_empty() {
+                        client
+                            .write_all(&initial_bytes)
+                            .await
+                            .context("failed flushing upstream websocket prelude")?;
+                    }
+                }
+                copy_bidirectional(&mut client, &mut *upstream_io)
+                    .await
+                    .context("websocket tunnel relay failed")?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(error) = result {
+                tracing::warn!(?error, upstream = %tunnel_upstream, "websocket tunnel failed");
+            }
+        });
+
+        Ok(GatewayHttpResponse {
+            status,
+            headers: response_headers,
+            body: Bytes::new(),
+            upstream,
+        })
     }
 
     async fn current_state(&self) -> Arc<DynamicState> {
@@ -1552,6 +1731,30 @@ impl GatewayHttpResponse {
             )],
             body,
             upstream: "-".to_string(),
+        }
+    }
+
+    fn html(body: impl Into<String>, upstream: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            headers: vec![(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            body: Bytes::from(body.into()),
+            upstream: upstream.into(),
+        }
+    }
+
+    fn redirect(location: impl Into<String>, upstream: impl Into<String>) -> Self {
+        let location = location.into();
+        let header =
+            HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/"));
+        Self {
+            status: StatusCode::TEMPORARY_REDIRECT,
+            headers: vec![(LOCATION, header)],
+            body: Bytes::new(),
+            upstream: upstream.into(),
         }
     }
 
@@ -1859,7 +2062,10 @@ fn run_command_checked(mut command: Command, description: &str) -> Result<()> {
 }
 
 fn build_upstream_url(base_upstream: &str, route: &RouteDecision, uri: &Uri) -> Result<Url> {
-    let upstream = if base_upstream.starts_with("http://") || base_upstream.starts_with("https://")
+    let upstream = if base_upstream.starts_with("http://")
+        || base_upstream.starts_with("https://")
+        || base_upstream.starts_with("ws://")
+        || base_upstream.starts_with("wss://")
     {
         base_upstream.to_string()
     } else {
@@ -2153,6 +2359,19 @@ fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Ful
         })
 }
 
+fn html_response(status: StatusCode, body: impl Into<String>) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(body.into())))
+        .unwrap_or_else(|_| {
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build html response",
+            )
+        })
+}
+
 fn text_response(status: StatusCode, body: impl Into<String>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -2181,6 +2400,485 @@ fn is_hop_header(name: &str) -> bool {
             | "upgrade"
             | "proxy-connection"
     )
+}
+
+fn websocket_upgrade_requested(headers: &HeaderMap) -> bool {
+    let upgrade = headers
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let connection = headers
+        .get("connection")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+
+    upgrade && connection
+}
+
+fn websocket_upstream_requested(route: &RouteDecision) -> bool {
+    route.upstream.starts_with("ws://") || route.upstream.starts_with("wss://")
+}
+
+fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> GatewayHttpResponse {
+    match route.upstream.as_str() {
+        "proxysss://welcome" => {
+            GatewayHttpResponse::html(render_welcome_html(config), "proxysss://welcome")
+        }
+        "proxysss://admin" => GatewayHttpResponse::redirect(
+            format!("http://{}/", config.admin.bind),
+            "proxysss://admin",
+        ),
+        _ => GatewayHttpResponse::error(StatusCode::NOT_FOUND, "unknown internal route"),
+    }
+}
+
+fn render_welcome_html(config: &GatewayConfig) -> String {
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>proxysss</title>
+    <style>
+        :root {
+            --panel: rgba(12, 25, 44, 0.78);
+            --panel-border: rgba(130, 182, 255, 0.18);
+            --text: #eef5ff;
+            --muted: #9eb4d1;
+            --accent: #56d7ff;
+            --accent-2: #7cffb6;
+            --warm: #ffcf6e;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(86, 215, 255, 0.22), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(124, 255, 182, 0.18), transparent 24%),
+                linear-gradient(160deg, #06101c, #091a31 50%, #0d1730 100%);
+            overflow-x: hidden;
+        }
+        .orb, .orb-2 {
+            position: fixed;
+            border-radius: 999px;
+            filter: blur(12px);
+            opacity: 0.48;
+            pointer-events: none;
+            animation: drift 12s ease-in-out infinite alternate;
+        }
+        .orb { width: 220px; height: 220px; top: 8%; right: 8%; background: rgba(86, 215, 255, 0.22); }
+        .orb-2 { width: 180px; height: 180px; bottom: 10%; left: 10%; background: rgba(124, 255, 182, 0.20); animation-duration: 9s; }
+        @keyframes drift {
+            from { transform: translateY(-16px) scale(0.98); }
+            to { transform: translateY(18px) scale(1.04); }
+        }
+        .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 64px; }
+        .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
+        .brand { display: flex; align-items: center; gap: 16px; }
+        .logo {
+            width: 72px; height: 72px; border-radius: 24px;
+            background: linear-gradient(135deg, rgba(86, 215, 255, 0.95), rgba(124, 255, 182, 0.86));
+            display: grid; place-items: center; color: #04111a; font-weight: 800; font-size: 28px;
+            box-shadow: 0 20px 50px rgba(86, 215, 255, 0.24);
+            animation: pulse 3.8s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: rotate(-4deg) scale(1); }
+            50% { transform: rotate(4deg) scale(1.06); }
+        }
+        .lang-switch { display: inline-flex; background: rgba(255,255,255,0.06); border: 1px solid var(--panel-border); border-radius: 999px; padding: 4px; }
+        .lang-switch button { border: 0; background: transparent; color: var(--muted); padding: 8px 14px; border-radius: 999px; cursor: pointer; }
+        .lang-switch button.active { background: rgba(86, 215, 255, 0.16); color: var(--text); }
+        .hero, .grid, .footer { position: relative; z-index: 1; }
+        .hero { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 28px; padding: 28px; backdrop-filter: blur(18px); box-shadow: 0 24px 80px rgba(0,0,0,0.25); }
+        .hero h1 { margin: 0 0 10px; font-size: clamp(34px, 5vw, 62px); line-height: 1; }
+        .hero p { margin: 0; color: var(--muted); font-size: 18px; line-height: 1.7; max-width: 760px; }
+        .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+        .actions a { text-decoration: none; color: #04111a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); padding: 12px 18px; border-radius: 14px; font-weight: 700; }
+        .actions a.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--panel-border); }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 20px; }
+        .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 22px; padding: 20px; backdrop-filter: blur(16px); }
+        .card h3 { margin-top: 0; margin-bottom: 10px; }
+        .card p, .card li { color: var(--muted); line-height: 1.7; }
+        .card code, pre { font-family: "Cascadia Code", "Consolas", monospace; font-size: 13px; }
+        pre { margin: 12px 0 0; padding: 14px; border-radius: 16px; overflow: auto; background: rgba(2, 8, 18, 0.72); color: #d8f2ff; border: 1px solid rgba(122, 171, 255, 0.12); }
+        .pill { display: inline-flex; padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); color: var(--warm); font-size: 12px; margin-bottom: 8px; }
+        [data-lang] { display: none; }
+        [data-lang].active { display: block; }
+        .footer { color: var(--muted); margin-top: 20px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="orb"></div>
+    <div class="orb-2"></div>
+    <div class="wrap">
+        <div class="topbar">
+            <div class="brand">
+                <div class="logo">P</div>
+                <div>
+                    <div style="font-size:12px;color:#7cffb6;letter-spacing:.18em;text-transform:uppercase;">Programmable Gateway</div>
+                    <div style="font-size:24px;font-weight:800;">proxysss v__VERSION__</div>
+                </div>
+            </div>
+            <div class="lang-switch">
+                <button class="active" data-target="zh">中文</button>
+                <button data-target="en">English</button>
+            </div>
+        </div>
+        <section class="hero">
+            <div data-lang="zh" class="active">
+                <h1>欢迎来到 proxysss</h1>
+                <p>一个面向 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP、WebSocket、WSS 的可编程 Rust 网关。默认页不该输给 nginx，所以这里直接给你一个带文档、带入口、带动画的启动面板。</p>
+                <div class="actions">
+                    <a href="http://__ADMIN_URL__/">打开后台管理界面</a>
+                    <a class="secondary" href="/admin">跳转管理入口</a>
+                </div>
+            </div>
+            <div data-lang="en">
+                <h1>Welcome to proxysss</h1>
+                <p>A programmable Rust gateway for HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP, WebSocket, and WSS. The default page should not lose to nginx, so this one ships with docs, entry points, and motion out of the box.</p>
+                <div class="actions">
+                    <a href="http://__ADMIN_URL__/">Open Admin Console</a>
+                    <a class="secondary" href="/admin">Jump to Admin Entry</a>
+                </div>
+            </div>
+        </section>
+        <section class="grid">
+            <article class="card">
+                <span class="pill">Gateway</span>
+                <div data-lang="zh" class="active">
+                    <h3>默认监听</h3>
+                    <p>HTTP/TLS/HTTP3 入口由配置决定，后台管理默认绑定到 <code>__ADMIN_URL__</code>。</p>
+                    <ul>
+                        <li>欢迎页：<code>http://localhost:23380/</code></li>
+                        <li>后台页：<code>http://__ADMIN_URL__/</code></li>
+                        <li>健康检查：<code>http://__ADMIN_URL__/healthz</code></li>
+                    </ul>
+                </div>
+                <div data-lang="en">
+                    <h3>Default Endpoints</h3>
+                    <p>HTTP/TLS/HTTP3 listeners come from config, while the admin console is bound to <code>__ADMIN_URL__</code> by default.</p>
+                    <ul>
+                        <li>Welcome page: <code>http://localhost:23380/</code></li>
+                        <li>Admin page: <code>http://__ADMIN_URL__/</code></li>
+                        <li>Health check: <code>http://__ADMIN_URL__/healthz</code></li>
+                    </ul>
+                </div>
+            </article>
+            <article class="card">
+                <span class="pill">Quick Start</span>
+                <div data-lang="zh" class="active">
+                    <h3>三步跑起来</h3>
+                    <pre>proxysss init
+proxysss check-config --config ./proxysss.yaml
+proxysss run --config ./proxysss.yaml</pre>
+                </div>
+                <div data-lang="en">
+                    <h3>Start in Three Commands</h3>
+                    <pre>proxysss init
+proxysss check-config --config ./proxysss.yaml
+proxysss run --config ./proxysss.yaml</pre>
+                </div>
+            </article>
+            <article class="card">
+                <span class="pill">WebSocket</span>
+                <div data-lang="zh" class="active">
+                    <h3>支持 ws / wss</h3>
+                    <p>脚本返回的 upstream 现在可以是 <code>ws://</code>、<code>wss://</code>、<code>http://</code>、<code>https://</code>，升级握手会自动走 WebSocket 隧道。</p>
+                    <pre>if (message.ctx.path?.startsWith("/ws")) {
+    return {
+        upstream: "ws://127.0.0.1:9001",
+        set_headers: { "x-gateway": "proxysss" },
+    };
+}</pre>
+                </div>
+                <div data-lang="en">
+                    <h3>ws / wss Ready</h3>
+                    <p>Your script upstream can now be <code>ws://</code>, <code>wss://</code>, <code>http://</code>, or <code>https://</code>, and upgrade handshakes are tunneled automatically.</p>
+                    <pre>if (message.ctx.path?.startsWith("/ws")) {
+    return {
+        upstream: "wss://chat.example.com/socket",
+        set_headers: { "x-gateway": "proxysss" },
+    };
+}</pre>
+                </div>
+            </article>
+            <article class="card">
+                <span class="pill">Why proxysss</span>
+                <div data-lang="zh" class="active">
+                    <h3>和 nginx 的差异</h3>
+                    <p>nginx 更像通用静态反代基建，proxysss 更偏业务网关：可脚本路由、玩家亲和、插件热加载、统一 TCP/UDP/HTTP 接入。</p>
+                </div>
+                <div data-lang="en">
+                    <h3>How It Differs from nginx</h3>
+                    <p>nginx is a proven general-purpose reverse proxy. proxysss is tuned for programmable gateway logic: sticky player routing, plugin hot-load, and unified TCP/UDP/HTTP entry handling.</p>
+                </div>
+            </article>
+        </section>
+        <div class="footer">
+            proxysss ships a prettier default landing page, but the real value is the programmable routing model behind it.
+        </div>
+    </div>
+    <script>
+        const buttons = document.querySelectorAll('[data-target]');
+        const blocks = document.querySelectorAll('[data-lang]');
+        buttons.forEach((button) => {
+            button.addEventListener('click', () => {
+                const target = button.getAttribute('data-target');
+                buttons.forEach((item) => item.classList.toggle('active', item === button));
+                blocks.forEach((block) => block.classList.toggle('active', block.getAttribute('data-lang') === target));
+                document.documentElement.lang = target === 'zh' ? 'zh-CN' : 'en';
+            });
+        });
+    </script>
+</body>
+</html>"#;
+
+    html.replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+        .replace("__ADMIN_URL__", &config.admin.bind)
+}
+
+fn render_admin_console_html(config: &GatewayConfig) -> String {
+    let html = r#"<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>proxysss admin</title>
+    <style>
+        body { margin: 0; font-family: "Segoe UI", "PingFang SC", sans-serif; background: linear-gradient(160deg, #07111d, #0e1a2f); color: #eef5ff; }
+        .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 40px; }
+        .panel { background: rgba(10, 23, 40, 0.82); border: 1px solid rgba(123, 176, 255, 0.16); border-radius: 22px; padding: 22px; margin-bottom: 18px; }
+        h1, h2 { margin-top: 0; }
+        input { width: 100%; padding: 12px 14px; margin-top: 8px; margin-bottom: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #eef5ff; }
+        button { padding: 12px 16px; border: 0; border-radius: 12px; cursor: pointer; font-weight: 700; background: linear-gradient(135deg, #56d7ff, #7cffb6); color: #04111a; }
+        pre { background: rgba(2, 8, 18, 0.72); border-radius: 16px; padding: 16px; overflow: auto; min-height: 180px; }
+        .muted { color: #9eb4d1; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="panel">
+            <h1>proxysss admin console</h1>
+            <p class="muted">Use the default credentials from your config to inspect stats, upstream state, and loaded plugins.</p>
+        </div>
+        <div class="panel">
+            <h2>Quick Login</h2>
+            <label>Username</label>
+            <input id="username" value="__ADMIN_USER__" />
+            <label>Password</label>
+            <input id="password" type="password" value="__ADMIN_PASS__" />
+            <button id="load">Load /v1/stats</button>
+        </div>
+        <div class="panel">
+            <h2>Response</h2>
+            <pre id="output">Click the button to query /v1/stats</pre>
+        </div>
+    </div>
+    <script>
+        const output = document.getElementById('output');
+        document.getElementById('load').addEventListener('click', async () => {
+            const user = document.getElementById('username').value;
+            const pass = document.getElementById('password').value;
+            const auth = 'Basic ' + btoa(user + ':' + pass);
+            try {
+                const response = await fetch('/v1/stats', { headers: { Authorization: auth } });
+                output.textContent = await response.text();
+            } catch (error) {
+                output.textContent = String(error);
+            }
+        });
+    </script>
+</body>
+</html>"#;
+
+    html.replace("__ADMIN_USER__", &config.admin.username)
+        .replace("__ADMIN_PASS__", &config.admin.password)
+}
+
+async fn connect_upgrade_upstream(url: &Url, allow_insecure: bool) -> Result<BoxedProxyIo> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("upstream URL missing host"))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("upstream URL missing port"))?;
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+
+    if matches!(url.scheme(), "https" | "wss") {
+        let client_config = if allow_insecure {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(InsecureUpstreamVerifier))
+                .with_no_client_auth()
+        } else {
+            return Err(anyhow!(
+                "wss/https websocket upstreams require http.allow_insecure_upstreams=true in the current build"
+            ));
+        };
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host)
+            .map_err(|_| anyhow!("invalid upstream tls server name"))?;
+        let tls = connector.connect(server_name, tcp).await?;
+        Ok(Box::new(tls))
+    } else {
+        Ok(Box::new(tcp))
+    }
+}
+
+async fn read_http_response_head(
+    upstream: &mut BoxedProxyIo,
+) -> Result<(StatusCode, Vec<(HeaderName, HeaderValue)>, Option<Bytes>)> {
+    let mut buffer = BytesMut::with_capacity(4096);
+
+    loop {
+        if let Some(position) = find_header_end(&buffer) {
+            let head = buffer.split_to(position + 4).freeze();
+            let leftover = if buffer.is_empty() {
+                None
+            } else {
+                Some(buffer.freeze())
+            };
+            let (status, headers) = parse_http_response_head(&head)?;
+            return Ok((status, headers, leftover));
+        }
+
+        if buffer.len() > 64 * 1024 {
+            return Err(anyhow!("upstream response headers exceeded 64KiB"));
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = upstream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(anyhow!("upstream closed during handshake"));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_http_response_head(head: &[u8]) -> Result<(StatusCode, Vec<(HeaderName, HeaderValue)>)> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers);
+    let status = response
+        .parse(head)
+        .context("failed parsing upstream handshake")?;
+    if !matches!(status, httparse::Status::Complete(_)) {
+        return Err(anyhow!("incomplete upstream handshake"));
+    }
+
+    let status = StatusCode::from_u16(
+        response
+            .code
+            .ok_or_else(|| anyhow!("missing upstream status code"))?,
+    )?;
+    let mut parsed_headers = Vec::new();
+    for header in response.headers.iter() {
+        let name = HeaderName::from_bytes(header.name.as_bytes())?;
+        let value = HeaderValue::from_bytes(header.value)?;
+        parsed_headers.push((name, value));
+    }
+    Ok((status, parsed_headers))
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn build_websocket_upstream_headers(
+    original: &HeaderMap,
+    route: &RouteDecision,
+    upstream_host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+    original_host: &str,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+
+    for (name, value) in original {
+        if name == HOST || name.as_str().eq_ignore_ascii_case("proxy-connection") {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+
+    for header_name in &route.strip_headers {
+        if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+
+    for (name, value) in &route.set_headers {
+        let name = HeaderName::from_bytes(name.as_bytes())?;
+        let value = HeaderValue::from_str(value)?;
+        headers.insert(name, value);
+    }
+
+    headers.insert(HOST, HeaderValue::from_str(upstream_host)?);
+    headers.insert(
+        HeaderName::from_static("x-forwarded-for"),
+        HeaderValue::from_str(&remote_addr.ip().to_string())?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-forwarded-host"),
+        HeaderValue::from_str(original_host)?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_str(scheme)?,
+    );
+
+    Ok(headers)
+}
+
+fn serialize_http_request(
+    method: &Method,
+    url: &Url,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Vec<u8>> {
+    let path_and_query = match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_string(),
+    };
+    let mut request = format!("{} {} HTTP/1.1\r\n", method, path_and_query).into_bytes();
+
+    for (name, value) in headers {
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    Ok(request)
+}
+
+fn upstream_host_header(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("upstream URL missing host"))?;
+    match url.port() {
+        Some(port)
+            if !matches!(
+                (url.scheme(), port),
+                ("http", 80) | ("https", 443) | ("ws", 80) | ("wss", 443)
+            ) =>
+        {
+            Ok(format!("{host}:{port}"))
+        }
+        _ => Ok(host.to_string()),
+    }
 }
 
 fn version_label(version: Version) -> &'static str {
@@ -2290,5 +2988,35 @@ mod tests {
             candidates,
             vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()]
         );
+    }
+
+    #[test]
+    fn build_upstream_url_accepts_websocket_schemes() {
+        let route = RouteDecision {
+            upstream: "wss://chat.example.com/socket".to_string(),
+            upstreams: Vec::new(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+        };
+
+        let uri: Uri = "/room?id=42".parse().expect("valid uri");
+        let url = build_upstream_url(&route.upstream, &route, &uri).expect("valid websocket url");
+
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.as_str(), "wss://chat.example.com/room?id=42");
+    }
+
+    #[test]
+    fn websocket_upgrade_detection_requires_upgrade_and_connection_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+
+        assert!(websocket_upgrade_requested(&headers));
     }
 }

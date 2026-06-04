@@ -90,6 +90,18 @@ function fallbackHttpRoute(message: GatewayMessage): RouteDecision {
   const path = message.ctx.path ?? "";
   const playerId = message.ctx.player_id;
 
+  if (path === "/" || path === "/index.html" || path === "/docs") {
+    return {
+      upstream: "proxysss://welcome",
+    };
+  }
+
+  if (path === "/admin") {
+    return {
+      upstream: "proxysss://admin",
+    };
+  }
+
   if (path.startsWith("/sdk/login") || path.startsWith("/sdk/register")) {
     return {
       upstream: "http://127.0.0.1:8088",

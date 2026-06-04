@@ -131,6 +131,7 @@ async fn main() -> Result<()> {
                 &gateway_config.logging.filter,
                 gateway_config.logging.format,
             );
+            emit_startup_banner(&config_path, &gateway_config);
             for warning in gateway_config.warnings() {
                 tracing::warn!(warning, "configuration warning");
             }
@@ -378,4 +379,67 @@ fn init_logging(filter: &str, format: LogFormat) {
                 .init();
         }
     }
+}
+
+fn emit_startup_banner(config_path: &std::path::Path, config: &GatewayConfig) {
+    let version = env!("CARGO_PKG_VERSION");
+    let plain_bind = if config.http.plain_bind.trim().is_empty() {
+        "disabled".to_string()
+    } else {
+        format!("http://{}", config.http.plain_bind)
+    };
+    let tls_bind = if config.http.tls_bind.trim().is_empty() {
+        "disabled".to_string()
+    } else {
+        format!("https://{}", config.http.tls_bind)
+    };
+    let h3_bind = if config.http.h3_bind.trim().is_empty() {
+        "disabled".to_string()
+    } else {
+        format!("h3://{}", config.http.h3_bind)
+    };
+    let admin_bind = if config.admin.enabled {
+        format!("http://{}", config.admin.bind)
+    } else {
+        "disabled".to_string()
+    };
+
+    if matches!(config.logging.format, LogFormat::Plain) {
+        println!(
+            r#"
+██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗███████╗███████╗
+██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝██╔════╝██╔════╝
+██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ ███████╗███████╗
+██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  ╚════██║╚════██║
+██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ███████║███████║
+╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚══════╝
+
+proxysss v{version}
+config  : {config}
+http    : {plain_bind}
+https   : {tls_bind}
+http/3  : {h3_bind}
+admin   : {admin_bind}
+
+open    : welcome page on /, admin console on {admin_bind}
+support : http / https / http3 / tcp / udp / ws / wss
+"#,
+            version = version,
+            config = config_path.display(),
+            plain_bind = plain_bind,
+            tls_bind = tls_bind,
+            h3_bind = h3_bind,
+            admin_bind = admin_bind,
+        );
+    }
+
+    tracing::info!(
+        version,
+        config = %config_path.display(),
+        plain_bind = %plain_bind,
+        tls_bind = %tls_bind,
+        h3_bind = %h3_bind,
+        admin_bind = %admin_bind,
+        "startup banner emitted"
+    );
 }
