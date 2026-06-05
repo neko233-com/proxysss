@@ -472,10 +472,9 @@ impl Gateway {
             }
 
             let Some(script) = &state.script else {
-                return Ok(json_gateway_response(
+                return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
-                    "proxysss://admin",
                 ));
             };
 
@@ -530,10 +529,9 @@ impl Gateway {
             };
 
             let Some(script) = &state.script else {
-                return Ok(json_gateway_response(
+                return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
-                    "proxysss://admin",
                 ));
             };
 
@@ -588,10 +586,9 @@ impl Gateway {
             };
 
             let Some(script) = &state.script else {
-                return Ok(json_gateway_response(
+                return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
-                    "proxysss://admin",
                 ));
             };
 
@@ -2130,6 +2127,8 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
         specs.push(ListenerSpec::Tcp(TcpListenerConfig {
             name: "ftp".to_string(),
             bind: config.services.ftp.bind.clone(),
+            upstream: config.services.ftp.upstream.clone(),
+            upstreams: Vec::new(),
         }));
     }
 
