@@ -33,11 +33,18 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 
 Do **not** describe proxysss as "more business gateway than nginx". Describe it as a **general gateway with script/plugin extension hooks**.
 
-## Agent Install Skill
+## Agent Skills
+
+| Skill | Path | Use when |
+| --- | --- | --- |
+| Install / update proxysss | `skills/proxysss-install/SKILL.md` | Bootstrap gateway, verify ports 80 and 7777 |
+| Monitor GitHub Actions | `skills/gh-cli/SKILL.md` | Inspect CI/release runs, logs, reruns, release assets |
+| Edit workflow YAML | `.github/skills/github-actions/SKILL.md` | Fix or extend `.github/workflows/*` locally |
 
 One-click bootstrap for autonomous agents:
 
 - `skills/proxysss-install/SKILL.md`
+- `skills/gh-cli/SKILL.md`
 
 After install, hand off these inspect commands:
 

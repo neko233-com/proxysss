@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monitor GitHub Actions"
+  short_description: "Use gh CLI to inspect CI and release workflows for proxysss."
+  default_prompt: "Check the latest GitHub Actions runs for proxysss, summarize failures, and suggest the next fix or rerun command."

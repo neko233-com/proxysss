@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0 - 2026-06-05
+
+- Positioned proxysss as an nginx-class general gateway with agent-first CLI (`config explain`, `nginx-parity`, `reload-plan`, etc.).
+- Added built-in static sites, WebDAV, declarative reverse proxy, HTTP rate limit, and FTP TCP passthrough.
+- Added access/error log file sinks (`logs/access.log`, `logs/error.log`) and demo plugins (`structured-log`, `traffic-stats`).
+- Merged listener supervisor hot-reload from v0.1.10; default admin port restored to `127.0.0.1:7777`.
+- Added agent skills: `skills/proxysss-install`, `skills/gh-cli`, and local verification lab under `examples/lab/`.
+
 ## v0.1.10 - 2026-06-04
 
 - Fixed Windows `proxysss start` fallback launching a visible console window.

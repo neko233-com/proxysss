@@ -1,0 +1,19 @@
+# Merge these settings into proxysss.yaml when you have a public domain.
+
+http:
+  tls:
+    mode: acme_external
+    cert_path: ./certs/proxysss-cert.pem
+    key_path: ./certs/proxysss-key.pem
+    generate_self_signed_if_missing: false
+    server_name: gateway.example.com
+    acme:
+      client: acme.sh
+      email: ops@example.com
+      domains:
+        - gateway.example.com
+      cache_dir: ./certs/acme-cache
+      challenge: http01
+      directory_production: false
+      renew_interval_hours: 12
+      extra_args: []
