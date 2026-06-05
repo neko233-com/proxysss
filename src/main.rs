@@ -142,6 +142,13 @@ enum ConfigCommands {
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
         format: ConfigOutputFormat,
     },
+    CreateTemplate {
+        #[arg(value_enum)]
+        kind: ConfigTemplateKind,
+        output: PathBuf,
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
+    },
     Includes,
     WatchedScripts,
     Routes,
@@ -152,6 +159,17 @@ enum ConfigCommands {
     },
     Explain,
     Capabilities,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfigTemplateKind {
+    Full,
+    Http,
+    Tcp,
+    Udp,
+    StaticSite,
+    Webdav,
+    Script,
 }
 
 #[derive(Subcommand, Debug)]
@@ -480,6 +498,15 @@ async fn main() -> Result<()> {
         Commands::Config { action, config } => {
             init_cli_logging();
             match action {
+                ConfigCommands::CreateTemplate {
+                    kind,
+                    output,
+                    overwrite,
+                } => {
+                    write_config_template(kind, &output, overwrite)?;
+                    println!("wrote {} template to {}", config_template_name(kind), output.display());
+                    Ok(())
+                }
                 ConfigCommands::Show { format } => {
                     let config_path = install::resolve_run_config_path(config)?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
@@ -884,6 +911,59 @@ fn blank_as_disabled(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
+    match kind {
+        ConfigTemplateKind::Full => "full",
+        ConfigTemplateKind::Http => "http",
+        ConfigTemplateKind::Tcp => "tcp",
+        ConfigTemplateKind::Udp => "udp",
+        ConfigTemplateKind::StaticSite => "static-site",
+        ConfigTemplateKind::Webdav => "webdav",
+        ConfigTemplateKind::Script => "script",
+    }
+}
+
+fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
+    match kind {
+        ConfigTemplateKind::Full => {
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: app\n        hosts: [example.com]\n        path_prefix: /\n        upstream: http://127.0.0.1:9000\n"
+        }
+        ConfigTemplateKind::Http => {
+            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: api\n        hosts: [api.example.com]\n        path_prefix: /api\n        upstream: http://127.0.0.1:8080\n        upstreams:\n          - http://127.0.0.1:8080\n          - http://127.0.0.1:8081\n        strip_prefix: true\n"
+        }
+        ConfigTemplateKind::Tcp => {
+            "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
+        }
+        ConfigTemplateKind::Udp => {
+            "udp:\n  listeners:\n    - name: realtime\n      bind: 0.0.0.0:7001\n      upstreams:\n        - 127.0.0.1:9100\n        - 127.0.0.1:9101\n"
+        }
+        ConfigTemplateKind::StaticSite => {
+            "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
+        }
+        ConfigTemplateKind::Webdav => {
+            "services:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: ./webdav\n    allow_write: true\n"
+        }
+        ConfigTemplateKind::Script => {
+            "script:\n  enabled: true\n  command: ~/.config/proxysss/runtime/deno/bin/deno\n  args: [run, -A, gateway.ts]\n  cwd: .\nplugins:\n  enabled: false\n"
+        }
+    }
+}
+
+fn write_config_template(kind: ConfigTemplateKind, output: &Path, overwrite: bool) -> Result<()> {
+    if output.exists() && !overwrite {
+        return Err(anyhow::anyhow!(
+            "{} already exists; pass --overwrite to replace it",
+            output.display()
+        ));
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(output, render_config_template(kind))
+        .with_context(|| format!("failed to write {}", output.display()))
 }
 
 fn run_script_runtime(
@@ -1486,6 +1566,15 @@ mod tests {
         assert!(CAPABILITY_MATRIX
             .iter()
             .any(|(name, status)| *name == "auto https" && status.contains("auto_https")));
+    }
+
+    #[test]
+    fn config_templates_cover_http_and_stream_learning_paths() {
+        assert!(render_config_template(ConfigTemplateKind::Http).contains("services:"));
+        assert!(render_config_template(ConfigTemplateKind::Http).contains("reverse_proxy"));
+        assert!(render_config_template(ConfigTemplateKind::Tcp).contains("tcp:"));
+        assert!(render_config_template(ConfigTemplateKind::Udp).contains("udp:"));
+        assert!(render_config_template(ConfigTemplateKind::Script).contains("script:"));
     }
 
     #[test]
