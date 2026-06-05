@@ -9,6 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,14 +51,27 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         skip_init: bool,
     },
-    Start,
-    Stop,
+    Start {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Stop {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Restart {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     Enable {
         #[arg(long)]
         config: Option<PathBuf>,
     },
     Disable,
-    Status,
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     CheckConfig {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -107,6 +121,12 @@ enum Commands {
         username: Option<String>,
         #[arg(long)]
         password: Option<String>,
+    },
+    Script {
+        #[command(subcommand)]
+        action: ScriptCommands,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -162,6 +182,20 @@ enum PluginCommands {
     Unload {
         #[arg(long)]
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ScriptCommands {
+    RunFile {
+        path: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Eval {
+        code: String,
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -353,13 +387,17 @@ async fn main() -> Result<()> {
             no_service_restart,
             skip_init,
         ),
-        Commands::Start => {
+        Commands::Start { config } => {
             init_cli_logging();
-            install::start_service()
+            install::start_background(config)
         }
-        Commands::Stop => {
+        Commands::Stop { config } => {
             init_cli_logging();
-            install::stop_service()
+            install::stop_background(config)
+        }
+        Commands::Restart { config } => {
+            init_cli_logging();
+            install::restart_background(config)
         }
         Commands::Enable { config } => {
             init_cli_logging();
@@ -369,9 +407,9 @@ async fn main() -> Result<()> {
             init_cli_logging();
             install::uninstall_service()
         }
-        Commands::Status => {
+        Commands::Status { config } => {
             init_cli_logging();
-            install::service_status()
+            install::background_status(config)
         }
         Commands::CheckConfig { config } => {
             init_cli_logging();
@@ -584,7 +622,23 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Script { action, config } => {
+            init_cli_logging();
+            match action {
+                ScriptCommands::RunFile { path, args } => {
+                    run_script_runtime(config, ScriptInvocation::File(path), args)
+                }
+                ScriptCommands::Eval { code, args } => {
+                    run_script_runtime(config, ScriptInvocation::Snippet(code), args)
+                }
+            }
+        }
     }
+}
+
+enum ScriptInvocation {
+    File(PathBuf),
+    Snippet(String),
 }
 
 fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
@@ -830,6 +884,61 @@ fn blank_as_disabled(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn run_script_runtime(
+    config: Option<PathBuf>,
+    invocation: ScriptInvocation,
+    extra_args: Vec<String>,
+) -> Result<()> {
+    let config_path = install::resolve_run_config_path(config)?;
+    let gateway_config = if config_path.exists() {
+        GatewayConfig::load(&config_path)?
+    } else {
+        let mut config = GatewayConfig::default();
+        config.root_dir = std::env::current_dir().context("failed to resolve current directory")?;
+        config.script.cwd = Some(config.root_dir.clone());
+        config
+    };
+
+    let runtime = install::preferred_script_command();
+    let mut command = Command::new(&runtime);
+    command.envs(gateway::default_script_env(&gateway_config));
+    command.envs(&gateway_config.script.env);
+
+    if let Some(cwd) = &gateway_config.script.cwd {
+        command.current_dir(cwd);
+    }
+
+    let temp_script_path = match invocation {
+        ScriptInvocation::File(path) => {
+            command.arg("run").arg("-A").arg(path);
+            None
+        }
+        ScriptInvocation::Snippet(code) => {
+            let temp_name = format!(
+                "proxysss-script-eval-{}.ts",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            let temp_path = std::env::temp_dir().join(temp_name);
+            fs::write(&temp_path, code)
+                .with_context(|| format!("failed to write {}", temp_path.display()))?;
+            command.arg("run").arg("-A").arg(&temp_path);
+            Some(temp_path)
+        }
+    };
+
+    command.args(extra_args);
+    let result = run_inherited(command, "run TypeScript runtime test");
+
+    if let Some(path) = temp_script_path {
+        let _ = fs::remove_file(path);
+    }
+
+    result
 }
 
 fn run_installer_command(

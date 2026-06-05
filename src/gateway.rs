@@ -2846,7 +2846,7 @@ fn configured_stream_listener_route(
     })
 }
 
-fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, String> {
+pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("PROXYSSS_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string());
     env.insert(

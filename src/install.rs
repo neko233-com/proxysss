@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use rcgen::generate_simple_self_signed;
@@ -16,6 +16,8 @@ const SERVICE_NAME: &str = "proxysss";
 const LAUNCH_AGENT_LABEL: &str = "com.neko233.proxysss";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x00000008;
 
 pub fn resolve_run_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = config {
@@ -204,6 +206,70 @@ pub fn start_service() -> Result<()> {
     }
 }
 
+pub fn start_background(config: Option<PathBuf>) -> Result<()> {
+    let executable = env::current_exe().context("failed to resolve current executable")?;
+    let config_path = resolve_run_config_path(config)?;
+    let working_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    stop_processes(Some(config_path.clone()))?;
+
+    let mut command = Command::new(&executable);
+    command
+        .args(["run", "--config", &config_path.display().to_string()])
+        .current_dir(&working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_detached_process(&mut command);
+
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    write_pid_file(&config_path, child.id())?;
+    println!(
+        "proxysss started in background with pid {} using {}",
+        child.id(),
+        config_path.display()
+    );
+    Ok(())
+}
+
+pub fn stop_background(config: Option<PathBuf>) -> Result<()> {
+    let config_path = resolve_run_config_path(config)?;
+    stop_processes(Some(config_path))
+}
+
+pub fn restart_background(config: Option<PathBuf>) -> Result<()> {
+    let config_path = resolve_run_config_path(config)?;
+    stop_processes(Some(config_path.clone()))?;
+    start_background(Some(config_path))
+}
+
+pub fn background_status(config: Option<PathBuf>) -> Result<()> {
+    let config_path = resolve_run_config_path(config)?;
+    let pid_from_file = read_pid_file(&config_path)?;
+    let mut pids = other_proxysss_pids(std::process::id())?;
+    if let Some(pid) = pid_from_file {
+        if !pids.contains(&pid) {
+            pids.insert(0, pid);
+        }
+    }
+
+    if pids.is_empty() {
+        println!("proxysss background status: stopped");
+    } else {
+        println!("proxysss background status: running");
+        for pid in pids {
+            println!(" - pid={pid}");
+        }
+    }
+    println!("config: {}", config_path.display());
+    Ok(())
+}
+
 pub fn stop_service() -> Result<()> {
     match env::consts::OS {
         "windows" => run_command(
@@ -363,6 +429,129 @@ fn delete_windows_run_key() -> Result<()> {
     )
 }
 
+fn stop_processes(config_path: Option<PathBuf>) -> Result<()> {
+    let current_pid = std::process::id();
+    let mut stopped = false;
+
+    if let Some(config_path) = &config_path {
+        if let Some(pid) = read_pid_file(config_path)? {
+            if pid != current_pid && kill_pid(pid)? {
+                stopped = true;
+            }
+        }
+        remove_pid_file(config_path)?;
+    }
+
+    let other_pids = other_proxysss_pids(current_pid)?;
+    for pid in other_pids {
+        if kill_pid(pid)? {
+            stopped = true;
+        }
+    }
+
+    if stopped {
+        println!("stopped existing proxysss background/foreground processes");
+    } else {
+        println!("no existing proxysss process found");
+    }
+
+    Ok(())
+}
+
+fn pid_file_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("proxysss.pid")
+}
+
+fn write_pid_file(config_path: &Path, pid: u32) -> Result<()> {
+    fs::write(pid_file_path(config_path), pid.to_string())
+        .with_context(|| format!("failed to write pid file for {}", config_path.display()))
+}
+
+fn read_pid_file(config_path: &Path) -> Result<Option<u32>> {
+    let pid_path = pid_file_path(config_path);
+    if !pid_path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&pid_path)
+        .with_context(|| format!("failed to read {}", pid_path.display()))?;
+    Ok(text.trim().parse::<u32>().ok())
+}
+
+fn remove_pid_file(config_path: &Path) -> Result<()> {
+    let pid_path = pid_file_path(config_path);
+    if pid_path.exists() {
+        fs::remove_file(&pid_path)
+            .with_context(|| format!("failed to remove {}", pid_path.display()))?;
+    }
+    Ok(())
+}
+
+fn other_proxysss_pids(current_pid: u32) -> Result<Vec<u32>> {
+    match env::consts::OS {
+        "windows" => windows_proxysss_pids(current_pid),
+        "linux" | "macos" => unix_proxysss_pids(current_pid),
+        os => Err(anyhow!("unsupported process inspection os {os}")),
+    }
+}
+
+fn kill_pid(pid: u32) -> Result<bool> {
+    match env::consts::OS {
+        "windows" => {
+            let output = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output()
+                .with_context(|| format!("failed to stop pid {pid}"))?;
+            Ok(output.status.success())
+        }
+        "linux" | "macos" => {
+            let output = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output()
+                .with_context(|| format!("failed to stop pid {pid}"))?;
+            Ok(output.status.success())
+        }
+        os => Err(anyhow!("unsupported process terminate os {os}")),
+    }
+}
+
+fn unix_proxysss_pids(current_pid: u32) -> Result<Vec<u32>> {
+    let output = Command::new("pgrep")
+        .args(["-x", SERVICE_NAME])
+        .output()
+        .context("failed to list proxysss processes via pgrep")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != current_pid)
+        .collect())
+}
+
+fn windows_proxysss_pids(current_pid: u32) -> Result<Vec<u32>> {
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'proxysss.exe' -and $_.ProcessId -ne {} }} | Select-Object -ExpandProperty ProcessId",
+        current_pid
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .context("failed to list proxysss processes via PowerShell")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
 fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
     let mut command = Command::new(executable);
     command.args(["run", "--config", &config_path.display().to_string()]);
@@ -414,6 +603,30 @@ fn configure_hidden_windows_process(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn configure_hidden_windows_process(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn configure_detached_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+}
+
+#[cfg(unix)]
+fn configure_detached_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_detached_process(_command: &mut Command) {}
 
 fn install_linux_service(executable: &Path, config_path: &Path, working_dir: &Path) -> Result<()> {
     let unit_path = linux_service_path()?;
@@ -584,5 +797,11 @@ mod tests {
     #[test]
     fn preferred_script_command_matches_managed_runtime_path() {
         assert_eq!(preferred_script_command(), default_managed_script_command());
+    }
+
+    #[test]
+    fn pid_file_path_lives_next_to_config() {
+        let config = PathBuf::from("/tmp/example/proxysss.yaml");
+        assert_eq!(pid_file_path(&config), PathBuf::from("/tmp/example/proxysss.pid"));
     }
 }

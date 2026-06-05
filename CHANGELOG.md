@@ -6,6 +6,8 @@
 - Switched gateway architecture to YAML-first routing by default so HTTP/HTTPS/TCP/UDP no longer depend on TypeScript scripts unless explicitly enabled.
 - Bundled the TypeScript runtime into release and deploy artifacts so proxysss installation no longer requires downloading or installing an external interpreter separately.
 - Updated release verification, installer flow, and workflow packaging to validate the bundled runtime alongside the proxysss binary.
+- Added `proxysss script run-file` and `proxysss script eval` for direct TypeScript runtime verification against bundled engine capability.
+- Changed `proxysss start` to silent background launch with stale proxysss process cleanup, added `proxysss restart`, and made top-level `status` report background process state.
 
 ## v0.2.5 - 2026-06-05
 

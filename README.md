@@ -64,6 +64,15 @@ proxysss check-config --config ./proxysss.yaml
 proxysss run --config ./proxysss.yaml
 ```
 
+后台静默启动 / 重启：
+
+```bash
+proxysss start --config ./proxysss.yaml
+proxysss restart --config ./proxysss.yaml
+proxysss status --config ./proxysss.yaml
+proxysss stop --config ./proxysss.yaml
+```
+
 默认端口：
 
 - 80: HTTP welcome page
@@ -202,6 +211,13 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 proxysss config explain
 proxysss config capabilities
+```
+
+直接验证内置 TypeScript 运行时：
+
+```bash
+proxysss script run-file ./examples/gateway.ts
+proxysss script eval "console.log('proxysss ts runtime ok')"
 ```
 
 ## proxysss 自动 SSL 配置
