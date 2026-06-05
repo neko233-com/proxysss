@@ -149,7 +149,7 @@ function fallbackHttpRoute(message: GatewayMessage): RouteDecision {
 }
 
 function fallbackTcpRoute(message: GatewayMessage): RouteDecision {
-  if (message.listener === "game-login") {
+  if (message.listener === "tcp-affinity-demo") {
     return {
       upstream: "127.0.0.1:7001",
       upstreams: ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"],
@@ -161,7 +161,7 @@ function fallbackTcpRoute(message: GatewayMessage): RouteDecision {
 }
 
 function fallbackUdpRoute(message: GatewayMessage): RouteDecision {
-  if (message.listener === "game-realtime") {
+  if (message.listener === "udp-affinity-demo") {
     return {
       upstream: "127.0.0.1:8101",
       upstreams: ["127.0.0.1:8101", "127.0.0.1:8102"],

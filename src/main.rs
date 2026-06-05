@@ -768,7 +768,6 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("static_sites\n");
     output.push_str("webdav settings\n");
     output.push_str("ftp upstream when services.ftp listener identity is unchanged\n");
-    output.push_str("logging.access_log_path/logging.error_log_path\n");
 
     output.push_str("[restart_required]\n");
     output.push_str("http.plain_bind/http.tls_bind/http.h3_bind\n");
@@ -778,6 +777,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("services.ftp.enabled/services.ftp.bind\n");
     output.push_str("http.tls.mode\n");
     output.push_str("logging.format/logging.filter/logging.level\n");
+    output.push_str("logging.access_log_path/logging.error_log_path\n");
 
     output
 }
@@ -1317,6 +1317,11 @@ mod tests {
         assert!(plan.contains("services.ftp.enabled/services.ftp.bind"));
         assert!(plan.contains("http.plain_bind/http.tls_bind/http.h3_bind"));
         assert!(plan.contains("logging.access_log_path/logging.error_log_path"));
+        let restart_section = plan
+            .split("[restart_required]")
+            .nth(1)
+            .expect("restart section");
+        assert!(restart_section.contains("logging.access_log_path/logging.error_log_path"));
     }
 
     #[test]

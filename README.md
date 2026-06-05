@@ -1,10 +1,10 @@
 # proxysss
 
-proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
+proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、WebSocket、TCP、UDP、FTP、WebDAV、静态文件和反向代理入口职责。
 
 产品目标：作为 nginx 同级通用网关完整替代 nginx 的常见入口职责，同时提供更适合人类和 agent 接管的配置、查询和输出体验。默认 HTTP 端口与 nginx 一致为 80，首页是更友好的 `Welcome to proxysss`。proxysss 不是“业务网关优先”的产品；脚本/插件扩展层类似 nginx + Lua，用来承载可选的业务逻辑。
 
-当前版本：v0.2.2
+当前版本：v0.2.3
 
 ## 核心能力
 
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.2
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.3
 ```
 
 ### Windows PowerShell
@@ -92,7 +92,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.2
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.3
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -119,7 +119,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.2.2
+proxysss update --version v0.2.3
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -128,7 +128,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.2
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.3
 ```
 
 降级到指定版本：
@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.2 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.3 -DryRun
 ```
 
 ### Linux / macOS
@@ -148,7 +148,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.2.2
+bash ./scripts/install.sh v0.2.3
 bash ./scripts/install.sh v0.1.0
 ```
 
@@ -158,7 +158,7 @@ bash ./scripts/install.sh v0.1.0
 
 | 产品 | 可编程路由 | HTTP/3 | 原生 TCP/UDP | 服务发现/控制面 | 配置复杂度 | 更适合的场景 |
 | --- | --- | --- | --- | --- | --- | --- |
-| proxysss | TS/JS 脚本 + 插件，偏业务路由 | 是 | 是 | 内置轻量管理面，偏单体网关 | 中 | 游戏网关、聊天网关、按 playerId/uid 做亲和与脚本路由 |
+| proxysss | TS/JS 脚本 + 插件，类似 nginx + Lua | 是 | 是 | 内置轻量管理面和 agent 友好 CLI | 中 | nginx 同级通用网关、静态/反代/WebDAV/stream/可扩展入口 |
 | Nginx | 有限，主要靠指令与模块 | 部分支持，依赖构建与配置 | TCP/UDP 依赖 stream 模块 | 弱，通常接外部服务注册 | 中 | 稳定 Web 入口、静态资源、传统反向代理 |
 | Caddy | 中，偏声明式与插件 | 是 | 以 HTTP 为主，L4 需插件或扩展 | 弱到中 | 低 | 快速 HTTPS 接入、简单网站和 API 代理 |
 | HAProxy | 中，规则强但业务脚本弱 | 有限且偏前沿 | 是，L4/L7 很强 | 中 | 中到高 | 高性能四层/七层负载均衡、传统流量调度 |
@@ -167,8 +167,8 @@ bash ./scripts/install.sh v0.1.0
 
 快速选型建议：
 
-- 如果你要按玩家、会话、设备 ID 做稳定选路，并且希望把业务路由逻辑直接写在脚本里，优先选 proxysss。
-- 如果你主要做通用 Web 反代，且希望生态成熟、运维习惯稳定，Nginx 或 Caddy 更省心。
+- 如果你要一个默认端口、通用入口职责和 nginx 对齐，同时希望配置、热重载和 CLI 更适合 agent 接管，优先选 proxysss。
+- 如果你需要把会话、设备 ID 或租户等业务逻辑接入路由层，把它放在 proxysss 脚本/插件里，而不是核心网关里。
 - 如果你已经在 Kubernetes 或 Service Mesh 体系里，Traefik 或 Envoy 更贴合现有控制面。
 - 如果核心诉求是极强的 L4/L7 性能与成熟负载均衡规则，HAProxy 仍然是强项。
 

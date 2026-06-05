@@ -4127,8 +4127,8 @@ mod tests {
 
     #[test]
     fn runtime_scope_key_contains_protocol_listener_and_upstream() {
-        let key = runtime_scope_key("tcp", Some("game-login"), "127.0.0.1:7001");
-        assert_eq!(key, "tcp:game-login:127.0.0.1:7001");
+        let key = runtime_scope_key("tcp", Some("tcp-affinity-demo"), "127.0.0.1:7001");
+        assert_eq!(key, "tcp:tcp-affinity-demo:127.0.0.1:7001");
     }
 
     #[test]

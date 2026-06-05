@@ -41,7 +41,7 @@ export default {
   },
 
   preread(message: { listener?: string; ctx: { player_id?: string } }) {
-    if (message.listener === "game-login") {
+    if (message.listener === "tcp-affinity-demo") {
       return {
         upstream: TCP_LOGIN_BACKENDS[0],
         upstreams: TCP_LOGIN_BACKENDS,
@@ -49,7 +49,7 @@ export default {
       };
     }
 
-    if (message.listener === "game-realtime") {
+    if (message.listener === "udp-affinity-demo") {
       return {
         upstream: UDP_REALTIME_BACKENDS[0],
         upstreams: UDP_REALTIME_BACKENDS,

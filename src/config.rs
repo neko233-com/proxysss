@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -777,27 +777,28 @@ impl GatewayConfig {
     }
 
     fn normalize(&mut self, root_dir: &Path) {
-        self.root_dir = root_dir.to_path_buf();
+        let root_dir = normalize_root_dir(root_dir);
+        self.root_dir = root_dir.clone();
 
         if self.logging.filter.trim().is_empty() {
             self.logging.filter = default_filter_for_level(self.logging.level);
         }
         self.log_filter = self.logging.filter.clone();
 
-        self.http.tls.cert_path = absolutize(root_dir, &self.http.tls.cert_path);
-        self.http.tls.key_path = absolutize(root_dir, &self.http.tls.key_path);
-        self.http.tls.acme.cache_dir = absolutize(root_dir, &self.http.tls.acme.cache_dir);
-        self.plugins.auto_load_dir = absolutize(root_dir, &self.plugins.auto_load_dir);
-        self.logging.access_log_path = absolutize(root_dir, &self.logging.access_log_path);
-        self.logging.error_log_path = absolutize(root_dir, &self.logging.error_log_path);
-        self.services.webdav.root = absolutize(root_dir, &self.services.webdav.root);
+        self.http.tls.cert_path = absolutize(&root_dir, &self.http.tls.cert_path);
+        self.http.tls.key_path = absolutize(&root_dir, &self.http.tls.key_path);
+        self.http.tls.acme.cache_dir = absolutize(&root_dir, &self.http.tls.acme.cache_dir);
+        self.plugins.auto_load_dir = absolutize(&root_dir, &self.plugins.auto_load_dir);
+        self.logging.access_log_path = absolutize(&root_dir, &self.logging.access_log_path);
+        self.logging.error_log_path = absolutize(&root_dir, &self.logging.error_log_path);
+        self.services.webdav.root = absolutize(&root_dir, &self.services.webdav.root);
         for site in &mut self.services.static_sites {
-            site.root = absolutize(root_dir, &site.root);
+            site.root = absolutize(&root_dir, &site.root);
         }
 
         self.script.cwd = Some(match &self.script.cwd {
-            Some(cwd) => absolutize(root_dir, cwd),
-            None => root_dir.to_path_buf(),
+            Some(cwd) => absolutize(&root_dir, cwd),
+            None => root_dir.clone(),
         });
 
         normalize_vec_lowercase(&mut self.affinity.http.header_keys);
@@ -1137,11 +1138,37 @@ fn merge_value(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
 }
 
 fn absolutize(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
+    };
+    normalize_path_lexically(&path)
+}
+
+fn normalize_root_dir(root_dir: &Path) -> PathBuf {
+    let path = if root_dir.is_absolute() {
+        root_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(root_dir)
+    };
+    normalize_path_lexically(&path)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
     }
+    normalized
 }
 
 fn normalize_vec_lowercase(values: &mut [String]) {
@@ -1249,17 +1276,11 @@ fn default_acme_renew_hours() -> u64 {
 }
 
 fn default_tcp_listeners() -> Vec<TcpListenerConfig> {
-    vec![TcpListenerConfig {
-        name: "game-login".to_string(),
-        bind: "0.0.0.0:26379".to_string(),
-    }]
+    Vec::new()
 }
 
 fn default_udp_listeners() -> Vec<UdpListenerConfig> {
-    vec![UdpListenerConfig {
-        name: "game-realtime".to_string(),
-        bind: "0.0.0.0:2053".to_string(),
-    }]
+    Vec::new()
 }
 
 fn default_script_command() -> String {
@@ -1459,6 +1480,8 @@ mod tests {
         assert_eq!(config.http.tls_bind, "0.0.0.0:443");
         assert_eq!(config.http.h3_bind, "0.0.0.0:443");
         assert_eq!(config.admin.bind, "127.0.0.1:7777");
+        assert!(config.tcp.listeners.is_empty());
+        assert!(config.udp.listeners.is_empty());
     }
 
     #[test]
@@ -1615,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn default_ports_are_nginx_and_caddy_replacement_ports() {
+    fn default_ports_are_nginx_replacement_ports() {
         let config = GatewayConfig::default();
         assert_eq!(config.http.plain_bind, "0.0.0.0:80");
         assert_eq!(config.http.tls_bind, "0.0.0.0:443");

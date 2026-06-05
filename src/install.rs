@@ -466,10 +466,18 @@ fn install_macos_service(executable: &Path, config_path: &Path, working_dir: &Pa
 }
 
 fn resolve_base_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
-    match dir {
-        Some(path) => Ok(path),
-        None => default_config_dir(),
-    }
+    let path = match dir {
+        Some(path) => path,
+        None => default_config_dir()?,
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path)
+    };
+    Ok(normalize_path_lexically(&path))
 }
 
 fn default_config_dir() -> Result<PathBuf> {
@@ -546,8 +554,35 @@ fn systemd_quote(path: &Path) -> String {
     format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 const DEFAULT_GATEWAY_SCRIPT: &str = include_str!("../templates/gateway.ts");
 const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
     include_str!("../templates/plugins/player-affinity.ts");
 const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/traffic-stats.ts");
 const DEFAULT_PLUGIN_STRUCTURED_LOG: &str = include_str!("../templates/plugins/structured-log.ts");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_base_dir_returns_absolute_path_for_relative_input() {
+        let path = resolve_base_dir(Some(PathBuf::from("target/proxysss-init-test")))
+            .expect("resolve base dir");
+        assert!(path.is_absolute());
+        assert!(path.ends_with(Path::new("target").join("proxysss-init-test")));
+    }
+}

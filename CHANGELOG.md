@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.3 - 2026-06-05
+
+- Tightened product positioning around proxysss as an nginx-level general gateway, not a business gateway.
+- Removed business-flavored default TCP/UDP listener names from generated config and made stream listener examples explicitly generic.
+- Fixed `config reload-plan` so logging level/filter/format/path changes are consistently shown as restart-required.
+- Normalized relative `proxysss init --dir` paths so watched script output stays readable for agents.
+- Updated README copy and comparison guidance for agent-first nginx replacement workflows.
+
 ## v0.2.2 - 2026-06-05
 
 - Serve the welcome page from Rust built-in routes on `/`, `/index.html`, and `/docs` so older `gateway.ts` installs still show the landing page.

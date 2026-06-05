@@ -27,10 +27,10 @@ services:
 
 tcp:
   listeners:
-    - name: game-login
+    - name: tcp-affinity-demo
       bind: 0.0.0.0:26379
 
 udp:
   listeners:
-    - name: game-realtime
+    - name: udp-affinity-demo
       bind: 0.0.0.0:2053
