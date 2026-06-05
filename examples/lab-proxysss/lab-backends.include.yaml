@@ -1,0 +1,36 @@
+# Explicit include: routes proxysss to D:\Server\proxysss_dir backends.
+# Copy to %APPDATA%\proxysss\conf.d\lab-backends.yaml
+
+services:
+  reverse_proxy:
+    routes:
+      - name: lab-http-echo
+        path_prefix: /echo
+        hosts: []
+        upstream: http://127.0.0.1:8081
+        strip_prefix: true
+  ftp:
+    enabled: true
+    bind: 0.0.0.0:21
+    upstream: 127.0.0.1:2121
+  webdav:
+    enabled: true
+    path_prefix: /dav
+    root: D:/Server/proxysss_dir/webdav
+    allow_write: true
+  static_sites:
+    - name: lab-assets
+      path_prefix: /assets
+      root: D:/Server/proxysss_dir/public
+      index_files: [index.html]
+      autoindex: true
+
+tcp:
+  listeners:
+    - name: game-login
+      bind: 0.0.0.0:26379
+
+udp:
+  listeners:
+    - name: game-realtime
+      bind: 0.0.0.0:2053
