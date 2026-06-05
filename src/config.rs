@@ -1178,6 +1178,7 @@ fn load_config_value_recursive(
 }
 
 fn parse_value_by_extension(raw: &str, path: &Path) -> Result<serde_yaml::Value> {
+    let raw = raw.trim_start_matches('\u{feff}');
     let ext = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1603,6 +1604,24 @@ mod tests {
         let config = GatewayConfig::load(&config_path).expect("load config");
         assert_eq!(config.logging.level, LogLevel::Warn);
         assert_eq!(config.logging.filter, "warn,proxysss=warn");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn config_loader_accepts_utf8_bom_yaml() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-bom-yaml-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "\u{feff}plugins:\n  enabled: false\nadmin:\n  bind: 127.0.0.1:17777\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load bom config");
+        assert_eq!(config.admin.bind, "127.0.0.1:17777");
 
         let _ = fs::remove_dir_all(base_dir);
     }

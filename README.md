@@ -4,7 +4,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 
 产品目标：作为 nginx 同级通用网关完整替代 nginx 的常见入口职责，同时提供更适合人类和 agent 接管的配置、查询和输出体验。默认 HTTP 端口与 nginx 一致为 80，首页是更友好的 `Welcome to proxysss`。proxysss 不是“业务网关优先”的产品；脚本/插件扩展层类似 nginx + Lua，用来承载可选的业务逻辑。
 
-当前版本：v0.2.4
+当前版本：v0.2.5
 
 ## 核心能力
 
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.4
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.5
 ```
 
 ### Windows PowerShell
@@ -92,7 +92,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.4
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.5
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -119,7 +119,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.2.4
+proxysss update --version v0.2.5
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -128,7 +128,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.4
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.5
 ```
 
 降级到指定版本：
@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.4 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.5 -DryRun
 ```
 
 ### Linux / macOS
@@ -148,7 +148,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.2.4
+bash ./scripts/install.sh v0.2.5
 bash ./scripts/install.sh v0.1.0
 ```
 
@@ -383,6 +383,26 @@ proxysss bench http --url https://127.0.0.1/ --concurrency 512 --duration-secs 3
 proxysss bench tcp --addr 127.0.0.1:26379 --connections 512 --duration-secs 30 --payload-bytes 512
 proxysss bench udp --addr 127.0.0.1:2053 --connections 512 --duration-secs 30 --payload-bytes 256
 ```
+
+横向压测：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\benchmark-gateways.ps1
+```
+
+本地 Windows loopback 横向结果（2026-06-05，`proxysss bench http` 作为统一客户端，同一静态 HTML 文件，顺序执行，concurrency=512，duration=30s）：
+
+| 网关 | 版本/运行方式 | URL | 成功请求 | 错误 | ops/sec | p50 | p95 | p99 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| proxysss | v0.2.5 dev build，内置 `services.static_sites` | `127.0.0.1:18083/bench/index.html` | 398,174 | 0 | 13,272.47 | 38.384 ms | 42.178 ms | 44.934 ms |
+| Caddy | v2.11.3 Windows amd64，`file-server` | `127.0.0.1:18082/index.html` | 358,264 | 0 | 11,942.13 | 42.160 ms | 50.181 ms | 54.104 ms |
+| nginx | 1.31.0 nginx/Windows，static alias | `127.0.0.1:18081/bench/index.html` | 14,496 | 1,748,575 | 483.20 | 43.551 ms | 70.809 ms | 28,958.072 ms |
+
+说明：
+
+- 这是 Windows 本机 loopback 的开发机数据，不代表 Linux 生产最终上限。
+- nginx 官方 Windows 版本主要适合开发/测试；生产性能对比应在 Linux 同机、同内核参数、同 worker 数、同连接限制下复测。
+- 当前数据只覆盖静态 HTTP GET；TLS、HTTP/2、HTTP/3、反向代理、WebDAV、TCP/UDP 需要单独矩阵。
 
 ## CI/CD 与发布
 
