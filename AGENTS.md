@@ -22,13 +22,14 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance must be treated as a core product requirement: aim for nginx-class throughput/latency and leave room to exceed nginx where proxysss can use Rust, async IO, and script isolation effectively.
 - Architecture should favor extensibility without putting hot-path traffic behind unnecessary dynamic dispatch, allocation, serialization, or script calls.
+- TypeScript scripting is a required product surface, but the long-term target is a single `proxysss` binary with an embedded TypeScript-capable runtime and hot reload execution inside the process. External `deno`, bundled `deno.exe`, or sidecar runtime directories are temporary implementation states, not the desired end architecture.
 
 ## What proxysss Is
 
 | Layer | Responsibility |
 | --- | --- |
 | Core gateway (Rust) | nginx-equivalent protocol termination, routing, static files, WebDAV, stream proxy, TLS, rate limits, logging, reload |
-| Extension scripts (TS/JS via proxysss-managed runtime) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
+| Extension scripts (TS/JS via embedded proxysss runtime target) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
 | Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload |
 
 Do **not** describe proxysss as "more business gateway than nginx". Describe it as a **general gateway with script/plugin extension hooks**.
