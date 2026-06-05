@@ -266,7 +266,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TCP/UDP stream proxy",
         status: ParityStatus::Supported,
-        evidence: "tcp.listeners and udp.listeners with script/select_upstream_plan",
+        evidence: "tcp.listeners and udp.listeners support YAML upstream/upstreams with optional script extension hooks",
         next_gap: "",
     },
     NginxParityItem {
@@ -425,10 +425,16 @@ async fn main() -> Result<()> {
         Commands::PrintDefaultConfig { format } => {
             match format {
                 ConfigOutputFormat::Yaml => {
-                    print!("{}", config::GatewayConfig::render_default_yaml("deno"))
+                    print!(
+                        "{}",
+                        config::GatewayConfig::render_default_yaml(&install::preferred_script_command())
+                    )
                 }
                 ConfigOutputFormat::Json => {
-                    print!("{}", config::GatewayConfig::render_default_json("deno"))
+                    print!(
+                        "{}",
+                        config::GatewayConfig::render_default_json(&install::preferred_script_command())
+                    )
                 }
             }
             Ok(())
@@ -656,7 +662,8 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.ftp.enabled, config.services.ftp.bind, config.services.ftp.upstream
     );
     println!(
-        "script            : {} {}",
+        "script            : enabled={}, command={}, args={}",
+        config.script.enabled,
         config.script.command,
         config.script.args.join(" ")
     );
@@ -740,7 +747,13 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         output.push_str("none\n");
     } else {
         for listener in &config.tcp.listeners {
-            output.push_str(&format!("{} bind={}\n", listener.name, listener.bind));
+            output.push_str(&format!(
+                "{} bind={} upstream={} upstreams={}\n",
+                listener.name,
+                listener.bind,
+                blank_as_disabled(&listener.upstream),
+                listener.upstreams.len()
+            ));
         }
         if config.services.ftp.enabled {
             output.push_str(&format!(
@@ -755,7 +768,13 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         output.push_str("none\n");
     } else {
         for listener in &config.udp.listeners {
-            output.push_str(&format!("{} bind={}\n", listener.name, listener.bind));
+            output.push_str(&format!(
+                "{} bind={} upstream={} upstreams={}\n",
+                listener.name,
+                listener.bind,
+                blank_as_disabled(&listener.upstream),
+                listener.upstreams.len()
+            ));
         }
     }
 
@@ -1314,6 +1333,18 @@ mod tests {
             });
         config.services.webdav.enabled = true;
         config.services.ftp.enabled = true;
+        config.tcp.listeners.push(crate::config::TcpListenerConfig {
+            name: "chat".to_string(),
+            bind: "0.0.0.0:7000".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            upstreams: vec!["127.0.0.1:9001".to_string()],
+        });
+        config.udp.listeners.push(crate::config::UdpListenerConfig {
+            name: "realtime".to_string(),
+            bind: "0.0.0.0:7001".to_string(),
+            upstream: String::new(),
+            upstreams: vec!["127.0.0.1:9100".to_string()],
+        });
 
         let topology = render_route_topology(&config);
         assert!(topology.contains("plain=0.0.0.0:80"));
@@ -1321,6 +1352,8 @@ mod tests {
         assert!(topology.contains("api hosts=api.example.com path=/api"));
         assert!(topology.contains("public path=/assets"));
         assert!(topology.contains("[webdav]"));
+        assert!(topology.contains("chat bind=0.0.0.0:7000 upstream=127.0.0.1:9000"));
+        assert!(topology.contains("realtime bind=0.0.0.0:7001 upstream=disabled upstreams=1"));
         assert!(topology.contains("ftp bind=0.0.0.0:21"));
     }
 

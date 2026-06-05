@@ -64,12 +64,12 @@ gh release view vX.Y.Z -R neko233-com/proxysss
 
 Verify all six assets exist:
 
-- `proxysss-windows-amd64.exe`
-- `proxysss-windows-arm64.exe`
-- `proxysss-linux-amd64`
-- `proxysss-linux-arm64`
-- `proxysss-darwin-amd64`
-- `proxysss-darwin-arm64`
+- `proxysss-windows-amd64.zip`
+- `proxysss-windows-arm64.zip`
+- `proxysss-linux-amd64.tar.gz`
+- `proxysss-linux-arm64.tar.gz`
+- `proxysss-darwin-amd64.tar.gz`
+- `proxysss-darwin-arm64.tar.gz`
 
 If `publish` fails on `Extract current changelog`, the tagged commit is missing `## vX.Y.Z` in `CHANGELOG.md`. Fix the changelog on `main`, bump version if needed, commit, then push a **new** tag on that commit (do not rely on rerunning an old tag).
 

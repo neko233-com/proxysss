@@ -28,7 +28,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 | Layer | Responsibility |
 | --- | --- |
 | Core gateway (Rust) | nginx-equivalent protocol termination, routing, static files, WebDAV, stream proxy, TLS, rate limits, logging, reload |
-| Extension scripts (TS/JS via Deno) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
+| Extension scripts (TS/JS via proxysss-managed runtime) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
 | Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload |
 
 Do **not** describe proxysss as "more business gateway than nginx". Describe it as a **general gateway with script/plugin extension hooks**.

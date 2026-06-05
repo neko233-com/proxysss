@@ -24,6 +24,22 @@ $Repo = "neko233-com/proxysss"
 $InstallDir = Join-Path $env:LOCALAPPDATA $BinaryName
 $Dest = Join-Path $InstallDir "$BinaryName.exe"
 
+function Get-ProxysssConfigDir {
+    Join-Path $env:APPDATA $BinaryName
+}
+
+function Get-ManagedDenoInstallRoot {
+    Join-Path (Get-ProxysssConfigDir) "runtime\deno"
+}
+
+function Get-ManagedDenoExePath {
+    Join-Path (Get-ManagedDenoInstallRoot) "bin\deno.exe"
+}
+
+function Get-BundleAssetName([string]$Arch) {
+    "${BinaryName}-windows-${Arch}.zip"
+}
+
 function Get-NormalizedVersion([string]$Value) {
     $v = $Value.Trim()
     while ($v.StartsWith("v") -or $v.StartsWith("V")) { $v = $v.Substring(1) }
@@ -102,40 +118,6 @@ public static extern IntPtr SendMessageTimeout(
         $null = [UIntPtr]::Zero
         [Win32.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, "Environment", 2, 5000, [ref]$null) | Out-Null
     } catch {
-    }
-}
-
-function Install-DenoIfMissing {
-    if (Get-Command deno -ErrorAction SilentlyContinue) {
-        return
-    }
-
-    Write-Host "Deno not found, installing Deno for TypeScript script runtime..."
-    if ($DryRun) {
-        Write-Host "[dry-run] winget install --id DenoLand.Deno -e --accept-source-agreements --accept-package-agreements"
-        return
-    }
-
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($null -ne $winget) {
-        & winget install --id DenoLand.Deno -e --accept-source-agreements --accept-package-agreements
-    } else {
-        irm https://deno.land/install.ps1 | iex
-    }
-
-    $denoBin = Join-Path $env:USERPROFILE ".deno\bin"
-    if (Test-Path $denoBin) {
-        Add-ToUserPath $denoBin | Out-Null
-        $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                    [Environment]::GetEnvironmentVariable("Path", "User")
-        return
-    }
-
-    $wingetDeno = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\deno.exe"
-    if (Test-Path $wingetDeno) {
-        Add-ToUserPath (Split-Path -Parent $wingetDeno) | Out-Null
-        $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                    [Environment]::GetEnvironmentVariable("Path", "User")
     }
 }
 
@@ -242,10 +224,10 @@ function Download-FileWithFallback([string]$Url, [string]$OutFile, [string]$Rele
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
             Invoke-WebRequest -Uri $Url -OutFile $OutFile
-            if (Test-ValidDownloadedBinary $OutFile) {
+            if (Test-ValidDownloadedFile $OutFile) {
                 return
             }
-            throw "downloaded file is not a valid Windows executable"
+            throw "downloaded file is incomplete"
         } catch {
             $lastError = $_
             Write-Host "warning: download attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -255,7 +237,7 @@ function Download-FileWithFallback([string]$Url, [string]$OutFile, [string]$Rele
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($null -ne $curl) {
         & curl.exe -L --retry 3 --connect-timeout 20 -o $OutFile $Url
-        if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedBinary $OutFile)) {
+        if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedFile $OutFile)) {
             return
         }
     }
@@ -270,7 +252,7 @@ function Download-FileWithFallback([string]$Url, [string]$OutFile, [string]$Rele
                 & gh release download $ReleaseTag --repo $Repo --pattern $AssetName --dir $downloadDir --clobber
             }
             $downloaded = Join-Path $downloadDir $AssetName
-            if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedBinary $downloaded)) {
+            if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedFile $downloaded)) {
                 Move-Item -Force $downloaded $OutFile
                 return
             }
@@ -282,7 +264,7 @@ function Download-FileWithFallback([string]$Url, [string]$OutFile, [string]$Rele
     throw "download failed after retries: $($lastError.Exception.Message)"
 }
 
-function Test-ValidDownloadedBinary([string]$Path) {
+function Test-ValidDownloadedFile([string]$Path) {
     if (!(Test-Path $Path)) {
         return $false
     }
@@ -292,18 +274,11 @@ function Test-ValidDownloadedBinary([string]$Path) {
         return $false
     }
 
-    $stream = [System.IO.File]::OpenRead($Path)
-    try {
-        $buffer = New-Object byte[] 2
-        $bytesRead = $stream.Read($buffer, 0, 2)
-        return ($bytesRead -eq 2 -and $buffer[0] -eq 0x4D -and $buffer[1] -eq 0x5A)
-    } finally {
-        $stream.Dispose()
-    }
+    return $true
 }
 
 $arch = Get-ArchName
-$asset = "${BinaryName}-windows-${arch}.exe"
+$asset = Get-BundleAssetName $arch
 $target = Resolve-TargetVersion $Version
 $currentVersion = Get-InstalledVersion $Dest
 $targetVersion = $target.Version
@@ -356,7 +331,9 @@ Write-Host "Downloading $url..."
 
 if ($DryRun) {
     Write-Host "[dry-run] mkdir $InstallDir"
-    Write-Host "[dry-run] download => $Dest"
+    Write-Host "[dry-run] download and extract => $asset"
+    Write-Host "[dry-run] install => $Dest"
+    Write-Host "[dry-run] install bundled TypeScript runtime => $(Get-ManagedDenoInstallRoot)"
     Write-Host "[dry-run] init/check/service install flow"
     exit 0
 }
@@ -364,9 +341,34 @@ if ($DryRun) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Stop-ServiceIfPresent $Dest
 
-$tmp = Join-Path $InstallDir ("$BinaryName.tmp.exe")
-Download-FileWithFallback -Url $url -OutFile $tmp -ReleaseTag $targetLabel -AssetName $asset
-Move-Item -Force $tmp $Dest
+$tmpRoot = Join-Path $InstallDir "bundle-tmp"
+$archivePath = Join-Path $InstallDir $asset
+$extractPath = Join-Path $tmpRoot "extract"
+Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+
+Download-FileWithFallback -Url $url -OutFile $archivePath -ReleaseTag $targetLabel -AssetName $asset
+Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath -Force
+
+$bundleExe = Join-Path $extractPath "$BinaryName.exe"
+$bundleRuntime = Join-Path $extractPath "runtime"
+$bundleDeno = Join-Path $bundleRuntime "deno\bin\deno.exe"
+if (!(Test-Path $bundleExe)) {
+    throw "release bundle is missing $BinaryName.exe"
+}
+if (!(Test-Path $bundleDeno)) {
+    throw "release bundle is missing bundled TypeScript runtime"
+}
+
+Move-Item -Force $bundleExe $Dest
+
+$runtimeRoot = Get-ProxysssConfigDir
+$runtimeTarget = Join-Path $runtimeRoot "runtime"
+New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+Remove-Item -LiteralPath $runtimeTarget -Recurse -Force -ErrorAction SilentlyContinue
+Copy-Item -LiteralPath $bundleRuntime -Destination $runtimeRoot -Recurse -Force
+Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 $pathCandidates = @(
     (Join-Path $env:USERPROFILE ".local\bin"),
@@ -396,8 +398,6 @@ if (-not $linked) {
 Notify-PathChanged
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
             [Environment]::GetEnvironmentVariable("Path", "User")
-
-Install-DenoIfMissing
 
 if (!$SkipInit) {
     & $Dest init

@@ -113,9 +113,11 @@ pub struct ScriptRuntime {
 }
 
 impl ScriptRuntime {
-    pub fn spawn(config: &ScriptConfig) -> Result<Self> {
+    pub fn spawn(config: &ScriptConfig, runtime_env: &BTreeMap<String, String>) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command.args(&config.args);
+        command.envs(runtime_env);
+        command.envs(&config.env);
 
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
@@ -125,9 +127,17 @@ impl ScriptRuntime {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::inherit());
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn script runtime {}", config.command))?;
+        let mut child = command.spawn().with_context(|| {
+            let mut message = format!("failed to spawn script runtime {}", config.command);
+            if !std::path::Path::new(&config.command).exists()
+                && config.command == crate::config::default_managed_script_command()
+            {
+                message.push_str(
+                    "; bundled TypeScript runtime is missing from proxysss runtime directory, reinstall the proxysss bundle",
+                );
+            }
+            message
+        })?;
 
         let stdin = child
             .stdin

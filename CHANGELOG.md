@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.6 - 2026-06-06
+
+- Reworked the default port 80 landing page into a compact, single-screen project page with no admin address exposure, protocol coverage, and benchmark highlights.
+- Switched gateway architecture to YAML-first routing by default so HTTP/HTTPS/TCP/UDP no longer depend on TypeScript scripts unless explicitly enabled.
+- Bundled the TypeScript runtime into release and deploy artifacts so proxysss installation no longer requires downloading or installing an external interpreter separately.
+- Updated release verification, installer flow, and workflow packaging to validate the bundled runtime alongside the proxysss binary.
+
 ## v0.2.5 - 2026-06-05
 
 - Added reproducible gateway benchmark workflow for proxysss, nginx, and Caddy.

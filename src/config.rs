@@ -13,6 +13,22 @@ pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
 
+pub fn default_managed_script_command() -> String {
+    let binary = if cfg!(windows) { "deno.exe" } else { "deno" };
+
+    dirs::config_dir()
+        .map(|dir| {
+            dir.join("proxysss")
+                .join("runtime")
+                .join("deno")
+                .join("bin")
+                .join(binary)
+                .to_string_lossy()
+                .to_string()
+        })
+        .unwrap_or_else(|| binary.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_config_version")]
@@ -200,6 +216,10 @@ pub struct TcpConfig {
 pub struct TcpListenerConfig {
     pub name: String,
     pub bind: String,
+    #[serde(default)]
+    pub upstream: String,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -212,16 +232,24 @@ pub struct UdpConfig {
 pub struct UdpListenerConfig {
     pub name: String,
     pub bind: String,
+    #[serde(default)]
+    pub upstream: String,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptConfig {
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default = "default_script_command")]
     pub command: String,
     #[serde(default = "default_script_args")]
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default = "default_script_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -502,12 +530,14 @@ impl GatewayConfig {
             errors.push("include.files cannot be empty when include.enabled=true".to_string());
         }
 
-        if self.script.command.trim().is_empty() {
-            errors.push("script.command cannot be empty".to_string());
-        }
+        if self.script.enabled {
+            if self.script.command.trim().is_empty() {
+                errors.push("script.command cannot be empty when script.enabled=true".to_string());
+            }
 
-        if self.script.timeout_ms == 0 {
-            errors.push("script.timeout_ms must be greater than 0".to_string());
+            if self.script.timeout_ms == 0 {
+                errors.push("script.timeout_ms must be greater than 0 when script.enabled=true".to_string());
+            }
         }
 
         if self.load_balance.retries.enabled && self.load_balance.retries.max_retries > 16 {
@@ -529,6 +559,11 @@ impl GatewayConfig {
         }
 
         if self.plugins.enabled {
+            if !self.script.enabled {
+                errors.push(
+                    "plugins.enabled=true requires script.enabled=true because plugins run inside the TypeScript runtime".to_string(),
+                );
+            }
             if self.plugins.extensions.is_empty() {
                 errors.push(
                     "plugins.extensions cannot be empty when plugins are enabled".to_string(),
@@ -689,6 +724,15 @@ impl GatewayConfig {
             if !tcp_binds.insert(listener.bind.clone()) {
                 errors.push(format!("duplicate tcp listener bind {}", listener.bind));
             }
+            if listener.upstream.trim().is_empty()
+                && listener.upstreams.iter().all(|item| item.trim().is_empty())
+                && !self.script.enabled
+            {
+                errors.push(format!(
+                    "tcp.listeners.{} requires upstream/upstreams when script.enabled=false",
+                    listener.name
+                ));
+            }
         }
 
         let mut udp_names = HashSet::<String>::new();
@@ -707,6 +751,15 @@ impl GatewayConfig {
             }
             if !udp_binds.insert(listener.bind.clone()) {
                 errors.push(format!("duplicate udp listener bind {}", listener.bind));
+            }
+            if listener.upstream.trim().is_empty()
+                && listener.upstreams.iter().all(|item| item.trim().is_empty())
+                && !self.script.enabled
+            {
+                errors.push(format!(
+                    "udp.listeners.{} requires upstream/upstreams when script.enabled=false",
+                    listener.name
+                ));
             }
         }
 
@@ -973,9 +1026,11 @@ impl Default for AcmeExternalConfig {
 impl Default for ScriptConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             command: default_script_command(),
             args: default_script_args(),
             cwd: Some(PathBuf::from(".")),
+            env: BTreeMap::new(),
             timeout_ms: default_script_timeout_ms(),
         }
     }
@@ -984,7 +1039,7 @@ impl Default for ScriptConfig {
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
-            enabled: default_true(),
+            enabled: false,
             auto_load_dir: default_plugins_auto_load_dir(),
             extensions: default_plugin_extensions(),
             allow_admin_manage: default_true(),
@@ -1369,7 +1424,7 @@ fn default_udp_listeners() -> Vec<UdpListenerConfig> {
 }
 
 fn default_script_command() -> String {
-    "deno".to_string()
+    default_managed_script_command()
 }
 
 fn default_script_args() -> Vec<String> {
@@ -1714,6 +1769,37 @@ mod tests {
             .validate()
             .expect_err("expected invalid rate limit window");
         assert!(error.to_string().contains("window_ms"));
+    }
+
+    #[test]
+    fn validate_rejects_plugins_without_script_runtime() {
+        let mut config = GatewayConfig::default();
+        config.plugins.enabled = true;
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid plugin/script relation");
+        assert!(error
+            .to_string()
+            .contains("plugins.enabled=true requires script.enabled=true"));
+    }
+
+    #[test]
+    fn validate_rejects_stream_listener_without_yaml_or_script_route() {
+        let mut config = GatewayConfig::default();
+        config.tcp.listeners.push(TcpListenerConfig {
+            name: "game".to_string(),
+            bind: "0.0.0.0:7000".to_string(),
+            upstream: String::new(),
+            upstreams: Vec::new(),
+        });
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid listener without upstream");
+        assert!(error
+            .to_string()
+            .contains("requires upstream/upstreams when script.enabled=false"));
     }
 
     #[test]

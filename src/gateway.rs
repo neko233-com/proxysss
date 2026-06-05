@@ -62,7 +62,7 @@ pub struct Gateway {
 struct DynamicState {
     config: GatewayConfig,
     http_client: reqwest::Client,
-    script: Arc<ScriptRuntime>,
+    script: Option<Arc<ScriptRuntime>>,
 }
 
 struct GatewayHttpResponse {
@@ -471,7 +471,15 @@ impl Gateway {
                 ));
             }
 
-            match state.script.list_plugins().await {
+            let Some(script) = &state.script else {
+                return Ok(json_gateway_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
+                    "proxysss://admin",
+                ));
+            };
+
+            match script.list_plugins().await {
                 Ok(plugins) => {
                     return Ok(json_response(
                         StatusCode::OK,
@@ -521,7 +529,15 @@ impl Gateway {
                 }
             };
 
-            match state.script.load_plugin(spec).await {
+            let Some(script) = &state.script else {
+                return Ok(json_gateway_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
+                    "proxysss://admin",
+                ));
+            };
+
+            match script.load_plugin(spec).await {
                 Ok(data) => {
                     return Ok(json_response(
                         StatusCode::OK,
@@ -571,7 +587,15 @@ impl Gateway {
                 }
             };
 
-            match state.script.unload_plugin(&unload.name).await {
+            let Some(script) = &state.script else {
+                return Ok(json_gateway_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "TypeScript runtime is disabled"}),
+                    "proxysss://admin",
+                ));
+            };
+
+            match script.unload_plugin(&unload.name).await {
                 Ok(data) => {
                     return Ok(json_response(
                         StatusCode::OK,
@@ -918,24 +942,6 @@ impl Gateway {
                         Some(first_packet_preview(&first_payload))
                     };
 
-                    let route = state
-                        .script
-                        .route_tcp(StreamContext {
-                            request_id: request_id.clone(),
-                            listener: listener_name.clone(),
-                            protocol: "tcp".to_string(),
-                            remote_addr: remote_addr.to_string(),
-                            player_id: player_id.clone(),
-                            first_packet_preview: preview,
-                            payload_len: first_payload.len(),
-                        })
-                        .await
-                        .inspect_err(|_| {
-                            gateway
-                                .stats
-                                .script_fail_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        })?;
                     let route = if listener_name == "ftp" && state.config.services.ftp.enabled {
                         RouteDecision {
                             upstream: state.config.services.ftp.upstream.clone(),
@@ -947,8 +953,35 @@ impl Gateway {
                             status: None,
                             content_type: None,
                         }
-                    } else {
+                    } else if let Some(route) = configured_tcp_listener_route(
+                        &state.config,
+                        &listener_name,
+                        player_id.clone(),
+                    ) {
                         route
+                    } else if let Some(script) = &state.script {
+                        script
+                            .route_tcp(StreamContext {
+                                request_id: request_id.clone(),
+                                listener: listener_name.clone(),
+                                protocol: "tcp".to_string(),
+                                remote_addr: remote_addr.to_string(),
+                                player_id: player_id.clone(),
+                                first_packet_preview: preview,
+                                payload_len: first_payload.len(),
+                            })
+                            .await
+                            .inspect_err(|_| {
+                                gateway
+                                    .stats
+                                    .script_fail_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            })?
+                    } else {
+                        return Err(anyhow!(
+                            "tcp listener {} has no configured upstream and script runtime is disabled",
+                            listener_name
+                        ));
                     };
 
                     let upstream_plan = gateway.select_upstream_plan(
@@ -1066,21 +1099,33 @@ impl Gateway {
                         existing.clone()
                     } else {
                         let player_id = extract_stream_player_id(&payload, &state.config.affinity.stream);
-                        let route = state
-                            .script
-                            .route_udp(StreamContext {
-                                request_id: request_id.clone(),
-                                listener: listener_name.clone(),
-                                protocol: "udp".to_string(),
-                                remote_addr: client_addr.to_string(),
-                                player_id: player_id.clone(),
-                                first_packet_preview: Some(first_packet_preview(&payload)),
-                                payload_len: payload.len(),
-                            })
-                            .await
-                            .inspect_err(|_| {
-                                gateway.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                            })?;
+                        let route = if let Some(route) = configured_udp_listener_route(
+                            &state.config,
+                            &listener_name,
+                            player_id.clone(),
+                        ) {
+                            route
+                        } else if let Some(script) = &state.script {
+                            script
+                                .route_udp(StreamContext {
+                                    request_id: request_id.clone(),
+                                    listener: listener_name.clone(),
+                                    protocol: "udp".to_string(),
+                                    remote_addr: client_addr.to_string(),
+                                    player_id: player_id.clone(),
+                                    first_packet_preview: Some(first_packet_preview(&payload)),
+                                    payload_len: payload.len(),
+                                })
+                                .await
+                                .inspect_err(|_| {
+                                    gateway.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
+                                })?
+                        } else {
+                            return Err(anyhow!(
+                                "udp listener {} has no configured upstream and script runtime is disabled",
+                                listener_name
+                            ));
+                        };
 
                         let upstream_plan = gateway.select_upstream_plan(
                             &state.config,
@@ -1334,10 +1379,10 @@ impl Gateway {
             return Ok(dispatch_internal_http(&state.config, &route));
         }
 
-        let route = match configured_reverse_proxy_route(&state.config, &host, &uri) {
-            Some(route) => route,
-            None => state
-                .script
+        let route = if let Some(route) = configured_reverse_proxy_route(&state.config, &host, &uri) {
+            route
+        } else if let Some(script) = &state.script {
+            script
                 .route_http(HttpContext {
                     request_id: request_id.clone(),
                     host: host.clone(),
@@ -1354,7 +1399,12 @@ impl Gateway {
                 .await
                 .inspect_err(|_| {
                     self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                })?,
+                })?
+        } else {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "no built-in or YAML route matched; enable script.enabled to use TypeScript routing",
+            ));
         };
 
         if route.upstream.starts_with("proxysss://") {
@@ -1958,9 +2008,18 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         .build()
         .context("failed to build upstream http client")?;
 
-    let script = Arc::new(ScriptRuntime::spawn(&config.script)?);
+    let script = if config.script.enabled {
+        Some(Arc::new(ScriptRuntime::spawn(
+            &config.script,
+            &default_script_env(&config),
+        )?))
+    } else {
+        None
+    };
 
-    auto_load_plugins(&config, &script).await?;
+    if let Some(script_runtime) = &script {
+        auto_load_plugins(&config, script_runtime).await?;
+    }
 
     Ok(DynamicState {
         config,
@@ -2723,6 +2782,107 @@ fn builtin_http_route(path: &str) -> Option<RouteDecision> {
         status: None,
         content_type: None,
     })
+}
+
+fn configured_tcp_listener_route(
+    config: &GatewayConfig,
+    listener_name: &str,
+    affinity_key: Option<String>,
+) -> Option<RouteDecision> {
+    config
+        .tcp
+        .listeners
+        .iter()
+        .find(|listener| listener.name == listener_name)
+        .and_then(|listener| configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key))
+}
+
+fn configured_udp_listener_route(
+    config: &GatewayConfig,
+    listener_name: &str,
+    affinity_key: Option<String>,
+) -> Option<RouteDecision> {
+    config
+        .udp
+        .listeners
+        .iter()
+        .find(|listener| listener.name == listener_name)
+        .and_then(|listener| configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key))
+}
+
+fn configured_stream_listener_route(
+    upstream: &str,
+    upstreams: &[String],
+    affinity_key: Option<String>,
+) -> Option<RouteDecision> {
+    let upstream = upstream.trim();
+    let mut normalized_upstreams: Vec<String> = upstreams
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect();
+
+    let selected = if !upstream.is_empty() {
+        if !normalized_upstreams.iter().any(|item| item == upstream) {
+            normalized_upstreams.insert(0, upstream.to_string());
+        }
+        upstream.to_string()
+    } else if let Some(first) = normalized_upstreams.first() {
+        first.clone()
+    } else {
+        return None;
+    };
+
+    Some(RouteDecision {
+        upstream: selected,
+        upstreams: normalized_upstreams,
+        affinity_key,
+        rewrite_path: None,
+        set_headers: BTreeMap::new(),
+        strip_headers: Vec::new(),
+        status: None,
+        content_type: None,
+    })
+}
+
+fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("PROXYSSS_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string());
+    env.insert(
+        "PROXYSSS_CONFIG_ROOT".to_string(),
+        config.root_dir.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "PROXYSSS_SCRIPT_CWD".to_string(),
+        config
+            .script
+            .cwd
+            .clone()
+            .unwrap_or_else(|| config.root_dir.clone())
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert("PROXYSSS_HTTP_BIND".to_string(), config.http.plain_bind.clone());
+    env.insert("PROXYSSS_HTTPS_BIND".to_string(), config.http.tls_bind.clone());
+    env.insert("PROXYSSS_HTTP3_BIND".to_string(), config.http.h3_bind.clone());
+    env.insert(
+        "PROXYSSS_ADMIN_BIND".to_string(),
+        if config.admin.enabled {
+            config.admin.bind.clone()
+        } else {
+            String::new()
+        },
+    );
+    env.insert(
+        "PROXYSSS_PLUGINS_ENABLED".to_string(),
+        if config.plugins.enabled { "1" } else { "0" }.to_string(),
+    );
+    env.insert(
+        "PROXYSSS_SCRIPT_ENABLED".to_string(),
+        if config.script.enabled { "1" } else { "0" }.to_string(),
+    );
+    env
 }
 
 fn configured_reverse_proxy_route(
@@ -3558,7 +3718,7 @@ fn guess_content_type(path: &Path) -> &'static str {
     }
 }
 
-fn render_welcome_html(config: &GatewayConfig) -> String {
+fn render_welcome_html(_config: &GatewayConfig) -> String {
     let html = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -3567,204 +3727,483 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
     <title>proxysss</title>
     <style>
         :root {
-            --panel: rgba(12, 25, 44, 0.78);
-            --panel-border: rgba(130, 182, 255, 0.18);
-            --text: #eef5ff;
-            --muted: #9eb4d1;
-            --accent: #56d7ff;
-            --accent-2: #7cffb6;
-            --warm: #ffcf6e;
+            --bg: #07111a;
+            --bg-soft: #0c1823;
+            --panel: rgba(10, 22, 33, 0.92);
+            --panel-strong: rgba(12, 28, 43, 0.96);
+            --line: rgba(139, 202, 255, 0.16);
+            --text: #f2f7fb;
+            --muted: #9ab0c2;
+            --cyan: #56d7ff;
+            --mint: #77f3bf;
+            --gold: #f3d27c;
+            --rose: #ff8f8f;
         }
         * { box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
         body {
             margin: 0;
-            min-height: 100vh;
-            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
             color: var(--text);
             background:
-                radial-gradient(circle at top left, rgba(86, 215, 255, 0.22), transparent 28%),
-                radial-gradient(circle at bottom right, rgba(124, 255, 182, 0.18), transparent 24%),
-                linear-gradient(160deg, #06101c, #091a31 50%, #0d1730 100%);
-            overflow-x: hidden;
+                radial-gradient(circle at 14% 12%, rgba(86, 215, 255, 0.14), transparent 28%),
+                radial-gradient(circle at 82% 18%, rgba(119, 243, 191, 0.10), transparent 26%),
+                linear-gradient(160deg, var(--bg), var(--bg-soft) 48%, #09131d 100%);
         }
-        .orb, .orb-2 {
+        body::before,
+        body::after {
+            content: "";
             position: fixed;
-            border-radius: 999px;
-            filter: blur(12px);
-            opacity: 0.48;
+            inset: auto;
             pointer-events: none;
-            animation: drift 12s ease-in-out infinite alternate;
+            border-radius: 999px;
+            filter: blur(18px);
+            opacity: 0.5;
         }
-        .orb { width: 220px; height: 220px; top: 8%; right: 8%; background: rgba(86, 215, 255, 0.22); }
-        .orb-2 { width: 180px; height: 180px; bottom: 10%; left: 10%; background: rgba(124, 255, 182, 0.20); animation-duration: 9s; }
-        @keyframes drift {
-            from { transform: translateY(-16px) scale(0.98); }
-            to { transform: translateY(18px) scale(1.04); }
+        body::before {
+            width: 210px;
+            height: 210px;
+            top: 9%;
+            right: 9%;
+            background: rgba(86, 215, 255, 0.15);
         }
-        .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 64px; }
-        .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
-        .brand { display: flex; align-items: center; gap: 16px; }
+        body::after {
+            width: 180px;
+            height: 180px;
+            bottom: 7%;
+            left: 6%;
+            background: rgba(119, 243, 191, 0.11);
+        }
+        .page {
+            position: relative;
+            z-index: 1;
+            width: min(1200px, calc(100vw - 40px));
+            height: min(760px, calc(100vh - 40px));
+            margin: 20px auto;
+            padding: 24px;
+            display: grid;
+            grid-template-columns: minmax(320px, 1.15fr) minmax(320px, 0.95fr);
+            gap: 18px;
+        }
+        .hero,
+        .panel {
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)) , var(--panel);
+            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+            backdrop-filter: blur(16px);
+        }
+        .hero {
+            padding: 28px;
+            display: grid;
+            grid-template-rows: auto auto 1fr auto;
+            min-height: 0;
+        }
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
         .logo {
-            width: 72px; height: 72px; border-radius: 24px;
-            background: linear-gradient(135deg, rgba(86, 215, 255, 0.95), rgba(124, 255, 182, 0.86));
-            display: grid; place-items: center; color: #04111a; font-weight: 800; font-size: 28px;
-            box-shadow: 0 20px 50px rgba(86, 215, 255, 0.24);
-            animation: pulse 3.8s ease-in-out infinite;
+            width: 76px;
+            height: 76px;
+            border-radius: 24px;
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(145deg, rgba(86, 215, 255, 0.95), rgba(119, 243, 191, 0.88));
+            box-shadow: 0 18px 44px rgba(86, 215, 255, 0.22);
         }
-        @keyframes pulse {
-            0%, 100% { transform: rotate(-4deg) scale(1); }
-            50% { transform: rotate(4deg) scale(1.06); }
+        .logo::before,
+        .logo::after {
+            content: "";
+            position: absolute;
+            inset: 0;
         }
-        .lang-switch { display: inline-flex; background: rgba(255,255,255,0.06); border: 1px solid var(--panel-border); border-radius: 999px; padding: 4px; }
-        .lang-switch button { border: 0; background: transparent; color: var(--muted); padding: 8px 14px; border-radius: 999px; cursor: pointer; }
-        .lang-switch button.active { background: rgba(86, 215, 255, 0.16); color: var(--text); }
-        .hero, .grid, .footer { position: relative; z-index: 1; }
-        .hero { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 28px; padding: 28px; backdrop-filter: blur(18px); box-shadow: 0 24px 80px rgba(0,0,0,0.25); }
-        .hero h1 { margin: 0 0 10px; font-size: clamp(34px, 5vw, 62px); line-height: 1; }
-        .hero p { margin: 0; color: var(--muted); font-size: 18px; line-height: 1.7; max-width: 760px; }
-        .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
-        .actions a { text-decoration: none; color: #04111a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); padding: 12px 18px; border-radius: 14px; font-weight: 700; }
-        .actions a.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--panel-border); }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 20px; }
-        .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 22px; padding: 20px; backdrop-filter: blur(16px); }
-        .card h3 { margin-top: 0; margin-bottom: 10px; }
-        .card p, .card li { color: var(--muted); line-height: 1.7; }
-        .card code, pre { font-family: "Cascadia Code", "Consolas", monospace; font-size: 13px; }
-        pre { margin: 12px 0 0; padding: 14px; border-radius: 16px; overflow: auto; background: rgba(2, 8, 18, 0.72); color: #d8f2ff; border: 1px solid rgba(122, 171, 255, 0.12); }
-        .pill { display: inline-flex; padding: 6px 10px; border-radius: 999px; background: rgba(255,255,255,0.08); color: var(--warm); font-size: 12px; margin-bottom: 8px; }
-        [data-lang] { display: none; }
-        [data-lang].active { display: block; }
-        .footer { color: var(--muted); margin-top: 20px; font-size: 14px; }
+        .logo::before {
+            background: linear-gradient(180deg, rgba(255,255,255,0.24), transparent 46%);
+        }
+        .logo::after {
+            width: 38px;
+            height: 38px;
+            inset: 19px auto auto 19px;
+            border-radius: 14px 14px 14px 4px;
+            border: 7px solid #04111a;
+            border-right-width: 10px;
+            transform: skewY(-8deg);
+        }
+        .brand-mark {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .eyebrow {
+            font-size: 11px;
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+            color: var(--mint);
+        }
+        .brand-title {
+            font-size: 26px;
+            line-height: 1;
+            font-weight: 800;
+        }
+        .version {
+            color: var(--muted);
+            font-size: 13px;
+        }
+        .docs-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            text-decoration: none;
+            padding: 12px 16px;
+            border-radius: 999px;
+            color: #04111a;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--cyan), var(--mint));
+            white-space: nowrap;
+        }
+        .hero-main {
+            display: grid;
+            align-content: center;
+            gap: 16px;
+            min-height: 0;
+        }
+        .hero-main h1 {
+            margin: 0;
+            font-size: clamp(42px, 6vw, 78px);
+            line-height: 0.92;
+            letter-spacing: -0.05em;
+        }
+        .hero-main p {
+            margin: 0;
+            max-width: 560px;
+            color: var(--muted);
+            font-size: clamp(15px, 2vw, 18px);
+            line-height: 1.6;
+        }
+        .protocols {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .protocol {
+            min-width: 0;
+            border-radius: 18px;
+            padding: 12px 12px 10px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .protocol strong {
+            display: block;
+            font-size: 13px;
+            line-height: 1.2;
+        }
+        .protocol span {
+            display: block;
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--muted);
+            line-height: 1.3;
+        }
+        .notes {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .note {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .note i {
+            width: 7px;
+            height: 7px;
+            border-radius: 999px;
+            background: var(--mint);
+            display: inline-block;
+        }
+        .side {
+            display: grid;
+            gap: 18px;
+            min-height: 0;
+        }
+        .panel {
+            padding: 20px 20px 18px;
+            min-height: 0;
+        }
+        .panel h2,
+        .panel h3,
+        .panel p {
+            margin: 0;
+        }
+        .panel-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .panel-head h2 {
+            font-size: 20px;
+        }
+        .panel-head span {
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .bench-grid {
+            display: grid;
+            gap: 12px;
+        }
+        .bench-card {
+            border-radius: 20px;
+            padding: 14px 14px 12px;
+            background: rgba(255,255,255,0.035);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .bench-card.proxysss {
+            background: linear-gradient(135deg, rgba(86, 215, 255, 0.10), rgba(119, 243, 191, 0.08));
+            border-color: rgba(86, 215, 255, 0.20);
+        }
+        .bench-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .bench-top strong {
+            font-size: 16px;
+        }
+        .bench-top span {
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .metric-row {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .metric {
+            min-width: 0;
+        }
+        .metric em {
+            display: block;
+            font-style: normal;
+            color: var(--muted);
+            font-size: 11px;
+            margin-bottom: 4px;
+        }
+        .metric strong {
+            display: block;
+            font-size: 15px;
+            line-height: 1.15;
+        }
+        .bench-note {
+            margin-top: 12px;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+        .bench-source {
+            margin-top: 12px;
+            color: var(--gold);
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        @media (max-width: 980px) {
+            .page {
+                width: min(100vw - 24px, 920px);
+                height: min(100vh - 24px, 900px);
+                margin: 12px auto;
+                grid-template-columns: 1fr;
+            }
+            .hero {
+                grid-template-rows: auto auto auto auto;
+            }
+        }
+        @media (max-width: 640px) {
+            .page {
+                width: calc(100vw - 16px);
+                height: calc(100vh - 16px);
+                margin: 8px auto;
+                padding: 10px;
+                gap: 10px;
+            }
+            .hero,
+            .panel {
+                border-radius: 22px;
+            }
+            .hero {
+                padding: 18px;
+                gap: 14px;
+            }
+            .panel {
+                padding: 16px;
+            }
+            .topbar {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            .logo {
+                width: 62px;
+                height: 62px;
+                border-radius: 20px;
+            }
+            .logo::after {
+                width: 31px;
+                height: 31px;
+                inset: 15px auto auto 15px;
+                border-width: 6px;
+                border-right-width: 8px;
+            }
+            .brand-title {
+                font-size: 22px;
+            }
+            .hero-main h1 {
+                font-size: 34px;
+            }
+            .hero-main p {
+                font-size: 14px;
+            }
+            .protocols,
+            .metric-row {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .protocol {
+                padding: 10px;
+            }
+            .bench-card {
+                padding: 12px;
+            }
+            .bench-top {
+                margin-bottom: 8px;
+            }
+            .bench-top strong {
+                font-size: 15px;
+            }
+            .metric strong {
+                font-size: 14px;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="orb"></div>
-    <div class="orb-2"></div>
-    <div class="wrap">
-        <div class="topbar">
-            <div class="brand">
-                <div class="logo">P</div>
-                <div>
-                    <div style="font-size:12px;color:#7cffb6;letter-spacing:.18em;text-transform:uppercase;">Programmable Gateway</div>
-                    <div style="font-size:24px;font-weight:800;">proxysss v__VERSION__</div>
-                </div>
-            </div>
-            <div class="lang-switch">
-                <button class="active" data-target="zh">中文</button>
-                <button data-target="en">English</button>
-            </div>
-        </div>
+    <main class="page">
         <section class="hero">
-            <div data-lang="zh" class="active">
-                <h1>欢迎来到 proxysss</h1>
-                <p>一个面向 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP、WebSocket、WSS 的可编程 Rust 网关。默认页不该输给 nginx，所以这里直接给你一个带文档、带入口、带动画的启动面板。</p>
-                <div class="actions">
-                    <a href="http://__ADMIN_URL__/">打开后台管理界面</a>
-                    <a class="secondary" href="/admin">跳转管理入口</a>
+            <div class="topbar">
+                <div class="brand">
+                    <div class="logo" aria-hidden="true"></div>
+                    <div class="brand-mark">
+                        <div class="eyebrow">General Gateway</div>
+                        <div class="brand-title">proxysss</div>
+                        <div class="version">v__VERSION__</div>
+                    </div>
                 </div>
+                <a class="docs-btn" href="https://github.com/neko233-com/proxysss#readme" target="_blank" rel="noreferrer">Docs</a>
             </div>
-            <div data-lang="en">
-                <h1>Welcome to proxysss</h1>
-                <p>A programmable Rust gateway for HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP, WebSocket, and WSS. The default page should not lose to nginx, so this one ships with docs, entry points, and motion out of the box.</p>
-                <div class="actions">
-                    <a href="http://__ADMIN_URL__/">Open Admin Console</a>
-                    <a class="secondary" href="/admin">Jump to Admin Entry</a>
-                </div>
+            <div class="hero-main">
+                <h1>proxysss</h1>
+                <p>通用网关与反向代理。YAML 负责主配置面，TypeScript 作为可选扩展脚本层。</p>
+            </div>
+            <div class="protocols" aria-label="supported protocols">
+                <div class="protocol"><strong>HTTP/1.1</strong><span>Reverse proxy and static delivery</span></div>
+                <div class="protocol"><strong>HTTP/2</strong><span>TLS termination and upstream proxying</span></div>
+                <div class="protocol"><strong>HTTP/3</strong><span>QUIC listener on the public edge</span></div>
+                <div class="protocol"><strong>WebSocket</strong><span>ws and wss upgrade tunneling</span></div>
+                <div class="protocol"><strong>TCP</strong><span>Declarative stream listener routing</span></div>
+                <div class="protocol"><strong>UDP</strong><span>YAML upstream and upstream pool support</span></div>
+                <div class="protocol"><strong>FTP</strong><span>Control-channel passthrough routing</span></div>
+                <div class="protocol"><strong>WebDAV</strong><span>Built-in file methods in Rust hot path</span></div>
+            </div>
+            <div class="notes">
+                <div class="note"><i></i><span>Default public ports: 80 / 443</span></div>
+                <div class="note"><i></i><span>Config-first runtime model</span></div>
+                <div class="note"><i></i><span>Bundled script engine delivery</span></div>
             </div>
         </section>
-        <section class="grid">
-            <article class="card">
-                <span class="pill">Gateway</span>
-                <div data-lang="zh" class="active">
-                    <h3>默认监听</h3>
-                    <p>HTTP/TLS/HTTP3 入口由配置决定，后台管理默认绑定到 <code>__ADMIN_URL__</code>。</p>
-                    <ul>
-                        <li>欢迎页：<code>http://localhost/</code></li>
-                        <li>后台页：<code>http://__ADMIN_URL__/</code></li>
-                        <li>健康检查：<code>http://__ADMIN_URL__/healthz</code></li>
-                    </ul>
+        <section class="side">
+            <article class="panel">
+                <div class="panel-head">
+                    <h2>Supported Protocols</h2>
+                    <span>Edge and stream</span>
                 </div>
-                <div data-lang="en">
-                    <h3>Default Endpoints</h3>
-                    <p>HTTP/TLS/HTTP3 listeners come from config, while the admin console is bound to <code>__ADMIN_URL__</code> by default.</p>
-                    <ul>
-                        <li>Welcome page: <code>http://localhost/</code></li>
-                        <li>Admin page: <code>http://__ADMIN_URL__/</code></li>
-                        <li>Health check: <code>http://__ADMIN_URL__/healthz</code></li>
-                    </ul>
+                <div class="protocols">
+                    <div class="protocol"><strong>HTTPS</strong><span>Self-signed, manual, or auto HTTPS</span></div>
+                    <div class="protocol"><strong>WSS</strong><span>Secure upgrade with upstream tunneling</span></div>
+                    <div class="protocol"><strong>TLS</strong><span>Gateway termination and certificate control</span></div>
+                    <div class="protocol"><strong>Static</strong><span>Built-in site serving and autoindex</span></div>
                 </div>
             </article>
-            <article class="card">
-                <span class="pill">Quick Start</span>
-                <div data-lang="zh" class="active">
-                    <h3>三步跑起来</h3>
-                    <pre>proxysss init
-proxysss check-config --config ./proxysss.yaml
-proxysss run --config ./proxysss.yaml</pre>
+            <article class="panel">
+                <div class="panel-head">
+                    <h2>Benchmark Snapshot</h2>
+                    <span>Windows loopback, 2026-06-05</span>
                 </div>
-                <div data-lang="en">
-                    <h3>Start in Three Commands</h3>
-                    <pre>proxysss init
-proxysss check-config --config ./proxysss.yaml
-proxysss run --config ./proxysss.yaml</pre>
+                <div class="bench-grid">
+                    <section class="bench-card proxysss">
+                        <div class="bench-top">
+                            <strong>proxysss</strong>
+                            <span>built-in static site runtime</span>
+                        </div>
+                        <div class="metric-row">
+                            <div class="metric"><em>ops/sec</em><strong>13,272</strong></div>
+                            <div class="metric"><em>success</em><strong>398,174</strong></div>
+                            <div class="metric"><em>p95</em><strong>42.178 ms</strong></div>
+                            <div class="metric"><em>p99</em><strong>44.934 ms</strong></div>
+                        </div>
+                    </section>
+                    <section class="bench-card">
+                        <div class="bench-top">
+                            <strong>Caddy</strong>
+                            <span>file-server</span>
+                        </div>
+                        <div class="metric-row">
+                            <div class="metric"><em>ops/sec</em><strong>11,942</strong></div>
+                            <div class="metric"><em>success</em><strong>358,264</strong></div>
+                            <div class="metric"><em>p95</em><strong>50.181 ms</strong></div>
+                            <div class="metric"><em>p99</em><strong>54.104 ms</strong></div>
+                        </div>
+                    </section>
+                    <section class="bench-card">
+                        <div class="bench-top">
+                            <strong>nginx</strong>
+                            <span>Windows static alias</span>
+                        </div>
+                        <div class="metric-row">
+                            <div class="metric"><em>ops/sec</em><strong>483</strong></div>
+                            <div class="metric"><em>errors</em><strong>1,748,575</strong></div>
+                            <div class="metric"><em>p95</em><strong>70.809 ms</strong></div>
+                            <div class="metric"><em>p99</em><strong>28,958 ms</strong></div>
+                        </div>
+                    </section>
                 </div>
-            </article>
-            <article class="card">
-                <span class="pill">WebSocket</span>
-                <div data-lang="zh" class="active">
-                    <h3>支持 ws / wss</h3>
-                    <p>脚本返回的 upstream 现在可以是 <code>ws://</code>、<code>wss://</code>、<code>http://</code>、<code>https://</code>，升级握手会自动走 WebSocket 隧道。</p>
-                    <pre>if (message.ctx.path?.startsWith("/ws")) {
-    return {
-        upstream: "ws://127.0.0.1:9001",
-        set_headers: { "x-gateway": "proxysss" },
-    };
-}</pre>
-                </div>
-                <div data-lang="en">
-                    <h3>ws / wss Ready</h3>
-                    <p>Your script upstream can now be <code>ws://</code>, <code>wss://</code>, <code>http://</code>, or <code>https://</code>, and upgrade handshakes are tunneled automatically.</p>
-                    <pre>if (message.ctx.path?.startsWith("/ws")) {
-    return {
-        upstream: "wss://chat.example.com/socket",
-        set_headers: { "x-gateway": "proxysss" },
-    };
-}</pre>
-                </div>
-            </article>
-            <article class="card">
-                <span class="pill">Why proxysss</span>
-                <div data-lang="zh" class="active">
-                    <h3>和 nginx 同级</h3>
-                    <p>proxysss 的定位是通用网关和反向代理，目标是覆盖 nginx 的入口职责；脚本与插件只是扩展层，类似 nginx 通过 Lua 承载更贴近业务的逻辑。</p>
-                </div>
-                <div data-lang="en">
-                    <h3>Same Tier as nginx</h3>
-                    <p>proxysss is a general gateway and reverse proxy intended to cover nginx-style front-door duties. Scripts and plugins are the extension layer, similar to using Lua with nginx.</p>
-                </div>
+                <p class="bench-note">同一静态 HTML、同一 bench 客户端、concurrency=512、duration=30s。本页展示的是仓库 README 已记录的本地 Windows loopback 数据。</p>
+                <div class="bench-source">README benchmark snapshot</div>
             </article>
         </section>
-        <div class="footer">
-            proxysss ships a prettier default landing page, but the real value is the programmable routing model behind it.
-        </div>
-    </div>
-    <script>
-        const buttons = document.querySelectorAll('[data-target]');
-        const blocks = document.querySelectorAll('[data-lang]');
-        buttons.forEach((button) => {
-            button.addEventListener('click', () => {
-                const target = button.getAttribute('data-target');
-                buttons.forEach((item) => item.classList.toggle('active', item === button));
-                blocks.forEach((block) => block.classList.toggle('active', block.getAttribute('data-lang') === target));
-                document.documentElement.lang = target === 'zh' ? 'zh-CN' : 'en';
-            });
-        });
-    </script>
+    </main>
 </body>
 </html>"#;
 
     html.replace("__VERSION__", env!("CARGO_PKG_VERSION"))
-        .replace("__ADMIN_URL__", &config.admin.bind)
 }
 
 fn render_admin_console_html(config: &GatewayConfig) -> String {
@@ -4056,16 +4495,18 @@ fn reload_fingerprint(config_path: &Path) -> Result<u64> {
 
 pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let cwd = config
-        .script
-        .cwd
-        .clone()
-        .unwrap_or_else(|| config.root_dir.clone());
+    if config.script.enabled {
+        let cwd = config
+            .script
+            .cwd
+            .clone()
+            .unwrap_or_else(|| config.root_dir.clone());
 
-    for arg in &config.script.args {
-        let candidate = PathBuf::from(arg);
-        if is_script_file(&candidate) {
-            paths.push(absolutize_script_path(&cwd, &candidate));
+        for arg in &config.script.args {
+            let candidate = PathBuf::from(arg);
+            if is_script_file(&candidate) {
+                paths.push(absolutize_script_path(&cwd, &candidate));
+            }
         }
     }
 
@@ -4522,6 +4963,7 @@ mod tests {
         let config = GatewayConfig {
             root_dir: root.clone(),
             script: crate::config::ScriptConfig {
+                enabled: true,
                 cwd: Some(root.clone()),
                 args: vec![
                     "run".to_string(),
@@ -4531,6 +4973,7 @@ mod tests {
                 ..crate::config::ScriptConfig::default()
             },
             plugins: crate::config::PluginsConfig {
+                enabled: true,
                 auto_load_dir: plugins.clone(),
                 ..crate::config::PluginsConfig::default()
             },
@@ -4555,12 +4998,15 @@ mod tests {
     }
 
     #[test]
-    fn welcome_page_includes_branding_and_admin_bind() {
+    fn welcome_page_stays_brand_focused() {
         let config = GatewayConfig::default();
         let html = render_welcome_html(&config);
-        assert!(html.contains("Welcome to proxysss"));
-        assert!(html.contains("欢迎来到 proxysss"));
-        assert!(html.contains("127.0.0.1:7777"));
+        assert!(html.contains("<h1>proxysss</h1>"));
+        assert!(html.contains("Supported Protocols"));
+        assert!(html.contains("Benchmark Snapshot"));
+        assert!(html.contains("https://github.com/neko233-com/proxysss#readme"));
+        assert!(!html.contains("127.0.0.1:7777"));
+        assert!(!html.contains("Open Admin Console"));
         assert!(html.contains(env!("CARGO_PKG_VERSION")));
     }
 
@@ -4576,7 +5022,8 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "script:\n  command: deno\n  args: [run, -A, gateway.ts]\n  cwd: {}\nplugins:\n  enabled: false\n",
+                "script:\n  enabled: true\n  command: {}\n  args: [run, -A, gateway.ts]\n  cwd: {}\nplugins:\n  enabled: false\n",
+                crate::config::default_managed_script_command(),
                 root.display().to_string().replace('\\', "/")
             ),
         )
@@ -4606,6 +5053,33 @@ mod tests {
 
         assert!(keys.contains(&"http:127.0.0.1:7000".to_string()));
         assert!(keys.contains(&"admin:127.0.0.1:7001".to_string()));
+    }
+
+    #[test]
+    fn configured_stream_listener_route_uses_yaml_upstreams() {
+        let mut config = GatewayConfig::default();
+        config.tcp.listeners.push(TcpListenerConfig {
+            name: "game-tcp".to_string(),
+            bind: "0.0.0.0:7000".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            upstreams: vec!["127.0.0.1:9001".to_string()],
+        });
+        config.udp.listeners.push(UdpListenerConfig {
+            name: "game-udp".to_string(),
+            bind: "0.0.0.0:7001".to_string(),
+            upstream: String::new(),
+            upstreams: vec!["127.0.0.1:9100".to_string(), "127.0.0.1:9101".to_string()],
+        });
+
+        let tcp = configured_tcp_listener_route(&config, "game-tcp", Some("pid-1".to_string()))
+            .expect("tcp route");
+        assert_eq!(tcp.upstream, "127.0.0.1:9000");
+        assert_eq!(tcp.upstreams[0], "127.0.0.1:9000");
+        assert_eq!(tcp.affinity_key.as_deref(), Some("pid-1"));
+
+        let udp = configured_udp_listener_route(&config, "game-udp", None).expect("udp route");
+        assert_eq!(udp.upstream, "127.0.0.1:9100");
+        assert_eq!(udp.upstreams.len(), 2);
     }
 
     #[test]

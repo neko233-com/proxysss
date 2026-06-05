@@ -10,6 +10,25 @@ DRY_RUN="false"
 BINARY_NAME="proxysss"
 REPO="neko233-com/proxysss"
 
+proxysss_config_dir() {
+    local os="$1"
+    case "$os" in
+        darwin) printf '%s\n' "$HOME/Library/Application Support/${BINARY_NAME}" ;;
+        *) printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/${BINARY_NAME}" ;;
+    esac
+}
+
+managed_deno_bin() {
+    local os="$1"
+    printf '%s\n' "$(proxysss_config_dir "$os")/runtime/deno/bin/deno"
+}
+
+bundle_asset_name() {
+    local os="$1"
+    local arch="$2"
+    printf '%s\n' "${BINARY_NAME}-${os}-${arch}.tar.gz"
+}
+
 detect_os() {
     case "$(uname -s)" in
         Linux*) echo "linux" ;;
@@ -95,11 +114,12 @@ parse_args() {
     done
 }
 
-install_binary() {
+install_bundle() {
     local os="$1"
     local arch="$2"
     local ver="$3"
-    local asset="${BINARY_NAME}-${os}-${arch}"
+    local asset
+    asset="$(bundle_asset_name "$os" "$arch")"
     local url
 
     if [ "$ver" = "latest" ]; then
@@ -110,26 +130,50 @@ install_binary() {
 
     local install_dir="/usr/local/bin"
     local target="${install_dir}/${BINARY_NAME}"
+    local config_dir
+    config_dir="$(proxysss_config_dir "$os")"
+    local runtime_target="${config_dir}/runtime"
     local tmpdir
     tmpdir=$(mktemp -d)
+    local archive_path="${tmpdir}/${asset}"
+    local bundle_dir="${tmpdir}/bundle"
 
     echo "Downloading ${url}..."
     if [ "$DRY_RUN" = "true" ]; then
-        echo "[dry-run] install ${asset} to ${target}"
+        echo "[dry-run] download ${asset}"
+        echo "[dry-run] extract bundle to ${bundle_dir}"
+        echo "[dry-run] install ${BINARY_NAME} to ${target}"
+        echo "[dry-run] install bundled TypeScript runtime to ${runtime_target}"
         return
     fi
-    curl -fsSL "$url" -o "${tmpdir}/${BINARY_NAME}"
 
-    if [ -w "$install_dir" ]; then
-        mv -f "${tmpdir}/${BINARY_NAME}" "$target"
-    else
-        sudo mv -f "${tmpdir}/${BINARY_NAME}" "$target"
+    mkdir -p "$bundle_dir"
+    curl -fsSL "$url" -o "$archive_path"
+    tar -xzf "$archive_path" -C "$bundle_dir"
+
+    if [ ! -f "${bundle_dir}/${BINARY_NAME}" ]; then
+        echo "bundle is missing ${BINARY_NAME}" >&2
+        exit 1
+    fi
+    if [ ! -x "${bundle_dir}/runtime/deno/bin/deno" ]; then
+        echo "bundle is missing bundled TypeScript runtime" >&2
+        exit 1
     fi
 
-    chmod +x "$target"
+    if [ -w "$install_dir" ]; then
+        install -m 755 "${bundle_dir}/${BINARY_NAME}" "$target"
+    else
+        sudo install -m 755 "${bundle_dir}/${BINARY_NAME}" "$target"
+    fi
+
+    mkdir -p "$config_dir"
+    rm -rf "$runtime_target"
+    cp -R "${bundle_dir}/runtime" "$runtime_target"
+
     rm -rf "$tmpdir"
 
     echo "Installed ${BINARY_NAME} to ${target}"
+    echo "Installed bundled TypeScript runtime to ${runtime_target}"
 }
 
 stop_service_if_present() {
@@ -154,16 +198,6 @@ start_service_if_present() {
     if command -v launchctl >/dev/null 2>&1 && [ -f "$HOME/Library/LaunchAgents/com.neko233.proxysss.plist" ]; then
         launchctl load -w "$HOME/Library/LaunchAgents/com.neko233.proxysss.plist" >/dev/null 2>&1 || true
     fi
-}
-
-install_deno_if_missing() {
-    if command -v deno >/dev/null 2>&1; then
-        return
-    fi
-
-    echo "Deno not found, installing Deno for TypeScript script runtime..."
-    curl -fsSL https://deno.land/install.sh | sh
-    export PATH="$HOME/.deno/bin:$PATH"
 }
 
 main() {
@@ -207,8 +241,7 @@ main() {
 
     echo "Detected ${os}/${arch}; action=${ACTION}; current=${current:-none}; target=${VERSION}"
     stop_service_if_present
-    install_binary "$os" "$arch" "$VERSION"
-    install_deno_if_missing
+    install_bundle "$os" "$arch" "$VERSION"
 
     if [ "$SKIP_INIT" != "true" ]; then
         ${BINARY_NAME} init

@@ -2,6 +2,7 @@ name: deploy
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DENO_VERSION: "2.4.5"
 
 on:
   workflow_dispatch:
@@ -24,14 +25,20 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: proxysss.exe
             artifact: deploy-windows-amd64
+            runtime_asset: deno-x86_64-pc-windows-msvc.zip
+            runtime_binary: deno.exe
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: proxysss
             artifact: deploy-linux-amd64
+            runtime_asset: deno-x86_64-unknown-linux-gnu.zip
+            runtime_binary: deno
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             binary: proxysss
             artifact: deploy-darwin-amd64
+            runtime_asset: deno-x86_64-apple-darwin.zip
+            runtime_binary: deno
 
     runs-on: ${{ matrix.runner }}
 
@@ -45,12 +52,32 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Fetch bundled TypeScript runtime (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p runtime/deno/bin
+          curl -fsSL -o runtime.zip "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/${{ matrix.runtime_asset }}"
+          unzip -q runtime.zip -d runtime-unpack
+          cp runtime-unpack/${{ matrix.runtime_binary }} runtime/deno/bin/${{ matrix.runtime_binary }}
+          chmod +x runtime/deno/bin/${{ matrix.runtime_binary }}
+
+      - name: Fetch bundled TypeScript runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "runtime/deno/bin" -Force | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/download/v${env:DENO_VERSION}/${{ matrix.runtime_asset }}" -OutFile runtime.zip
+          Expand-Archive -LiteralPath runtime.zip -DestinationPath runtime-unpack -Force
+          Copy-Item "runtime-unpack/${{ matrix.runtime_binary }}" "runtime/deno/bin/${{ matrix.runtime_binary }}" -Force
+
       - name: Package bundle (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p bundle
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
+          cp -R runtime bundle/runtime
           cp -R scripts bundle/scripts
           cp README.md bundle/
           if [ -d templates ]; then cp -R templates bundle/templates; fi
@@ -63,6 +90,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path bundle -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
+          Copy-Item runtime "bundle/runtime" -Recurse -Force
           Copy-Item scripts "bundle/scripts" -Recurse -Force
           Copy-Item README.md "bundle/" -Force
           if (Test-Path templates) { Copy-Item templates "bundle/templates" -Recurse -Force }

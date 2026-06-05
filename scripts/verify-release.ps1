@@ -20,12 +20,12 @@ function Require-Command([string]$Name) {
 Require-Command gh
 
 $assets = @(
-    "proxysss-windows-amd64.exe",
-    "proxysss-windows-arm64.exe",
-    "proxysss-linux-amd64",
-    "proxysss-linux-arm64",
-    "proxysss-darwin-amd64",
-    "proxysss-darwin-arm64"
+    "proxysss-windows-amd64.zip",
+    "proxysss-windows-arm64.zip",
+    "proxysss-linux-amd64.tar.gz",
+    "proxysss-linux-arm64.tar.gz",
+    "proxysss-darwin-amd64.tar.gz",
+    "proxysss-darwin-arm64.tar.gz"
 )
 
 function Get-InstalledProxysssVersion {
@@ -41,31 +41,52 @@ function Get-InstalledProxysssVersion {
 
 function Assert-InstalledWindowsAsset([string]$ExpectedVersion) {
     $installed = Get-InstalledProxysssVersion
-    if ($installed -eq $ExpectedVersion) {
-        return
-    }
-
     $installPath = Join-Path $env:LOCALAPPDATA "proxysss\proxysss.exe"
     if (!(Test-Path -LiteralPath $installPath)) {
         throw "installed proxysss.exe not found at $installPath"
     }
 
-    $tmp = Join-Path $env:TEMP "proxysss-$ExpectedVersion-windows-amd64.exe"
+    $runtimePath = Join-Path $env:APPDATA "proxysss\runtime\deno\bin\deno.exe"
+    if (!(Test-Path -LiteralPath $runtimePath)) {
+        throw "installed bundled runtime not found at $runtimePath"
+    }
+
+    if ($installed -eq $ExpectedVersion) {
+        return
+    }
+
+    $tmp = Join-Path $env:TEMP "proxysss-$ExpectedVersion-windows-amd64.zip"
+    $extract = Join-Path $env:TEMP "proxysss-$ExpectedVersion-windows-amd64"
     $assetTag = "v$ExpectedVersion"
-    $url = "https://github.com/$Repo/releases/download/$assetTag/proxysss-windows-amd64.exe"
+    $url = "https://github.com/$Repo/releases/download/$assetTag/proxysss-windows-amd64.zip"
     try {
         Invoke-WebRequest -Uri $url -OutFile $tmp
     } catch {
-        $assetName = "proxysss-windows-amd64.exe"
+        $assetName = "proxysss-windows-amd64.zip"
         gh release download $assetTag --repo $Repo --pattern $assetName --dir $env:TEMP --clobber
         $downloaded = Join-Path $env:TEMP $assetName
         Move-Item -Force $downloaded $tmp
     }
 
+    Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $tmp -DestinationPath $extract -Force
+
+    $expectedExe = Join-Path $extract "proxysss.exe"
+    $expectedRuntime = Join-Path $extract "runtime\deno\bin\deno.exe"
+    if (!(Test-Path $expectedExe) -or !(Test-Path $expectedRuntime)) {
+        throw "release bundle is missing proxysss.exe or bundled runtime"
+    }
+
     $installedHash = (Get-FileHash -LiteralPath $installPath -Algorithm SHA256).Hash
-    $expectedHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    $expectedHash = (Get-FileHash -LiteralPath $expectedExe -Algorithm SHA256).Hash
     if ($installedHash -ne $expectedHash) {
         throw "installed binary hash mismatch for $assetTag"
+    }
+
+    $installedRuntimeHash = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash
+    $expectedRuntimeHash = (Get-FileHash -LiteralPath $expectedRuntime -Algorithm SHA256).Hash
+    if ($installedRuntimeHash -ne $expectedRuntimeHash) {
+        throw "installed bundled runtime hash mismatch for $assetTag"
     }
 }
 

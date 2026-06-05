@@ -4,15 +4,15 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 
 产品目标：作为 nginx 同级通用网关完整替代 nginx 的常见入口职责，同时提供更适合人类和 agent 接管的配置、查询和输出体验。默认 HTTP 端口与 nginx 一致为 80，首页是更友好的 `Welcome to proxysss`。proxysss 不是“业务网关优先”的产品；脚本/插件扩展层类似 nginx + Lua，用来承载可选的业务逻辑。
 
-当前版本：v0.2.5
+当前版本：v0.2.6
 
 ## 核心能力
 
 - 多协议统一入口：HTTP/1.1、HTTP/2（TCP）+ HTTP/3（UDP）+ TCP + UDP
 - 声明式反向代理：`services.reverse_proxy.routes` 支持 host/path 匹配、upstream 池、strip_prefix
 - 限流：`services.rate_limit.http` 支持按 IP、Host 或 Header 的请求速率限制
-- TS/JS 可编程路由：默认通过 Deno 运行 gateway.ts
-- 插件机制：支持插件自动加载、动态 load/unload/list
+- TS/JS 可编程路由：显式开启 script/plugins 后才进入 TypeScript 运行时，默认 HTTP/HTTPS 走 YAML 内建能力
+- 插件机制：作为可选扩展层，支持自动加载、动态 load/unload/list
 - 负载均衡：rendezvous、round_robin、least_connections、source_hash
 - 被动健康检查：失败阈值隔离 + 隔离期后恢复
 - 重试策略：可配置最大重试次数
@@ -30,7 +30,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 
 - Windows / Linux / macOS
 - x86_64(amd64) / arm64
-- 脚本运行时：Deno（安装脚本会自动安装）
+- 脚本运行时：由 proxysss 发布包内置并随安装一起解包，用户不需要额外安装任何解释器或运行时
 
 ## 快速开始
 
@@ -49,6 +49,8 @@ proxysss init
 - plugins/structured-log.ts
 - certs/proxysss-cert.pem
 - certs/proxysss-key.pem
+
+默认生成的配置会优先使用 YAML 内建能力处理 HTTP/HTTPS、反向代理、静态文件和 WebDAV。gateway.ts 与 plugins/*.ts 只是可选扩展层，只有在把 script.enabled 或 plugins.enabled 打开后才会参与请求处理。
 
 ### 2. 校验配置
 
@@ -79,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.5
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.6
 ```
 
 ### Windows PowerShell
@@ -92,7 +94,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.5
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.6
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -107,9 +109,9 @@ install.ps1 支持参数：
 
 安装脚本会完成：
 
-- 下载对应平台二进制
+- 下载对应平台 bundle（内含 proxysss 二进制和内置 TypeScript 运行时）
 - 安装到 PATH 可访问位置
-- 自动安装 Deno（若缺失）
+- 把内置 TypeScript 运行时解包到 proxysss 运行目录
 - 执行 init/check-config
 - 安装并启用服务（开机自启动）
 
@@ -119,7 +121,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.2.5
+proxysss update --version v0.2.6
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -128,7 +130,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.5
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.6
 ```
 
 降级到指定版本：
@@ -140,7 +142,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.5 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.6 -DryRun
 ```
 
 ### Linux / macOS
@@ -148,7 +150,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.2.5
+bash ./scripts/install.sh v0.2.6
 bash ./scripts/install.sh v0.1.0
 ```
 
