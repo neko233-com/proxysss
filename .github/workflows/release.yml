@@ -25,12 +25,6 @@ jobs:
             binary: proxysss.exe
             runtime_asset: deno-x86_64-pc-windows-msvc.zip
             runtime_binary: deno.exe
-          - runner: windows-latest
-            target: aarch64-pc-windows-msvc
-            asset: proxysss-windows-arm64.zip
-            binary: proxysss.exe
-            runtime_asset: deno-aarch64-pc-windows-msvc.zip
-            runtime_binary: deno.exe
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: proxysss-linux-amd64.tar.gz
