@@ -755,6 +755,12 @@ impl GatewayConfig {
             warnings.push("tls.mode=self_signed is for development or internal environments; use acme_external for public traffic".to_string());
         }
 
+        if self.http.plain_bind.trim().is_empty() {
+            warnings.push(
+                "http.plain_bind is disabled; the welcome page will not be reachable on port 80 (nginx parity expects 0.0.0.0:80)".to_string(),
+            );
+        }
+
         warnings
     }
 
@@ -1422,6 +1428,16 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|item| item.contains("admin credentials are still default")));
+    }
+
+    #[test]
+    fn warnings_include_disabled_plain_bind() {
+        let mut config = GatewayConfig::default();
+        config.http.plain_bind.clear();
+        let warnings = config.warnings();
+        assert!(warnings
+            .iter()
+            .any(|item| item.contains("http.plain_bind is disabled")));
     }
 
     #[test]

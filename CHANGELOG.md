@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 - 2026-06-05
+
+- Serve the welcome page from Rust built-in routes on `/`, `/index.html`, and `/docs` so older `gateway.ts` installs still show the landing page.
+- Warn during `check-config` when `http.plain_bind` is disabled because port 80 will not expose the nginx-parity welcome page.
+
 ## v0.2.1 - 2026-06-05
 
 - Fixed release publish job changelog extraction so tagged releases always find `CHANGELOG.md` sections.

@@ -1330,6 +1330,10 @@ impl Gateway {
             return dispatch_static_site(site, &method, &uri).await;
         }
 
+        if let Some(route) = builtin_http_route(uri.path()) {
+            return Ok(dispatch_internal_http(&state.config, &route));
+        }
+
         let route = match configured_reverse_proxy_route(&state.config, &host, &uri) {
             Some(route) => route,
             None => state
@@ -2687,6 +2691,38 @@ fn apply_http_rate_limit_to_store(
             .max(1)
             .to_string(),
     )
+}
+
+fn builtin_http_route(path: &str) -> Option<RouteDecision> {
+    let upstream = match path {
+        "/" | "/index.html" | "/docs" => "proxysss://welcome",
+        "/healthz" => "proxysss://healthz",
+        "/admin" => "proxysss://admin",
+        path if path.starts_with("/static/") => {
+            return Some(RouteDecision {
+                upstream: format!("proxysss://static/{}", path.trim_start_matches("/static/")),
+                upstreams: Vec::new(),
+                affinity_key: None,
+                rewrite_path: None,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                status: None,
+                content_type: None,
+            });
+        }
+        _ => return None,
+    };
+
+    Some(RouteDecision {
+        upstream: upstream.to_string(),
+        upstreams: Vec::new(),
+        affinity_key: None,
+        rewrite_path: None,
+        set_headers: BTreeMap::new(),
+        strip_headers: Vec::new(),
+        status: None,
+        content_type: None,
+    })
 }
 
 fn configured_reverse_proxy_route(
@@ -4506,6 +4542,16 @@ mod tests {
         assert!(paths.contains(&plugins.join("traffic-stats.ts")));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_http_route_serves_welcome_on_root() {
+        let route = builtin_http_route("/").expect("root route");
+        assert_eq!(route.upstream, "proxysss://welcome");
+        assert_eq!(
+            builtin_http_route("/echo").map(|route| route.upstream),
+            None
+        );
     }
 
     #[test]
