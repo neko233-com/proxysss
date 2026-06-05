@@ -236,7 +236,7 @@ function Resolve-TargetVersion([string]$RequestedVersion) {
     return @{ Label = "v$normalized"; Version = $normalized }
 }
 
-function Download-FileWithFallback([string]$Url, [string]$OutFile) {
+function Download-FileWithFallback([string]$Url, [string]$OutFile, [string]$ReleaseTag, [string]$AssetName) {
     $lastError = $null
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -257,6 +257,25 @@ function Download-FileWithFallback([string]$Url, [string]$OutFile) {
         & curl.exe -L --retry 3 --connect-timeout 20 -o $OutFile $Url
         if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedBinary $OutFile)) {
             return
+        }
+    }
+
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($null -ne $gh) {
+        try {
+            $downloadDir = Split-Path -Parent $OutFile
+            if ($ReleaseTag -eq "latest") {
+                & gh release download --repo $Repo --pattern $AssetName --dir $downloadDir --clobber
+            } else {
+                & gh release download $ReleaseTag --repo $Repo --pattern $AssetName --dir $downloadDir --clobber
+            }
+            $downloaded = Join-Path $downloadDir $AssetName
+            if ($LASTEXITCODE -eq 0 -and (Test-ValidDownloadedBinary $downloaded)) {
+                Move-Item -Force $downloaded $OutFile
+                return
+            }
+        } catch {
+            Write-Host "warning: gh release download failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
@@ -346,7 +365,7 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Stop-ServiceIfPresent $Dest
 
 $tmp = Join-Path $InstallDir ("$BinaryName.tmp.exe")
-Download-FileWithFallback -Url $url -OutFile $tmp
+Download-FileWithFallback -Url $url -OutFile $tmp -ReleaseTag $targetLabel -AssetName $asset
 Move-Item -Force $tmp $Dest
 
 $pathCandidates = @(
@@ -398,7 +417,7 @@ if (Test-ServiceTaskExists) {
 
 Write-Host ""
 Write-Host "Installed to $Dest"
-Write-Host "Gateway port: 23380 (TCP for HTTP/1.1 + HTTP/2, UDP for HTTP/3)"
+Write-Host "Gateway ports: 80 (HTTP), 443 (HTTPS + HTTP/3)"
 if ($null -ne $targetVersion) {
     Write-Host "Applied version: $targetVersion"
 } else {

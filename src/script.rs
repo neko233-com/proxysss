@@ -53,6 +53,10 @@ pub struct RouteDecision {
     pub set_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub strip_headers: Vec<String>,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

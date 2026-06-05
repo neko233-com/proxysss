@@ -115,6 +115,14 @@ install.ps1 支持参数：
 
 ## 升级与降级
 
+### CLI 一键升级/切版
+
+```bash
+proxysss update --version latest
+proxysss update --version v0.2.0
+proxysss switch-version v0.1.4 --allow-downgrade
+```
+
 ### Windows
 
 升级到指定版本：

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_PORT: u16 = 443;
 pub const DEFAULT_HTTP_PORT: u16 = 80;
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "proxysss.yaml";
 pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
@@ -39,6 +39,8 @@ pub struct GatewayConfig {
     pub affinity: AffinityConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
@@ -101,9 +103,9 @@ pub enum LogLevel {
 pub struct HttpConfig {
     #[serde(default)]
     pub plain_bind: String,
-    #[serde(default = "default_gateway_bind")]
+    #[serde(default = "default_tls_gateway_bind")]
     pub tls_bind: String,
-    #[serde(default = "default_gateway_bind")]
+    #[serde(default = "default_tls_gateway_bind")]
     pub h3_bind: String,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -302,6 +304,14 @@ pub struct AdminConfig {
     pub expose_config: bool,
     #[serde(default = "default_true")]
     pub enable_write_ops: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_monitoring_path")]
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -624,6 +634,10 @@ impl GatewayConfig {
             }
         }
 
+        if self.monitoring.enabled && !self.monitoring.path.starts_with('/') {
+            errors.push("monitoring.path must start with '/'".to_string());
+        }
+
         if self.affinity.sticky_ttl_secs == 0 {
             errors.push("affinity.sticky_ttl_secs must be greater than 0".to_string());
         }
@@ -800,6 +814,7 @@ impl Default for GatewayConfig {
             load_balance: LoadBalanceConfig::default(),
             affinity: AffinityConfig::default(),
             admin: AdminConfig::default(),
+            monitoring: MonitoringConfig::default(),
             runtime: RuntimeConfig::default(),
             services: ServicesConfig::default(),
             root_dir: PathBuf::from("."),
@@ -826,9 +841,9 @@ impl Default for LoggingConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            plain_bind: default_plain_bind(),
-            tls_bind: default_gateway_bind(),
-            h3_bind: default_gateway_bind(),
+            plain_bind: default_plain_gateway_bind(),
+            tls_bind: default_tls_gateway_bind(),
+            h3_bind: default_tls_gateway_bind(),
             request_timeout_ms: default_request_timeout_ms(),
             allow_insecure_upstreams: false,
             tls: TlsConfig::default(),
@@ -947,6 +962,15 @@ impl Default for AdminConfig {
             password: default_admin_password(),
             expose_config: default_true(),
             enable_write_ops: default_true(),
+        }
+    }
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            path: default_monitoring_path(),
         }
     }
 }
@@ -1154,12 +1178,12 @@ fn default_filter_for_level(level: LogLevel) -> String {
     }
 }
 
-fn default_gateway_bind() -> String {
-    format!("0.0.0.0:{DEFAULT_PORT}")
+fn default_plain_gateway_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_HTTP_PORT}")
 }
 
-fn default_plain_bind() -> String {
-    format!("0.0.0.0:{DEFAULT_HTTP_PORT}")
+fn default_tls_gateway_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_HTTPS_PORT}")
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -1306,6 +1330,10 @@ fn default_stream_peek_timeout_ms() -> u64 {
 
 fn default_admin_bind() -> String {
     "127.0.0.1:7777".to_string()
+}
+
+fn default_monitoring_path() -> String {
+    "/metrics".to_string()
 }
 
 fn default_admin_username() -> String {
@@ -1568,5 +1596,25 @@ mod tests {
         config.admin.username = "ops-admin".to_string();
         config.admin.password = "super-secret-password".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn default_ports_are_nginx_and_caddy_replacement_ports() {
+        let config = GatewayConfig::default();
+        assert_eq!(config.http.plain_bind, "0.0.0.0:80");
+        assert_eq!(config.http.tls_bind, "0.0.0.0:443");
+        assert_eq!(config.http.h3_bind, "0.0.0.0:443");
+        assert_eq!(config.admin.bind, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn monitoring_path_is_configurable_and_validated() {
+        let mut config = GatewayConfig::default();
+        assert_eq!(config.monitoring.path, "/metrics");
+        config.monitoring.path = "metrics".to_string();
+        let error = config
+            .validate()
+            .expect_err("expected invalid monitoring path");
+        assert!(error.to_string().contains("monitoring.path"));
     }
 }

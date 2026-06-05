@@ -1,5 +1,8 @@
 name: ci
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   push:
     branches:
@@ -24,6 +27,13 @@ jobs:
 
       - name: Lint GitHub Actions workflows
         run: actionlint
+
+      - name: Validate changelog entry
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          grep -q "^## v${version} " CHANGELOG.md
 
       - uses: dtolnay/rust-toolchain@stable
         with:

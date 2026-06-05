@@ -11,6 +11,8 @@ use crate::config::{GatewayConfig, DEFAULT_CONFIG_FILE_NAME, DEFAULT_SCRIPT_FILE
 
 const SERVICE_NAME: &str = "proxysss";
 const LAUNCH_AGENT_LABEL: &str = "com.neko233.proxysss";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub fn resolve_run_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = config {
@@ -231,19 +233,23 @@ pub fn service_status() -> Result<()> {
 }
 
 fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> {
-    let task_command = format!(
-        "\"{}\" run --config \"{}\"",
-        executable.display(),
-        config_path.display()
-    );
+    let launcher_path = write_windows_hidden_launcher(executable, config_path)?;
+    let task_command = format!("wscript.exe //B //Nologo \"{}\"", launcher_path.display());
+
+    if install_windows_run_key(&task_command).is_ok() {
+        let _ = run_command(
+            Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]),
+            "delete stale windows scheduled task",
+        );
+        return start_windows_command(executable, config_path);
+    }
+
     let scheduled_task = run_command(
         Command::new("schtasks").args([
             "/Create",
             "/F",
             "/SC",
             "ONLOGON",
-            "/RL",
-            "HIGHEST",
             "/TN",
             SERVICE_NAME,
             "/TR",
@@ -256,8 +262,9 @@ fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> 
         return start_windows_service();
     }
 
-    install_windows_run_key(&task_command)?;
-    start_windows_command(executable, config_path)
+    Err(anyhow!(
+        "failed to install windows auto-start entry using HKCU Run or Scheduled Tasks"
+    ))
 }
 
 fn uninstall_windows_service() -> Result<()> {
@@ -284,15 +291,6 @@ fn uninstall_windows_service() -> Result<()> {
 }
 
 fn start_windows_service() -> Result<()> {
-    if run_command(
-        Command::new("schtasks").args(["/Run", "/TN", SERVICE_NAME]),
-        "run windows scheduled task",
-    )
-    .is_ok()
-    {
-        return Ok(());
-    }
-
     let current_exe = env::current_exe().context("failed to resolve current executable")?;
     let config_path = resolve_run_config_path(None)?;
     start_windows_command(&current_exe, &config_path)
@@ -363,12 +361,56 @@ fn delete_windows_run_key() -> Result<()> {
 }
 
 fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
-    Command::new(executable)
-        .args(["run", "--config", &config_path.display().to_string()])
+    let mut command = Command::new(executable);
+    command.args(["run", "--config", &config_path.display().to_string()]);
+    configure_hidden_windows_process(&mut command);
+    command
         .spawn()
         .with_context(|| format!("failed to start {}", executable.display()))?;
     Ok(())
 }
+
+#[cfg(windows)]
+fn write_windows_hidden_launcher(executable: &Path, config_path: &Path) -> Result<PathBuf> {
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent: {}", config_path.display()))?;
+    let launcher_path = dir.join("proxysss-start.vbs");
+    let working_dir = dir.display().to_string();
+    let run_command = format!(
+        "\"{}\" run --config \"{}\"",
+        executable.display(),
+        config_path.display()
+    );
+    let script = format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nshell.Run \"{}\", 0, False\r\n",
+        vbs_escape(&working_dir),
+        vbs_escape(&run_command)
+    );
+    fs::write(&launcher_path, script)
+        .with_context(|| format!("failed writing {}", launcher_path.display()))?;
+    Ok(launcher_path)
+}
+
+#[cfg(windows)]
+fn vbs_escape(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+#[cfg(not(windows))]
+fn write_windows_hidden_launcher(_executable: &Path, _config_path: &Path) -> Result<PathBuf> {
+    Err(anyhow!("windows launcher is only available on windows"))
+}
+
+#[cfg(windows)]
+fn configure_hidden_windows_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_hidden_windows_process(_command: &mut Command) {}
 
 fn install_linux_service(executable: &Path, config_path: &Path, working_dir: &Path) -> Result<()> {
     let unit_path = linux_service_path()?;
