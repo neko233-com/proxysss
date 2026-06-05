@@ -41,6 +41,12 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 | Monitor GitHub Actions | `skills/gh-cli/SKILL.md` | Inspect CI/release runs, logs, reruns, release assets |
 | Edit workflow YAML | `.github/skills/github-actions/SKILL.md` | Fix or extend `.github/workflows/*` locally |
 
+### Mandatory agent rules
+
+- **GitHub Actions / release work must use `skills/gh-cli/SKILL.md`.** Do not guess workflow status from memory or stale logs. Always confirm with `gh run list`, `gh run view`, `gh run watch`, and `gh release view` before reporting success or failure.
+- **Workflow JavaScript actions must target Node.js 24 LTS or newer.** Use `actions/upload-artifact@v6` and `actions/download-artifact@v6` (or later). Do not add `actions/*-artifact@v4` or other Node 20 actions without upgrading.
+- **Release tags require a matching changelog section on the same commit.** Before pushing `vX.Y.Z`, ensure `CHANGELOG.md` contains `## vX.Y.Z` and `Cargo.toml` `version` matches. CI validates this; `release.yml` publish fails if the section is missing.
+
 One-click bootstrap for autonomous agents:
 
 - `skills/proxysss-install/SKILL.md`

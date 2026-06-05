@@ -27,6 +27,7 @@ user-invocable: true
    - `cargo test --workspace --all-targets`
 3. Prefer minimal workflow changes:
    - keep `actions/checkout` current
+   - use `actions/upload-artifact@v6` and `actions/download-artifact@v6` (Node.js 24 LTS); never add v4 artifact actions
    - use supported runner labels
    - pin third-party tool download versions when practical
 4. After edits, rerun `actionlint` and the narrow Rust checks affected by the workflow.

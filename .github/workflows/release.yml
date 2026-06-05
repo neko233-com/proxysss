@@ -1,8 +1,5 @@
 name: release
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 permissions:
   contents: write
 
@@ -74,7 +71,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -87,20 +84,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: dist
+          merge-multiple: true
 
       - name: Extract current changelog
         shell: bash
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          if ! grep -Eq "^## ${tag}( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md is missing a section heading for ${tag}" >&2
+            echo "Add: ## ${tag} - YYYY-MM-DD" >&2
+            exit 1
+          fi
           awk -v tag="$tag" '
-            $0 ~ "^## " {
-              if (seen) { exit }
-              if ($2 == tag) { seen=1; print; next }
-            }
-            seen { print }
+            $0 ~ "^## " tag "( |$)" { found=1 }
+            found { print }
+            found && $0 ~ "^## " && $0 !~ "^## " tag "( |$)" { exit }
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
 
@@ -108,4 +110,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: RELEASE_NOTES.md
-          files: dist/**
+          files: dist/**/*

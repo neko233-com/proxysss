@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1 - 2026-06-05
+
+- Fixed release publish job changelog extraction so tagged releases always find `CHANGELOG.md` sections.
+- Upgraded GitHub Actions artifact steps to `upload-artifact@v6` / `download-artifact@v6` (Node.js 24 LTS runtime).
+- Required agents to monitor CI/release through `skills/gh-cli/SKILL.md` and documented the rule in `AGENTS.md`.
+- Split backend lab (`examples/lab/`) from proxysss default install paths (`examples/lab-proxysss/`).
+
 ## v0.2.0 - 2026-06-05
 
 - Positioned proxysss as an nginx-class general gateway with agent-first CLI (`config explain`, `nginx-parity`, `reload-plan`, etc.).

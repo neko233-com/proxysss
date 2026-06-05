@@ -71,7 +71,17 @@ Verify all six assets exist:
 - `proxysss-darwin-amd64`
 - `proxysss-darwin-arm64`
 
-If `publish` fails on `Extract current changelog`, add a `## vX.Y.Z` section to `CHANGELOG.md` and re-tag or rerun publish.
+If `publish` fails on `Extract current changelog`, the tagged commit is missing `## vX.Y.Z` in `CHANGELOG.md`. Fix the changelog on `main`, bump version if needed, commit, then push a **new** tag on that commit (do not rely on rerunning an old tag).
+
+## Release Checklist (agents)
+
+1. Bump `Cargo.toml` `version` and add `## vX.Y.Z - YYYY-MM-DD` to `CHANGELOG.md`.
+2. Push to `main` and wait for green `ci` (`gh run watch` on the latest CI run).
+3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. Watch release: `gh run list -R neko233-com/proxysss --workflow=release.yml --limit 1` then `gh run watch <id> --exit-status`.
+5. Confirm assets: `gh release view vX.Y.Z -R neko233-com/proxysss`.
+
+Workflows use `upload-artifact@v6` / `download-artifact@v6` (Node.js 24 LTS). Do not downgrade to v4.
 
 ## Rerun And Repair
 
