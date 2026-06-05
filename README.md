@@ -19,7 +19,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 - 亲和路由：基于 playerId/uid/pid 稳定选路
 - 管理端：内置 admin API（可关闭）
 - 配置热重载：配置文件变更后自动校验并重载
-- TLS 模式：self_signed / manual / acme_external
+- TLS 模式：self_signed / manual / acme_external，以及 proxysss YAML 风格 `http.tls.auto_https`
 - 显式子配置：通过 `include.enabled` + `include.files` 声明子配置，不自动扫目录
 - 扩展服务：内建 `services.static_sites` 静态文件服务、`services.ftp` TCP 透传、内建 `services.webdav` 运行时
 - 热重载：配置、显式 include、主扩展脚本、自动加载插件脚本均参与热重载 fingerprint
@@ -158,11 +158,11 @@ bash ./scripts/install.sh v0.1.0
 
 | 产品 | 层级定位 | HTTP/HTTPS | HTTP/3 | TCP/UDP/L4 | 自动 HTTPS | 配置与热重载 | 更适合的场景 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| proxysss | nginx 同级通用网关 + TS/JS 扩展 hooks | HTTP/1.1、HTTPS、HTTP/2、WebSocket | 是 | TCP/UDP、FTP passthrough、WebDAV、静态/反代 | self_signed / manual / acme_external；目标是继续靠近 Caddy 式自动证书体验 | YAML/JSON，显式 include，`config explain/routes/reload-plan/nginx-parity`，配置/脚本/插件热重载 | agent 接管、nginx 替代、通用入口、可脚本扩展 |
+| proxysss | nginx 同级通用网关 + TS/JS 扩展 hooks | HTTP/1.1、HTTPS、HTTP/2、WebSocket | 是 | TCP/UDP、FTP passthrough、WebDAV、静态/反代 | `http.tls.auto_https`，proxysss YAML 风格自动证书入口 | YAML/JSON，显式 include，`config explain/routes/reload-plan/nginx-parity`，配置/脚本/插件热重载 | agent 接管、nginx 替代、通用入口、可脚本扩展 |
 | Nginx | 通用 Web/server gateway | 极成熟 | 部分支持，依赖版本/构建/配置 | stream 模块支持 TCP/UDP | 通常配 Certbot/acme.sh 等外部工具 | 指令体系强但学习成本高，reload 成熟 | 传统 Web 入口、静态资源、反向代理 |
 | LVS | Linux 内核级 L4 负载均衡 | 不处理 HTTP 语义 | 否 | 极强，四层转发/DR/NAT/TUN | 不处理 TLS 证书 | 依赖内核/IPVS/keepalived 等运维体系 | 超高性能四层 VIP、数据中心入口 |
 | HAProxy | 高性能 L4/L7 负载均衡 | 极强 | 有限/前沿 | 极强 | 可终止 TLS，但证书自动化通常接外部工具 | 配置强大，reload/Runtime API 成熟 | 高性能负载均衡、复杂 L4/L7 调度 |
-| Caddy | 通用 Web server / reverse proxy | 强 | 是 | 核心偏 HTTP，L4 需插件/扩展 | 默认自动签发、续期证书，并自动 HTTP->HTTPS | Caddyfile 极简，reload 简单 | 快速 HTTPS、个人/中小型服务、证书省心 |
+| Caddy | 通用 Web server / reverse proxy | 强 | 是 | 核心偏 HTTP，L4 需插件/扩展 | 默认自动签发、续期证书，并自动 HTTP->HTTPS | 声明式配置极简，reload 简单 | 快速 HTTPS、个人/中小型服务、证书省心 |
 | Envoy | 云原生代理/数据面 | 强 | 是 | 强 | 通常由控制面/证书系统管理 | xDS 强，配置复杂 | Service Mesh、多集群治理、复杂过滤器 |
 | Traefik | 云原生入口控制器 | 强 | 是 | HTTP 强，TCP/UDP 可用 | ACME 自动证书集成成熟 | 动态配置，擅长 Docker/K8s 自动发现 | 容器平台入口、Kubernetes Ingress |
 
@@ -171,7 +171,7 @@ bash ./scripts/install.sh v0.1.0
 - 如果你要一个默认端口、通用入口职责和 nginx 对齐，同时希望配置、热重载和 CLI 更适合 agent 接管，优先选 proxysss。
 - 如果你只需要极致四层 VIP 转发，LVS 仍然是经典选择。
 - 如果你需要成熟高性能 L4/L7 负载均衡规则，HAProxy 仍然是强项。
-- 如果你最快想把一个域名转到后端并自动拿到 SSL，Caddy 是极省心的参考实现。
+- 如果你最快想把一个域名转到后端并自动拿到 SSL，proxysss 使用 `http.tls.auto_https`，不是其他产品的配置格式。
 - 如果你需要把会话、设备 ID 或租户等业务逻辑接入路由层，把它放在 proxysss 脚本/插件里，而不是核心网关里。
 - 如果你已经在 Kubernetes 或 Service Mesh 体系里，Traefik 或 Envoy 更贴合现有控制面。
 
@@ -202,39 +202,11 @@ proxysss config explain
 proxysss config capabilities
 ```
 
-## 超快自动 SSL 配置
+## proxysss 自动 SSL 配置
 
-Caddy 的 Automatic HTTPS 是 proxysss 证书体验要追赶的标杆：当配置里出现公开域名、DNS A/AAAA 已指向服务器、80/443 对外开放、Caddy 有权限绑定端口并且数据目录可持久化时，Caddy 会自动向 Let's Encrypt/ZeroSSL 等 ACME CA 申请证书、自动续期，并自动把 HTTP 跳转到 HTTPS。官方说明见 [Automatic HTTPS](https://caddyserver.com/docs/automatic-https) 和 [Reverse proxy quick-start](https://caddyserver.com/docs/quick-starts/reverse-proxy)。
+目标效果：像 Caddy 那样省心地自动拿证书和续期，但配置风格必须是 proxysss 自己的 YAML，不搬其他产品的配置格式。公网服务器只需要写域名、邮箱和 upstream，proxysss 会把 `http.tls.auto_https` 展开到 ACME 签发/续期流程。
 
-最快的 Caddy 反代写法：
-
-```bash
-# 后端服务监听 127.0.0.1:9000
-caddy reverse-proxy --from example.com --to 127.0.0.1:9000
-```
-
-等价 Caddyfile：
-
-```caddyfile
-example.com {
-  reverse_proxy 127.0.0.1:9000
-}
-```
-
-服务器上线检查清单：
-
-- 域名 `example.com` 的 A/AAAA 记录已经指向服务器公网 IP。
-- 云厂商安全组、防火墙、路由器都放行 `80/tcp` 和 `443/tcp`。
-- Caddy 能绑定 80/443；Linux 可用 `sudo` 运行，或给二进制加能力：
-
-```bash
-sudo setcap cap_net_bind_service=+ep "$(which caddy)"
-```
-
-- Caddy 的 data 目录必须持久化，容器部署时不要把证书缓存放到临时文件系统。
-- 测试时不要频繁打正式 ACME CA；需要反复试配置时用 staging，避免触发证书签发限流。
-
-proxysss 当前对应做法：
+最小生产配置：
 
 ```yaml
 http:
@@ -242,14 +214,21 @@ http:
   tls_bind: 0.0.0.0:443
   h3_bind: 0.0.0.0:443
   tls:
-    mode: acme_external
-    server_name: example.com
-    acme:
-      client: acme.sh
+    auto_https:
+      enabled: true
+      domains: [example.com, www.example.com]
       email: admin@example.com
-      domains: [example.com]
+      production: true
+      client: acme.sh
       challenge: tls_alpn01
-      directory_production: true
+
+services:
+  reverse_proxy:
+    routes:
+      - name: app
+        hosts: [example.com, www.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:9000
 ```
 
 推荐上线顺序：
@@ -262,7 +241,20 @@ proxysss config reload-plan --config ./proxysss.yaml
 proxysss run --config ./proxysss.yaml
 ```
 
-`acme_external` 适合生产自动证书路线；`self_signed` 只适合开发或内网。后续 proxysss 会继续把 ACME 自动化做得更接近 Caddy 的“写域名就自动 HTTPS”体验。
+服务器上线检查清单：
+
+- 域名 `example.com` / `www.example.com` 的 A/AAAA 记录已经指向服务器公网 IP。
+- 云厂商安全组、防火墙、路由器都放行 `80/tcp` 和 `443/tcp`。
+- proxysss 能绑定 80/443；Linux 可用 root/service 运行，或给二进制加能力：
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$(which proxysss)"
+```
+
+- `auto_https.production: false` 用于测试，避免频繁打正式 ACME CA 触发限流；确认无误后再改成 `true`。
+- 证书和 ACME 缓存目录必须持久化，容器部署时不要放到临时文件系统。
+
+`http.tls.auto_https` 是 proxysss 风格的高层入口；底层会映射到现有 ACME 外部客户端签发/续期流程。`self_signed` 只适合开发或内网。
 
 显式子配置示例：
 

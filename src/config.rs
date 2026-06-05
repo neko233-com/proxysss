@@ -119,6 +119,8 @@ pub struct HttpConfig {
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
+    #[serde(default)]
+    pub auto_https: AutoHttpsConfig,
     #[serde(default = "default_cert_path")]
     pub cert_path: PathBuf,
     #[serde(default = "default_key_path")]
@@ -129,6 +131,26 @@ pub struct TlsConfig {
     pub server_name: String,
     #[serde(default)]
     pub acme: AcmeExternalConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoHttpsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub production: bool,
+    #[serde(default = "default_acme_client")]
+    pub client: String,
+    #[serde(default)]
+    pub challenge: AcmeChallengeType,
+    #[serde(default = "default_acme_renew_hours")]
+    pub renew_interval_hours: u64,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -704,6 +726,32 @@ impl GatewayConfig {
                 }
             }
             TlsMode::AcmeExternal => {
+                if self.http.tls.auto_https.enabled {
+                    if self.http.tls.auto_https.domains.is_empty() {
+                        errors.push(
+                            "http.tls.auto_https.domains cannot be empty when auto_https.enabled=true"
+                                .to_string(),
+                        );
+                    }
+                    if self.http.tls.auto_https.email.trim().is_empty() {
+                        errors.push(
+                            "http.tls.auto_https.email cannot be empty when auto_https.enabled=true"
+                                .to_string(),
+                        );
+                    }
+                    if self.http.tls.auto_https.client.trim().is_empty() {
+                        errors.push(
+                            "http.tls.auto_https.client cannot be empty when auto_https.enabled=true"
+                                .to_string(),
+                        );
+                    }
+                    if self.http.tls.auto_https.renew_interval_hours == 0 {
+                        errors.push(
+                            "http.tls.auto_https.renew_interval_hours must be greater than 0"
+                                .to_string(),
+                        );
+                    }
+                }
                 if self.http.tls.acme.domains.is_empty() {
                     errors.push(
                         "http.tls.acme.domains cannot be empty when mode is acme_external"
@@ -779,6 +827,7 @@ impl GatewayConfig {
     fn normalize(&mut self, root_dir: &Path) {
         let root_dir = normalize_root_dir(root_dir);
         self.root_dir = root_dir.clone();
+        self.apply_auto_https();
 
         if self.logging.filter.trim().is_empty() {
             self.logging.filter = default_filter_for_level(self.logging.level);
@@ -803,6 +852,25 @@ impl GatewayConfig {
 
         normalize_vec_lowercase(&mut self.affinity.http.header_keys);
         normalize_vec_lowercase(&mut self.logging.redact_headers);
+    }
+
+    fn apply_auto_https(&mut self) {
+        if !self.http.tls.auto_https.enabled {
+            return;
+        }
+
+        self.http.tls.mode = TlsMode::AcmeExternal;
+        self.http.tls.acme.domains = self.http.tls.auto_https.domains.clone();
+        self.http.tls.acme.email = self.http.tls.auto_https.email.clone();
+        self.http.tls.acme.client = self.http.tls.auto_https.client.clone();
+        self.http.tls.acme.challenge = self.http.tls.auto_https.challenge;
+        self.http.tls.acme.directory_production = self.http.tls.auto_https.production;
+        self.http.tls.acme.renew_interval_hours = self.http.tls.auto_https.renew_interval_hours;
+        self.http.tls.acme.extra_args = self.http.tls.auto_https.extra_args.clone();
+
+        if let Some(primary_domain) = self.http.tls.auto_https.domains.first() {
+            self.http.tls.server_name = primary_domain.clone();
+        }
     }
 }
 
@@ -862,11 +930,27 @@ impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             mode: TlsMode::default(),
+            auto_https: AutoHttpsConfig::default(),
             cert_path: default_cert_path(),
             key_path: default_key_path(),
             generate_self_signed_if_missing: default_true(),
             server_name: default_server_name(),
             acme: AcmeExternalConfig::default(),
+        }
+    }
+}
+
+impl Default for AutoHttpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domains: Vec::new(),
+            email: String::new(),
+            production: false,
+            client: default_acme_client(),
+            challenge: AcmeChallengeType::default(),
+            renew_interval_hours: default_acme_renew_hours(),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -1521,6 +1605,43 @@ mod tests {
         assert_eq!(config.logging.filter, "warn,proxysss=warn");
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn auto_https_expands_to_acme_external_config() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-auto-https-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "http:\n  tls:\n    auto_https:\n      enabled: true\n      domains: [example.com, www.example.com]\n      email: admin@example.com\n      production: true\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeExternal);
+        assert_eq!(config.http.tls.server_name, "example.com");
+        assert_eq!(
+            config.http.tls.acme.domains,
+            vec!["example.com".to_string(), "www.example.com".to_string()]
+        );
+        assert_eq!(config.http.tls.acme.email, "admin@example.com");
+        assert!(config.http.tls.acme.directory_production);
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn auto_https_requires_domains_and_email() {
+        let mut config = GatewayConfig::default();
+        config.http.tls.auto_https.enabled = true;
+        config.apply_auto_https();
+
+        let error = config.validate().expect_err("expected invalid auto_https");
+        let message = error.to_string();
+        assert!(message.contains("http.tls.auto_https.domains"));
+        assert!(message.contains("http.tls.auto_https.email"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 ## v0.2.4 - 2026-06-05
 
 - Expanded README gateway comparison coverage for Nginx, LVS, HAProxy, Caddy, Envoy, Traefik, and proxysss.
-- Added a Caddy Automatic HTTPS quick-start and mapped the equivalent proxysss `acme_external` production SSL configuration.
+- Added proxysss-style `http.tls.auto_https` documentation for fast production SSL without copying another product's config syntax.
 - Recorded local HTTP benchmark results for the current release preparation workflow.
 
 ## v0.2.3 - 2026-06-05

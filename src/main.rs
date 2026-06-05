@@ -203,6 +203,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "debug/info/warn/error with info as default, debug reserved for internal diagnostics, file sinks at logs/access.log and logs/error.log",
     ),
     (
+        "auto https",
+        "proxysss YAML style http.tls.auto_https expands to ACME external certificate issue/renew",
+    ),
+    (
         "admin api/console",
         "supported on 127.0.0.1:7777 by default",
     ),
@@ -274,7 +278,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TLS certificates",
         status: ParityStatus::Partial,
-        evidence: "self_signed/manual/acme_external modes",
+        evidence: "self_signed/manual/acme_external modes plus proxysss YAML auto_https sugar",
         next_gap: "first-class multi-cert/SNI certificate selection",
     },
     NginxParityItem {
@@ -618,6 +622,16 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.logging.access_log,
         config.logging.access_log_path.display(),
         config.logging.error_log_path.display()
+    );
+    println!(
+        "auto https        : enabled={}, domains={}, production={}",
+        config.http.tls.auto_https.enabled,
+        if config.http.tls.auto_https.domains.is_empty() {
+            "[]".to_string()
+        } else {
+            config.http.tls.auto_https.domains.join(",")
+        },
+        config.http.tls.auto_https.production
     );
     println!(
         "reverse proxy     : routes={}",
@@ -1248,6 +1262,7 @@ mod tests {
             "explicit sub-config",
             "hot reload",
             "logging levels",
+            "auto https",
             "admin api/console",
             "agent install skill",
         ];
@@ -1322,6 +1337,13 @@ mod tests {
             .nth(1)
             .expect("restart section");
         assert!(restart_section.contains("logging.access_log_path/logging.error_log_path"));
+    }
+
+    #[test]
+    fn capability_matrix_mentions_auto_https() {
+        assert!(CAPABILITY_MATRIX
+            .iter()
+            .any(|(name, status)| *name == "auto https" && status.contains("auto_https")));
     }
 
     #[test]
