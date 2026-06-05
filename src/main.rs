@@ -5,14 +5,17 @@ mod gateway;
 mod install;
 mod script;
 
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use config::{GatewayConfig, LogFormat};
+use config::{GatewayConfig, LogFormat, LoggingConfig};
 use reqwest::Method;
+use serde::Serialize;
 use serde_json::json;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[derive(Parser, Debug)]
 #[command(name = "proxysss")]
@@ -60,6 +63,12 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
         format: ConfigOutputFormat,
     },
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
     Plugin {
         #[command(subcommand)]
         action: PluginCommands,
@@ -78,6 +87,24 @@ enum Commands {
 enum ConfigOutputFormat {
     Yaml,
     Json,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    Show {
+        #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
+        format: ConfigOutputFormat,
+    },
+    Includes,
+    WatchedScripts,
+    Routes,
+    ReloadPlan,
+    NginxParity {
+        #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
+        format: ConfigOutputFormat,
+    },
+    Explain,
+    Capabilities,
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,6 +144,145 @@ struct AdminClientContext {
     password: String,
 }
 
+const CAPABILITY_MATRIX: &[(&str, &str)] = &[
+    (
+        "http reverse proxy",
+        "built-in services.reverse_proxy routes with host/path matching, upstream pools, and strip_prefix",
+    ),
+    ("https/http2 termination", "supported"),
+    ("http3/quic", "supported"),
+    ("websocket/ws/wss", "supported"),
+    ("tcp stream proxy", "supported"),
+    ("udp stream proxy", "supported"),
+    (
+        "static files",
+        "built-in services.static_sites runtime for GET/HEAD, index files, and optional autoindex",
+    ),
+    ("ftp", "supported via services.ftp TCP passthrough"),
+    (
+        "webdav",
+        "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
+    ),
+    (
+        "explicit sub-config",
+        "supported via include.enabled + include.files",
+    ),
+    (
+        "hot reload",
+        "configuration, explicit includes, main script, and auto-loaded plugins are fingerprinted",
+    ),
+    (
+        "logging levels",
+        "debug/info/warn/error with info as default, debug reserved for internal diagnostics, file sinks at logs/access.log and logs/error.log",
+    ),
+    (
+        "admin api/console",
+        "supported on 127.0.0.1:7777 by default",
+    ),
+    (
+        "agent install skill",
+        "see skills/proxysss-install/SKILL.md",
+    ),
+];
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParityStatus {
+    Supported,
+    Partial,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct NginxParityItem {
+    capability: &'static str,
+    status: ParityStatus,
+    evidence: &'static str,
+    next_gap: &'static str,
+}
+
+const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
+    NginxParityItem {
+        capability: "default HTTP port 80",
+        status: ParityStatus::Supported,
+        evidence: "GatewayConfig default http.plain_bind=0.0.0.0:80",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "default HTTPS/HTTP3 port 443",
+        status: ParityStatus::Supported,
+        evidence: "GatewayConfig default http.tls_bind/http.h3_bind=0.0.0.0:443",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "declarative reverse proxy",
+        status: ParityStatus::Supported,
+        evidence: "services.reverse_proxy.routes with host/path/upstream pool matching",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "static file service",
+        status: ParityStatus::Supported,
+        evidence: "services.static_sites supports GET/HEAD, index files, autoindex",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "WebDAV",
+        status: ParityStatus::Supported,
+        evidence: "built-in OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "TCP/UDP stream proxy",
+        status: ParityStatus::Supported,
+        evidence: "tcp.listeners and udp.listeners with script/select_upstream_plan",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "FTP",
+        status: ParityStatus::Partial,
+        evidence: "services.ftp TCP passthrough listener",
+        next_gap: "native FTP control/passive data channel awareness",
+    },
+    NginxParityItem {
+        capability: "TLS certificates",
+        status: ParityStatus::Partial,
+        evidence: "self_signed/manual/acme_external modes",
+        next_gap: "first-class multi-cert/SNI certificate selection",
+    },
+    NginxParityItem {
+        capability: "access/error logging",
+        status: ParityStatus::Supported,
+        evidence:
+            "access tracing, debug/info/warn/error levels, logs/access.log and logs/error.log sinks",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "hot reload",
+        status: ParityStatus::Supported,
+        evidence: "reload fingerprint covers config, includes, main script, auto-loaded plugins",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "compression",
+        status: ParityStatus::Missing,
+        evidence: "no gzip/brotli response filter yet",
+        next_gap: "add configurable gzip/brotli response compression",
+    },
+    NginxParityItem {
+        capability: "cache/proxy cache",
+        status: ParityStatus::Missing,
+        evidence: "no on-disk or memory proxy cache yet",
+        next_gap: "add proxy cache zones and cache key policy",
+    },
+    NginxParityItem {
+        capability: "rate limiting",
+        status: ParityStatus::Partial,
+        evidence: "services.rate_limit.http fixed-window request limiter",
+        next_gap: "add connection limiting and shared-zone style policies",
+    },
+];
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -127,10 +293,7 @@ async fn main() -> Result<()> {
             let config_path = install::resolve_run_config_path(config)?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
-            init_logging(
-                &gateway_config.logging.filter,
-                gateway_config.logging.format,
-            );
+            init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
             emit_startup_banner(&config_path, &gateway_config);
             for warning in gateway_config.warnings() {
                 tracing::warn!(warning, "configuration warning");
@@ -143,7 +306,7 @@ async fn main() -> Result<()> {
                 .await
         }
         Commands::CheckConfig { config } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
 
             let config_path = install::resolve_run_config_path(config)?;
             let gateway_config = GatewayConfig::load(&config_path)?;
@@ -154,41 +317,41 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Init { dir, overwrite } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
             install::init_layout(dir, overwrite)
         }
         Commands::CertBootstrap { dir, overwrite } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
             install::bootstrap_certs_in_dir(dir, overwrite)
         }
         Commands::Service { action } => match action {
             ServiceCommands::Install { config } => {
-                init_logging("info,proxysss=info", LogFormat::Plain);
+                init_cli_logging();
                 install::install_service(config)
             }
             ServiceCommands::Uninstall => {
-                init_logging("info,proxysss=info", LogFormat::Plain);
+                init_cli_logging();
                 install::uninstall_service()
             }
             ServiceCommands::Start => {
-                init_logging("info,proxysss=info", LogFormat::Plain);
+                init_cli_logging();
                 install::start_service()
             }
             ServiceCommands::Stop => {
-                init_logging("info,proxysss=info", LogFormat::Plain);
+                init_cli_logging();
                 install::stop_service()
             }
             ServiceCommands::Status => {
-                init_logging("info,proxysss=info", LogFormat::Plain);
+                init_cli_logging();
                 install::service_status()
             }
         },
         Commands::Bench { protocol } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
             bench::run(protocol).await
         }
         Commands::Demo { kind } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
             demo::run(kind).await
         }
         Commands::PrintDefaultConfig { format } => {
@@ -202,6 +365,92 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Config { action, config } => {
+            init_cli_logging();
+            match action {
+                ConfigCommands::Show { format } => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    match format {
+                        ConfigOutputFormat::Yaml => {
+                            print!("{}", serde_yaml::to_string(&gateway_config)?)
+                        }
+                        ConfigOutputFormat::Json => {
+                            print!("{}", serde_json::to_string_pretty(&gateway_config)?)
+                        }
+                    }
+                    Ok(())
+                }
+                ConfigCommands::Includes => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    println!("config: {}", config_path.display());
+                    println!("include.enabled: {}", gateway_config.include.enabled);
+                    println!("include.required: {}", gateway_config.include.required);
+                    if gateway_config.include.files.is_empty() {
+                        println!("include.files: []");
+                    } else {
+                        println!("include.files:");
+                        for file in &gateway_config.include.files {
+                            println!(" - {}", file.display());
+                        }
+                    }
+                    Ok(())
+                }
+                ConfigCommands::WatchedScripts => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    let paths = gateway::watched_script_paths(&gateway_config);
+                    println!("config: {}", config_path.display());
+                    println!(
+                        "hot_reload.enabled: {}",
+                        gateway_config.runtime.hot_reload.enabled
+                    );
+                    if paths.is_empty() {
+                        println!("watched_scripts: []");
+                    } else {
+                        println!("watched_scripts:");
+                        for path in paths {
+                            println!(" - {}", path.display());
+                        }
+                    }
+                    Ok(())
+                }
+                ConfigCommands::Routes => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    print!("{}", render_route_topology(&gateway_config));
+                    Ok(())
+                }
+                ConfigCommands::ReloadPlan => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    print!("{}", render_reload_plan(&gateway_config));
+                    Ok(())
+                }
+                ConfigCommands::NginxParity { format } => {
+                    match format {
+                        ConfigOutputFormat::Yaml => {
+                            print!("{}", serde_yaml::to_string(NGINX_PARITY_MATRIX)?)
+                        }
+                        ConfigOutputFormat::Json => {
+                            print!("{}", serde_json::to_string_pretty(NGINX_PARITY_MATRIX)?)
+                        }
+                    }
+                    Ok(())
+                }
+                ConfigCommands::Explain => {
+                    let config_path = install::resolve_run_config_path(config)?;
+                    let gateway_config = GatewayConfig::load(&config_path)?;
+                    print_config_explain(&config_path, &gateway_config);
+                    Ok(())
+                }
+                ConfigCommands::Capabilities => {
+                    print_capabilities();
+                    Ok(())
+                }
+            }
+        }
         Commands::Plugin {
             action,
             config,
@@ -209,7 +458,7 @@ async fn main() -> Result<()> {
             username,
             password,
         } => {
-            init_logging("info,proxysss=info", LogFormat::Plain);
+            init_cli_logging();
             let admin = resolve_admin_context(config, admin_url, username, password)?;
             let client = reqwest::Client::new();
 
@@ -261,6 +510,228 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
+    println!("proxysss config summary");
+    println!("config path       : {}", config_path.display());
+    println!(
+        "http plain        : {}",
+        blank_as_disabled(&config.http.plain_bind)
+    );
+    println!(
+        "https/http2       : {}",
+        blank_as_disabled(&config.http.tls_bind)
+    );
+    println!(
+        "http3             : {}",
+        blank_as_disabled(&config.http.h3_bind)
+    );
+    println!(
+        "admin             : {}",
+        if config.admin.enabled {
+            &config.admin.bind
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "include           : enabled={}, required={}, files={}",
+        config.include.enabled,
+        config.include.required,
+        config.include.files.len()
+    );
+    println!(
+        "tcp listeners     : {}",
+        config.tcp.listeners.len() + usize::from(config.services.ftp.enabled)
+    );
+    println!("udp listeners     : {}", config.udp.listeners.len());
+    println!(
+        "logging           : level={:?}, format={:?}, access_log={}, access_log_path={}, error_log_path={}",
+        config.logging.level,
+        config.logging.format,
+        config.logging.access_log,
+        config.logging.access_log_path.display(),
+        config.logging.error_log_path.display()
+    );
+    println!(
+        "reverse proxy     : routes={}",
+        config.services.reverse_proxy.routes.len()
+    );
+    println!(
+        "rate limit        : http.enabled={}, requests={}, window_ms={}, burst={}",
+        config.services.rate_limit.http.enabled,
+        config.services.rate_limit.http.requests,
+        config.services.rate_limit.http.window_ms,
+        config.services.rate_limit.http.burst
+    );
+    println!("static sites      : {}", config.services.static_sites.len());
+    println!(
+        "webdav            : enabled={}, prefix={}, root={}",
+        config.services.webdav.enabled,
+        config.services.webdav.path_prefix,
+        config.services.webdav.root.display()
+    );
+    println!(
+        "ftp               : enabled={}, bind={}, upstream={}",
+        config.services.ftp.enabled, config.services.ftp.bind, config.services.ftp.upstream
+    );
+    println!(
+        "script            : {} {}",
+        config.script.command,
+        config.script.args.join(" ")
+    );
+}
+
+fn render_route_topology(config: &GatewayConfig) -> String {
+    let mut output = String::new();
+    output.push_str("proxysss route topology\n");
+
+    output.push_str("[http.listeners]\n");
+    output.push_str(&format!(
+        "plain={}\n",
+        blank_as_disabled(&config.http.plain_bind)
+    ));
+    output.push_str(&format!(
+        "tls={}\n",
+        blank_as_disabled(&config.http.tls_bind)
+    ));
+    output.push_str(&format!("h3={}\n", blank_as_disabled(&config.http.h3_bind)));
+
+    output.push_str("[reverse_proxy]\n");
+    if config.services.reverse_proxy.routes.is_empty() {
+        output.push_str("none\n");
+    } else {
+        for route in &config.services.reverse_proxy.routes {
+            output.push_str(&format!(
+                "{} hosts={} path={} upstream={} upstreams={} strip_prefix={}\n",
+                route.name,
+                if route.hosts.is_empty() {
+                    "*".to_string()
+                } else {
+                    route.hosts.join(",")
+                },
+                route.path_prefix,
+                route.upstream,
+                route.upstreams.len(),
+                route.strip_prefix
+            ));
+        }
+    }
+
+    output.push_str("[rate_limit]\n");
+    output.push_str(&format!(
+        "http enabled={} requests={} window_ms={} burst={} status={}\n",
+        config.services.rate_limit.http.enabled,
+        config.services.rate_limit.http.requests,
+        config.services.rate_limit.http.window_ms,
+        config.services.rate_limit.http.burst,
+        config.services.rate_limit.http.status
+    ));
+
+    output.push_str("[static_sites]\n");
+    if config.services.static_sites.is_empty() {
+        output.push_str("none\n");
+    } else {
+        for site in &config.services.static_sites {
+            output.push_str(&format!(
+                "{} path={} root={} autoindex={}\n",
+                site.name,
+                site.path_prefix,
+                site.root.display(),
+                site.autoindex
+            ));
+        }
+    }
+
+    output.push_str("[webdav]\n");
+    if config.services.webdav.enabled {
+        output.push_str(&format!(
+            "path={} root={} allow_write={}\n",
+            config.services.webdav.path_prefix,
+            config.services.webdav.root.display(),
+            config.services.webdav.allow_write
+        ));
+    } else {
+        output.push_str("disabled\n");
+    }
+
+    output.push_str("[tcp]\n");
+    if config.tcp.listeners.is_empty() && !config.services.ftp.enabled {
+        output.push_str("none\n");
+    } else {
+        for listener in &config.tcp.listeners {
+            output.push_str(&format!("{} bind={}\n", listener.name, listener.bind));
+        }
+        if config.services.ftp.enabled {
+            output.push_str(&format!(
+                "ftp bind={} upstream={}\n",
+                config.services.ftp.bind, config.services.ftp.upstream
+            ));
+        }
+    }
+
+    output.push_str("[udp]\n");
+    if config.udp.listeners.is_empty() {
+        output.push_str("none\n");
+    } else {
+        for listener in &config.udp.listeners {
+            output.push_str(&format!("{} bind={}\n", listener.name, listener.bind));
+        }
+    }
+
+    output
+}
+
+fn render_reload_plan(config: &GatewayConfig) -> String {
+    let mut output = String::new();
+    output.push_str("proxysss reload plan\n");
+    output.push_str(&format!(
+        "hot_reload.enabled={}\n",
+        config.runtime.hot_reload.enabled
+    ));
+    output.push_str(&format!(
+        "hot_reload.interval_ms={}\n",
+        config.runtime.hot_reload.interval_ms
+    ));
+    output.push_str("[hot_reload]\n");
+    output.push_str("configuration values except listener identity\n");
+    output.push_str("explicit include files from include.files\n");
+    output.push_str("main extension script from script.args\n");
+    output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
+    output.push_str("reverse_proxy routes\n");
+    output.push_str("static_sites\n");
+    output.push_str("webdav settings\n");
+    output.push_str("ftp upstream when services.ftp listener identity is unchanged\n");
+    output.push_str("logging.access_log_path/logging.error_log_path\n");
+
+    output.push_str("[restart_required]\n");
+    output.push_str("http.plain_bind/http.tls_bind/http.h3_bind\n");
+    output.push_str("admin.enabled/admin.bind\n");
+    output.push_str("tcp listener name/bind set\n");
+    output.push_str("udp listener name/bind set\n");
+    output.push_str("services.ftp.enabled/services.ftp.bind\n");
+    output.push_str("http.tls.mode\n");
+    output.push_str("logging.format/logging.filter/logging.level\n");
+
+    output
+}
+
+static LOG_GUARDS: OnceLock<Vec<tracing_appender::non_blocking::WorkerGuard>> = OnceLock::new();
+
+fn print_capabilities() {
+    println!("proxysss capability matrix");
+    for (name, status) in CAPABILITY_MATRIX {
+        println!("{name:<25}: {status}");
+    }
+}
+
+fn blank_as_disabled(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "disabled"
+    } else {
+        value
     }
 }
 
@@ -358,27 +829,177 @@ async fn admin_request_json(
     Ok(payload)
 }
 
-fn init_logging(filter: &str, format: LogFormat) {
-    match format {
-        LogFormat::Plain => {
-            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
+fn init_cli_logging() {
+    let logging = LoggingConfig {
+        access_log_path: PathBuf::new(),
+        error_log_path: PathBuf::new(),
+        ..LoggingConfig::default()
+    };
+    let _ = init_logging(&logging, Path::new("."));
+}
 
+fn init_logging(logging: &LoggingConfig, root_dir: &Path) -> Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logging.filter.as_str()));
+
+    let mut guards = Vec::new();
+    let use_access_file = logging.access_log && !logging.access_log_path.as_os_str().is_empty();
+    let use_error_file = !logging.error_log_path.as_os_str().is_empty();
+
+    let access_writer = if use_access_file {
+        Some(open_non_blocking_log_writer(
+            &logging.access_log_path,
+            root_dir,
+            &mut guards,
+        )?)
+    } else {
+        None
+    };
+    let error_writer = if use_error_file {
+        Some(open_non_blocking_log_writer(
+            &logging.error_log_path,
+            root_dir,
+            &mut guards,
+        )?)
+    } else {
+        None
+    };
+
+    let access_filter =
+        tracing_subscriber::filter::filter_fn(|metadata| metadata.target() == "access");
+    let error_filter = tracing_subscriber::filter::filter_fn(|metadata| {
+        metadata.level() == &tracing::Level::WARN || metadata.level() == &tracing::Level::ERROR
+    });
+
+    match (logging.format, access_writer, error_writer) {
+        (LogFormat::Plain, Some(access), Some(error)) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().compact())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(access)
+                        .with_filter(access_filter),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(error)
+                        .with_filter(error_filter),
+                )
+                .init();
+        }
+        (LogFormat::Plain, Some(access), None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().compact())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(access)
+                        .with_filter(access_filter),
+                )
+                .init();
+        }
+        (LogFormat::Plain, None, Some(error)) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().compact())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(error)
+                        .with_filter(error_filter),
+                )
+                .init();
+        }
+        (LogFormat::Plain, None, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().compact())
                 .init();
         }
-        LogFormat::Json => {
-            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
-
+        (LogFormat::Json, Some(access), Some(error)) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(access)
+                        .with_filter(access_filter),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(error)
+                        .with_filter(error_filter),
+                )
+                .init();
+        }
+        (LogFormat::Json, Some(access), None) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(access)
+                        .with_filter(access_filter),
+                )
+                .init();
+        }
+        (LogFormat::Json, None, Some(error)) => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().json())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(error)
+                        .with_filter(error_filter),
+                )
+                .init();
+        }
+        (LogFormat::Json, None, None) => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().json())
                 .init();
         }
     }
+
+    let _ = LOG_GUARDS.set(guards);
+    Ok(())
+}
+
+fn open_non_blocking_log_writer(
+    path: &Path,
+    root_dir: &Path,
+    guards: &mut Vec<tracing_appender::non_blocking::WorkerGuard>,
+) -> Result<tracing_appender::non_blocking::NonBlocking> {
+    let writer = open_log_writer(path, root_dir)?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(writer);
+    guards.push(guard);
+    Ok(non_blocking)
+}
+
+fn open_log_writer(path: &Path, root_dir: &Path) -> Result<std::fs::File> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root_dir.join(path)
+    };
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating log directory {}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved)
+        .with_context(|| format!("failed opening log file {}", resolved.display()))
 }
 
 fn emit_startup_banner(config_path: &std::path::Path, config: &GatewayConfig) {
@@ -442,4 +1063,135 @@ support : http / https / http3 / tcp / udp / ws / wss
         admin_bind = %admin_bind,
         "startup banner emitted"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_matrix_tracks_nginx_parity_surface() {
+        let required = [
+            "http reverse proxy",
+            "https/http2 termination",
+            "http3/quic",
+            "websocket/ws/wss",
+            "tcp stream proxy",
+            "udp stream proxy",
+            "static files",
+            "ftp",
+            "webdav",
+            "explicit sub-config",
+            "hot reload",
+            "logging levels",
+            "admin api/console",
+            "agent install skill",
+        ];
+
+        for item in required {
+            assert!(
+                CAPABILITY_MATRIX.iter().any(|(name, _)| *name == item),
+                "missing capability matrix item: {item}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_matrix_mentions_default_admin_port() {
+        let admin = CAPABILITY_MATRIX
+            .iter()
+            .find(|(name, _)| *name == "admin api/console")
+            .expect("admin capability exists");
+
+        assert!(admin.1.contains("7777"));
+    }
+
+    #[test]
+    fn route_topology_lists_agent_relevant_entries() {
+        let mut config = GatewayConfig::default();
+        config
+            .services
+            .reverse_proxy
+            .routes
+            .push(crate::config::ReverseProxyRouteConfig {
+                name: "api".to_string(),
+                path_prefix: "/api".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+                upstream: "http://127.0.0.1:8080".to_string(),
+                upstreams: vec!["http://127.0.0.1:8080".to_string()],
+                strip_prefix: true,
+                set_headers: std::collections::BTreeMap::new(),
+                strip_headers: Vec::new(),
+            });
+        config
+            .services
+            .static_sites
+            .push(crate::config::StaticSiteConfig {
+                name: "public".to_string(),
+                path_prefix: "/assets".to_string(),
+                root: "public".into(),
+                index_files: vec!["index.html".to_string()],
+                autoindex: false,
+            });
+        config.services.webdav.enabled = true;
+        config.services.ftp.enabled = true;
+
+        let topology = render_route_topology(&config);
+        assert!(topology.contains("plain=0.0.0.0:80"));
+        assert!(topology.contains("tls=0.0.0.0:443"));
+        assert!(topology.contains("api hosts=api.example.com path=/api"));
+        assert!(topology.contains("public path=/assets"));
+        assert!(topology.contains("[webdav]"));
+        assert!(topology.contains("ftp bind=0.0.0.0:21"));
+    }
+
+    #[test]
+    fn reload_plan_lists_hot_reload_and_restart_boundaries() {
+        let plan = render_reload_plan(&GatewayConfig::default());
+        assert!(plan.contains("reverse_proxy routes"));
+        assert!(plan.contains("auto-loaded plugin scripts"));
+        assert!(plan.contains("services.ftp.enabled/services.ftp.bind"));
+        assert!(plan.contains("http.plain_bind/http.tls_bind/http.h3_bind"));
+        assert!(plan.contains("logging.access_log_path/logging.error_log_path"));
+    }
+
+    #[test]
+    fn open_log_writer_creates_parent_directory() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-log-writer-test-{}", std::process::id()));
+        let log_path = root.join("logs").join("access.log");
+        let _ = std::fs::remove_dir_all(&root);
+
+        open_log_writer(&log_path, &root).expect("open log writer");
+        assert!(log_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nginx_parity_matrix_tracks_supported_and_gap_items() {
+        for required in [
+            "declarative reverse proxy",
+            "static file service",
+            "WebDAV",
+            "hot reload",
+            "compression",
+            "cache/proxy cache",
+            "rate limiting",
+        ] {
+            assert!(
+                NGINX_PARITY_MATRIX
+                    .iter()
+                    .any(|item| item.capability == required),
+                "missing nginx parity item: {required}"
+            );
+        }
+
+        assert!(NGINX_PARITY_MATRIX
+            .iter()
+            .any(|item| item.status == ParityStatus::Partial));
+        assert!(NGINX_PARITY_MATRIX
+            .iter()
+            .any(|item| item.status == ParityStatus::Missing));
+    }
 }

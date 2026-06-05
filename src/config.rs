@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_PORT: u16 = 23380;
+pub const DEFAULT_PORT: u16 = 443;
+pub const DEFAULT_HTTP_PORT: u16 = 80;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "proxysss.yaml";
 pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
@@ -16,6 +17,8 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
 pub struct GatewayConfig {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
+    #[serde(default)]
+    pub include: IncludeConfig,
     #[serde(default = "default_log_filter")]
     pub log_filter: String,
     #[serde(default)]
@@ -38,15 +41,29 @@ pub struct GatewayConfig {
     pub admin: AdminConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub services: ServicesConfig,
     #[serde(skip)]
     pub root_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IncludeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub format: LogFormat,
-    #[serde(default = "default_log_filter")]
+    #[serde(default)]
+    pub level: LogLevel,
+    #[serde(default)]
     pub filter: String,
     #[serde(default = "default_true")]
     pub access_log: bool,
@@ -56,6 +73,10 @@ pub struct LoggingConfig {
     pub slow_request_ms: u64,
     #[serde(default = "default_redact_headers")]
     pub redact_headers: Vec<String>,
+    #[serde(default = "default_access_log_path")]
+    pub access_log_path: PathBuf,
+    #[serde(default = "default_error_log_path")]
+    pub error_log_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -64,6 +85,16 @@ pub enum LogFormat {
     Plain,
     #[default]
     Json,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,20 +318,118 @@ pub struct HotReloadConfig {
     pub interval_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServicesConfig {
+    #[serde(default)]
+    pub reverse_proxy: ReverseProxyConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub webdav: WebDavConfig,
+    #[serde(default)]
+    pub static_sites: Vec<StaticSiteConfig>,
+    #[serde(default)]
+    pub ftp: FtpConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub http: HttpRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpRateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub key: RateLimitKey,
+    #[serde(default = "default_rate_limit_requests")]
+    pub requests: u32,
+    #[serde(default = "default_rate_limit_window_ms")]
+    pub window_ms: u64,
+    #[serde(default)]
+    pub burst: u32,
+    #[serde(default = "default_rate_limit_status")]
+    pub status: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKey {
+    #[default]
+    RemoteAddr,
+    Host,
+    Header(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReverseProxyConfig {
+    #[serde(default)]
+    pub routes: Vec<ReverseProxyRouteConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReverseProxyRouteConfig {
+    pub name: String,
+    #[serde(default = "default_route_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    pub upstream: String,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub strip_prefix: bool,
+    #[serde(default)]
+    pub set_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub strip_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticSiteConfig {
+    pub name: String,
+    #[serde(default = "default_static_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default = "default_static_root")]
+    pub root: PathBuf,
+    #[serde(default = "default_static_index_files")]
+    pub index_files: Vec<String>,
+    #[serde(default)]
+    pub autoindex: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebDavConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_webdav_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default = "default_webdav_root")]
+    pub root: PathBuf,
+    #[serde(default = "default_true")]
+    pub allow_write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ftp_bind")]
+    pub bind: String,
+    #[serde(default = "default_ftp_upstream")]
+    pub upstream: String,
+    #[serde(default = "default_true")]
+    pub passive_hint: bool,
+}
+
 impl GatewayConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-
-        let ext = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase());
-
-        let mut config = match ext.as_deref() {
-            Some("json") => parse_json_then_yaml(&raw, path)?,
-            _ => parse_yaml_then_json(&raw, path)?,
-        };
+        let mut visited = HashSet::new();
+        let value = load_config_value_recursive(path, &mut visited)?;
+        let mut config: GatewayConfig = serde_yaml::from_value(value)
+            .with_context(|| format!("failed to decode merged config {}", path.display()))?;
 
         config.normalize(path.parent().unwrap_or_else(|| Path::new(".")));
         config.validate()?;
@@ -335,6 +464,10 @@ impl GatewayConfig {
 
         if self.runtime.hot_reload.interval_ms < 200 {
             errors.push("runtime.hot_reload.interval_ms must be >= 200".to_string());
+        }
+
+        if self.include.enabled && self.include.files.is_empty() {
+            errors.push("include.files cannot be empty when include.enabled=true".to_string());
         }
 
         if self.script.command.trim().is_empty() {
@@ -373,6 +506,108 @@ impl GatewayConfig {
                 errors.push(
                     "plugins.auto_load_dir cannot be empty when plugins are enabled".to_string(),
                 );
+            }
+        }
+
+        if self.services.rate_limit.http.enabled {
+            if self.services.rate_limit.http.requests == 0 {
+                errors.push("services.rate_limit.http.requests must be greater than 0".to_string());
+            }
+            if self.services.rate_limit.http.window_ms < 100 {
+                errors.push("services.rate_limit.http.window_ms must be >= 100".to_string());
+            }
+            if !(100..=599).contains(&self.services.rate_limit.http.status) {
+                errors.push(
+                    "services.rate_limit.http.status must be a valid HTTP status".to_string(),
+                );
+            }
+            if let RateLimitKey::Header(name) = &self.services.rate_limit.http.key {
+                if name.trim().is_empty() {
+                    errors.push(
+                        "services.rate_limit.http.key header name cannot be empty".to_string(),
+                    );
+                }
+            }
+        }
+
+        let mut route_names = HashSet::<String>::new();
+        for route in &self.services.reverse_proxy.routes {
+            if route.name.trim().is_empty() {
+                errors.push("services.reverse_proxy.routes.name cannot be empty".to_string());
+            }
+            if !route_names.insert(route.name.clone()) {
+                errors.push(format!("duplicate reverse proxy route name {}", route.name));
+            }
+            if route.path_prefix.trim().is_empty() || !route.path_prefix.starts_with('/') {
+                errors.push(format!(
+                    "services.reverse_proxy.routes.{}.path_prefix must start with /",
+                    route.name
+                ));
+            }
+            if route.upstream.trim().is_empty() {
+                errors.push(format!(
+                    "services.reverse_proxy.routes.{}.upstream cannot be empty",
+                    route.name
+                ));
+            }
+            if route.hosts.iter().any(|host| host.trim().is_empty()) {
+                errors.push(format!(
+                    "services.reverse_proxy.routes.{}.hosts cannot contain empty items",
+                    route.name
+                ));
+            }
+        }
+
+        if self.services.webdav.enabled {
+            if self.services.webdav.path_prefix.trim().is_empty()
+                || !self.services.webdav.path_prefix.starts_with('/')
+            {
+                errors.push("services.webdav.path_prefix must start with /".to_string());
+            }
+            if self.services.webdav.root.as_os_str().is_empty() {
+                errors.push(
+                    "services.webdav.root cannot be empty when webdav is enabled".to_string(),
+                );
+            }
+        }
+
+        let mut static_names = HashSet::<String>::new();
+        for site in &self.services.static_sites {
+            if site.name.trim().is_empty() {
+                errors.push("services.static_sites.name cannot be empty".to_string());
+            }
+            if !static_names.insert(site.name.clone()) {
+                errors.push(format!("duplicate static site name {}", site.name));
+            }
+            if site.path_prefix.trim().is_empty() || !site.path_prefix.starts_with('/') {
+                errors.push(format!(
+                    "services.static_sites.{}.path_prefix must start with /",
+                    site.name
+                ));
+            }
+            if site.root.as_os_str().is_empty() {
+                errors.push(format!(
+                    "services.static_sites.{}.root cannot be empty",
+                    site.name
+                ));
+            }
+            if site
+                .index_files
+                .iter()
+                .any(|item| item.contains('/') || item.contains('\\'))
+            {
+                errors.push(format!(
+                    "services.static_sites.{}.index_files must contain file names only",
+                    site.name
+                ));
+            }
+        }
+
+        if self.services.ftp.enabled {
+            validate_bind_required("services.ftp.bind", &self.services.ftp.bind, &mut errors);
+            if self.services.ftp.upstream.trim().is_empty() {
+                errors
+                    .push("services.ftp.upstream cannot be empty when ftp is enabled".to_string());
             }
         }
 
@@ -525,7 +760,7 @@ impl GatewayConfig {
         self.root_dir = root_dir.to_path_buf();
 
         if self.logging.filter.trim().is_empty() {
-            self.logging.filter = self.log_filter.clone();
+            self.logging.filter = default_filter_for_level(self.logging.level);
         }
         self.log_filter = self.logging.filter.clone();
 
@@ -533,6 +768,12 @@ impl GatewayConfig {
         self.http.tls.key_path = absolutize(root_dir, &self.http.tls.key_path);
         self.http.tls.acme.cache_dir = absolutize(root_dir, &self.http.tls.acme.cache_dir);
         self.plugins.auto_load_dir = absolutize(root_dir, &self.plugins.auto_load_dir);
+        self.logging.access_log_path = absolutize(root_dir, &self.logging.access_log_path);
+        self.logging.error_log_path = absolutize(root_dir, &self.logging.error_log_path);
+        self.services.webdav.root = absolutize(root_dir, &self.services.webdav.root);
+        for site in &mut self.services.static_sites {
+            site.root = absolutize(root_dir, &site.root);
+        }
 
         self.script.cwd = Some(match &self.script.cwd {
             Some(cwd) => absolutize(root_dir, cwd),
@@ -548,6 +789,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             config_version: default_config_version(),
+            include: IncludeConfig::default(),
             log_filter: default_log_filter(),
             logging: LoggingConfig::default(),
             http: HttpConfig::default(),
@@ -559,6 +801,7 @@ impl Default for GatewayConfig {
             affinity: AffinityConfig::default(),
             admin: AdminConfig::default(),
             runtime: RuntimeConfig::default(),
+            services: ServicesConfig::default(),
             root_dir: PathBuf::from("."),
         }
     }
@@ -568,11 +811,14 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             format: LogFormat::default(),
+            level: LogLevel::default(),
             filter: default_log_filter(),
             access_log: default_true(),
             access_sample_rate: default_sample_rate(),
             slow_request_ms: default_slow_request_ms(),
             redact_headers: default_redact_headers(),
+            access_log_path: default_access_log_path(),
+            error_log_path: default_error_log_path(),
         }
     }
 }
@@ -580,7 +826,7 @@ impl Default for LoggingConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            plain_bind: String::new(),
+            plain_bind: default_plain_bind(),
             tls_bind: default_gateway_bind(),
             h3_bind: default_gateway_bind(),
             request_timeout_ms: default_request_timeout_ms(),
@@ -714,16 +960,150 @@ impl Default for HotReloadConfig {
     }
 }
 
-fn parse_yaml_then_json(raw: &str, path: &Path) -> Result<GatewayConfig> {
-    serde_yaml::from_str(raw)
-        .or_else(|_| serde_json::from_str(raw))
-        .with_context(|| format!("failed to parse config as yaml/json: {}", path.display()))
+impl Default for WebDavConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_webdav_path_prefix(),
+            root: default_webdav_root(),
+            allow_write: default_true(),
+        }
+    }
 }
 
-fn parse_json_then_yaml(raw: &str, path: &Path) -> Result<GatewayConfig> {
-    serde_json::from_str(raw)
-        .or_else(|_| serde_yaml::from_str(raw))
-        .with_context(|| format!("failed to parse config as json/yaml: {}", path.display()))
+impl Default for StaticSiteConfig {
+    fn default() -> Self {
+        Self {
+            name: "public".to_string(),
+            path_prefix: default_static_path_prefix(),
+            root: default_static_root(),
+            index_files: default_static_index_files(),
+            autoindex: false,
+        }
+    }
+}
+
+impl Default for ReverseProxyRouteConfig {
+    fn default() -> Self {
+        Self {
+            name: "api".to_string(),
+            path_prefix: default_route_path_prefix(),
+            hosts: Vec::new(),
+            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: Vec::new(),
+            strip_prefix: false,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+        }
+    }
+}
+
+impl Default for HttpRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            key: RateLimitKey::default(),
+            requests: default_rate_limit_requests(),
+            window_ms: default_rate_limit_window_ms(),
+            burst: 0,
+            status: default_rate_limit_status(),
+        }
+    }
+}
+
+impl Default for FtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_ftp_bind(),
+            upstream: default_ftp_upstream(),
+            passive_hint: default_true(),
+        }
+    }
+}
+
+fn load_config_value_recursive(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<serde_yaml::Value> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical.clone()) {
+        return Err(anyhow!(
+            "configuration include cycle detected at {}",
+            canonical.display()
+        ));
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let mut base = parse_value_by_extension(&raw, path)?;
+    let include = read_include_config(&base)?;
+
+    if include.enabled {
+        let root_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for child in include.files {
+            let child_path = absolutize(root_dir, &child);
+            if !child_path.exists() {
+                if include.required {
+                    return Err(anyhow!(
+                        "required include file does not exist: {}",
+                        child_path.display()
+                    ));
+                }
+                continue;
+            }
+
+            let child_value = load_config_value_recursive(&child_path, visited)?;
+            merge_value(&mut base, child_value);
+        }
+    }
+
+    visited.remove(&canonical);
+    Ok(base)
+}
+
+fn parse_value_by_extension(raw: &str, path: &Path) -> Result<serde_yaml::Value> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("json") => {
+            let json: serde_json::Value = serde_json::from_str(raw)
+                .with_context(|| format!("failed to parse json config {}", path.display()))?;
+            serde_yaml::to_value(json)
+                .with_context(|| format!("failed to convert json config {}", path.display()))
+        }
+        _ => serde_yaml::from_str(raw)
+            .with_context(|| format!("failed to parse yaml config {}", path.display())),
+    }
+}
+
+fn read_include_config(value: &serde_yaml::Value) -> Result<IncludeConfig> {
+    let include = value
+        .get("include")
+        .cloned()
+        .unwrap_or(serde_yaml::Value::Null);
+    Ok(serde_yaml::from_value(include).unwrap_or_default())
+}
+
+fn merge_value(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    match (base, overlay) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(base_value) => merge_value(base_value, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
+    }
 }
 
 fn absolutize(root: &Path, path: &Path) -> PathBuf {
@@ -765,8 +1145,21 @@ fn default_log_filter() -> String {
     "info,proxysss=info".to_string()
 }
 
+fn default_filter_for_level(level: LogLevel) -> String {
+    match level {
+        LogLevel::Debug => "debug,proxysss=debug".to_string(),
+        LogLevel::Info => "info,proxysss=info".to_string(),
+        LogLevel::Warn => "warn,proxysss=warn".to_string(),
+        LogLevel::Error => "error,proxysss=error".to_string(),
+    }
+}
+
 fn default_gateway_bind() -> String {
     format!("0.0.0.0:{DEFAULT_PORT}")
+}
+
+fn default_plain_bind() -> String {
+    format!("0.0.0.0:{DEFAULT_HTTP_PORT}")
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -791,6 +1184,14 @@ fn default_redact_headers() -> Vec<String> {
         "cookie".to_string(),
         "set-cookie".to_string(),
     ]
+}
+
+fn default_access_log_path() -> PathBuf {
+    PathBuf::from("logs/access.log")
+}
+
+fn default_error_log_path() -> PathBuf {
+    PathBuf::from("logs/error.log")
 }
 
 fn default_cert_path() -> PathBuf {
@@ -904,7 +1305,7 @@ fn default_stream_peek_timeout_ms() -> u64 {
 }
 
 fn default_admin_bind() -> String {
-    "127.0.0.1:23381".to_string()
+    "127.0.0.1:7777".to_string()
 }
 
 fn default_admin_username() -> String {
@@ -929,6 +1330,50 @@ fn default_lb_quarantine_secs() -> u64 {
 
 fn default_reload_interval_ms() -> u64 {
     1500
+}
+
+fn default_webdav_path_prefix() -> String {
+    "/dav".to_string()
+}
+
+fn default_webdav_root() -> PathBuf {
+    PathBuf::from("webdav")
+}
+
+fn default_static_path_prefix() -> String {
+    "/public".to_string()
+}
+
+fn default_static_root() -> PathBuf {
+    PathBuf::from("public")
+}
+
+fn default_static_index_files() -> Vec<String> {
+    vec!["index.html".to_string(), "index.htm".to_string()]
+}
+
+fn default_route_path_prefix() -> String {
+    "/".to_string()
+}
+
+fn default_rate_limit_requests() -> u32 {
+    60
+}
+
+fn default_rate_limit_window_ms() -> u64 {
+    60_000
+}
+
+fn default_rate_limit_status() -> u16 {
+    429
+}
+
+fn default_ftp_bind() -> String {
+    "0.0.0.0:21".to_string()
+}
+
+fn default_ftp_upstream() -> String {
+    "127.0.0.1:2121".to_string()
 }
 
 #[cfg(test)]
@@ -961,6 +1406,138 @@ mod tests {
         assert_eq!(config.load_balance.retries.max_retries, 2);
         assert_eq!(config.load_balance.passive_health.fail_threshold, 3);
         assert_eq!(config.load_balance.passive_health.quarantine_secs, 15);
+    }
+
+    #[test]
+    fn default_ports_match_nginx_takeover_goals() {
+        let config = GatewayConfig::default();
+        assert_eq!(config.http.plain_bind, "0.0.0.0:80");
+        assert_eq!(config.http.tls_bind, "0.0.0.0:443");
+        assert_eq!(config.http.h3_bind, "0.0.0.0:443");
+        assert_eq!(config.admin.bind, "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn default_logging_level_is_info() {
+        let config = GatewayConfig::default();
+        assert_eq!(config.logging.level, LogLevel::Info);
+        assert_eq!(config.logging.filter, "info,proxysss=info");
+    }
+
+    #[test]
+    fn default_log_paths_match_nginx_style_layout() {
+        let config = GatewayConfig::default();
+        assert_eq!(
+            config.logging.access_log_path,
+            PathBuf::from("logs/access.log")
+        );
+        assert_eq!(
+            config.logging.error_log_path,
+            PathBuf::from("logs/error.log")
+        );
+    }
+
+    #[test]
+    fn logging_level_derives_filter_when_filter_is_omitted() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-log-level-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "logging:\n  level: warn\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(config.logging.level, LogLevel::Warn);
+        assert_eq!(config.logging.filter, "warn,proxysss=warn");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn validate_rejects_static_index_paths() {
+        let mut config = GatewayConfig::default();
+        config.services.static_sites.push(StaticSiteConfig {
+            name: "bad".to_string(),
+            path_prefix: "/bad".to_string(),
+            root: PathBuf::from("public"),
+            index_files: vec!["../index.html".to_string()],
+            autoindex: false,
+        });
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid static index");
+        assert!(error.to_string().contains("index_files"));
+    }
+
+    #[test]
+    fn validate_rejects_reverse_proxy_route_without_upstream() {
+        let mut config = GatewayConfig::default();
+        config
+            .services
+            .reverse_proxy
+            .routes
+            .push(ReverseProxyRouteConfig {
+                name: "api".to_string(),
+                path_prefix: "/api".to_string(),
+                hosts: Vec::new(),
+                upstream: String::new(),
+                upstreams: Vec::new(),
+                strip_prefix: false,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+            });
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid reverse proxy route");
+        assert!(error.to_string().contains("upstream"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_rate_limit_window() {
+        let mut config = GatewayConfig::default();
+        config.services.rate_limit.http.enabled = true;
+        config.services.rate_limit.http.window_ms = 1;
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid rate limit window");
+        assert!(error.to_string().contains("window_ms"));
+    }
+
+    #[test]
+    fn explicit_include_merges_child_config() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-include-test-{}", std::process::id()));
+        let conf_dir = base_dir.join("conf.d");
+        fs::create_dir_all(&conf_dir).expect("create temp config dir");
+        let base = base_dir.join("proxysss.yaml");
+        let child = conf_dir.join("admin.yaml");
+
+        fs::write(
+            &base,
+            "include:\n  enabled: true\n  required: true\n  files:\n    - ./conf.d/admin.yaml\n",
+        )
+        .expect("write base config");
+        fs::write(&child, "admin:\n  bind: 127.0.0.1:7778\n").expect("write child config");
+
+        let config = GatewayConfig::load(&base).expect("load merged config");
+        assert_eq!(config.admin.bind, "127.0.0.1:7778");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn include_enabled_requires_files() {
+        let mut config = GatewayConfig::default();
+        config.include.enabled = true;
+        config.include.files.clear();
+        let error = config.validate().expect_err("expected invalid include");
+        assert!(error.to_string().contains("include.files"));
     }
 
     #[test]

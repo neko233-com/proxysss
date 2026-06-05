@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,8 +40,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::config::{
-    AcmeChallengeType, AdminConfig, GatewayConfig, HttpAffinityConfig, LoadBalanceAlgorithm,
-    StreamAffinityConfig, TcpListenerConfig, TlsMode, UdpListenerConfig,
+    AcmeChallengeType, AdminConfig, GatewayConfig, HttpAffinityConfig, HttpRateLimitConfig,
+    LoadBalanceAlgorithm, RateLimitKey, ReverseProxyRouteConfig, StaticSiteConfig,
+    StreamAffinityConfig, TcpListenerConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -55,6 +56,7 @@ pub struct Gateway {
     sticky_affinity: Arc<DashMap<String, StickyEntry>>,
     round_robin_state: Arc<DashMap<String, u64>>,
     upstream_runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
+    http_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
 }
 
 struct DynamicState {
@@ -81,6 +83,12 @@ struct UpstreamRuntimeState {
     consecutive_failures: u32,
     quarantined_until: Option<Instant>,
     active_connections: u64,
+}
+
+#[derive(Clone)]
+struct RateLimitBucket {
+    window_start: Instant,
+    count: u32,
 }
 
 #[derive(Default)]
@@ -182,6 +190,7 @@ impl Gateway {
             sticky_affinity: Arc::new(DashMap::new()),
             round_robin_state: Arc::new(DashMap::new()),
             upstream_runtime: Arc::new(DashMap::new()),
+            http_rate_limits: Arc::new(DashMap::new()),
         }))
     }
 
@@ -218,6 +227,15 @@ impl Gateway {
             tasks.spawn(async move { gateway.run_tcp_listener(listener).await });
         }
 
+        if self.bootstrap_config.services.ftp.enabled {
+            let gateway = self.clone();
+            let listener = TcpListenerConfig {
+                name: "ftp".to_string(),
+                bind: self.bootstrap_config.services.ftp.bind.clone(),
+            };
+            tasks.spawn(async move { gateway.run_tcp_listener(listener).await });
+        }
+
         for listener in self.bootstrap_config.udp.listeners.clone() {
             let gateway = self.clone();
             tasks.spawn(async move { gateway.run_udp_listener(listener).await });
@@ -236,7 +254,7 @@ impl Gateway {
     }
 
     async fn run_hot_reload_loop(self: Arc<Self>) -> Result<()> {
-        let mut last_hash = read_file_hash(&self.config_path).unwrap_or(0);
+        let mut last_hash = reload_fingerprint(&self.config_path).unwrap_or(0);
 
         loop {
             let interval_ms = {
@@ -245,13 +263,13 @@ impl Gateway {
             };
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
 
-            let hash = match read_file_hash(&self.config_path) {
+            let hash = match reload_fingerprint(&self.config_path) {
                 Ok(value) => value,
                 Err(error) => {
                     self.stats
                         .reload_failure_total
                         .fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(?error, path = %self.config_path.display(), "hot reload failed to read config hash");
+                    tracing::warn!(?error, path = %self.config_path.display(), "hot reload failed to read reload fingerprint");
                     continue;
                 }
             };
@@ -878,6 +896,18 @@ impl Gateway {
                                 .script_fail_total
                                 .fetch_add(1, Ordering::Relaxed);
                         })?;
+                    let route = if listener_name == "ftp" && state.config.services.ftp.enabled {
+                        RouteDecision {
+                            upstream: state.config.services.ftp.upstream.clone(),
+                            upstreams: Vec::new(),
+                            affinity_key: player_id.clone(),
+                            rewrite_path: None,
+                            set_headers: BTreeMap::new(),
+                            strip_headers: Vec::new(),
+                        }
+                    } else {
+                        route
+                    };
 
                     let upstream_plan = gateway.select_upstream_plan(
                         &state.config,
@@ -1224,25 +1254,54 @@ impl Gateway {
         let player_id = extract_http_player_id(&uri, &headers, &state.config.affinity.http);
         let request_id = Uuid::new_v4().to_string();
 
-        let route = state
-            .script
-            .route_http(HttpContext {
-                request_id: request_id.clone(),
-                host: host.clone(),
-                method: method.as_str().to_string(),
-                path: uri.path().to_string(),
-                query: uri.query().map(|value| value.to_string()),
-                scheme: scheme.to_string(),
-                version: version.to_string(),
-                remote_addr: remote_addr.to_string(),
-                player_id: player_id.clone(),
-                headers: header_map_to_btree(&headers),
-                body_len: body.len(),
-            })
-            .await
-            .inspect_err(|_| {
-                self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-            })?;
+        if let Some(response) = self.apply_http_rate_limit(
+            &state.config.services.rate_limit.http,
+            &host,
+            &headers,
+            remote_addr,
+        ) {
+            return Ok(response);
+        }
+
+        if state.config.services.webdav.enabled
+            && webdav_path_matches(&state.config.services.webdav.path_prefix, uri.path())
+        {
+            return dispatch_webdav(&state.config.services.webdav, &method, &uri, &headers, body)
+                .await;
+        }
+
+        if let Some(site) = state
+            .config
+            .services
+            .static_sites
+            .iter()
+            .find(|site| static_site_path_matches(site, uri.path()))
+        {
+            return dispatch_static_site(site, &method, &uri).await;
+        }
+
+        let route = match configured_reverse_proxy_route(&state.config, &host, &uri) {
+            Some(route) => route,
+            None => state
+                .script
+                .route_http(HttpContext {
+                    request_id: request_id.clone(),
+                    host: host.clone(),
+                    method: method.as_str().to_string(),
+                    path: uri.path().to_string(),
+                    query: uri.query().map(|value| value.to_string()),
+                    scheme: scheme.to_string(),
+                    version: version.to_string(),
+                    remote_addr: remote_addr.to_string(),
+                    player_id: player_id.clone(),
+                    headers: header_map_to_btree(&headers),
+                    body_len: body.len(),
+                })
+                .await
+                .inspect_err(|_| {
+                    self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
+                })?,
+        };
 
         if route.upstream.starts_with("proxysss://") {
             return Ok(dispatch_internal_http(&state.config, &route));
@@ -1432,6 +1491,33 @@ impl Gateway {
 
     async fn current_state(&self) -> Arc<DynamicState> {
         self.dynamic.read().await.clone()
+    }
+
+    fn apply_http_rate_limit(
+        &self,
+        config: &HttpRateLimitConfig,
+        host: &str,
+        headers: &HeaderMap,
+        remote_addr: SocketAddr,
+    ) -> Option<GatewayHttpResponse> {
+        if !config.enabled {
+            return None;
+        }
+
+        let key = http_rate_limit_key(config, host, headers, remote_addr)?;
+        let retry_after = apply_http_rate_limit_to_store(&self.http_rate_limits, config, key)?;
+        let status = StatusCode::from_u16(config.status).unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+        let mut response = GatewayHttpResponse::bytes(
+            status,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"rate limit exceeded"),
+            "proxysss://rate-limit",
+        );
+        response.headers.push((
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_str(&retry_after).unwrap_or_else(|_| HeaderValue::from_static("1")),
+        ));
+        Some(response)
     }
 
     fn select_upstream_plan(
@@ -1758,6 +1844,20 @@ impl GatewayHttpResponse {
         }
     }
 
+    fn bytes(
+        status: StatusCode,
+        content_type: &'static str,
+        body: impl Into<Bytes>,
+        upstream: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            headers: vec![(CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            body: body.into(),
+            upstream: upstream.into(),
+        }
+    }
+
     fn into_hyper(self) -> Response<Full<Bytes>> {
         let mut builder = Response::builder().status(self.status);
         for (name, value) in self.headers {
@@ -1910,6 +2010,14 @@ fn ensure_reload_compatible(old: &GatewayConfig, new: &GatewayConfig) -> Result<
 
     if listener_signature_udp(&old.udp.listeners) != listener_signature_udp(&new.udp.listeners) {
         return Err(anyhow!("udp listener set changed; restart required"));
+    }
+
+    if old.services.ftp.enabled != new.services.ftp.enabled
+        || old.services.ftp.bind != new.services.ftp.bind
+    {
+        return Err(anyhow!(
+            "ftp listener changes require restart (services.ftp.enabled/services.ftp.bind)"
+        ));
     }
 
     if old.http.tls.mode != new.http.tls.mode {
@@ -2425,6 +2533,793 @@ fn websocket_upstream_requested(route: &RouteDecision) -> bool {
     route.upstream.starts_with("ws://") || route.upstream.starts_with("wss://")
 }
 
+fn http_rate_limit_key(
+    config: &HttpRateLimitConfig,
+    host: &str,
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+) -> Option<String> {
+    match &config.key {
+        RateLimitKey::RemoteAddr => Some(format!("remote:{}", remote_addr.ip())),
+        RateLimitKey::Host => Some(format!("host:{}", host.to_ascii_lowercase())),
+        RateLimitKey::Header(name) => headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            .map(|value| format!("header:{}:{}", name.to_ascii_lowercase(), value)),
+    }
+}
+
+fn apply_http_rate_limit_to_store(
+    store: &DashMap<String, RateLimitBucket>,
+    config: &HttpRateLimitConfig,
+    key: String,
+) -> Option<String> {
+    let now = Instant::now();
+    let window = Duration::from_millis(config.window_ms.max(100));
+    let limit = config.requests.saturating_add(config.burst).max(1);
+
+    let mut bucket = store.entry(key).or_insert(RateLimitBucket {
+        window_start: now,
+        count: 0,
+    });
+
+    if now.duration_since(bucket.window_start) >= window {
+        bucket.window_start = now;
+        bucket.count = 0;
+    }
+
+    bucket.count = bucket.count.saturating_add(1);
+    if bucket.count <= limit {
+        return None;
+    }
+
+    Some(
+        window
+            .saturating_sub(now.duration_since(bucket.window_start))
+            .as_secs()
+            .max(1)
+            .to_string(),
+    )
+}
+
+fn configured_reverse_proxy_route(
+    config: &GatewayConfig,
+    host: &str,
+    uri: &Uri,
+) -> Option<RouteDecision> {
+    config
+        .services
+        .reverse_proxy
+        .routes
+        .iter()
+        .filter(|route| reverse_proxy_route_matches(route, host, uri.path()))
+        .max_by_key(|route| route.path_prefix.len())
+        .map(|route| reverse_proxy_route_decision(route, uri))
+}
+
+fn reverse_proxy_route_matches(route: &ReverseProxyRouteConfig, host: &str, path: &str) -> bool {
+    if !route.hosts.is_empty() && !route.hosts.iter().any(|item| host_matches(item, host)) {
+        return false;
+    }
+
+    let prefix = normalize_route_prefix(&route.path_prefix);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let host = host
+        .split_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+
+    host == pattern
+}
+
+fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> RouteDecision {
+    let rewrite_path = route.strip_prefix.then(|| {
+        let prefix = normalize_route_prefix(&route.path_prefix);
+        let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
+        let path = if suffix.is_empty() {
+            "/".to_string()
+        } else if suffix.starts_with('/') {
+            suffix.to_string()
+        } else {
+            format!("/{suffix}")
+        };
+        match uri.query() {
+            Some(query) => format!("{path}?{query}"),
+            None => path,
+        }
+    });
+
+    RouteDecision {
+        upstream: route.upstream.clone(),
+        upstreams: route.upstreams.clone(),
+        affinity_key: None,
+        rewrite_path,
+        set_headers: route.set_headers.clone(),
+        strip_headers: route.strip_headers.clone(),
+    }
+}
+
+fn normalize_route_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+async fn dispatch_static_site(
+    site: &StaticSiteConfig,
+    method: &Method,
+    uri: &Uri,
+) -> Result<GatewayHttpResponse> {
+    if method != Method::GET && method != Method::HEAD {
+        return Ok(GatewayHttpResponse::bytes(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"static site method not allowed"),
+            "proxysss://static",
+        ));
+    }
+
+    let Some(mut target) = static_site_filesystem_path(site, uri.path())? else {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::NOT_FOUND,
+            "static path not found",
+        ));
+    };
+
+    let metadata = match tokio::fs::metadata(&target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "static path not found",
+            ));
+        }
+        Err(error) => return Err(error).context("failed reading static metadata"),
+    };
+
+    let metadata = if metadata.is_dir() {
+        let mut found_index = None;
+        for index in &site.index_files {
+            let candidate = target.join(index);
+            if tokio::fs::metadata(&candidate)
+                .await
+                .map(|item| item.is_file())
+                .unwrap_or(false)
+            {
+                found_index = Some(candidate);
+                break;
+            }
+        }
+
+        if let Some(index) = found_index {
+            target = index;
+            tokio::fs::metadata(&target)
+                .await
+                .context("failed reading static index metadata")?
+        } else if site.autoindex {
+            return static_autoindex(site, uri.path(), &target).await;
+        } else {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::FORBIDDEN,
+                "static directory listing is disabled",
+            ));
+        }
+    } else {
+        metadata
+    };
+
+    let body = if method == Method::HEAD {
+        Bytes::new()
+    } else {
+        Bytes::from(
+            tokio::fs::read(&target)
+                .await
+                .context("failed reading static file")?,
+        )
+    };
+    let mut response = GatewayHttpResponse::bytes(
+        StatusCode::OK,
+        static_content_type(&target),
+        body,
+        "proxysss://static",
+    );
+    response.headers.push((
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    ));
+    Ok(response)
+}
+
+async fn static_autoindex(
+    site: &StaticSiteConfig,
+    request_path: &str,
+    target: &Path,
+) -> Result<GatewayHttpResponse> {
+    let mut entries = tokio::fs::read_dir(target)
+        .await
+        .context("failed reading static directory")?;
+    let mut links = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .context("failed reading static directory entry")?
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let href = join_static_href(&site.path_prefix, request_path, &name);
+        links.push(format!(
+            r#"<li><a href="{}">{}</a></li>"#,
+            xml_escape(&href),
+            xml_escape(&name)
+        ));
+    }
+    links.sort();
+
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of {}</title></head><body><h1>Index of {}</h1><ul>{}</ul></body></html>",
+        xml_escape(request_path),
+        xml_escape(request_path),
+        links.join("")
+    );
+
+    Ok(GatewayHttpResponse::bytes(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        Bytes::from(body),
+        "proxysss://static",
+    ))
+}
+
+fn static_site_path_matches(site: &StaticSiteConfig, path: &str) -> bool {
+    webdav_path_matches(&site.path_prefix, path)
+}
+
+fn static_site_filesystem_path(
+    site: &StaticSiteConfig,
+    request_path: &str,
+) -> Result<Option<PathBuf>> {
+    let prefix = normalize_webdav_prefix(&site.path_prefix);
+    if !webdav_path_matches(&prefix, request_path) {
+        return Ok(None);
+    }
+
+    let relative = request_path
+        .strip_prefix(&prefix)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let decoded = percent_decode_path(relative)?;
+    let mut target = site.root.clone();
+
+    for part in decoded.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        let component_path = Path::new(part);
+        if component_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(anyhow!("static path escapes root"));
+        }
+        target.push(part);
+    }
+
+    Ok(Some(target))
+}
+
+fn join_static_href(prefix: &str, base_path: &str, child_name: &str) -> String {
+    let base = if base_path.ends_with('/') {
+        base_path.to_string()
+    } else if static_site_path_matches(
+        &StaticSiteConfig {
+            name: "_".to_string(),
+            path_prefix: prefix.to_string(),
+            root: PathBuf::new(),
+            index_files: Vec::new(),
+            autoindex: false,
+        },
+        base_path,
+    ) {
+        format!("{base_path}/")
+    } else {
+        format!("{}/", normalize_webdav_prefix(prefix))
+    };
+    format!("{base}{child_name}")
+}
+
+fn static_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn dispatch_webdav(
+    config: &WebDavConfig,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<GatewayHttpResponse> {
+    let Some(target) = webdav_filesystem_path(config, uri.path())? else {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::NOT_FOUND,
+            "webdav path not found",
+        ));
+    };
+
+    let upstream = "proxysss://webdav";
+    match method.as_str() {
+        "OPTIONS" => Ok(webdav_options_response(upstream)),
+        "PROPFIND" => webdav_propfind(config, uri.path(), &target, upstream).await,
+        "GET" => webdav_get(&target, false, upstream).await,
+        "HEAD" => webdav_get(&target, true, upstream).await,
+        "PUT" => {
+            if !config.allow_write {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::FORBIDDEN,
+                    "webdav writes are disabled",
+                ));
+            }
+            webdav_put(&target, body, upstream).await
+        }
+        "DELETE" => {
+            if !config.allow_write {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::FORBIDDEN,
+                    "webdav writes are disabled",
+                ));
+            }
+            webdav_delete(&target, upstream).await
+        }
+        "MKCOL" => {
+            if !config.allow_write {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::FORBIDDEN,
+                    "webdav writes are disabled",
+                ));
+            }
+            webdav_mkcol(&target, upstream).await
+        }
+        "COPY" | "MOVE" => {
+            if !config.allow_write {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::FORBIDDEN,
+                    "webdav writes are disabled",
+                ));
+            }
+            let Some(destination) = webdav_destination_path(config, headers)? else {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::BAD_REQUEST,
+                    "missing webdav Destination header",
+                ));
+            };
+            webdav_copy_or_move(method.as_str(), &target, &destination, upstream).await
+        }
+        _ => Ok(GatewayHttpResponse::bytes(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"webdav method not allowed"),
+            upstream,
+        )),
+    }
+}
+
+fn webdav_options_response(upstream: &str) -> GatewayHttpResponse {
+    let mut response = GatewayHttpResponse::bytes(
+        StatusCode::NO_CONTENT,
+        "text/plain; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    );
+    response.headers.push((
+        HeaderName::from_static("dav"),
+        HeaderValue::from_static("1, 2"),
+    ));
+    response.headers.push((
+        HeaderName::from_static("allow"),
+        HeaderValue::from_static("OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE"),
+    ));
+    response
+}
+
+async fn webdav_propfind(
+    config: &WebDavConfig,
+    request_path: &str,
+    target: &Path,
+    upstream: &str,
+) -> Result<GatewayHttpResponse> {
+    let metadata = match tokio::fs::metadata(target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "webdav path not found",
+            ));
+        }
+        Err(error) => return Err(error).context("failed reading webdav metadata"),
+    };
+
+    let mut responses = Vec::new();
+    responses.push(webdav_prop_response(request_path, &metadata));
+
+    if metadata.is_dir() {
+        let mut entries = tokio::fs::read_dir(target)
+            .await
+            .context("failed reading webdav directory")?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .context("failed reading webdav directory entry")?
+        {
+            let child_metadata = entry
+                .metadata()
+                .await
+                .context("failed reading webdav child metadata")?;
+            let child_name = entry.file_name().to_string_lossy().to_string();
+            let href = join_webdav_href(&config.path_prefix, request_path, &child_name);
+            responses.push(webdav_prop_response(&href, &child_metadata));
+        }
+    }
+
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">{}</D:multistatus>"#,
+        responses.join("")
+    );
+    Ok(GatewayHttpResponse::bytes(
+        StatusCode::from_u16(207).expect("valid multistatus code"),
+        "application/xml; charset=utf-8",
+        Bytes::from(body),
+        upstream,
+    ))
+}
+
+async fn webdav_get(target: &Path, head_only: bool, upstream: &str) -> Result<GatewayHttpResponse> {
+    let metadata = match tokio::fs::metadata(target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "webdav path not found",
+            ));
+        }
+        Err(error) => return Err(error).context("failed reading webdav metadata"),
+    };
+
+    if metadata.is_dir() {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::FORBIDDEN,
+            "webdav GET on directories is disabled",
+        ));
+    }
+
+    let body = if head_only {
+        Bytes::new()
+    } else {
+        Bytes::from(
+            tokio::fs::read(target)
+                .await
+                .context("failed reading webdav file")?,
+        )
+    };
+    let mut response =
+        GatewayHttpResponse::bytes(StatusCode::OK, "application/octet-stream", body, upstream);
+    response.headers.push((
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    ));
+    Ok(response)
+}
+
+async fn webdav_put(target: &Path, body: Bytes, upstream: &str) -> Result<GatewayHttpResponse> {
+    let existed = tokio::fs::metadata(target).await.is_ok();
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("failed creating webdav parent directory")?;
+    }
+    tokio::fs::write(target, body)
+        .await
+        .context("failed writing webdav file")?;
+    Ok(GatewayHttpResponse::bytes(
+        if existed {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::CREATED
+        },
+        "text/plain; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    ))
+}
+
+async fn webdav_delete(target: &Path, upstream: &str) -> Result<GatewayHttpResponse> {
+    let metadata = match tokio::fs::metadata(target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "webdav path not found",
+            ));
+        }
+        Err(error) => return Err(error).context("failed reading webdav metadata"),
+    };
+
+    if metadata.is_dir() {
+        tokio::fs::remove_dir_all(target)
+            .await
+            .context("failed deleting webdav directory")?;
+    } else {
+        tokio::fs::remove_file(target)
+            .await
+            .context("failed deleting webdav file")?;
+    }
+
+    Ok(GatewayHttpResponse::bytes(
+        StatusCode::NO_CONTENT,
+        "text/plain; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    ))
+}
+
+async fn webdav_mkcol(target: &Path, upstream: &str) -> Result<GatewayHttpResponse> {
+    if tokio::fs::metadata(target).await.is_ok() {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "webdav collection already exists",
+        ));
+    }
+    tokio::fs::create_dir_all(target)
+        .await
+        .context("failed creating webdav collection")?;
+    Ok(GatewayHttpResponse::bytes(
+        StatusCode::CREATED,
+        "text/plain; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    ))
+}
+
+async fn webdav_copy_or_move(
+    method: &str,
+    source: &Path,
+    destination: &Path,
+    upstream: &str,
+) -> Result<GatewayHttpResponse> {
+    let metadata = match tokio::fs::metadata(source).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "webdav source path not found",
+            ));
+        }
+        Err(error) => return Err(error).context("failed reading webdav source metadata"),
+    };
+
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("failed creating webdav destination parent")?;
+    }
+
+    if method == "MOVE" {
+        tokio::fs::rename(source, destination)
+            .await
+            .context("failed moving webdav path")?;
+    } else if metadata.is_dir() {
+        copy_dir_recursive(source, destination).await?;
+    } else {
+        tokio::fs::copy(source, destination)
+            .await
+            .context("failed copying webdav file")?;
+    }
+
+    Ok(GatewayHttpResponse::bytes(
+        StatusCode::CREATED,
+        "text/plain; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    ))
+}
+
+async fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+
+    while let Some((from, to)) = pending.pop() {
+        tokio::fs::create_dir_all(&to)
+            .await
+            .context("failed creating copied webdav directory")?;
+        let mut entries = tokio::fs::read_dir(&from)
+            .await
+            .context("failed reading copied webdav directory")?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .context("failed reading copied webdav directory entry")?
+        {
+            let child_from = entry.path();
+            let child_to = to.join(entry.file_name());
+            let metadata = entry
+                .metadata()
+                .await
+                .context("failed reading copied webdav metadata")?;
+            if metadata.is_dir() {
+                pending.push((child_from, child_to));
+            } else {
+                tokio::fs::copy(&child_from, &child_to)
+                    .await
+                    .context("failed copying webdav file")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn webdav_path_matches(prefix: &str, path: &str) -> bool {
+    let prefix = normalize_webdav_prefix(prefix);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn webdav_filesystem_path(config: &WebDavConfig, request_path: &str) -> Result<Option<PathBuf>> {
+    let prefix = normalize_webdav_prefix(&config.path_prefix);
+    if !webdav_path_matches(&prefix, request_path) {
+        return Ok(None);
+    }
+
+    let relative = request_path
+        .strip_prefix(&prefix)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let decoded = percent_decode_path(relative)?;
+    let mut target = config.root.clone();
+
+    for part in decoded.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        let component_path = Path::new(part);
+        if component_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(anyhow!("webdav path escapes root"));
+        }
+        if part == "." {
+            continue;
+        }
+        target.push(part);
+    }
+
+    Ok(Some(target))
+}
+
+fn webdav_destination_path(config: &WebDavConfig, headers: &HeaderMap) -> Result<Option<PathBuf>> {
+    let Some(destination) = headers
+        .get("destination")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+
+    let path = if destination.starts_with("http://") || destination.starts_with("https://") {
+        Url::parse(destination)
+            .context("invalid webdav Destination URL")?
+            .path()
+            .to_string()
+    } else {
+        destination.to_string()
+    };
+
+    webdav_filesystem_path(config, &path)
+}
+
+fn normalize_webdav_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn percent_decode_path(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(anyhow!("invalid percent-encoded webdav path"));
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .context("invalid percent-encoded webdav path")?;
+            let byte =
+                u8::from_str_radix(hex, 16).context("invalid percent-encoded webdav path")?;
+            output.push(byte);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(output).context("webdav path is not utf-8")
+}
+
+fn join_webdav_href(prefix: &str, base_path: &str, child_name: &str) -> String {
+    let base = if base_path.ends_with('/') {
+        base_path.to_string()
+    } else if webdav_path_matches(prefix, base_path) {
+        format!("{base_path}/")
+    } else {
+        format!("{}/", normalize_webdav_prefix(prefix))
+    };
+    format!("{base}{}", xml_escape(child_name))
+}
+
+fn webdav_prop_response(path: &str, metadata: &std::fs::Metadata) -> String {
+    let resource_type = if metadata.is_dir() {
+        "<D:resourcetype><D:collection/></D:resourcetype>"
+    } else {
+        "<D:resourcetype/>"
+    };
+    let content_length = if metadata.is_dir() { 0 } else { metadata.len() };
+    format!(
+        r#"<D:response><D:href>{}</D:href><D:propstat><D:prop>{}<D:getcontentlength>{}</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+        xml_escape(path),
+        resource_type,
+        content_length
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> GatewayHttpResponse {
     match route.upstream.as_str() {
         "proxysss://welcome" => {
@@ -2559,7 +3454,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>默认监听</h3>
                     <p>HTTP/TLS/HTTP3 入口由配置决定，后台管理默认绑定到 <code>__ADMIN_URL__</code>。</p>
                     <ul>
-                        <li>欢迎页：<code>http://localhost:23380/</code></li>
+                        <li>欢迎页：<code>http://localhost/</code></li>
                         <li>后台页：<code>http://__ADMIN_URL__/</code></li>
                         <li>健康检查：<code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>
@@ -2568,7 +3463,7 @@ fn render_welcome_html(config: &GatewayConfig) -> String {
                     <h3>Default Endpoints</h3>
                     <p>HTTP/TLS/HTTP3 listeners come from config, while the admin console is bound to <code>__ADMIN_URL__</code> by default.</p>
                     <ul>
-                        <li>Welcome page: <code>http://localhost:23380/</code></li>
+                        <li>Welcome page: <code>http://localhost/</code></li>
                         <li>Admin page: <code>http://__ADMIN_URL__/</code></li>
                         <li>Health check: <code>http://__ADMIN_URL__/healthz</code></li>
                     </ul>
@@ -2615,12 +3510,12 @@ proxysss run --config ./proxysss.yaml</pre>
             <article class="card">
                 <span class="pill">Why proxysss</span>
                 <div data-lang="zh" class="active">
-                    <h3>和 nginx 的差异</h3>
-                    <p>nginx 更像通用静态反代基建，proxysss 更偏业务网关：可脚本路由、玩家亲和、插件热加载、统一 TCP/UDP/HTTP 接入。</p>
+                    <h3>和 nginx 同级</h3>
+                    <p>proxysss 的定位是通用网关和反向代理，目标是覆盖 nginx 的入口职责；脚本与插件只是扩展层，类似 nginx 通过 Lua 承载更贴近业务的逻辑。</p>
                 </div>
                 <div data-lang="en">
-                    <h3>How It Differs from nginx</h3>
-                    <p>nginx is a proven general-purpose reverse proxy. proxysss is tuned for programmable gateway logic: sticky player routing, plugin hot-load, and unified TCP/UDP/HTTP entry handling.</p>
+                    <h3>Same Tier as nginx</h3>
+                    <p>proxysss is a general gateway and reverse proxy intended to cover nginx-style front-door duties. Scripts and plugins are the extension layer, similar to using Lua with nginx.</p>
                 </div>
             </article>
         </section>
@@ -2910,18 +3805,100 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
 }
 
-fn read_file_hash(path: &Path) -> Result<u64> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+fn reload_fingerprint(config_path: &Path) -> Result<u64> {
+    let config = GatewayConfig::load(config_path)?;
     let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
+    serde_json::to_vec(&config)
+        .context("failed serializing reload config fingerprint")?
+        .hash(&mut hasher);
+
+    for path in watched_script_paths(&config) {
+        path.display().to_string().hash(&mut hasher);
+        match std::fs::read(&path) {
+            Ok(bytes) => bytes.hash(&mut hasher),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                "missing".hash(&mut hasher);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed reading script {}", path.display()));
+            }
+        }
+    }
+
     Ok(hasher.finish())
+}
+
+pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let cwd = config
+        .script
+        .cwd
+        .clone()
+        .unwrap_or_else(|| config.root_dir.clone());
+
+    for arg in &config.script.args {
+        let candidate = PathBuf::from(arg);
+        if is_script_file(&candidate) {
+            paths.push(absolutize_script_path(&cwd, &candidate));
+        }
+    }
+
+    if config.plugins.enabled && config.plugins.auto_load_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&config.plugins.auto_load_dir) {
+            let extension_set: HashSet<String> = config
+                .plugins
+                .extensions
+                .iter()
+                .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+                .collect();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| extension_set.contains(&value.to_ascii_lowercase()))
+                        .unwrap_or(false)
+                {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn is_script_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "ts" | "js" | "mjs" | "cjs"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn absolutize_script_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AdminConfig, StreamAffinityConfig};
+    use crate::config::{
+        AdminConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
+        ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
+    };
 
     #[test]
     fn runtime_scope_key_contains_protocol_listener_and_upstream() {
@@ -3018,5 +3995,387 @@ mod tests {
         );
 
         assert!(websocket_upgrade_requested(&headers));
+    }
+
+    #[test]
+    fn reverse_proxy_route_matches_wildcard_host_and_strips_prefix() {
+        let route = ReverseProxyRouteConfig {
+            name: "api".to_string(),
+            path_prefix: "/api".to_string(),
+            hosts: vec!["*.example.com".to_string()],
+            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: Vec::new(),
+            strip_prefix: true,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+        };
+        let uri: Uri = "/api/v1/users?q=1".parse().expect("valid uri");
+
+        assert!(reverse_proxy_route_matches(
+            &route,
+            "edge.example.com:80",
+            uri.path()
+        ));
+        let decision = reverse_proxy_route_decision(&route, &uri);
+        assert_eq!(decision.rewrite_path.as_deref(), Some("/v1/users?q=1"));
+    }
+
+    #[test]
+    fn configured_reverse_proxy_uses_longest_path_prefix() {
+        let mut config = GatewayConfig::default();
+        config.services.reverse_proxy = ReverseProxyConfig {
+            routes: vec![
+                ReverseProxyRouteConfig {
+                    name: "root-api".to_string(),
+                    path_prefix: "/api".to_string(),
+                    hosts: Vec::new(),
+                    upstream: "http://127.0.0.1:8080".to_string(),
+                    upstreams: Vec::new(),
+                    strip_prefix: false,
+                    set_headers: BTreeMap::new(),
+                    strip_headers: Vec::new(),
+                },
+                ReverseProxyRouteConfig {
+                    name: "admin-api".to_string(),
+                    path_prefix: "/api/admin".to_string(),
+                    hosts: Vec::new(),
+                    upstream: "http://127.0.0.1:9090".to_string(),
+                    upstreams: Vec::new(),
+                    strip_prefix: false,
+                    set_headers: BTreeMap::new(),
+                    strip_headers: Vec::new(),
+                },
+            ],
+        };
+
+        let uri: Uri = "/api/admin/users".parse().expect("valid uri");
+        let decision =
+            configured_reverse_proxy_route(&config, "example.com", &uri).expect("matched route");
+        assert_eq!(decision.upstream, "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn reload_allows_http_hot_path_service_changes() {
+        let old = GatewayConfig::default();
+        let mut new = old.clone();
+        new.services
+            .reverse_proxy
+            .routes
+            .push(ReverseProxyRouteConfig {
+                name: "api".to_string(),
+                path_prefix: "/api".to_string(),
+                hosts: Vec::new(),
+                upstream: "http://127.0.0.1:8080".to_string(),
+                upstreams: Vec::new(),
+                strip_prefix: false,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+            });
+        new.services.static_sites.push(StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: PathBuf::from("public"),
+            index_files: vec!["index.html".to_string()],
+            autoindex: false,
+        });
+        new.services.webdav.enabled = true;
+
+        assert!(ensure_reload_compatible(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn reload_rejects_ftp_listener_changes() {
+        let old = GatewayConfig::default();
+        let mut new = old.clone();
+        new.services.ftp.enabled = true;
+
+        let error =
+            ensure_reload_compatible(&old, &new).expect_err("ftp listener enable requires restart");
+        assert!(error.to_string().contains("ftp listener changes"));
+    }
+
+    #[test]
+    fn http_rate_limit_key_can_use_header() {
+        let config = HttpRateLimitConfig {
+            enabled: true,
+            key: RateLimitKey::Header("x-api-key".to_string()),
+            requests: 1,
+            window_ms: 1000,
+            burst: 0,
+            status: 429,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("abc"));
+        let remote: SocketAddr = "127.0.0.1:12345".parse().expect("remote addr");
+
+        let key = http_rate_limit_key(&config, "example.com", &headers, remote);
+        assert_eq!(key.as_deref(), Some("header:x-api-key:abc"));
+    }
+
+    #[test]
+    fn http_rate_limit_blocks_after_limit() {
+        let config = HttpRateLimitConfig {
+            enabled: true,
+            key: RateLimitKey::RemoteAddr,
+            requests: 1,
+            window_ms: 60_000,
+            burst: 0,
+            status: 429,
+        };
+        let store = DashMap::new();
+
+        assert!(
+            apply_http_rate_limit_to_store(&store, &config, "remote:127.0.0.1".to_string())
+                .is_none()
+        );
+        let retry_after =
+            apply_http_rate_limit_to_store(&store, &config, "remote:127.0.0.1".to_string())
+                .expect("second request blocked");
+        assert!(retry_after.parse::<u64>().expect("retry-after number") > 0);
+    }
+
+    #[test]
+    fn webdav_path_mapping_rejects_traversal() {
+        let config = WebDavConfig {
+            enabled: true,
+            path_prefix: "/dav".to_string(),
+            root: PathBuf::from("/tmp/webdav-root"),
+            allow_write: true,
+        };
+
+        let error = webdav_filesystem_path(&config, "/dav/%2e%2e/secret")
+            .expect_err("traversal must be rejected");
+        assert!(error.to_string().contains("escapes root"));
+    }
+
+    #[test]
+    fn webdav_path_mapping_decodes_safe_paths() {
+        let config = WebDavConfig {
+            enabled: true,
+            path_prefix: "/dav".to_string(),
+            root: PathBuf::from("/tmp/webdav-root"),
+            allow_write: true,
+        };
+
+        let target = webdav_filesystem_path(&config, "/dav/folder/a%20b.txt")
+            .expect("path should map")
+            .expect("path should match prefix");
+
+        assert!(target.ends_with(Path::new("folder").join("a b.txt")));
+    }
+
+    #[tokio::test]
+    async fn webdav_put_get_delete_roundtrip() {
+        let root = std::env::temp_dir().join(format!("proxysss-webdav-test-{}", Uuid::new_v4()));
+        let config = WebDavConfig {
+            enabled: true,
+            path_prefix: "/dav".to_string(),
+            root: root.clone(),
+            allow_write: true,
+        };
+        let uri: Uri = "/dav/hello.txt".parse().expect("valid uri");
+        let headers = HeaderMap::new();
+
+        let put = dispatch_webdav(
+            &config,
+            &Method::PUT,
+            &uri,
+            &headers,
+            Bytes::from_static(b"hello webdav"),
+        )
+        .await
+        .expect("put succeeds");
+        assert_eq!(put.status, StatusCode::CREATED);
+
+        let get = dispatch_webdav(&config, &Method::GET, &uri, &headers, Bytes::new())
+            .await
+            .expect("get succeeds");
+        assert_eq!(get.status, StatusCode::OK);
+        assert_eq!(get.body, Bytes::from_static(b"hello webdav"));
+
+        let delete = dispatch_webdav(&config, &Method::DELETE, &uri, &headers, Bytes::new())
+            .await
+            .expect("delete succeeds");
+        assert_eq!(delete.status, StatusCode::NO_CONTENT);
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn webdav_propfind_lists_collection() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-webdav-propfind-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create webdav root");
+        tokio::fs::write(root.join("item.txt"), b"item")
+            .await
+            .expect("write child");
+
+        let config = WebDavConfig {
+            enabled: true,
+            path_prefix: "/dav".to_string(),
+            root: root.clone(),
+            allow_write: true,
+        };
+        let uri: Uri = "/dav".parse().expect("valid uri");
+        let response = dispatch_webdav(
+            &config,
+            &Method::from_bytes(b"PROPFIND").unwrap(),
+            &uri,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("propfind succeeds");
+
+        assert_eq!(response.status, StatusCode::from_u16(207).unwrap());
+        let body = String::from_utf8(response.body.to_vec()).expect("utf8 body");
+        assert!(body.contains("item.txt"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn static_path_mapping_rejects_traversal() {
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: PathBuf::from("/tmp/static-root"),
+            index_files: vec!["index.html".to_string()],
+            autoindex: false,
+        };
+
+        let error = static_site_filesystem_path(&site, "/assets/%2e%2e/secret")
+            .expect_err("traversal must be rejected");
+        assert!(error.to_string().contains("escapes root"));
+    }
+
+    #[tokio::test]
+    async fn static_site_serves_index_file() {
+        let root = std::env::temp_dir().join(format!("proxysss-static-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create static root");
+        tokio::fs::write(root.join("index.html"), b"<h1>ok</h1>")
+            .await
+            .expect("write index");
+
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: root.clone(),
+            index_files: vec!["index.html".to_string()],
+            autoindex: false,
+        };
+        let uri: Uri = "/assets".parse().expect("valid uri");
+        let response = dispatch_static_site(&site, &Method::GET, &uri)
+            .await
+            .expect("static response");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"<h1>ok</h1>"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn static_site_autoindex_lists_directory() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-static-autoindex-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create static root");
+        tokio::fs::write(root.join("item.txt"), b"item")
+            .await
+            .expect("write item");
+
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: root.clone(),
+            index_files: vec!["index.html".to_string()],
+            autoindex: true,
+        };
+        let uri: Uri = "/assets".parse().expect("valid uri");
+        let response = dispatch_static_site(&site, &Method::GET, &uri)
+            .await
+            .expect("static response");
+
+        assert_eq!(response.status, StatusCode::OK);
+        let body = String::from_utf8(response.body.to_vec()).expect("utf8 body");
+        assert!(body.contains("item.txt"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn watched_script_paths_include_main_script_and_plugins() {
+        let root = std::env::temp_dir().join(format!("proxysss-watch-test-{}", Uuid::new_v4()));
+        let plugins = root.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("create plugin dir");
+        std::fs::write(root.join("gateway.ts"), "// gateway").expect("write gateway");
+        std::fs::write(plugins.join("traffic-stats.ts"), "// plugin").expect("write plugin");
+
+        let config = GatewayConfig {
+            root_dir: root.clone(),
+            script: crate::config::ScriptConfig {
+                cwd: Some(root.clone()),
+                args: vec![
+                    "run".to_string(),
+                    "-A".to_string(),
+                    "gateway.ts".to_string(),
+                ],
+                ..crate::config::ScriptConfig::default()
+            },
+            plugins: crate::config::PluginsConfig {
+                auto_load_dir: plugins.clone(),
+                ..crate::config::PluginsConfig::default()
+            },
+            ..GatewayConfig::default()
+        };
+
+        let paths = watched_script_paths(&config);
+        assert!(paths.contains(&root.join("gateway.ts")));
+        assert!(paths.contains(&plugins.join("traffic-stats.ts")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn welcome_page_includes_branding_and_admin_bind() {
+        let config = GatewayConfig::default();
+        let html = render_welcome_html(&config);
+        assert!(html.contains("Welcome to proxysss"));
+        assert!(html.contains("欢迎来到 proxysss"));
+        assert!(html.contains("127.0.0.1:7777"));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn reload_fingerprint_changes_when_main_script_changes() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-fingerprint-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("proxysss.yaml");
+        let script_path = root.join("gateway.ts");
+
+        std::fs::write(&script_path, "console.log('v1');").expect("write script v1");
+        std::fs::write(
+            &config_path,
+            format!(
+                "script:\n  command: deno\n  args: [run, -A, gateway.ts]\n  cwd: {}\nplugins:\n  enabled: false\n",
+                root.display().to_string().replace('\\', "/")
+            ),
+        )
+        .expect("write config");
+
+        let before = reload_fingerprint(&config_path).expect("fingerprint before");
+        std::fs::write(&script_path, "console.log('v2');").expect("write script v2");
+        let after = reload_fingerprint(&config_path).expect("fingerprint after");
+
+        assert_ne!(before, after);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

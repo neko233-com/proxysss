@@ -37,6 +37,8 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     let config_path = base_dir.join(DEFAULT_CONFIG_FILE_NAME);
     let script_path = base_dir.join(DEFAULT_SCRIPT_FILE_NAME);
     let plugin_path = plugin_dir.join("player-affinity.ts");
+    let traffic_stats_plugin_path = plugin_dir.join("traffic-stats.ts");
+    let structured_log_plugin_path = plugin_dir.join("structured-log.ts");
 
     fs::create_dir_all(&cert_dir)
         .with_context(|| format!("failed to create {}", cert_dir.display()))?;
@@ -54,6 +56,16 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     write_if_needed(&config_path, &config_yaml, overwrite)?;
     write_if_needed(&script_path, DEFAULT_GATEWAY_SCRIPT, overwrite)?;
     write_if_needed(&plugin_path, DEFAULT_PLUGIN_PLAYER_AFFINITY, overwrite)?;
+    write_if_needed(
+        &traffic_stats_plugin_path,
+        DEFAULT_PLUGIN_TRAFFIC_STATS,
+        overwrite,
+    )?;
+    write_if_needed(
+        &structured_log_plugin_path,
+        DEFAULT_PLUGIN_STRUCTURED_LOG,
+        overwrite,
+    )?;
 
     ensure_cert_pair(
         &cert_dir.join("proxysss-cert.pem"),
@@ -495,3 +507,5 @@ fn systemd_quote(path: &Path) -> String {
 const DEFAULT_GATEWAY_SCRIPT: &str = include_str!("../templates/gateway.ts");
 const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
     include_str!("../templates/plugins/player-affinity.ts");
+const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/traffic-stats.ts");
+const DEFAULT_PLUGIN_STRUCTURED_LOG: &str = include_str!("../templates/plugins/structured-log.ts");

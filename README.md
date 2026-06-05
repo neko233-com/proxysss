@@ -2,11 +2,15 @@
 
 proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/3、TCP、UDP，适合游戏网关、聊天网关和通用高并发接入层。
 
-当前版本：v0.1.4
+产品目标：作为 nginx 同级通用网关完整替代 nginx 的常见入口职责，同时提供更适合人类和 agent 接管的配置、查询和输出体验。默认 HTTP 端口与 nginx 一致为 80，首页是更友好的 `Welcome to proxysss`。proxysss 不是“业务网关优先”的产品；脚本/插件扩展层类似 nginx + Lua，用来承载可选的业务逻辑。
+
+当前版本：v0.2.0
 
 ## 核心能力
 
 - 多协议统一入口：HTTP/1.1、HTTP/2（TCP）+ HTTP/3（UDP）+ TCP + UDP
+- 声明式反向代理：`services.reverse_proxy.routes` 支持 host/path 匹配、upstream 池、strip_prefix
+- 限流：`services.rate_limit.http` 支持按 IP、Host 或 Header 的请求速率限制
 - TS/JS 可编程路由：默认通过 Deno 运行 gateway.ts
 - 插件机制：支持插件自动加载、动态 load/unload/list
 - 负载均衡：rendezvous、round_robin、least_connections、source_hash
@@ -16,6 +20,11 @@ proxysss 是一个可编程 Rust 网关，统一支持 HTTP/1.1、HTTP/2、HTTP/
 - 管理端：内置 admin API（可关闭）
 - 配置热重载：配置文件变更后自动校验并重载
 - TLS 模式：self_signed / manual / acme_external
+- 显式子配置：通过 `include.enabled` + `include.files` 声明子配置，不自动扫目录
+- 扩展服务：内建 `services.static_sites` 静态文件服务、`services.ftp` TCP 透传、内建 `services.webdav` 运行时
+- 热重载：配置、显式 include、主扩展脚本、自动加载插件脚本均参与热重载 fingerprint
+- 日志：访问日志（`logs/access.log`）、错误日志（`logs/error.log`）、`debug/info/warn/error` 级别控制，默认 `info`；`debug` 用于项目内部诊断
+- 性能目标：以 nginx 级吞吐/延迟为基线，热路径设计优先考虑低分配、背压、锁竞争和可水平扩展
 
 ## 运行环境
 
@@ -36,6 +45,8 @@ proxysss init
 - proxysss.yaml
 - gateway.ts
 - plugins/player-affinity.ts
+- plugins/traffic-stats.ts
+- plugins/structured-log.ts
 - certs/proxysss-cert.pem
 - certs/proxysss-key.pem
 
@@ -51,10 +62,11 @@ proxysss check-config --config ./proxysss.yaml
 proxysss run --config ./proxysss.yaml
 ```
 
-默认网关端口：23380
+默认端口：
 
-- TCP: HTTP/1.1 + HTTP/2
-- UDP: HTTP/3
+- 80: HTTP welcome page
+- 7777: admin console/API
+- 443: HTTPS/HTTP2 与 HTTP/3
 
 ## 一键安装
 
@@ -67,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.1.4
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.0
 ```
 
 ### Windows PowerShell
@@ -80,7 +92,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.1.4
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.0
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -108,7 +120,7 @@ install.ps1 支持参数：
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.1.4
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.0
 ```
 
 降级到指定版本：
@@ -120,7 +132,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.1.4 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.0 -DryRun
 ```
 
 ### Linux / macOS
@@ -128,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.1.4
+bash ./scripts/install.sh v0.2.0
 bash ./scripts/install.sh v0.1.0
 ```
 
@@ -155,7 +167,7 @@ bash ./scripts/install.sh v0.1.0
 ## 配置与安全
 
 - 推荐配置格式：YAML（同样支持 JSON）
-- 默认管理端地址：127.0.0.1:23381
+- 默认管理端地址：127.0.0.1:7777
 - 默认管理端账号：root / root
 - 生产环境必须修改默认管理账号密码
 
@@ -165,6 +177,83 @@ bash ./scripts/install.sh v0.1.0
 proxysss print-default-config --format yaml
 proxysss print-default-config --format json
 ```
+
+快速查阅当前配置：
+
+```bash
+proxysss config show --format yaml
+proxysss config includes
+proxysss config watched-scripts
+proxysss config routes
+proxysss config reload-plan
+proxysss config nginx-parity --format yaml
+proxysss config explain
+proxysss config capabilities
+```
+
+显式子配置示例：
+
+```yaml
+include:
+  enabled: true
+  required: true
+  files:
+    - ./conf.d/http.yaml
+    - ./conf.d/services.yaml
+```
+
+FTP/WebDAV 示例：
+
+```yaml
+services:
+  reverse_proxy:
+    routes:
+      - name: api
+        hosts: [api.example.com]
+        path_prefix: /api
+        upstream: http://127.0.0.1:8080
+        upstreams:
+          - http://127.0.0.1:8080
+          - http://127.0.0.1:8081
+        strip_prefix: true
+        set_headers:
+          x-gateway: proxysss
+  rate_limit:
+    http:
+      enabled: true
+      key: remote_addr
+      requests: 120
+      window_ms: 60000
+      burst: 20
+      status: 429
+  static_sites:
+    - name: public
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false
+  ftp:
+    enabled: true
+    bind: 0.0.0.0:21
+    upstream: 127.0.0.1:2121
+  webdav:
+    enabled: true
+    path_prefix: /dav
+    root: ./webdav
+    allow_write: true
+```
+
+WebDAV 内建支持 `OPTIONS`、`PROPFIND`、`GET`、`HEAD`、`PUT`、`DELETE`、`MKCOL`、`COPY`、`MOVE`。启用后请求会在脚本路由之前由 proxysss 热路径处理，避免把通用文件流量压到业务脚本上。
+
+官方默认扩展脚本：
+
+- `plugins/structured-log.ts`：演示 log hook、结构化访问事件输出。
+- `plugins/traffic-stats.ts`：演示 log hook、访问事件、错误计数、流量统计。
+- `plugins/player-affinity.ts`：演示亲和路由。
+
+给 agent 的一键安装 skill 位于：
+
+- skills/proxysss-install/SKILL.md
 
 ## 管理接口
 
@@ -219,7 +308,7 @@ proxysss demo udp-echo --listen 127.0.0.1:8101
 压测命令：
 
 ```bash
-proxysss bench http --url https://127.0.0.1:23380/ --concurrency 512 --duration-secs 30 --insecure
+proxysss bench http --url https://127.0.0.1/ --concurrency 512 --duration-secs 30 --insecure
 proxysss bench tcp --addr 127.0.0.1:26379 --connections 512 --duration-secs 30 --payload-bytes 512
 proxysss bench udp --addr 127.0.0.1:2053 --connections 512 --duration-secs 30 --payload-bytes 256
 ```

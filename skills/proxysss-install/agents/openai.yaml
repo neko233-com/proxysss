@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install proxysss"
+  short_description: "Install and verify proxysss for agent takeover."
+  default_prompt: "Install proxysss on this machine, initialize its config, verify it, and report the admin URL."
