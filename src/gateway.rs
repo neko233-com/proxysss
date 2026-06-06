@@ -2012,7 +2012,7 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
             Err(error) => {
                 tracing::warn!(
                     ?error,
-                    command = %config.script.command,
+                    entry = %config.script.entry.display(),
                     "script runtime failed to start; continuing with YAML-only routing and skipping TypeScript extensions"
                 );
                 None
@@ -4535,10 +4535,20 @@ pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
             .clone()
             .unwrap_or_else(|| config.root_dir.clone());
 
+        if !config.script.entry.as_os_str().is_empty() {
+            let entry = absolutize_script_path(&cwd, &config.script.entry);
+            if is_script_file(&entry) {
+                paths.push(entry);
+            }
+        }
+
         for arg in &config.script.args {
             let candidate = PathBuf::from(arg);
             if is_script_file(&candidate) {
-                paths.push(absolutize_script_path(&cwd, &candidate));
+                let path = absolutize_script_path(&cwd, &candidate);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
             }
         }
     }
@@ -4997,6 +5007,7 @@ mod tests {
             root_dir: root.clone(),
             script: crate::config::ScriptConfig {
                 enabled: true,
+                entry: PathBuf::from("gateway.ts"),
                 cwd: Some(root.clone()),
                 args: vec![
                     "run".to_string(),
@@ -5077,6 +5088,7 @@ mod tests {
     async fn build_dynamic_state_disables_broken_script_runtime() {
         let mut config = GatewayConfig::default();
         config.script.enabled = true;
+        config.script.entry = PathBuf::from("gateway.ts");
         config.script.command = "/definitely/missing/proxysss-ts-runtime".to_string();
         config.script.args = vec![
             "run".to_string(),

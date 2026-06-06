@@ -242,6 +242,8 @@ pub struct UdpListenerConfig {
 pub struct ScriptConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_script_entry")]
+    pub entry: PathBuf,
     #[serde(default = "default_script_command")]
     pub command: String,
     #[serde(default = "default_script_args")]
@@ -531,8 +533,11 @@ impl GatewayConfig {
         }
 
         if self.script.enabled {
-            if self.script.command.trim().is_empty() {
-                errors.push("script.command cannot be empty when script.enabled=true".to_string());
+            if self.script.entry.as_os_str().is_empty() && self.script.args.is_empty() {
+                errors.push(
+                    "script.entry cannot be empty when script.enabled=true unless script.args is explicitly provided"
+                        .to_string(),
+                );
             }
 
             if self.script.timeout_ms == 0 {
@@ -869,13 +874,27 @@ impl GatewayConfig {
 
     pub fn render_default_yaml(script_command: &str) -> String {
         let mut config = Self::default();
-        config.script.command = script_command.to_string();
+        config.script.command.clear();
+        config.script.args.clear();
+        if !script_command.trim().is_empty() {
+            config
+                .script
+                .env
+                .insert("PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(), script_command.to_string());
+        }
         serde_yaml::to_string(&config).unwrap_or_else(|_| "".to_string())
     }
 
     pub fn render_default_json(script_command: &str) -> String {
         let mut config = Self::default();
-        config.script.command = script_command.to_string();
+        config.script.command.clear();
+        config.script.args.clear();
+        if !script_command.trim().is_empty() {
+            config
+                .script
+                .env
+                .insert("PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(), script_command.to_string());
+        }
         serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -1029,6 +1048,7 @@ impl Default for ScriptConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            entry: default_script_entry(),
             command: default_script_command(),
             args: default_script_args(),
             cwd: Some(PathBuf::from(".")),
@@ -1427,6 +1447,10 @@ fn default_udp_listeners() -> Vec<UdpListenerConfig> {
 
 fn default_script_command() -> String {
     default_managed_script_command()
+}
+
+fn default_script_entry() -> PathBuf {
+    PathBuf::from(DEFAULT_SCRIPT_FILE_NAME)
 }
 
 fn default_script_args() -> Vec<String> {

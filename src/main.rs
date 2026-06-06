@@ -751,8 +751,9 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.ftp.enabled, config.services.ftp.bind, config.services.ftp.upstream
     );
     println!(
-        "script            : enabled={}, command={}, args={}",
+        "script            : enabled={}, entry={}, command={}, args={}",
         config.script.enabled,
+        config.script.entry.display(),
         config.script.command,
         config.script.args.join(" ")
     );
@@ -884,7 +885,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("[hot_reload]\n");
     output.push_str("configuration values except listener identity\n");
     output.push_str("explicit include files from include.files\n");
-    output.push_str("main extension script from script.args\n");
+    output.push_str("main extension script from script.entry/script.args\n");
     output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
     output.push_str("reverse_proxy routes\n");
     output.push_str("static_sites\n");

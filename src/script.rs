@@ -114,8 +114,23 @@ pub struct ScriptRuntime {
 
 impl ScriptRuntime {
     pub fn spawn(config: &ScriptConfig, runtime_env: &BTreeMap<String, String>) -> Result<Self> {
-        let mut command = Command::new(&config.command);
-        command.args(&config.args);
+        let command_name = if config.command.trim().is_empty() {
+            crate::config::default_managed_script_command()
+        } else {
+            config.command.clone()
+        };
+        let command_args = if !config.args.is_empty() {
+            config.args.clone()
+        } else {
+            vec![
+                "run".to_string(),
+                "-A".to_string(),
+                config.entry.to_string_lossy().to_string(),
+            ]
+        };
+
+        let mut command = Command::new(&command_name);
+        command.args(&command_args);
         command.envs(runtime_env);
         command.envs(&config.env);
 
@@ -128,9 +143,9 @@ impl ScriptRuntime {
         command.stderr(Stdio::inherit());
 
         let mut child = command.spawn().with_context(|| {
-            let mut message = format!("failed to spawn script runtime {}", config.command);
-            if !std::path::Path::new(&config.command).exists()
-                && config.command == crate::config::default_managed_script_command()
+            let mut message = format!("failed to spawn script runtime {}", command_name);
+            if !std::path::Path::new(&command_name).exists()
+                && command_name == crate::config::default_managed_script_command()
             {
                 message.push_str(
                     "; bundled TypeScript runtime is missing from proxysss runtime directory, reinstall the proxysss bundle",
