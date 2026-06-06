@@ -483,13 +483,17 @@ async fn main() -> Result<()> {
                 ConfigOutputFormat::Yaml => {
                     print!(
                         "{}",
-                        config::GatewayConfig::render_default_yaml(&install::preferred_script_command())
+                        config::GatewayConfig::render_default_yaml(
+                            &install::preferred_script_command()
+                        )
                     )
                 }
                 ConfigOutputFormat::Json => {
                     print!(
                         "{}",
-                        config::GatewayConfig::render_default_json(&install::preferred_script_command())
+                        config::GatewayConfig::render_default_json(
+                            &install::preferred_script_command()
+                        )
                     )
                 }
             }

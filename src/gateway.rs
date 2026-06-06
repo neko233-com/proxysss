@@ -1376,7 +1376,8 @@ impl Gateway {
             return Ok(dispatch_internal_http(&state.config, &route));
         }
 
-        let route = if let Some(route) = configured_reverse_proxy_route(&state.config, &host, &uri) {
+        let route = if let Some(route) = configured_reverse_proxy_route(&state.config, &host, &uri)
+        {
             route
         } else if let Some(script) = &state.script {
             script
@@ -2810,7 +2811,9 @@ fn configured_tcp_listener_route(
         .listeners
         .iter()
         .find(|listener| listener.name == listener_name)
-        .and_then(|listener| configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key))
+        .and_then(|listener| {
+            configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key)
+        })
 }
 
 fn configured_udp_listener_route(
@@ -2823,7 +2826,9 @@ fn configured_udp_listener_route(
         .listeners
         .iter()
         .find(|listener| listener.name == listener_name)
-        .and_then(|listener| configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key))
+        .and_then(|listener| {
+            configured_stream_listener_route(&listener.upstream, &listener.upstreams, affinity_key)
+        })
 }
 
 fn configured_stream_listener_route(
@@ -2864,7 +2869,10 @@ fn configured_stream_listener_route(
 
 pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    env.insert("PROXYSSS_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string());
+    env.insert(
+        "PROXYSSS_VERSION".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
     env.insert(
         "PROXYSSS_CONFIG_ROOT".to_string(),
         config.root_dir.to_string_lossy().to_string(),
@@ -2879,9 +2887,18 @@ pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, Str
             .to_string_lossy()
             .to_string(),
     );
-    env.insert("PROXYSSS_HTTP_BIND".to_string(), config.http.plain_bind.clone());
-    env.insert("PROXYSSS_HTTPS_BIND".to_string(), config.http.tls_bind.clone());
-    env.insert("PROXYSSS_HTTP3_BIND".to_string(), config.http.h3_bind.clone());
+    env.insert(
+        "PROXYSSS_HTTP_BIND".to_string(),
+        config.http.plain_bind.clone(),
+    );
+    env.insert(
+        "PROXYSSS_HTTPS_BIND".to_string(),
+        config.http.tls_bind.clone(),
+    );
+    env.insert(
+        "PROXYSSS_HTTP3_BIND".to_string(),
+        config.http.h3_bind.clone(),
+    );
     env.insert(
         "PROXYSSS_ADMIN_BIND".to_string(),
         if config.admin.enabled {
@@ -5061,10 +5078,16 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.script.enabled = true;
         config.script.command = "/definitely/missing/proxysss-ts-runtime".to_string();
-        config.script.args = vec!["run".to_string(), "-A".to_string(), "gateway.ts".to_string()];
+        config.script.args = vec![
+            "run".to_string(),
+            "-A".to_string(),
+            "gateway.ts".to_string(),
+        ];
         config.plugins.enabled = false;
 
-        let state = build_dynamic_state(config).await.expect("dynamic state without script runtime");
+        let state = build_dynamic_state(config)
+            .await
+            .expect("dynamic state without script runtime");
         assert!(state.script.is_none());
     }
 

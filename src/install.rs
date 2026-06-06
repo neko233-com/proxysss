@@ -802,6 +802,9 @@ mod tests {
     #[test]
     fn pid_file_path_lives_next_to_config() {
         let config = PathBuf::from("/tmp/example/proxysss.yaml");
-        assert_eq!(pid_file_path(&config), PathBuf::from("/tmp/example/proxysss.pid"));
+        assert_eq!(
+            pid_file_path(&config),
+            PathBuf::from("/tmp/example/proxysss.pid")
+        );
     }
 }
