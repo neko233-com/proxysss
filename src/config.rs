@@ -413,12 +413,7 @@ pub struct HttpAccessControlConfig {
     pub enabled: bool,
     #[serde(default, alias = "allowlist", alias = "whitelist")]
     pub allow: Vec<String>,
-    #[serde(
-        default,
-        alias = "denylist",
-        alias = "blacklist",
-        alias = "blocklist"
-    )]
+    #[serde(default, alias = "denylist", alias = "blacklist", alias = "blocklist")]
     pub deny: Vec<String>,
     #[serde(default = "default_access_control_status")]
     pub status: u16,
@@ -2266,7 +2261,9 @@ mod tests {
         let error = config
             .validate()
             .expect_err("expected invalid access control rule");
-        assert!(error.to_string().contains("services.access_control.http.deny.0"));
+        assert!(error
+            .to_string()
+            .contains("services.access_control.http.deny.0"));
     }
 
     #[test]
