@@ -45,11 +45,6 @@ function Assert-InstalledWindowsAsset([string]$ExpectedVersion) {
         throw "installed proxysss.exe not found at $installPath"
     }
 
-    $runtimePath = Join-Path $env:APPDATA "proxysss\runtime\deno\bin\deno.exe"
-    if (!(Test-Path -LiteralPath $runtimePath)) {
-        throw "installed bundled runtime not found at $runtimePath"
-    }
-
     if ($installed -eq $ExpectedVersion) {
         return
     }
@@ -71,21 +66,14 @@ function Assert-InstalledWindowsAsset([string]$ExpectedVersion) {
     Expand-Archive -LiteralPath $tmp -DestinationPath $extract -Force
 
     $expectedExe = Join-Path $extract "proxysss.exe"
-    $expectedRuntime = Join-Path $extract "runtime\deno\bin\deno.exe"
-    if (!(Test-Path $expectedExe) -or !(Test-Path $expectedRuntime)) {
-        throw "release bundle is missing proxysss.exe or bundled runtime"
+    if (!(Test-Path $expectedExe)) {
+        throw "release bundle is missing proxysss.exe"
     }
 
     $installedHash = (Get-FileHash -LiteralPath $installPath -Algorithm SHA256).Hash
     $expectedHash = (Get-FileHash -LiteralPath $expectedExe -Algorithm SHA256).Hash
     if ($installedHash -ne $expectedHash) {
         throw "installed binary hash mismatch for $assetTag"
-    }
-
-    $installedRuntimeHash = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash
-    $expectedRuntimeHash = (Get-FileHash -LiteralPath $expectedRuntime -Algorithm SHA256).Hash
-    if ($installedRuntimeHash -ne $expectedRuntimeHash) {
-        throw "installed bundled runtime hash mismatch for $assetTag"
     }
 }
 

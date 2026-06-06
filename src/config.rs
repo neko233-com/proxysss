@@ -13,22 +13,6 @@ pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
 
-pub fn default_managed_script_command() -> String {
-    let binary = if cfg!(windows) { "deno.exe" } else { "deno" };
-
-    dirs::config_dir()
-        .map(|dir| {
-            dir.join("proxysss")
-                .join("runtime")
-                .join("deno")
-                .join("bin")
-                .join(binary)
-                .to_string_lossy()
-                .to_string()
-        })
-        .unwrap_or_else(|| binary.to_string())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_config_version")]
@@ -244,16 +228,19 @@ pub struct ScriptConfig {
     pub enabled: bool,
     #[serde(default = "default_script_entry")]
     pub entry: PathBuf,
-    #[serde(default = "default_script_command")]
-    pub command: String,
-    #[serde(default = "default_script_args")]
-    pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_script_timeout_ms")]
     pub timeout_ms: u64,
+    /// Hard memory ceiling (MiB) for the embedded QuickJS engine. A plugin that
+    /// exceeds it triggers a JavaScript out-of-memory error, never an abort.
+    #[serde(default = "default_script_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// Maximum JavaScript stack size (KiB) for the embedded engine.
+    #[serde(default = "default_script_max_stack_size_kb")]
+    pub max_stack_size_kb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,11 +520,8 @@ impl GatewayConfig {
         }
 
         if self.script.enabled {
-            if self.script.entry.as_os_str().is_empty() && self.script.args.is_empty() {
-                errors.push(
-                    "script.entry cannot be empty when script.enabled=true unless script.args is explicitly provided"
-                        .to_string(),
-                );
+            if self.script.entry.as_os_str().is_empty() {
+                errors.push("script.entry cannot be empty when script.enabled=true".to_string());
             }
 
             if self.script.timeout_ms == 0 {
@@ -872,29 +856,13 @@ impl GatewayConfig {
         warnings
     }
 
-    pub fn render_default_yaml(script_command: &str) -> String {
-        let mut config = Self::default();
-        config.script.command.clear();
-        config.script.args.clear();
-        if !script_command.trim().is_empty() {
-            config.script.env.insert(
-                "PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(),
-                script_command.to_string(),
-            );
-        }
+    pub fn render_default_yaml() -> String {
+        let config = Self::default();
         serde_yaml::to_string(&config).unwrap_or_else(|_| "".to_string())
     }
 
-    pub fn render_default_json(script_command: &str) -> String {
-        let mut config = Self::default();
-        config.script.command.clear();
-        config.script.args.clear();
-        if !script_command.trim().is_empty() {
-            config.script.env.insert(
-                "PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(),
-                script_command.to_string(),
-            );
-        }
+    pub fn render_default_json() -> String {
+        let config = Self::default();
         serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -1049,11 +1017,11 @@ impl Default for ScriptConfig {
         Self {
             enabled: false,
             entry: default_script_entry(),
-            command: default_script_command(),
-            args: default_script_args(),
             cwd: Some(PathBuf::from(".")),
             env: BTreeMap::new(),
             timeout_ms: default_script_timeout_ms(),
+            memory_limit_mb: default_script_memory_limit_mb(),
+            max_stack_size_kb: default_script_max_stack_size_kb(),
         }
     }
 }
@@ -1445,24 +1413,20 @@ fn default_udp_listeners() -> Vec<UdpListenerConfig> {
     Vec::new()
 }
 
-fn default_script_command() -> String {
-    default_managed_script_command()
-}
-
 fn default_script_entry() -> PathBuf {
     PathBuf::from(DEFAULT_SCRIPT_FILE_NAME)
 }
 
-fn default_script_args() -> Vec<String> {
-    vec![
-        "run".to_string(),
-        "-A".to_string(),
-        DEFAULT_SCRIPT_FILE_NAME.to_string(),
-    ]
-}
-
 fn default_script_timeout_ms() -> u64 {
     500
+}
+
+fn default_script_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_script_max_stack_size_kb() -> u64 {
+    512
 }
 
 fn default_plugins_auto_load_dir() -> PathBuf {

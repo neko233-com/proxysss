@@ -28,14 +28,6 @@ function Get-ProxysssConfigDir {
     Join-Path $env:APPDATA $BinaryName
 }
 
-function Get-ManagedDenoInstallRoot {
-    Join-Path (Get-ProxysssConfigDir) "runtime\deno"
-}
-
-function Get-ManagedDenoExePath {
-    Join-Path (Get-ManagedDenoInstallRoot) "bin\deno.exe"
-}
-
 function Get-BundleAssetName([string]$Arch) {
     "${BinaryName}-windows-${Arch}.zip"
 }
@@ -333,7 +325,6 @@ if ($DryRun) {
     Write-Host "[dry-run] mkdir $InstallDir"
     Write-Host "[dry-run] download and extract => $asset"
     Write-Host "[dry-run] install => $Dest"
-    Write-Host "[dry-run] install bundled TypeScript runtime => $(Get-ManagedDenoInstallRoot)"
     Write-Host "[dry-run] init/check/service install flow"
     exit 0
 }
@@ -351,22 +342,12 @@ Download-FileWithFallback -Url $url -OutFile $archivePath -ReleaseTag $targetLab
 Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath -Force
 
 $bundleExe = Join-Path $extractPath "$BinaryName.exe"
-$bundleRuntime = Join-Path $extractPath "runtime"
-$bundleDeno = Join-Path $bundleRuntime "deno\bin\deno.exe"
 if (!(Test-Path $bundleExe)) {
     throw "release bundle is missing $BinaryName.exe"
-}
-if (!(Test-Path $bundleDeno)) {
-    throw "release bundle is missing bundled TypeScript runtime"
 }
 
 Move-Item -Force $bundleExe $Dest
 
-$runtimeRoot = Get-ProxysssConfigDir
-$runtimeTarget = Join-Path $runtimeRoot "runtime"
-New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
-Remove-Item -LiteralPath $runtimeTarget -Recurse -Force -ErrorAction SilentlyContinue
-Copy-Item -LiteralPath $bundleRuntime -Destination $runtimeRoot -Recurse -Force
 Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 

@@ -81,7 +81,6 @@ if (-not (Test-Path $CaddyExe)) {
     Set-Content -Path (Join-Path $Www "index.html") -Encoding ascii
 
 & $ReleaseProxysss init --dir (Join-Path $BenchRoot "proxysss") --overwrite | Out-Null
-$ManagedScriptCommand = Join-Path $env:APPDATA "proxysss\runtime\deno\bin\deno.exe"
 $ProxyConfig = @"
 config_version: 1
 include:
@@ -97,11 +96,7 @@ http:
   tls_bind: ''
   h3_bind: ''
 script:
-    command: $ManagedScriptCommand
-  args:
-    - run
-    - '-A'
-    - gateway.ts
+  enabled: false
   cwd: '$($BenchRoot.Replace('\','/'))/proxysss'
 plugins:
   enabled: false

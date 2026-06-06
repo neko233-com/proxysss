@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0 - 2026-06-06
+
+- Replaced the external `deno` script sidecar with an embedded TypeScript/JavaScript engine compiled directly into the proxysss binary (QuickJS via `rquickjs`, TypeScript stripped in-process with `swc_ts_fast_strip`); there is no longer any external `deno`/`node`/`tsc` dependency or bundled runtime directory.
+- Added hard per-call isolation for scripts: every plugin hook runs under a configurable timeout enforced by a QuickJS interrupt handler plus a memory limit, so a buggy plugin (throw, infinite loop, runaway memory) is reported to the error log and never affects native/YAML proxy traffic.
+- Moved routing pipeline orchestration (priority ordering, merge/normalize, fallback) from the TypeScript harness into Rust for full control of script input/output; the main `gateway.ts` is now a normal default-export plugin that acts as the lowest-priority fallback router.
+- Added `script.memory_limit_mb` (default 64) and `script.max_stack_size_kb` (default 512) and removed the deno-specific `script.command`/`script.args` settings.
+- Reworked `proxysss script run-file` / `proxysss script eval` to execute through the embedded engine instead of spawning deno.
+- Removed deno download/bundling from release, deploy, and install packaging; release artifacts are now a single self-contained binary.
+- Added `specs/embedded-ts-runtime.md` documenting the engine decision, isolation model, host/script contract, and verification plan.
+
 ## v0.2.7 - 2026-06-06
 
 - Hardened TypeScript extension execution so startup and hot reload now fall back to YAML-only routing when the script runtime cannot start.

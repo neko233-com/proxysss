@@ -7,10 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, Context, Result};
 use rcgen::generate_simple_self_signed;
 
-use crate::config::{
-    default_managed_script_command, GatewayConfig, DEFAULT_CONFIG_FILE_NAME,
-    DEFAULT_SCRIPT_FILE_NAME,
-};
+use crate::config::{GatewayConfig, DEFAULT_CONFIG_FILE_NAME, DEFAULT_SCRIPT_FILE_NAME};
 
 const SERVICE_NAME: &str = "proxysss";
 const LAUNCH_AGENT_LABEL: &str = "com.neko233.proxysss";
@@ -52,8 +49,7 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     fs::create_dir_all(&plugin_dir)
         .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
 
-    let script_command = preferred_script_command();
-    let config_yaml = GatewayConfig::render_default_yaml(&script_command).replace(
+    let config_yaml = GatewayConfig::render_default_yaml().replace(
         "\n  cwd: .\n",
         &format!(
             "\n  cwd: {}\n",
@@ -719,10 +715,6 @@ fn write_if_needed(path: &Path, content: &str, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn preferred_script_command() -> String {
-    default_managed_script_command()
-}
-
 fn run_command(command: &mut Command, description: &str) -> Result<()> {
     let output = command
         .output()
@@ -792,11 +784,6 @@ mod tests {
             .expect("resolve base dir");
         assert!(path.is_absolute());
         assert!(path.ends_with(Path::new("target").join("proxysss-init-test")));
-    }
-
-    #[test]
-    fn preferred_script_command_matches_managed_runtime_path() {
-        assert_eq!(preferred_script_command(), default_managed_script_command());
     }
 
     #[test]

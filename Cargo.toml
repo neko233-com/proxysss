@@ -1,6 +1,6 @@
 [package]
 name = "proxysss"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "General-purpose Rust gateway built to replace nginx with HTTP, HTTPS, HTTP/2, HTTP/3, TCP, UDP, FTP, WebDAV, and script hooks"
@@ -38,3 +38,6 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+rquickjs = "0.12.0"
+swc_ts_fast_strip = "52.0.0"
+swc_common = { version = "23.0.1", features = ["tty-emitter"] }

@@ -4541,16 +4541,6 @@ pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
                 paths.push(entry);
             }
         }
-
-        for arg in &config.script.args {
-            let candidate = PathBuf::from(arg);
-            if is_script_file(&candidate) {
-                let path = absolutize_script_path(&cwd, &candidate);
-                if !paths.contains(&path) {
-                    paths.push(path);
-                }
-            }
-        }
     }
 
     if config.plugins.enabled && config.plugins.auto_load_dir.exists() {
@@ -5009,11 +4999,6 @@ mod tests {
                 enabled: true,
                 entry: PathBuf::from("gateway.ts"),
                 cwd: Some(root.clone()),
-                args: vec![
-                    "run".to_string(),
-                    "-A".to_string(),
-                    "gateway.ts".to_string(),
-                ],
                 ..crate::config::ScriptConfig::default()
             },
             plugins: crate::config::PluginsConfig {
@@ -5066,8 +5051,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "script:\n  enabled: true\n  command: {}\n  args: [run, -A, gateway.ts]\n  cwd: {}\nplugins:\n  enabled: false\n",
-                crate::config::default_managed_script_command(),
+                "script:\n  enabled: true\n  cwd: {}\nplugins:\n  enabled: false\n",
                 root.display().to_string().replace('\\', "/")
             ),
         )
@@ -5085,22 +5069,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_dynamic_state_disables_broken_script_runtime() {
+    async fn build_dynamic_state_starts_embedded_script_engine() {
         let mut config = GatewayConfig::default();
         config.script.enabled = true;
         config.script.entry = PathBuf::from("gateway.ts");
-        config.script.command = "/definitely/missing/proxysss-ts-runtime".to_string();
-        config.script.args = vec![
-            "run".to_string(),
-            "-A".to_string(),
-            "gateway.ts".to_string(),
-        ];
         config.plugins.enabled = false;
 
+        // The embedded engine starts even when the entry script is missing; the
+        // gateway simply falls back to native/YAML routing for unmatched paths.
         let state = build_dynamic_state(config)
             .await
-            .expect("dynamic state without script runtime");
-        assert!(state.script.is_none());
+            .expect("dynamic state with embedded script engine");
+        assert!(state.script.is_some());
     }
 
     #[test]

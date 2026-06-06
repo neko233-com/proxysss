@@ -4,6 +4,7 @@ mod demo;
 mod gateway;
 mod install;
 mod script;
+mod ts_transpile;
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -481,20 +482,10 @@ async fn main() -> Result<()> {
         Commands::PrintDefaultConfig { format } => {
             match format {
                 ConfigOutputFormat::Yaml => {
-                    print!(
-                        "{}",
-                        config::GatewayConfig::render_default_yaml(
-                            &install::preferred_script_command()
-                        )
-                    )
+                    print!("{}", config::GatewayConfig::render_default_yaml())
                 }
                 ConfigOutputFormat::Json => {
-                    print!(
-                        "{}",
-                        config::GatewayConfig::render_default_json(
-                            &install::preferred_script_command()
-                        )
-                    )
+                    print!("{}", config::GatewayConfig::render_default_json())
                 }
             }
             Ok(())
@@ -751,11 +742,12 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.ftp.enabled, config.services.ftp.bind, config.services.ftp.upstream
     );
     println!(
-        "script            : enabled={}, entry={}, command={}, args={}",
+        "script            : enabled={}, entry={}, timeout_ms={}, memory_mb={}, stack_kb={}",
         config.script.enabled,
         config.script.entry.display(),
-        config.script.command,
-        config.script.args.join(" ")
+        config.script.timeout_ms,
+        config.script.memory_limit_mb,
+        config.script.max_stack_size_kb
     );
 }
 
@@ -885,7 +877,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("[hot_reload]\n");
     output.push_str("configuration values except listener identity\n");
     output.push_str("explicit include files from include.files\n");
-    output.push_str("main extension script from script.entry/script.args\n");
+    output.push_str("main extension script from script.entry\n");
     output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
     output.push_str("reverse_proxy routes\n");
     output.push_str("static_sites\n");
@@ -955,7 +947,7 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
             "services:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: ./webdav\n    allow_write: true\n"
         }
         ConfigTemplateKind::Script => {
-            "script:\n  enabled: true\n  command: ~/.config/proxysss/runtime/deno/bin/deno\n  args: [run, -A, gateway.ts]\n  cwd: .\nplugins:\n  enabled: false\n"
+            "script:\n  enabled: true\n  entry: gateway.ts\n  cwd: .\n  timeout_ms: 500\n  memory_limit_mb: 64\n  max_stack_size_kb: 512\nplugins:\n  enabled: false\n"
         }
     }
 }
@@ -993,20 +985,27 @@ fn run_script_runtime(
         config
     };
 
-    let runtime = install::preferred_script_command();
-    let mut command = Command::new(&runtime);
-    command.envs(gateway::default_script_env(&gateway_config));
-    command.envs(&gateway_config.script.env);
-
-    if let Some(cwd) = &gateway_config.script.cwd {
-        command.current_dir(cwd);
+    if !extra_args.is_empty() {
+        eprintln!(
+            "note: extra script args are ignored by the embedded TypeScript engine: {:?}",
+            extra_args
+        );
     }
 
-    let temp_script_path = match invocation {
-        ScriptInvocation::File(path) => {
-            command.arg("run").arg("-A").arg(path);
-            None
-        }
+    let mut env = gateway::default_script_env(&gateway_config);
+    for (key, value) in &gateway_config.script.env {
+        env.insert(key.clone(), value.clone());
+    }
+    let timeout = std::time::Duration::from_millis(
+        gateway_config
+            .script
+            .timeout_ms
+            .saturating_mul(10)
+            .max(2000),
+    );
+
+    let (script_path, temp_script_path) = match invocation {
+        ScriptInvocation::File(path) => (path, None),
         ScriptInvocation::Snippet(code) => {
             let temp_name = format!(
                 "proxysss-script-eval-{}.ts",
@@ -1018,13 +1017,11 @@ fn run_script_runtime(
             let temp_path = std::env::temp_dir().join(temp_name);
             fs::write(&temp_path, code)
                 .with_context(|| format!("failed to write {}", temp_path.display()))?;
-            command.arg("run").arg("-A").arg(&temp_path);
-            Some(temp_path)
+            (temp_path.clone(), Some(temp_path))
         }
     };
 
-    command.args(extra_args);
-    let result = run_inherited(command, "run TypeScript runtime test");
+    let result = script::run_module_file(&script_path, &env, timeout);
 
     if let Some(path) = temp_script_path {
         let _ = fs::remove_file(path);

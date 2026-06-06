@@ -22,7 +22,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance must be treated as a core product requirement: aim for nginx-class throughput/latency and leave room to exceed nginx where proxysss can use Rust, async IO, and script isolation effectively.
 - Architecture should favor extensibility without putting hot-path traffic behind unnecessary dynamic dispatch, allocation, serialization, or script calls.
-- TypeScript scripting is a required product surface, but the long-term target is a single `proxysss` binary with an embedded TypeScript-capable runtime and hot reload execution inside the process. External `deno`, bundled `deno.exe`, or sidecar runtime directories are temporary implementation states, not the desired end architecture.
+- TypeScript scripting is a required product surface, and it is implemented as a single `proxysss` binary with an embedded TypeScript-capable engine (QuickJS via `rquickjs`, TypeScript stripped in-process with `swc_ts_fast_strip`) executing inside the process with hot reload. There is no external `deno`/`node`/`tsc` dependency, no bundled `deno.exe`, and no sidecar runtime directory — those are removed legacy states. See `specs/embedded-ts-runtime.md`.
 
 ## What proxysss Is
 

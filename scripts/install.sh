@@ -18,9 +18,9 @@ proxysss_config_dir() {
     esac
 }
 
-managed_deno_bin() {
+managed_bin_path() {
     local os="$1"
-    printf '%s\n' "$(proxysss_config_dir "$os")/runtime/deno/bin/deno"
+    printf '%s\n' "$(proxysss_config_dir "$os")/${BINARY_NAME}"
 }
 
 bundle_asset_name() {
@@ -132,7 +132,6 @@ install_bundle() {
     local target="${install_dir}/${BINARY_NAME}"
     local config_dir
     config_dir="$(proxysss_config_dir "$os")"
-    local runtime_target="${config_dir}/runtime"
     local tmpdir
     tmpdir=$(mktemp -d)
     local archive_path="${tmpdir}/${asset}"
@@ -143,7 +142,6 @@ install_bundle() {
         echo "[dry-run] download ${asset}"
         echo "[dry-run] extract bundle to ${bundle_dir}"
         echo "[dry-run] install ${BINARY_NAME} to ${target}"
-        echo "[dry-run] install bundled TypeScript runtime to ${runtime_target}"
         return
     fi
 
@@ -155,10 +153,6 @@ install_bundle() {
         echo "bundle is missing ${BINARY_NAME}" >&2
         exit 1
     fi
-    if [ ! -x "${bundle_dir}/runtime/deno/bin/deno" ]; then
-        echo "bundle is missing bundled TypeScript runtime" >&2
-        exit 1
-    fi
 
     if [ -w "$install_dir" ]; then
         install -m 755 "${bundle_dir}/${BINARY_NAME}" "$target"
@@ -167,13 +161,10 @@ install_bundle() {
     fi
 
     mkdir -p "$config_dir"
-    rm -rf "$runtime_target"
-    cp -R "${bundle_dir}/runtime" "$runtime_target"
 
     rm -rf "$tmpdir"
 
     echo "Installed ${BINARY_NAME} to ${target}"
-    echo "Installed bundled TypeScript runtime to ${runtime_target}"
 }
 
 stop_service_if_present() {
