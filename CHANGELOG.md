@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4 - 2026-06-07
+
+- Added global CLI config path support for both `-c <file>` and compatibility-style `-config <file>`, while keeping the default fallback to `proxysss.yaml` when no path is supplied.
+- Updated README command examples to prefer the new global config-path form so users can launch subcommands against arbitrary YAML files without repeating per-command `--config` flags.
+
 ## v0.3.3 - 2026-06-07
 
 - Added bilingual Chinese/English annotations to `proxysss-script.d.ts` so embedded TypeScript hooks, contexts, and route fields are easier to use without guessing the runtime contract.

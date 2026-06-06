@@ -8,6 +8,7 @@ mod ts_transpile;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -26,6 +27,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 #[command(about = "Programmable Rust gateway with TS/JS routing scripts")]
 #[command(version)]
 struct Cli {
+    #[arg(short = 'c', long = "config", visible_alias = "config-file", global = true)]
+    config_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -541,11 +544,12 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
+    let global_config = cli.config_file.clone();
 
     match cli.command.unwrap_or(Commands::Run { config: None }) {
         Commands::Run { config } => {
-            let config_path = install::resolve_run_config_path(config)?;
+            let config_path = install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
             init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
@@ -579,19 +583,19 @@ async fn main() -> Result<()> {
         ),
         Commands::Start { config } => {
             init_cli_logging();
-            install::start_background(config)
+            install::start_background(merge_config_arg(global_config.clone(), config))
         }
         Commands::Stop { config } => {
             init_cli_logging();
-            install::stop_background(config)
+            install::stop_background(merge_config_arg(global_config.clone(), config))
         }
         Commands::Restart { config } => {
             init_cli_logging();
-            install::restart_background(config)
+            install::restart_background(merge_config_arg(global_config.clone(), config))
         }
         Commands::Enable { config } => {
             init_cli_logging();
-            install::install_service(config)
+            install::install_service(merge_config_arg(global_config.clone(), config))
         }
         Commands::Disable => {
             init_cli_logging();
@@ -599,12 +603,12 @@ async fn main() -> Result<()> {
         }
         Commands::Status { config } => {
             init_cli_logging();
-            install::background_status(config)
+            install::background_status(merge_config_arg(global_config.clone(), config))
         }
         Commands::CheckConfig { config } => {
             init_cli_logging();
 
-            let config_path = install::resolve_run_config_path(config)?;
+            let config_path = install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
             println!("configuration check passed: {}", config_path.display());
             for warning in gateway_config.warnings() {
@@ -663,6 +667,7 @@ async fn main() -> Result<()> {
         }
         Commands::Config { action, config } => {
             init_cli_logging();
+            let command_config = merge_config_arg(global_config.clone(), config);
             match action {
                 ConfigCommands::CreateTemplate {
                     kind,
@@ -678,7 +683,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConfigCommands::Show { format } => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     match format {
                         ConfigOutputFormat::Yaml => {
@@ -691,7 +696,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConfigCommands::Includes => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     println!("config: {}", config_path.display());
                     println!("include.enabled: {}", gateway_config.include.enabled);
@@ -707,7 +712,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConfigCommands::WatchedScripts => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     let paths = gateway::watched_script_paths(&gateway_config);
                     println!("config: {}", config_path.display());
@@ -726,13 +731,13 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConfigCommands::Routes => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     print!("{}", render_route_topology(&gateway_config));
                     Ok(())
                 }
                 ConfigCommands::ReloadPlan => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     print!("{}", render_reload_plan(&gateway_config));
                     Ok(())
@@ -760,7 +765,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConfigCommands::Explain => {
-                    let config_path = install::resolve_run_config_path(config)?;
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     print_config_explain(&config_path, &gateway_config);
                     Ok(())
@@ -779,7 +784,7 @@ async fn main() -> Result<()> {
             password,
         } => {
             init_cli_logging();
-            let admin = resolve_admin_context(config, admin_url, username, password)?;
+            let admin = resolve_admin_context(merge_config_arg(global_config.clone(), config), admin_url, username, password)?;
             let client = reqwest::Client::new();
 
             match action {
@@ -834,10 +839,10 @@ async fn main() -> Result<()> {
             init_cli_logging();
             match action {
                 ScriptCommands::RunFile { path, args } => {
-                    run_script_runtime(config, ScriptInvocation::File(path), args)
+                    run_script_runtime(merge_config_arg(global_config.clone(), config), ScriptInvocation::File(path), args)
                 }
                 ScriptCommands::Eval { code, args } => {
-                    run_script_runtime(config, ScriptInvocation::Snippet(code), args)
+                    run_script_runtime(merge_config_arg(global_config.clone(), config), ScriptInvocation::Snippet(code), args)
                 }
             }
         }
@@ -848,6 +853,25 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn merge_config_arg(global_config: Option<PathBuf>, local_config: Option<PathBuf>) -> Option<PathBuf> {
+    local_config.or(global_config)
+}
+
+fn normalize_cli_args<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .map(|arg| {
+            if arg == "-config" {
+                OsString::from("--config")
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 
 enum ScriptInvocation {
@@ -2151,5 +2175,29 @@ mod tests {
         assert!(CADDY_FEATURE_MATRIX
             .iter()
             .any(|item| item.status == ParityStatus::Missing));
+    }
+
+    #[test]
+    fn merge_config_arg_prefers_command_local_value() {
+        let global = Some(PathBuf::from("global.yaml"));
+        let local = Some(PathBuf::from("local.yaml"));
+        assert_eq!(merge_config_arg(global, local), Some(PathBuf::from("local.yaml")));
+    }
+
+    #[test]
+    fn merge_config_arg_falls_back_to_global_value() {
+        let global = Some(PathBuf::from("global.yaml"));
+        assert_eq!(merge_config_arg(global, None), Some(PathBuf::from("global.yaml")));
+    }
+
+    #[test]
+    fn normalize_cli_args_rewrites_single_dash_config_flag() {
+        let args = normalize_cli_args([
+            OsString::from("proxysss"),
+            OsString::from("-config"),
+            OsString::from("custom.yaml"),
+        ]);
+        assert_eq!(args[1], OsString::from("--config"));
+        assert_eq!(args[2], OsString::from("custom.yaml"));
     }
 }
