@@ -1,3 +1,5 @@
+/// <reference path="../proxysss-script.d.ts" />
+
 const LOGIN_BACKENDS = [
   "http://127.0.0.1:8088",
   "http://127.0.0.1:8089",

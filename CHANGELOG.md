@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.2 - 2026-06-07
+
+- Added managed ACME renewal flows for both HTTP-01 and TLS-ALPN-01 without requiring an external ACME binary on the default path.
+- Expanded FTP from raw TCP passthrough into native control-channel proxying with passive and active data-channel rewriting.
+- Added global and route-level active health control with default-on HTTP/TCP liveness probes, hysteresis thresholds, jitter, and webhook hooks.
+- Added persistent upstream maintenance state so manual drain/restore actions survive reloads and restarts.
+- Upgraded the admin dashboard on port 7777 with search, filter, grouping, route aggregation, manual upstream drain controls, and richer upstream health telemetry.
+- Added configurable browser-facing error pages, including a polished built-in 404/4xx/5xx experience and route-level docs entrypoints.
+- Added the built-in `docs.html` manual, TypeScript declaration file, TS usage guide, and nginx-to-proxysss mapping guide, and made `proxysss init` generate them.
+
 ## v0.3.1 - 2026-06-06
 
 - Added built-in HTTP access control with IP / CIDR allow and deny lists via `services.access_control.http`, including `blacklist` / `denylist` aliases for direct YAML use.

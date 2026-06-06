@@ -1,13 +1,14 @@
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -30,7 +31,12 @@ use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use instant_acme::{
+    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
+    RetryPolicy,
+};
 use quinn::crypto::rustls::QuicServerConfig;
+use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -38,21 +44,26 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
-use serde::Deserialize;
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
+use tokio::io::{
+    copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+    BufReader as TokioBufReader,
+};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 use uuid::Uuid;
+use zstd::stream::encode_all as zstd_encode_all;
 
 use crate::config::{
-    AcmeChallengeType, AdminConfig, DomainRouteConfig, GatewayConfig, HttpAccessControlConfig,
-    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
-    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
-    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
-    WebDavConfig,
+    ActiveHealthConfig, ActiveHealthOverrideConfig, AcmeChallengeType, AdminConfig,
+    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig,
+    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
+    RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig,
+    StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode,
+    UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -67,7 +78,10 @@ pub struct Gateway {
     round_robin_state: Arc<DashMap<String, u64>>,
     upstream_runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
     http_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
+    http_connection_limits: Arc<DashMap<String, u32>>,
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
+    acme_http_challenges: Arc<DashMap<String, String>>,
+    acme_tls_alpn_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
 }
 
 struct DynamicState {
@@ -85,6 +99,7 @@ struct GatewayHttpResponse {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionEncoding {
+    Zstd,
     Brotli,
     Gzip,
 }
@@ -100,6 +115,17 @@ struct UpstreamRuntimeState {
     consecutive_failures: u32,
     quarantined_until: Option<Instant>,
     active_connections: u64,
+    manually_disabled: bool,
+    manual_reason: Option<String>,
+    manual_changed_at_unix_ms: Option<u64>,
+    active_probe_kind: Option<String>,
+    active_probe_failure_count: u32,
+    active_probe_success_count: u32,
+    active_probe_healthy: Option<bool>,
+    active_probe_status: Option<u16>,
+    active_probe_error: Option<String>,
+    active_probe_checked_at_unix_ms: Option<u64>,
+    active_probe_rtt_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -110,24 +136,48 @@ struct RateLimitBucket {
 
 #[derive(Clone)]
 struct CachedHttpEntry {
-    expires_at: Instant,
+    expires_at_unix_ms: u64,
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
     upstream: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DiskCachedHttpEntry {
+    expires_at_unix_ms: u64,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_base64: String,
+    upstream: String,
+}
+
 #[derive(Clone)]
 struct HttpRouteConfig {
+    runtime_scope: Option<String>,
     decision: RouteDecision,
     compression: ResponseCompressionConfig,
     cache: ResponseCacheConfig,
+    rate_limit: HttpRateLimitConfig,
+}
+
+#[derive(Clone)]
+struct ResolvedActiveHealthConfig {
+    enabled: bool,
+    path: String,
+    timeout_ms: u64,
+    expected_statuses: Vec<u16>,
+    failure_threshold: u32,
+    success_threshold: u32,
+    jitter_percent: u8,
+    alert_webhooks: Vec<String>,
 }
 
 #[derive(Debug)]
 struct SniResolver {
     default: Arc<CertifiedKey>,
     by_name: BTreeMap<String, Arc<CertifiedKey>>,
+    acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
 }
 
 #[derive(Default)]
@@ -147,6 +197,11 @@ struct GatewayStats {
 
 struct UpstreamLease {
     runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
+    key: String,
+}
+
+struct HttpRateLimitLease {
+    store: Arc<DashMap<String, u32>>,
     key: String,
 }
 
@@ -231,6 +286,15 @@ impl ServerCertVerifier for InsecureUpstreamVerifier {
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let server_name = client_hello.server_name()?.to_ascii_lowercase();
+        let is_acme_tls_alpn = client_hello
+            .alpn()
+            .map(|protocols| protocols.into_iter().any(|protocol| protocol == b"acme-tls/1"))
+            .unwrap_or(false);
+        if is_acme_tls_alpn {
+            if let Some(certified) = self.acme_tls_alpn_by_name.get(&server_name) {
+                return Some(certified.clone());
+            }
+        }
         if let Some(certified) = self.by_name.get(&server_name) {
             return Some(certified.clone());
         }
@@ -266,13 +330,26 @@ impl Drop for UpstreamLease {
     }
 }
 
+impl Drop for HttpRateLimitLease {
+    fn drop(&mut self) {
+        if let Some(mut entry) = self.store.get_mut(&self.key) {
+            if *entry <= 1 {
+                drop(entry);
+                self.store.remove(&self.key);
+            } else {
+                *entry = entry.saturating_sub(1);
+            }
+        }
+    }
+}
+
 impl Gateway {
     pub async fn from_config(config_path: PathBuf, config: GatewayConfig) -> Result<Arc<Self>> {
         prepare_tls_material(&config)?;
 
         let dynamic = Arc::new(build_dynamic_state(config.clone()).await?);
 
-        Ok(Arc::new(Self {
+        let gateway = Arc::new(Self {
             config_path,
             bootstrap_config: config,
             dynamic: Arc::new(RwLock::new(dynamic)),
@@ -281,8 +358,13 @@ impl Gateway {
             round_robin_state: Arc::new(DashMap::new()),
             upstream_runtime: Arc::new(DashMap::new()),
             http_rate_limits: Arc::new(DashMap::new()),
+            http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
-        }))
+            acme_http_challenges: Arc::new(DashMap::new()),
+            acme_tls_alpn_certs: Arc::new(DashMap::new()),
+        });
+        gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
+        Ok(gateway)
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -293,13 +375,23 @@ impl Gateway {
             tasks.spawn(async move { gateway.run_hot_reload_loop().await });
         }
 
-        if self.bootstrap_config.http.tls.mode == TlsMode::AcmeExternal {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_acme_renew_loop().await });
+        match self.bootstrap_config.http.tls.mode {
+            TlsMode::AcmeManaged => {
+                let gateway = self.clone();
+                tasks.spawn(async move { gateway.run_managed_acme_renew_loop().await });
+            }
+            TlsMode::AcmeExternal => {
+                let gateway = self.clone();
+                tasks.spawn(async move { gateway.run_acme_renew_loop().await });
+            }
+            TlsMode::SelfSigned | TlsMode::Manual => {}
         }
 
         let gateway = self.clone();
         tasks.spawn(async move { gateway.run_listener_supervisor().await });
+
+        let gateway = self.clone();
+        tasks.spawn(async move { gateway.run_active_health_loop().await });
 
         while let Some(result) = tasks.join_next().await {
             result??;
@@ -351,6 +443,25 @@ impl Gateway {
         }
     }
 
+    async fn run_active_health_loop(self: Arc<Self>) -> Result<()> {
+        loop {
+            let state = self.current_state().await;
+            let config = state.config.clone();
+            let health = config.load_balance.active_health.clone();
+            let client = state.http_client.clone();
+            drop(state);
+
+            let sleep_for = if health.enabled {
+                self.run_active_health_pass(&config, &client).await;
+                Duration::from_secs(health.interval_secs.max(1))
+            } else {
+                Duration::from_secs(1)
+            };
+
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+
     async fn run_acme_renew_loop(self: Arc<Self>) -> Result<()> {
         let tls = self.bootstrap_config.http.tls.clone();
         let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
@@ -366,6 +477,32 @@ impl Gateway {
                 Ok(Err(error)) => tracing::warn!(?error, "acme renewal failed"),
                 Err(error) => tracing::warn!(?error, "acme renewal task join failed"),
             }
+        }
+    }
+
+    async fn run_managed_acme_renew_loop(self: Arc<Self>) -> Result<()> {
+        let tls = self.bootstrap_config.http.tls.clone();
+        let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
+
+        loop {
+            match issue_managed_acme_certificate(
+                &tls,
+                &self.acme_http_challenges,
+                &self.acme_tls_alpn_certs,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Err(error) = self.reload_from_disk().await {
+                        tracing::warn!(?error, "managed acme issued certificate but reload failed");
+                    } else {
+                        tracing::info!("managed acme certificate refreshed");
+                    }
+                }
+                Err(error) => tracing::warn!(?error, "managed acme renewal failed"),
+            }
+
+            tokio::time::sleep(renew_every).await;
         }
     }
 
@@ -511,7 +648,71 @@ impl Gateway {
         if method == Method::GET && path == "/v1/upstreams" {
             return Ok(json_response(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "items": self.upstream_runtime_snapshot()}),
+                serde_json::json!({"ok": true, "items": self.upstream_runtime_snapshot(&state.config)}),
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/upstreams/disable" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<UpstreamToggleRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid upstream toggle payload: {error}")}),
+                    ));
+                }
+            };
+            self.set_manual_upstream_state(&state.config, &payload.key, true, payload.reason);
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "key": payload.key}),
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/upstreams/enable" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<UpstreamToggleRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid upstream toggle payload: {error}")}),
+                    ));
+                }
+            };
+            self.set_manual_upstream_state(&state.config, &payload.key, false, None);
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "key": payload.key}),
             ));
         }
 
@@ -721,6 +922,7 @@ impl Gateway {
             let mut state = self.dynamic.write().await;
             *state = new_state;
         }
+        self.load_persisted_manual_upstream_state(&new_config)?;
 
         for warning in new_config.warnings() {
             tracing::warn!(warning, "configuration warning");
@@ -771,7 +973,8 @@ impl Gateway {
         let state = self.current_state().await;
         let tls_acceptor = TlsAcceptor::from(Arc::new(build_rustls_server_config(
             &state.config,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            self.acme_tls_alpn_certs.clone(),
+            vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
         )?));
         let listener = TcpListener::bind(bind_addr)
             .await
@@ -820,7 +1023,11 @@ impl Gateway {
         let state = self.current_state().await;
         let mut server_config =
             quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
-                build_rustls_server_config(&state.config, vec![b"h3".to_vec()])?,
+                build_rustls_server_config(
+                    &state.config,
+                    self.acme_tls_alpn_certs.clone(),
+                    vec![b"h3".to_vec()],
+                )?,
             )?));
         let transport = Arc::get_mut(&mut server_config.transport)
             .context("failed to configure quic transport")?;
@@ -985,6 +1192,20 @@ impl Gateway {
                 let request_id = Uuid::new_v4().to_string();
                 if let Err(error) = async {
                     let state = gateway.current_state().await;
+                    if listener_name == "ftp"
+                        && state.config.services.ftp.enabled
+                        && state.config.services.ftp.native_control
+                    {
+                        gateway
+                            .handle_ftp_control_session(
+                                inbound,
+                                &state.config.services.ftp,
+                                remote_addr,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+
                     let stream_cfg = state.config.affinity.stream.clone();
                     let mut first_payload = BytesMut::new();
 
@@ -1124,6 +1345,94 @@ impl Gateway {
                     .fetch_sub(1, Ordering::Relaxed);
             });
         }
+    }
+
+    async fn handle_ftp_control_session(
+        &self,
+        inbound: TcpStream,
+        config: &crate::config::FtpConfig,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let upstream = TcpStream::connect(&config.upstream)
+            .await
+            .with_context(|| format!("failed to connect ftp upstream {}", config.upstream))?;
+        let upstream_control_ip = upstream
+            .peer_addr()
+            .context("failed to resolve ftp upstream peer")?
+            .ip();
+        let local_control_ip = inbound
+            .local_addr()
+            .context("failed to resolve local ftp control address")?
+            .ip();
+        let public_ip = if config.public_ip.trim().is_empty() {
+            local_control_ip
+        } else {
+            config
+                .public_ip
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid services.ftp.public_ip {}", config.public_ip))?
+        };
+
+        let (client_read, mut client_write) = inbound.into_split();
+        let (server_read, mut server_write) = upstream.into_split();
+        let mut client_reader = TokioBufReader::new(client_read);
+        let mut server_reader = TokioBufReader::new(server_read);
+
+        loop {
+            let mut client_line = Vec::new();
+            let mut server_line = Vec::new();
+
+            tokio::select! {
+                read = client_reader.read_until(b'\n', &mut client_line) => {
+                    let read = read.context("failed reading ftp client command")?;
+                    if read == 0 {
+                        break;
+                    }
+                    let outbound_line = rewrite_ftp_active_command(
+                        &client_line,
+                        config,
+                        local_control_ip,
+                        public_ip,
+                        remote_addr,
+                    )
+                    .await?
+                    .unwrap_or_else(|| String::from_utf8_lossy(&client_line).into_owned());
+                    server_write
+                        .write_all(outbound_line.as_bytes())
+                        .await
+                        .context("failed forwarding ftp client command")?;
+                }
+                read = server_reader.read_until(b'\n', &mut server_line) => {
+                    let read = read.context("failed reading ftp upstream reply")?;
+                    if read == 0 {
+                        break;
+                    }
+
+                    let maybe_reply = rewrite_ftp_passive_reply(
+                        &server_line,
+                        config,
+                        local_control_ip,
+                        public_ip,
+                        upstream_control_ip,
+                        remote_addr,
+                    ).await?;
+
+                    if let Some(reply) = maybe_reply {
+                        client_write
+                            .write_all(reply.as_bytes())
+                            .await
+                            .context("failed writing rewritten ftp passive reply")?;
+                    } else {
+                        client_write
+                            .write_all(&server_line)
+                            .await
+                            .context("failed forwarding ftp upstream reply")?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn run_udp_listener(self: Arc<Self>, listener_config: UdpListenerConfig) -> Result<()> {
@@ -1324,7 +1633,7 @@ impl Gateway {
             .dispatch_http(
                 method,
                 uri,
-                headers,
+                headers.clone(),
                 body,
                 remote_addr,
                 scheme,
@@ -1347,6 +1656,7 @@ impl Gateway {
         }
 
         let state = self.current_state().await;
+        let response = decorate_error_response(&state.config, &headers, response);
         if state.config.logging.access_log {
             let request_id = Uuid::new_v4().to_string();
             if should_sample(state.config.logging.access_sample_rate, &request_id) {
@@ -1409,6 +1719,30 @@ impl Gateway {
         let player_id = extract_http_player_id(&uri, &headers, &state.config.affinity.http);
         let request_id = Uuid::new_v4().to_string();
 
+        if let Some(token) = uri.path().strip_prefix("/.well-known/acme-challenge/") {
+            if let Some(value) = self.acme_http_challenges.get(token) {
+                return Ok(GatewayHttpResponse::bytes(
+                    StatusCode::OK,
+                    "text/plain; charset=utf-8",
+                    Bytes::from(value.value().clone()),
+                    "proxysss://acme-http01",
+                ));
+            }
+        }
+
+        if scheme == "http" && should_redirect_http_to_https(&state.config, &host, &uri) {
+            let target = format!(
+                "https://{}{}",
+                strip_default_port(&host, 80),
+                uri.path_and_query().map(|value| value.as_str()).unwrap_or("/")
+            );
+            return Ok(GatewayHttpResponse::redirect_with_status(
+                StatusCode::PERMANENT_REDIRECT,
+                target,
+                "proxysss://auto-https-redirect",
+            ));
+        }
+
         if monitoring_path_matches(&state.config.monitoring, uri.path()) {
             return Ok(json_gateway_response(
                 StatusCode::OK,
@@ -1423,20 +1757,26 @@ impl Gateway {
             return Ok(response);
         }
 
-        if let Some(response) = self.apply_http_rate_limit(
-            &state.config.services.rate_limit.http,
-            &host,
-            &headers,
-            remote_addr,
-        ) {
-            return Ok(response);
-        }
-
         if state.config.services.webdav.enabled
             && webdav_path_matches(&state.config.services.webdav.path_prefix, uri.path())
         {
-            return dispatch_webdav(&state.config.services.webdav, &method, &uri, &headers, body)
-                .await;
+            let _rate_limit_lease = match self.apply_http_rate_limit(
+                &state.config.services.rate_limit.http,
+                &host,
+                &headers,
+                remote_addr,
+            ) {
+                Ok(lease) => lease,
+                Err(response) => return Ok(response),
+            };
+            let response =
+                dispatch_webdav(&state.config.services.webdav, &method, &uri, &headers, body)
+                    .await?;
+            return finalize_http_response(
+                &headers,
+                &state.config.services.response_policy.compression,
+                response,
+            );
         }
 
         if let Some(site) = state
@@ -1446,17 +1786,45 @@ impl Gateway {
             .iter()
             .find(|site| static_site_path_matches(site, uri.path()))
         {
-            return dispatch_static_site(site, &method, &uri).await;
+            let _rate_limit_lease = match self.apply_http_rate_limit(
+                &state.config.services.rate_limit.http,
+                &host,
+                &headers,
+                remote_addr,
+            ) {
+                Ok(lease) => lease,
+                Err(response) => return Ok(response),
+            };
+            let response = dispatch_static_site(site, &method, &uri).await?;
+            return finalize_http_response(
+                &headers,
+                &state.config.services.response_policy.compression,
+                response,
+            );
         }
 
         if let Some(route) = builtin_http_route(uri.path()) {
-            return Ok(dispatch_internal_http(&state.config, &route));
+            let _rate_limit_lease = match self.apply_http_rate_limit(
+                &state.config.services.rate_limit.http,
+                &host,
+                &headers,
+                remote_addr,
+            ) {
+                Ok(lease) => lease,
+                Err(response) => return Ok(response),
+            };
+            return finalize_http_response(
+                &headers,
+                &state.config.services.response_policy.compression,
+                dispatch_internal_http(&state.config, &route),
+            );
         }
 
         let route = if let Some(route) = configured_http_route(&state.config, &host, &uri) {
             route
         } else if let Some(script) = &state.script {
             HttpRouteConfig {
+                runtime_scope: Some("script".to_string()),
                 decision: script
                     .route_http(HttpContext {
                         request_id: request_id.clone(),
@@ -1475,14 +1843,25 @@ impl Gateway {
                     .inspect_err(|_| {
                         self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
                     })?,
-                compression: ResponseCompressionConfig::default(),
-                cache: ResponseCacheConfig::default(),
+                compression: state.config.services.response_policy.compression.clone(),
+                cache: state.config.services.response_policy.cache.clone(),
+                rate_limit: state.config.services.rate_limit.http.clone(),
             }
         } else {
             return Ok(GatewayHttpResponse::error(
                 StatusCode::NOT_FOUND,
                 "no built-in or YAML route matched; enable script.enabled to use TypeScript routing",
             ));
+        };
+
+        let _rate_limit_lease = match self.apply_http_rate_limit(
+            &route.rate_limit,
+            &host,
+            &headers,
+            remote_addr,
+        ) {
+            Ok(lease) => lease,
+            Err(response) => return Ok(response),
         };
 
         if route.decision.upstream.starts_with("proxysss://") {
@@ -1509,9 +1888,13 @@ impl Gateway {
                 .await;
         }
 
+        if method.as_str() == "PURGE" {
+            return Ok(self.purge_http_cache(&state.config, &route.cache, &host, &uri));
+        }
+
         let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
         if let Some(cache_key) = cache_key.as_deref() {
-            if let Some(response) = self.load_cached_http_response(cache_key) {
+            if let Some(response) = self.load_cached_http_response(&state.config, &route.cache, cache_key) {
                 return finalize_http_response(&headers, &route.compression, response);
             }
         }
@@ -1520,7 +1903,7 @@ impl Gateway {
             &state.config,
             &route.decision,
             "http",
-            None,
+            route.runtime_scope.as_deref(),
             route
                 .decision
                 .affinity_key
@@ -1542,7 +1925,8 @@ impl Gateway {
             let upstream_url = build_upstream_url(upstream, &route.decision, &uri)?;
             let upstream_headers =
                 build_upstream_headers(&headers, &route.decision, &host, remote_addr, scheme)?;
-            let _lease = self.acquire_upstream_lease("http", None, upstream);
+            let _lease =
+                self.acquire_upstream_lease("http", route.runtime_scope.as_deref(), upstream);
 
             let send_result = state
                 .http_client
@@ -1555,7 +1939,12 @@ impl Gateway {
             let upstream_response = match send_result {
                 Ok(response) => response,
                 Err(error) => {
-                    self.on_upstream_failure(&state.config, "http", None, upstream);
+                    self.on_upstream_failure(
+                        &state.config,
+                        "http",
+                        route.runtime_scope.as_deref(),
+                        upstream,
+                    );
                     last_error = Some(anyhow!("upstream request failed: {error}"));
                     continue;
                 }
@@ -1571,14 +1960,24 @@ impl Gateway {
             let response_body = match upstream_response.bytes().await {
                 Ok(body_bytes) => body_bytes,
                 Err(error) => {
-                    self.on_upstream_failure(&state.config, "http", None, upstream);
+                    self.on_upstream_failure(
+                        &state.config,
+                        "http",
+                        route.runtime_scope.as_deref(),
+                        upstream,
+                    );
                     last_error = Some(anyhow!("failed reading upstream response body: {error}"));
                     continue;
                 }
             };
 
             if status.is_server_error() && attempt + 1 < max_attempts {
-                self.on_upstream_failure(&state.config, "http", None, upstream);
+                self.on_upstream_failure(
+                    &state.config,
+                    "http",
+                    route.runtime_scope.as_deref(),
+                    upstream,
+                );
                 last_error = Some(anyhow!(
                     "upstream {upstream} returned server error {}",
                     status.as_u16()
@@ -1586,7 +1985,7 @@ impl Gateway {
                 continue;
             }
 
-            self.on_upstream_success("http", None, upstream);
+            self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
             let response = GatewayHttpResponse {
                 status,
                 headers: response_headers,
@@ -1594,7 +1993,7 @@ impl Gateway {
                 upstream: upstream.clone(),
             };
             if let Some(cache_key) = cache_key.as_deref() {
-                self.store_cached_http_response(cache_key, &route.cache, &response);
+                self.store_cached_http_response(&state.config, cache_key, &route.cache, &response);
             }
             return finalize_http_response(&headers, &route.compression, response);
         }
@@ -1691,31 +2090,56 @@ impl Gateway {
         self.dynamic.read().await.clone()
     }
 
-    fn load_cached_http_response(&self, key: &str) -> Option<GatewayHttpResponse> {
-        let now = Instant::now();
-        let entry = self.http_cache.get(key)?;
-        if entry.expires_at <= now {
-            drop(entry);
-            self.http_cache.remove(key);
+    fn load_cached_http_response(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        key: &str,
+    ) -> Option<GatewayHttpResponse> {
+        let storage_key = cache_storage_key(cache, key);
+        let now = current_unix_millis();
+
+        if let Some(entry) = self.http_cache.get(&storage_key) {
+            if entry.expires_at_unix_ms <= now {
+                drop(entry);
+                self.http_cache.remove(&storage_key);
+                self.remove_disk_cached_http_response(config, cache, &storage_key);
+            } else {
+                return Some(GatewayHttpResponse {
+                    status: entry.status,
+                    headers: entry.headers.clone(),
+                    body: entry.body.clone(),
+                    upstream: entry.upstream.clone(),
+                });
+            }
+        }
+
+        let entry = self.load_disk_cached_http_response(config, cache, &storage_key)?;
+        if entry.expires_at_unix_ms <= now {
+            self.remove_disk_cached_http_response(config, cache, &storage_key);
             return None;
         }
-        Some(GatewayHttpResponse {
+
+        let response = GatewayHttpResponse {
             status: entry.status,
             headers: entry.headers.clone(),
             body: entry.body.clone(),
             upstream: entry.upstream.clone(),
-        })
+        };
+        self.http_cache.insert(storage_key, entry);
+        Some(response)
     }
 
     fn store_cached_http_response(
         &self,
+        gateway_config: &GatewayConfig,
         key: &str,
-        config: &ResponseCacheConfig,
+        cache_config: &ResponseCacheConfig,
         response: &GatewayHttpResponse,
     ) {
-        if !config.enabled
-            || response.body.len() > config.max_body_bytes
-            || !config
+        if !cache_config.enabled
+            || response.body.len() > cache_config.max_body_bytes
+            || !cache_config
                 .statuses
                 .iter()
                 .any(|status| *status == response.status.as_u16())
@@ -1725,16 +2149,187 @@ impl Gateway {
             return;
         }
 
-        self.http_cache.insert(
-            key.to_string(),
-            CachedHttpEntry {
-                expires_at: Instant::now() + Duration::from_secs(config.ttl_secs),
-                status: response.status,
-                headers: response.headers.clone(),
-                body: response.body.clone(),
-                upstream: response.upstream.clone(),
-            },
+        let storage_key = cache_storage_key(cache_config, key);
+        let entry = CachedHttpEntry {
+            expires_at_unix_ms: current_unix_millis()
+                .saturating_add(cache_config.ttl_secs.saturating_mul(1000)),
+            status: response.status,
+            headers: response.headers.clone(),
+            body: response.body.clone(),
+            upstream: response.upstream.clone(),
+        };
+        self.http_cache.insert(storage_key.clone(), entry.clone());
+        self.persist_disk_cached_http_response(gateway_config, cache_config, &storage_key, &entry);
+        self.evict_cache_zone_if_needed(gateway_config, cache_config);
+    }
+
+    fn purge_http_cache(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        host: &str,
+        uri: &Uri,
+    ) -> GatewayHttpResponse {
+        if !cache.enabled || !cache.allow_purge {
+            return GatewayHttpResponse::error(
+                StatusCode::FORBIDDEN,
+                "cache purge is disabled for this route",
+            );
+        }
+
+        let key = format!(
+            "GET:{}:{}",
+            host.to_ascii_lowercase(),
+            uri.path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/")
         );
+        if self.purge_cached_http_response(config, cache, &key) {
+            GatewayHttpResponse::bytes(
+                StatusCode::OK,
+                "application/json",
+                Bytes::from(
+                    serde_json::json!({"ok": true, "zone": cache.zone, "key": key})
+                        .to_string(),
+                ),
+                "proxysss://cache-purge",
+            )
+        } else {
+            GatewayHttpResponse::bytes(
+                StatusCode::NOT_FOUND,
+                "application/json",
+                Bytes::from(
+                    serde_json::json!({"ok": false, "zone": cache.zone, "key": key})
+                        .to_string(),
+                ),
+                "proxysss://cache-purge",
+            )
+        }
+    }
+
+    fn purge_cached_http_response(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        key: &str,
+    ) -> bool {
+        let storage_key = cache_storage_key(cache, key);
+        let removed = self.http_cache.remove(&storage_key).is_some();
+        let removed_disk = self.remove_disk_cached_http_response(config, cache, &storage_key);
+        removed || removed_disk
+    }
+
+    fn evict_cache_zone_if_needed(&self, config: &GatewayConfig, cache: &ResponseCacheConfig) {
+        let max_entries = cache_zone_max_entries(config, &cache.zone);
+        let prefix = format!("{}:", cache.zone);
+        let now = current_unix_millis();
+
+        let stale_keys = self
+            .http_cache
+            .iter()
+            .filter(|entry| {
+                entry.key().starts_with(&prefix) && entry.value().expires_at_unix_ms <= now
+            })
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            self.http_cache.remove(&stale_key);
+            self.remove_disk_cached_http_response(config, cache, &stale_key);
+        }
+
+        let zone_keys = self
+            .http_cache
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        if zone_keys.len() < max_entries {
+            return;
+        }
+
+        let overflow = zone_keys.len().saturating_sub(max_entries).saturating_add(1);
+        for key in zone_keys.into_iter().take(overflow) {
+            self.http_cache.remove(&key);
+            self.remove_disk_cached_http_response(config, cache, &key);
+        }
+    }
+
+    fn load_disk_cached_http_response(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        storage_key: &str,
+    ) -> Option<CachedHttpEntry> {
+        let path = cache_disk_path(config, cache, storage_key)?;
+        let payload = fs::read(&path).ok()?;
+        let disk: DiskCachedHttpEntry = serde_json::from_slice(&payload).ok()?;
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(disk.body_base64)
+            .ok()?;
+        let status = StatusCode::from_u16(disk.status).ok()?;
+        let headers = disk
+            .headers
+            .into_iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    HeaderName::from_bytes(name.as_bytes()).ok()?,
+                    HeaderValue::from_str(&value).ok()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        Some(CachedHttpEntry {
+            expires_at_unix_ms: disk.expires_at_unix_ms,
+            status,
+            headers,
+            body: Bytes::from(body),
+            upstream: disk.upstream,
+        })
+    }
+
+    fn persist_disk_cached_http_response(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        storage_key: &str,
+        entry: &CachedHttpEntry,
+    ) {
+        let Some(path) = cache_disk_path(config, cache, storage_key) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let disk = DiskCachedHttpEntry {
+            expires_at_unix_ms: entry.expires_at_unix_ms,
+            status: entry.status.as_u16(),
+            headers: entry
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+                })
+                .collect(),
+            body_base64: base64::engine::general_purpose::STANDARD.encode(&entry.body),
+            upstream: entry.upstream.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&disk) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    fn remove_disk_cached_http_response(
+        &self,
+        config: &GatewayConfig,
+        cache: &ResponseCacheConfig,
+        storage_key: &str,
+    ) -> bool {
+        let Some(path) = cache_disk_path(config, cache, storage_key) else {
+            return false;
+        };
+        fs::remove_file(path).is_ok()
     }
 
     fn apply_http_rate_limit(
@@ -1743,25 +2338,35 @@ impl Gateway {
         host: &str,
         headers: &HeaderMap,
         remote_addr: SocketAddr,
-    ) -> Option<GatewayHttpResponse> {
+    ) -> std::result::Result<Option<HttpRateLimitLease>, GatewayHttpResponse> {
         if !config.enabled {
-            return None;
+            return Ok(None);
         }
 
-        let key = http_rate_limit_key(config, host, headers, remote_addr)?;
-        let retry_after = apply_http_rate_limit_to_store(&self.http_rate_limits, config, key)?;
-        let status = StatusCode::from_u16(config.status).unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-        let mut response = GatewayHttpResponse::bytes(
-            status,
-            "text/plain; charset=utf-8",
-            Bytes::from_static(b"rate limit exceeded"),
-            "proxysss://rate-limit",
-        );
-        response.headers.push((
-            HeaderName::from_static("retry-after"),
-            HeaderValue::from_str(&retry_after).unwrap_or_else(|_| HeaderValue::from_static("1")),
-        ));
-        Some(response)
+        let Some(key) = http_rate_limit_key(config, host, headers, remote_addr) else {
+            return Ok(None);
+        };
+        if let Some(retry_after) =
+            apply_http_rate_limit_to_store(&self.http_rate_limits, config, key.clone())
+        {
+            return Err(rate_limit_rejection_response(config, &retry_after));
+        }
+
+        if config.max_connections == 0 {
+            return Ok(None);
+        }
+
+        let mut entry = self.http_connection_limits.entry(key.clone()).or_insert(0);
+        if *entry >= config.max_connections {
+            return Err(rate_limit_rejection_response(config, "1"));
+        }
+        *entry = entry.saturating_add(1);
+        drop(entry);
+
+        Ok(Some(HttpRateLimitLease {
+            store: self.http_connection_limits.clone(),
+            key,
+        }))
     }
 
     fn apply_http_access_control(
@@ -1939,20 +2544,29 @@ impl Gateway {
         listener: Option<&str>,
         candidates: Vec<String>,
     ) -> Vec<String> {
-        if !config.load_balance.passive_health.enabled {
-            return candidates;
-        }
-
         let now = Instant::now();
         let mut available = Vec::new();
 
         for candidate in &candidates {
             let key = runtime_scope_key(protocol, listener, candidate);
             let healthy = match self.upstream_runtime.get(&key) {
-                Some(state) => match state.quarantined_until {
-                    Some(until) => until <= now,
-                    None => true,
-                },
+                Some(state) => {
+                    if state.manually_disabled {
+                        false
+                    } else {
+                    let passive_healthy = match state.quarantined_until {
+                        Some(until) if config.load_balance.passive_health.enabled => until <= now,
+                        None => true,
+                        Some(_) => true,
+                    };
+                    let active_healthy = if config.load_balance.active_health.enabled {
+                        state.active_probe_healthy.unwrap_or(true)
+                    } else {
+                        true
+                    };
+                    passive_healthy && active_healthy
+                    }
+                }
                 None => true,
             };
 
@@ -1972,7 +2586,9 @@ impl Gateway {
         let key = runtime_scope_key(protocol, listener, upstream);
         let mut entry = self.upstream_runtime.entry(key).or_default();
         entry.consecutive_failures = 0;
-        entry.quarantined_until = None;
+        if !entry.manually_disabled {
+            entry.quarantined_until = None;
+        }
     }
 
     fn on_upstream_failure(
@@ -2020,23 +2636,44 @@ impl Gateway {
             .unwrap_or(0)
     }
 
-    fn upstream_runtime_snapshot(&self) -> Vec<serde_json::Value> {
+    fn upstream_runtime_snapshot(&self, config: &GatewayConfig) -> Vec<serde_json::Value> {
         let now = Instant::now();
         let mut result = self
             .upstream_runtime
             .iter()
             .map(|entry| {
+                let (protocol, listener, upstream) = split_runtime_scope_key(entry.key());
+                let route_names = route_names_for_runtime_scope(config, protocol, listener, upstream);
                 let value = entry.value();
                 let remaining = value
                     .quarantined_until
                     .map(|until| until.saturating_duration_since(now).as_secs())
                     .unwrap_or(0);
+                let passive_healthy = value
+                    .quarantined_until
+                    .map(|until| until <= now)
+                    .unwrap_or(true);
+                let active_healthy = value.active_probe_healthy.unwrap_or(true);
                 serde_json::json!({
                     "key": entry.key(),
+                    "protocol": protocol,
+                    "listener": listener,
+                    "upstream": upstream,
+                    "route_names": route_names,
                     "consecutive_failures": value.consecutive_failures,
                     "active_connections": value.active_connections,
+                    "manually_disabled": value.manually_disabled,
+                    "manual_reason": value.manual_reason,
+                    "manual_changed_at_unix_ms": value.manual_changed_at_unix_ms,
+                    "active_probe_kind": value.active_probe_kind,
                     "quarantine_remaining_secs": remaining,
-                    "healthy": value.quarantined_until.map(|until| until <= now).unwrap_or(true),
+                    "passive_healthy": passive_healthy,
+                    "active_healthy": value.active_probe_healthy,
+                    "active_probe_status": value.active_probe_status,
+                    "active_probe_error": value.active_probe_error,
+                    "active_probe_checked_at_unix_ms": value.active_probe_checked_at_unix_ms,
+                    "active_probe_rtt_ms": value.active_probe_rtt_ms,
+                    "healthy": passive_healthy && active_healthy,
                 })
             })
             .collect::<Vec<_>>();
@@ -2054,6 +2691,520 @@ impl Gateway {
         self.sticky_affinity
             .retain(|_, entry| entry.expires_at > now);
     }
+
+    async fn run_active_health_pass(&self, config: &GatewayConfig, client: &reqwest::Client) {
+        let targets = collect_active_health_targets(config);
+        if targets.is_empty() {
+            return;
+        }
+
+        for target in targets {
+            if !target.settings.enabled {
+                continue;
+            }
+
+            if let Some(jitter) = health_check_jitter_delay(&target) {
+                tokio::time::sleep(jitter).await;
+            }
+
+            let key = runtime_scope_key(&target.protocol, target.listener.as_deref(), &target.upstream);
+            let (healthy, status, error, rtt_ms) = match target.kind {
+                ActiveHealthKind::Http => {
+                    probe_http_upstream(client, &target.upstream, &target.settings).await
+                }
+                ActiveHealthKind::Tcp => probe_tcp_upstream(&target.upstream, &target.settings).await,
+            };
+
+            let mut alert_payload = None;
+            let mut entry = self.upstream_runtime.entry(key.clone()).or_default();
+            entry.active_probe_kind = Some(target.kind.as_str().to_string());
+            entry.active_probe_status = status;
+            entry.active_probe_error = error;
+            entry.active_probe_checked_at_unix_ms = Some(current_unix_millis());
+            entry.active_probe_rtt_ms = rtt_ms;
+            let previous_health = entry.active_probe_healthy;
+
+            if healthy {
+                entry.active_probe_success_count = entry.active_probe_success_count.saturating_add(1);
+                entry.active_probe_failure_count = 0;
+                if entry.active_probe_success_count >= target.settings.success_threshold {
+                    entry.active_probe_healthy = Some(true);
+                }
+            } else {
+                entry.active_probe_failure_count = entry.active_probe_failure_count.saturating_add(1);
+                entry.active_probe_success_count = 0;
+                if entry.active_probe_failure_count >= target.settings.failure_threshold {
+                    entry.active_probe_healthy = Some(false);
+                }
+            }
+
+            if previous_health != entry.active_probe_healthy {
+                alert_payload = Some(serde_json::json!({
+                    "key": key,
+                    "protocol": target.protocol,
+                    "listener": target.listener,
+                    "upstream": target.upstream,
+                    "healthy": entry.active_probe_healthy,
+                    "probe_kind": entry.active_probe_kind,
+                    "status": entry.active_probe_status,
+                    "error": entry.active_probe_error,
+                    "checked_at_unix_ms": entry.active_probe_checked_at_unix_ms,
+                }));
+            }
+            drop(entry);
+
+            if let Some(payload) = alert_payload {
+                dispatch_active_health_alerts(client, &target.settings.alert_webhooks, payload).await;
+            }
+        }
+    }
+}
+
+fn split_runtime_scope_key(key: &str) -> (&str, &str, &str) {
+    let mut parts = key.splitn(3, ':');
+    let protocol = parts.next().unwrap_or("unknown");
+    let listener = parts.next().unwrap_or("default");
+    let upstream = parts.next().unwrap_or("");
+    (protocol, listener, upstream)
+}
+
+fn route_names_for_runtime_scope(
+    config: &GatewayConfig,
+    protocol: &str,
+    listener: &str,
+    upstream: &str,
+) -> Vec<String> {
+    let mut names = BTreeSet::new();
+
+    match protocol {
+        "http" => {
+            if listener != "default" && !listener.is_empty() {
+                names.insert(listener.to_string());
+                return names.into_iter().collect();
+            }
+            for route in &config.services.reverse_proxy.routes {
+                if normalize_candidates(&RouteDecision {
+                    upstream: route.upstream.clone(),
+                    upstreams: route.upstreams.clone(),
+                    affinity_key: None,
+                    rewrite_path: None,
+                    set_headers: BTreeMap::new(),
+                    strip_headers: Vec::new(),
+                    status: None,
+                    content_type: None,
+                })
+                .iter()
+                .any(|candidate| candidate == upstream)
+                {
+                    names.insert(route.name.clone());
+                }
+            }
+            for route in &config.services.domain_routes {
+                if normalize_candidates(&RouteDecision {
+                    upstream: route.upstream.clone(),
+                    upstreams: route.upstreams.clone(),
+                    affinity_key: None,
+                    rewrite_path: None,
+                    set_headers: BTreeMap::new(),
+                    strip_headers: Vec::new(),
+                    status: None,
+                    content_type: None,
+                })
+                .iter()
+                .any(|candidate| candidate == upstream)
+                {
+                    names.insert(route.name.clone());
+                }
+            }
+        }
+        "tcp" => {
+            if listener == "ftp" {
+                names.insert("ftp".to_string());
+            } else if !listener.is_empty() && listener != "default" {
+                names.insert(listener.to_string());
+            }
+        }
+        "udp" => {
+            if !listener.is_empty() && listener != "default" {
+                names.insert(listener.to_string());
+            }
+        }
+        _ => {}
+    }
+
+    names.into_iter().collect()
+}
+
+#[derive(Clone)]
+struct ActiveHealthTarget {
+    protocol: String,
+    listener: Option<String>,
+    upstream: String,
+    kind: ActiveHealthKind,
+    settings: ResolvedActiveHealthConfig,
+}
+
+#[derive(Clone, Copy)]
+enum ActiveHealthKind {
+    Http,
+    Tcp,
+}
+
+impl ActiveHealthKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarget> {
+    let mut upstreams = BTreeMap::<String, ActiveHealthTarget>::new();
+
+    if config.load_balance.active_health.enabled && config.load_balance.active_health.http_enabled {
+        for route in &config.services.reverse_proxy.routes {
+            for upstream in normalize_candidates(&RouteDecision {
+                upstream: route.upstream.clone(),
+                upstreams: route.upstreams.clone(),
+                affinity_key: None,
+                rewrite_path: None,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                status: None,
+                content_type: None,
+            }) {
+                let key = runtime_scope_key("http", Some(&route.name), &upstream);
+                upstreams.entry(key).or_insert(ActiveHealthTarget {
+                    protocol: "http".to_string(),
+                    listener: Some(route.name.clone()),
+                    upstream,
+                    kind: ActiveHealthKind::Http,
+                    settings: resolve_active_health_config(
+                        &config.load_balance.active_health,
+                        &route.active_health,
+                    ),
+                });
+            }
+        }
+
+        for route in &config.services.domain_routes {
+            for upstream in normalize_candidates(&RouteDecision {
+                upstream: route.upstream.clone(),
+                upstreams: route.upstreams.clone(),
+                affinity_key: None,
+                rewrite_path: None,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                status: None,
+                content_type: None,
+            }) {
+                let key = runtime_scope_key("http", Some(&route.name), &upstream);
+                upstreams.entry(key).or_insert(ActiveHealthTarget {
+                    protocol: "http".to_string(),
+                    listener: Some(route.name.clone()),
+                    upstream,
+                    kind: ActiveHealthKind::Http,
+                    settings: resolve_active_health_config(
+                        &config.load_balance.active_health,
+                        &route.active_health,
+                    ),
+                });
+            }
+        }
+    }
+
+    if config.load_balance.active_health.enabled && config.load_balance.active_health.tcp_enabled {
+        for listener in &config.tcp.listeners {
+            for upstream in normalize_candidates(&RouteDecision {
+                upstream: listener.upstream.clone(),
+                upstreams: listener.upstreams.clone(),
+                affinity_key: None,
+                rewrite_path: None,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                status: None,
+                content_type: None,
+            }) {
+                let key = runtime_scope_key("tcp", Some(&listener.name), &upstream);
+                upstreams.entry(key).or_insert(ActiveHealthTarget {
+                    protocol: "tcp".to_string(),
+                    listener: Some(listener.name.clone()),
+                    upstream,
+                    kind: ActiveHealthKind::Tcp,
+                    settings: resolve_global_active_health_config(&config.load_balance.active_health),
+                });
+            }
+        }
+
+        if config.services.ftp.enabled {
+            let upstream = config.services.ftp.upstream.clone();
+            let key = runtime_scope_key("tcp", Some("ftp"), &upstream);
+            upstreams.entry(key).or_insert(ActiveHealthTarget {
+                protocol: "tcp".to_string(),
+                listener: Some("ftp".to_string()),
+                upstream,
+                kind: ActiveHealthKind::Tcp,
+                settings: resolve_global_active_health_config(&config.load_balance.active_health),
+            });
+        }
+    }
+
+    upstreams.into_values().collect()
+}
+
+async fn probe_http_upstream(
+    client: &reqwest::Client,
+    upstream: &str,
+    settings: &ResolvedActiveHealthConfig,
+) -> (bool, Option<u16>, Option<String>, Option<u64>) {
+    let started_at = Instant::now();
+
+    let target_url = match build_health_check_url(upstream, &settings.path) {
+        Ok(url) => url,
+        Err(error) => return (false, None, Some(error.to_string()), None),
+    };
+
+    let request = client
+        .get(target_url)
+        .timeout(Duration::from_millis(settings.timeout_ms.max(100)));
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let healthy = settings.expected_statuses.contains(&status);
+            let error = if healthy {
+                None
+            } else {
+                Some(format!("unexpected status {status}"))
+            };
+            (
+                healthy,
+                Some(status),
+                error,
+                Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            )
+        }
+        Err(error) => (
+            false,
+            None,
+            Some(error.to_string()),
+            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+        ),
+    }
+}
+
+async fn probe_tcp_upstream(
+    upstream: &str,
+    settings: &ResolvedActiveHealthConfig,
+) -> (bool, Option<u16>, Option<String>, Option<u64>) {
+    let started_at = Instant::now();
+    let timeout = Duration::from_millis(settings.timeout_ms.max(100));
+    let target = match tcp_probe_target(upstream) {
+        Ok(target) => target,
+        Err(error) => return (false, None, Some(error.to_string()), None),
+    };
+
+    match tokio::time::timeout(timeout, TcpStream::connect(&target)).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            (
+                true,
+                None,
+                None,
+                Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            )
+        }
+        Ok(Err(error)) => (
+            false,
+            None,
+            Some(error.to_string()),
+            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+        ),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("tcp connect timeout after {}ms", timeout.as_millis())),
+            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+        ),
+    }
+}
+
+fn tcp_probe_target(upstream: &str) -> Result<String> {
+    if upstream.starts_with("http://")
+        || upstream.starts_with("https://")
+        || upstream.starts_with("ws://")
+        || upstream.starts_with("wss://")
+    {
+        let url = Url::parse(upstream)
+            .with_context(|| format!("invalid tcp probe upstream url {upstream}"))?;
+        let host = url.host_str().ok_or_else(|| anyhow!("upstream URL missing host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow!("upstream URL missing port"))?;
+        Ok(format!("{host}:{port}"))
+    } else {
+        Ok(upstream.to_string())
+    }
+}
+
+fn health_check_jitter_delay(target: &ActiveHealthTarget) -> Option<Duration> {
+    if target.settings.jitter_percent == 0 {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    target.protocol.hash(&mut hasher);
+    target.listener.hash(&mut hasher);
+    target.upstream.hash(&mut hasher);
+    let bucket = hasher.finish() % 10_000;
+    let max_ms = target
+        .settings
+        .timeout_ms
+        .saturating_mul(target.settings.jitter_percent as u64)
+        / 100;
+    Some(Duration::from_millis(
+        (bucket.saturating_mul(max_ms.max(1)) / 10_000).max(1),
+    ))
+}
+
+async fn dispatch_active_health_alerts(
+    client: &reqwest::Client,
+    webhooks: &[String],
+    payload: serde_json::Value,
+) {
+    for webhook in webhooks {
+        let result = client.post(webhook).json(&payload).send().await;
+        if let Err(error) = result {
+            tracing::warn!(?error, webhook = %webhook, "active health alert webhook failed");
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedManualUpstreamState {
+    items: BTreeMap<String, PersistedManualUpstreamEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedManualUpstreamEntry {
+    manually_disabled: bool,
+    manual_reason: Option<String>,
+    manual_changed_at_unix_ms: Option<u64>,
+}
+
+impl Gateway {
+fn set_manual_upstream_state(
+    &self,
+    config: &GatewayConfig,
+    key: &str,
+    disabled: bool,
+    reason: Option<String>,
+) {
+    let mut entry = self.upstream_runtime.entry(key.to_string()).or_default();
+    entry.manually_disabled = disabled;
+    entry.manual_reason = if disabled { reason } else { None };
+    entry.manual_changed_at_unix_ms = Some(current_unix_millis());
+    if !disabled {
+        entry.quarantined_until = None;
+    }
+    drop(entry);
+    let _ = self.persist_manual_upstream_state(config);
+}
+
+fn persist_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
+    if !config.runtime.maintenance_state.enabled {
+        return Ok(());
+    }
+
+    let items = self
+        .upstream_runtime
+        .iter()
+        .filter(|entry| entry.value().manually_disabled)
+        .map(|entry| {
+            (
+                entry.key().clone(),
+                PersistedManualUpstreamEntry {
+                    manually_disabled: entry.value().manually_disabled,
+                    manual_reason: entry.value().manual_reason.clone(),
+                    manual_changed_at_unix_ms: entry.value().manual_changed_at_unix_ms,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let payload = PersistedManualUpstreamState { items };
+    if let Some(parent) = config.runtime.maintenance_state.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        &config.runtime.maintenance_state.path,
+        serde_json::to_vec_pretty(&payload).context("failed to serialize maintenance state")?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            config.runtime.maintenance_state.path.display()
+        )
+    })
+}
+
+fn load_persisted_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
+    if !config.runtime.maintenance_state.enabled
+        || !config.runtime.maintenance_state.path.exists()
+    {
+        return Ok(());
+    }
+
+    let bytes = fs::read(&config.runtime.maintenance_state.path).with_context(|| {
+        format!(
+            "failed to read {}",
+            config.runtime.maintenance_state.path.display()
+        )
+    })?;
+    let payload: PersistedManualUpstreamState = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to decode {}",
+            config.runtime.maintenance_state.path.display()
+        )
+    })?;
+
+    for (key, item) in payload.items {
+        if item.manually_disabled {
+            let mut entry = self.upstream_runtime.entry(key).or_default();
+            entry.manually_disabled = true;
+            entry.manual_reason = item.manual_reason;
+            entry.manual_changed_at_unix_ms = item.manual_changed_at_unix_ms;
+        }
+    }
+    Ok(())
+}
+}
+
+fn build_health_check_url(upstream: &str, path: &str) -> Result<Url> {
+    let normalized = if upstream.starts_with("http://")
+        || upstream.starts_with("https://")
+        || upstream.starts_with("ws://")
+        || upstream.starts_with("wss://")
+    {
+        upstream.to_string()
+    } else {
+        format!("http://{upstream}")
+    };
+    let mut url = Url::parse(&normalized)
+        .with_context(|| format!("invalid health check upstream url {upstream}"))?;
+    let mapped_scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    }
+    .to_string();
+    if mapped_scheme != url.scheme() {
+        url.set_scheme(&mapped_scheme)
+            .map_err(|_| anyhow!("failed to map upstream scheme for {upstream}"))?;
+    }
+    url.set_path(path);
+    url.set_query(None);
+    Ok(url)
 }
 
 impl GatewayHttpResponse {
@@ -2071,8 +3222,16 @@ impl GatewayHttpResponse {
     }
 
     fn html(body: impl Into<String>, upstream: impl Into<String>) -> Self {
+        Self::html_with_status(StatusCode::OK, body, upstream)
+    }
+
+    fn html_with_status(
+        status: StatusCode,
+        body: impl Into<String>,
+        upstream: impl Into<String>,
+    ) -> Self {
         Self {
-            status: StatusCode::OK,
+            status,
             headers: vec![(
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/html; charset=utf-8"),
@@ -2148,6 +3307,111 @@ impl GatewayStats {
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
         })
     }
+}
+
+fn decorate_error_response(
+    config: &GatewayConfig,
+    request_headers: &HeaderMap,
+    response: GatewayHttpResponse,
+) -> GatewayHttpResponse {
+    if !response.status.is_client_error() && !response.status.is_server_error() {
+        return response;
+    }
+
+    if let Some(page) = config
+        .http
+        .error_pages
+        .pages
+        .iter()
+        .find(|page| page.status == response.status.as_u16())
+    {
+        if let Some(body) = load_configured_error_page(page, response.status, &response.body, config.http.error_pages.show_details) {
+            let mut replacement = response;
+            replacement.headers = vec![(
+                CONTENT_TYPE,
+                HeaderValue::from_str(&page.content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("text/html; charset=utf-8")),
+            )];
+            replacement.body = Bytes::from(body);
+            return replacement;
+        }
+    }
+
+    if wants_html_response(request_headers) {
+        let detail = if config.http.error_pages.show_details {
+            String::from_utf8_lossy(&response.body).to_string()
+        } else {
+            String::new()
+        };
+        return GatewayHttpResponse::html_with_status(
+            response.status,
+            render_default_error_html(response.status, &detail),
+            response.upstream,
+        );
+    }
+
+    response
+}
+
+fn load_configured_error_page(
+    page: &crate::config::HttpErrorPageConfig,
+    status: StatusCode,
+    body: &[u8],
+    show_details: bool,
+) -> Option<String> {
+    let mut content = if !page.body.trim().is_empty() {
+        page.body.clone()
+    } else if !page.file_path.as_os_str().is_empty() {
+        fs::read_to_string(&page.file_path).ok()?
+    } else {
+        return None;
+    };
+
+    let detail = if show_details {
+        String::from_utf8_lossy(body).to_string()
+    } else {
+        String::new()
+    };
+    content = content.replace("{{status}}", &status.as_u16().to_string());
+    content = content.replace("{{reason}}", status.canonical_reason().unwrap_or("Error"));
+    content = content.replace("{{detail}}", &detail);
+    Some(content)
+}
+
+fn wants_html_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|accept| {
+            accept.contains("text/html")
+                || accept.contains("application/xhtml+xml")
+                || accept.contains("*/*")
+        })
+        .unwrap_or(true)
+}
+
+fn render_default_error_html(status: StatusCode, detail: &str) -> String {
+    let title = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error"));
+    let detail_block = if detail.trim().is_empty() {
+        "".to_string()
+    } else {
+        format!("<pre>{}</pre>", html_escape(detail))
+    };
+
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" /><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /><title>{title}</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Avenir Next,PingFang SC,Microsoft YaHei,sans-serif;background:radial-gradient(circle at top left,rgba(89,208,255,.18),transparent 30%),linear-gradient(160deg,#07111a,#0c1823);color:#eef6ff}}.card{{width:min(760px,calc(100vw - 28px));padding:28px;border-radius:28px;background:rgba(10,20,34,.88);border:1px solid rgba(146,191,255,.14);box-shadow:0 24px 70px rgba(0,0,0,.24)}}.eyebrow{{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:#7ef4b0}}h1{{margin:12px 0 8px;font-size:clamp(44px,8vw,88px);line-height:.92;letter-spacing:-.05em}}p{{margin:0;color:#9ab0c2;font-size:16px;line-height:1.6}}.actions{{display:flex;gap:12px;flex-wrap:wrap;margin-top:22px}}a{{display:inline-flex;align-items:center;text-decoration:none;padding:12px 16px;border-radius:999px;font-weight:800}}.primary{{background:linear-gradient(135deg,#56d7ff,#77f3bf);color:#04111a}}.ghost{{background:rgba(255,255,255,.06);color:#eef6ff}}pre{{margin-top:18px;padding:16px;border-radius:18px;background:rgba(2,8,18,.76);overflow:auto;color:#d7e9ff}}</style></head><body><main class=\"card\"><div class=\"eyebrow\">gateway response</div><h1>{}</h1><p>{}</p><div class=\"actions\"><a class=\"primary\" href=\"/\">Back to proxysss</a><a class=\"ghost\" href=\"/docs.html\">Open docs</a></div>{}</main></body></html>",
+        html_escape(&title),
+        html_escape(status.canonical_reason().unwrap_or("The gateway returned an error response.")),
+        detail_block,
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
@@ -2437,6 +3701,23 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
                 ));
             }
         }
+        TlsMode::AcmeManaged => {
+            if config.http.tls.generate_self_signed_if_missing {
+                install::ensure_cert_pair(
+                    &config.http.tls.cert_path,
+                    &config.http.tls.key_path,
+                    &config.http.tls.server_name,
+                    false,
+                )?;
+            }
+            if !config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists() {
+                return Err(anyhow!(
+                    "tls.mode=acme_managed requires bootstrap cert/key or generate_self_signed_if_missing=true: {} {}",
+                    config.http.tls.cert_path.display(),
+                    config.http.tls.key_path.display()
+                ));
+            }
+        }
         TlsMode::AcmeExternal => {
             if !config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists() {
                 run_acme_command(&config.http.tls, false)?;
@@ -2466,16 +3747,20 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
 
 fn build_rustls_server_config(
     config: &GatewayConfig,
+    acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<rustls::ServerConfig> {
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(build_tls_resolver(config)?);
+        .with_cert_resolver(build_tls_resolver(config, acme_tls_alpn_by_name)?);
     server_config.alpn_protocols = alpn_protocols;
     Ok(server_config)
 }
 
-fn build_tls_resolver(config: &GatewayConfig) -> Result<Arc<dyn ResolvesServerCert>> {
+fn build_tls_resolver(
+    config: &GatewayConfig,
+    acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
+) -> Result<Arc<dyn ResolvesServerCert>> {
     let default = Arc::new(build_certified_key(
         &config.http.tls.cert_path,
         &config.http.tls.key_path,
@@ -2490,7 +3775,11 @@ fn build_tls_resolver(config: &GatewayConfig) -> Result<Arc<dyn ResolvesServerCe
         insert_certificate_domains(&mut by_name, certified, certificate);
     }
 
-    Ok(Arc::new(SniResolver { default, by_name }))
+    Ok(Arc::new(SniResolver {
+        default,
+        by_name,
+        acme_tls_alpn_by_name,
+    }))
 }
 
 fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
@@ -2518,6 +3807,187 @@ fn insert_certificate_domains(
             );
         }
     }
+}
+
+fn build_acme_tls_alpn_certified_key(domain: &str, digest: &[u8]) -> Result<CertifiedKey> {
+    if digest.len() != 32 {
+        return Err(anyhow!(
+            "acme tls-alpn digest must be 32 bytes, got {}",
+            digest.len()
+        ));
+    }
+
+    let mut params = CertificateParams::new(vec![domain.to_string()])
+        .context("failed to initialize acme tls-alpn certificate params")?;
+    params.distinguished_name = DistinguishedName::new();
+    params.custom_extensions.push(CustomExtension::from_oid_content(
+        &[1, 3, 6, 1, 5, 5, 7, 1, 31],
+        acme_identifier_extension_content(digest),
+    ));
+
+    let key_pair = KeyPair::generate().context("failed generating acme tls-alpn key pair")?;
+    let certificate = params
+        .self_signed(&key_pair)
+        .context("failed generating acme tls-alpn certificate")?;
+    let certs = load_certs_from_pem(&certificate.pem())?;
+    let key = load_private_key_from_pem(&key_pair.serialize_pem())?;
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|error| anyhow!("failed loading in-memory acme tls-alpn private key: {error}"))?;
+    Ok(CertifiedKey::new(certs, signing_key))
+}
+
+fn acme_identifier_extension_content(digest: &[u8]) -> Vec<u8> {
+    let mut der = Vec::with_capacity(2 + digest.len());
+    der.push(0x04);
+    der.push(u8::try_from(digest.len()).unwrap_or(32));
+    der.extend_from_slice(digest);
+    der
+}
+
+async fn issue_managed_acme_certificate(
+    tls: &crate::config::TlsConfig,
+    challenges: &DashMap<String, String>,
+    tls_alpn_certs: &DashMap<String, Arc<CertifiedKey>>,
+) -> Result<()> {
+    let cache_dir = tls.acme.cache_dir.clone();
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create acme cache dir {}", cache_dir.display()))?;
+    let credentials_path = cache_dir.join("account.json");
+    let directory_url = if tls.acme.directory_production {
+        LetsEncrypt::Production.url().to_string()
+    } else {
+        LetsEncrypt::Staging.url().to_string()
+    };
+
+    let account = if credentials_path.exists() {
+        let bytes = fs::read(&credentials_path)
+            .with_context(|| format!("failed to read {}", credentials_path.display()))?;
+        let credentials: instant_acme::AccountCredentials = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to decode {}", credentials_path.display()))?;
+        Account::builder()
+            .context("failed to build managed acme account client")?
+            .from_credentials(credentials)
+            .await
+            .context("failed to restore managed acme account")?
+    } else {
+        let contact = format!("mailto:{}", tls.acme.email);
+        let contacts = [contact.as_str()];
+        let (account, credentials) = Account::builder()
+            .context("failed to build managed acme account client")?
+            .create(
+                &NewAccount {
+                    contact: &contacts,
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                directory_url,
+                None,
+            )
+            .await
+            .context("failed to create managed acme account")?;
+        fs::write(
+            &credentials_path,
+            serde_json::to_vec_pretty(&credentials).context("failed to serialize acme credentials")?,
+        )
+        .with_context(|| format!("failed to write {}", credentials_path.display()))?;
+        account
+    };
+
+    let identifiers = tls
+        .acme
+        .domains
+        .iter()
+        .map(|domain| Identifier::Dns(domain.clone()))
+        .collect::<Vec<_>>();
+    let mut order = account
+        .new_order(&NewOrder::new(&identifiers))
+        .await
+        .context("failed to create managed acme order")?;
+
+    let mut inserted_tokens = Vec::new();
+    let mut inserted_tls_domains = Vec::new();
+    let result = async {
+        let mut authorizations = order.authorizations();
+        while let Some(authz) = authorizations.next().await {
+            let mut authz = authz.context("failed to fetch acme authorization")?;
+            let identifier = authz.identifier().to_string().to_ascii_lowercase();
+            let mut challenge = match tls.acme.challenge {
+                AcmeChallengeType::Http01 => authz
+                    .challenge(ChallengeType::Http01)
+                    .ok_or_else(|| anyhow!("acme server did not offer http-01 challenge"))?,
+                AcmeChallengeType::TlsAlpn01 => authz
+                    .challenge(ChallengeType::TlsAlpn01)
+                    .ok_or_else(|| anyhow!("acme server did not offer tls-alpn-01 challenge"))?,
+            };
+
+            match tls.acme.challenge {
+                AcmeChallengeType::Http01 => {
+                    let token = challenge.token.clone();
+                    let key_authorization = challenge.key_authorization().as_str().to_string();
+                    challenges.insert(token.clone(), key_authorization);
+                    inserted_tokens.push(token);
+                }
+                AcmeChallengeType::TlsAlpn01 => {
+                    let certified = build_acme_tls_alpn_certified_key(
+                        &identifier,
+                        challenge.key_authorization().digest().as_ref(),
+                    )?;
+                    tls_alpn_certs.insert(identifier.clone(), Arc::new(certified));
+                    inserted_tls_domains.push(identifier);
+                }
+            }
+            challenge
+                .set_ready()
+                .await
+                .context("failed to notify acme server that challenge is ready")?;
+        }
+
+        let retry = RetryPolicy::default().timeout(Duration::from_secs(120));
+        let status = order
+            .poll_ready(&retry)
+            .await
+            .context("timed out waiting for acme order readiness")?;
+        if status != OrderStatus::Ready {
+            return Err(anyhow!("acme order ended in unexpected state {status:?}"));
+        }
+
+        let private_key_pem = order
+            .finalize()
+            .await
+            .context("failed to finalize managed acme order")?;
+        let certificate_pem = order
+            .poll_certificate(&retry)
+            .await
+            .context("failed to retrieve managed acme certificate")?;
+
+        if let Some(parent) = tls.cert_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if let Some(parent) = tls.key_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&tls.cert_path, certificate_pem)
+            .with_context(|| format!("failed to write {}", tls.cert_path.display()))?;
+        fs::write(&tls.key_path, private_key_pem)
+            .with_context(|| format!("failed to write {}", tls.key_path.display()))?;
+
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    for token in inserted_tokens {
+        challenges.remove(&token);
+    }
+    for domain in inserted_tls_domains {
+        tls_alpn_certs.remove(&domain);
+    }
+
+    result
 }
 
 fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<()> {
@@ -2674,7 +4144,7 @@ fn finalize_http_response(
     if !compression.enabled || !response_allows_compression(&response) {
         return Ok(response);
     }
-    let Some(encoding) = select_compression_encoding(request_headers) else {
+    let Some(encoding) = select_compression_encoding(request_headers, compression) else {
         return Ok(response);
     };
     if response.body.len() < compression.min_length
@@ -2684,6 +4154,10 @@ fn finalize_http_response(
     }
 
     let (compressed, encoding_header) = match encoding {
+        CompressionEncoding::Zstd => (
+            zstd_bytes(&response.body)?,
+            HeaderValue::from_static("zstd"),
+        ),
         CompressionEncoding::Brotli => (
             brotli_bytes(&response.body)?,
             HeaderValue::from_static("br"),
@@ -2718,8 +4192,23 @@ fn brotli_bytes(body: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.into_inner())
 }
 
-fn select_compression_encoding(headers: &HeaderMap) -> Option<CompressionEncoding> {
+fn zstd_bytes(body: &[u8]) -> Result<Vec<u8>> {
+    zstd_encode_all(body, 3).context("failed to zstd-compress response body")
+}
+
+fn select_compression_encoding(
+    headers: &HeaderMap,
+    compression: &ResponseCompressionConfig,
+) -> Option<CompressionEncoding> {
     let accepted = headers.get(ACCEPT_ENCODING)?.to_str().ok()?;
+    let allow_zstd = compression.algorithms.contains(&CompressionAlgorithm::Zstd);
+    let allow_br = compression.algorithms.contains(&CompressionAlgorithm::Brotli);
+    let allow_gzip = compression.algorithms.contains(&CompressionAlgorithm::Gzip);
+    if !allow_zstd && !allow_br && !allow_gzip {
+        return None;
+    }
+
+    let mut zstd_q: Option<f32> = None;
     let mut br_q: Option<f32> = None;
     let mut gzip_q: Option<f32> = None;
     let mut wildcard_q: Option<f32> = None;
@@ -2750,6 +4239,7 @@ fn select_compression_encoding(headers: &HeaderMap) -> Option<CompressionEncodin
         }
 
         match encoding.as_str() {
+            "zstd" => zstd_q = Some(zstd_q.map_or(q, |existing| existing.max(q))),
             "br" => br_q = Some(br_q.map_or(q, |existing| existing.max(q))),
             "gzip" => gzip_q = Some(gzip_q.map_or(q, |existing| existing.max(q))),
             "*" => wildcard_q = Some(wildcard_q.map_or(q, |existing| existing.max(q))),
@@ -2757,13 +4247,28 @@ fn select_compression_encoding(headers: &HeaderMap) -> Option<CompressionEncodin
         }
     }
 
-    let br = br_q.or(wildcard_q).unwrap_or(0.0);
-    let gzip = gzip_q.or(wildcard_q).unwrap_or(0.0);
-    if br <= 0.0 && gzip <= 0.0 {
+    let zstd = if allow_zstd {
+        zstd_q.or(wildcard_q).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let br = if allow_br {
+        br_q.or(wildcard_q).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let gzip = if allow_gzip {
+        gzip_q.or(wildcard_q).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if zstd <= 0.0 && br <= 0.0 && gzip <= 0.0 {
         return None;
     }
 
-    if br >= gzip {
+    if zstd >= br && zstd >= gzip {
+        Some(CompressionEncoding::Zstd)
+    } else if br >= gzip {
         Some(CompressionEncoding::Brotli)
     } else {
         Some(CompressionEncoding::Gzip)
@@ -2842,6 +4347,290 @@ fn cache_lookup_key(
             .map(|value| value.as_str())
             .unwrap_or("/")
     ))
+}
+
+fn cache_storage_key(config: &ResponseCacheConfig, key: &str) -> String {
+    format!("{}:{key}", config.zone)
+}
+
+fn cache_zone_max_entries(config: &GatewayConfig, zone: &str) -> usize {
+    config
+        .services
+        .cache_zones
+        .iter()
+        .find(|item| item.name == zone)
+        .map(|item| item.max_entries)
+        .unwrap_or(4096)
+}
+
+fn cache_disk_path(
+    config: &GatewayConfig,
+    cache: &ResponseCacheConfig,
+    storage_key: &str,
+) -> Option<PathBuf> {
+    let zone = config
+        .services
+        .cache_zones
+        .iter()
+        .find(|item| item.name == cache.zone)?;
+    if zone.disk_path.as_os_str().is_empty() {
+        return None;
+    }
+    let digest = md5::compute(storage_key.as_bytes());
+    Some(zone.disk_path.join(format!("{:x}.json", digest)))
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+async fn rewrite_ftp_passive_reply(
+    raw_reply: &[u8],
+    config: &crate::config::FtpConfig,
+    bind_ip: IpAddr,
+    public_ip: IpAddr,
+    upstream_control_ip: IpAddr,
+    remote_addr: SocketAddr,
+) -> Result<Option<String>> {
+    let reply = String::from_utf8_lossy(raw_reply);
+
+    if let Some(upstream_addr) = parse_ftp_pasv_addr(&reply) {
+        let Some((listener, port)) =
+            bind_ftp_passive_listener(bind_ip, config.passive_port_start, config.passive_port_end)
+                .await?
+        else {
+            tracing::warn!(%remote_addr, "ftp passive listener pool exhausted");
+            return Ok(Some("425 Can't open passive data connection.\r\n".to_string()));
+        };
+        spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
+
+        let IpAddr::V4(public_v4) = public_ip else {
+            tracing::warn!(%remote_addr, "ftp PASV rewrite requires IPv4 public_ip/local bind");
+            return Ok(Some("425 Can't expose passive IPv6 address via PASV.\r\n".to_string()));
+        };
+        let octets = public_v4.octets();
+        let p1 = port / 256;
+        let p2 = port % 256;
+        return Ok(Some(format!(
+            "227 Entering Passive Mode ({},{},{},{},{},{}).\r\n",
+            octets[0], octets[1], octets[2], octets[3], p1, p2
+        )));
+    }
+
+    if let Some(upstream_port) = parse_ftp_epsv_port(&reply) {
+        let Some((listener, port)) =
+            bind_ftp_passive_listener(bind_ip, config.passive_port_start, config.passive_port_end)
+                .await?
+        else {
+            tracing::warn!(%remote_addr, "ftp EPSV listener pool exhausted");
+            return Ok(Some("425 Can't open passive data connection.\r\n".to_string()));
+        };
+        let upstream_addr = SocketAddr::new(upstream_control_ip, upstream_port);
+        spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
+        return Ok(Some(format!(
+            "229 Entering Extended Passive Mode (|||{}|)\r\n",
+            port
+        )));
+    }
+
+    Ok(None)
+}
+
+async fn rewrite_ftp_active_command(
+    raw_command: &[u8],
+    config: &crate::config::FtpConfig,
+    bind_ip: IpAddr,
+    public_ip: IpAddr,
+    remote_addr: SocketAddr,
+) -> Result<Option<String>> {
+    let command = String::from_utf8_lossy(raw_command);
+
+    if let Some(target_addr) = parse_ftp_port_command(&command) {
+        let Some((listener, port)) =
+            bind_ftp_passive_listener(bind_ip, config.passive_port_start, config.passive_port_end)
+                .await?
+        else {
+            return Err(anyhow!("ftp active listener pool exhausted"));
+        };
+        spawn_ftp_active_bridge(listener, target_addr, remote_addr);
+
+        let IpAddr::V4(ip) = public_ip else {
+            return Err(anyhow!("ftp PORT rewrite requires an IPv4 public_ip/local bind"));
+        };
+        let octets = ip.octets();
+        let p1 = port / 256;
+        let p2 = port % 256;
+        return Ok(Some(format!(
+            "PORT {},{},{},{},{},{}\r\n",
+            octets[0], octets[1], octets[2], octets[3], p1, p2
+        )));
+    }
+
+    if let Some((af, target_addr)) = parse_ftp_eprt_command(&command) {
+        let Some((listener, port)) =
+            bind_ftp_passive_listener(bind_ip, config.passive_port_start, config.passive_port_end)
+                .await?
+        else {
+            return Err(anyhow!("ftp active listener pool exhausted"));
+        };
+        spawn_ftp_active_bridge(listener, target_addr, remote_addr);
+
+        let advertised_addr = match (af, public_ip) {
+            (1, IpAddr::V4(ip)) => ip.to_string(),
+            (2, IpAddr::V6(ip)) => ip.to_string(),
+            (1, IpAddr::V6(_)) => return Err(anyhow!("ftp EPRT IPv4 rewrite requires an IPv4 public_ip/local bind")),
+            (2, IpAddr::V4(_)) => return Err(anyhow!("ftp EPRT IPv6 rewrite requires an IPv6 public_ip/local bind")),
+            _ => return Ok(None),
+        };
+
+        return Ok(Some(format!("EPRT |{af}|{advertised_addr}|{port}|\r\n")));
+    }
+
+    Ok(None)
+}
+
+fn parse_ftp_pasv_addr(reply: &str) -> Option<SocketAddr> {
+    let start = reply.find('(')?;
+    let end = reply[start + 1..].find(')')? + start + 1;
+    let numbers = reply[start + 1..end]
+        .split(',')
+        .map(|part| part.trim().parse::<u16>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if numbers.len() != 6 {
+        return None;
+    }
+    let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+        numbers[0].try_into().ok()?,
+        numbers[1].try_into().ok()?,
+        numbers[2].try_into().ok()?,
+        numbers[3].try_into().ok()?,
+    ));
+    let port = numbers[4].saturating_mul(256).saturating_add(numbers[5]);
+    Some(SocketAddr::new(ip, port))
+}
+
+fn parse_ftp_port_command(command: &str) -> Option<SocketAddr> {
+    let payload = command.trim().strip_prefix("PORT ")?;
+    let numbers = payload
+        .split(',')
+        .map(|part| part.trim().parse::<u16>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if numbers.len() != 6 {
+        return None;
+    }
+    let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+        numbers[0].try_into().ok()?,
+        numbers[1].try_into().ok()?,
+        numbers[2].try_into().ok()?,
+        numbers[3].try_into().ok()?,
+    ));
+    let port = numbers[4].saturating_mul(256).saturating_add(numbers[5]);
+    Some(SocketAddr::new(ip, port))
+}
+
+fn parse_ftp_eprt_command(command: &str) -> Option<(u8, SocketAddr)> {
+    let payload = command.trim().strip_prefix("EPRT ")?;
+    let delimiter = payload.chars().next()?;
+    let segments = payload[1..].split(delimiter).collect::<Vec<_>>();
+    if segments.len() < 3 {
+        return None;
+    }
+    let af = segments[0].trim().parse::<u8>().ok()?;
+    let ip = segments[1].trim().parse::<IpAddr>().ok()?;
+    let port = segments[2].trim().parse::<u16>().ok()?;
+    Some((af, SocketAddr::new(ip, port)))
+}
+
+fn parse_ftp_epsv_port(reply: &str) -> Option<u16> {
+    let start = reply.find('(')?;
+    let end = reply[start + 1..].find(')')? + start + 1;
+    let payload = &reply[start + 1..end];
+    let digits = payload.chars().filter(|ch| ch.is_ascii_digit()).collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u16>().ok()
+    }
+}
+
+async fn bind_ftp_passive_listener(
+    bind_ip: IpAddr,
+    start: u16,
+    end: u16,
+) -> Result<Option<(TcpListener, u16)>> {
+    let candidate_ip = match bind_ip {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        ip => ip,
+    };
+
+    for port in start..=end {
+        match TcpListener::bind(SocketAddr::new(candidate_ip, port)).await {
+            Ok(listener) => return Ok(Some((listener, port))),
+            Err(_) => continue,
+        }
+    }
+
+    Ok(None)
+}
+
+fn spawn_ftp_passive_bridge(
+    listener: TcpListener,
+    upstream_addr: SocketAddr,
+    remote_addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let (mut downstream_data, _) = listener
+                .accept()
+                .await
+                .context("failed accepting ftp passive data connection")?;
+            let mut upstream_data = TcpStream::connect(upstream_addr)
+                .await
+                .with_context(|| format!("failed connecting ftp passive upstream {upstream_addr}"))?;
+            copy_bidirectional(&mut downstream_data, &mut upstream_data)
+                .await
+                .context("ftp passive data relay failed")?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            tracing::warn!(?error, %remote_addr, %upstream_addr, "ftp passive bridge failed");
+        }
+    });
+}
+
+fn spawn_ftp_active_bridge(
+    listener: TcpListener,
+    client_target: SocketAddr,
+    remote_addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let (mut server_data, _) = listener
+                .accept()
+                .await
+                .context("failed accepting ftp active data connection from upstream")?;
+            let mut client_data = TcpStream::connect(client_target)
+                .await
+                .with_context(|| format!("failed connecting ftp active client target {client_target}"))?;
+            copy_bidirectional(&mut server_data, &mut client_data)
+                .await
+                .context("ftp active data relay failed")?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            tracing::warn!(?error, %remote_addr, %client_target, "ftp active bridge failed");
+        }
+    });
 }
 
 fn cache_control_prevents_storage(headers: &[(HeaderName, HeaderValue)]) -> bool {
@@ -3133,6 +4922,13 @@ struct PluginUnloadRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpstreamToggleRequest {
+    key: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -3325,14 +5121,33 @@ fn http_rate_limit_key(
     headers: &HeaderMap,
     remote_addr: SocketAddr,
 ) -> Option<String> {
-    match &config.key {
-        RateLimitKey::RemoteAddr => Some(format!("remote:{}", remote_addr.ip())),
-        RateLimitKey::Host => Some(format!("host:{}", host.to_ascii_lowercase())),
+    let scope = match &config.key {
+        RateLimitKey::RemoteAddr => format!("remote:{}", remote_addr.ip()),
+        RateLimitKey::Host => format!("host:{}", host.to_ascii_lowercase()),
         RateLimitKey::Header(name) => headers
             .get(name.as_str())
             .and_then(|value| value.to_str().ok())
-            .map(|value| format!("header:{}:{}", name.to_ascii_lowercase(), value)),
-    }
+            .map(|value| format!("header:{}:{}", name.to_ascii_lowercase(), value))?,
+    };
+    Some(format!("{}:{scope}", config.zone))
+}
+
+fn rate_limit_rejection_response(
+    config: &HttpRateLimitConfig,
+    retry_after: &str,
+) -> GatewayHttpResponse {
+    let status = StatusCode::from_u16(config.status).unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+    let mut response = GatewayHttpResponse::bytes(
+        status,
+        "text/plain; charset=utf-8",
+        Bytes::from_static(b"rate limit exceeded"),
+        "proxysss://rate-limit",
+    );
+    response.headers.push((
+        HeaderName::from_static("retry-after"),
+        HeaderValue::from_str(retry_after).unwrap_or_else(|_| HeaderValue::from_static("1")),
+    ));
+    response
 }
 
 fn apply_http_rate_limit_to_store(
@@ -3370,7 +5185,8 @@ fn apply_http_rate_limit_to_store(
 
 fn builtin_http_route(path: &str) -> Option<RouteDecision> {
     let upstream = match path {
-        "/" | "/index.html" | "/docs" => "proxysss://welcome",
+        "/" | "/index.html" => "proxysss://welcome",
+        "/docs" | "/docs.html" => "proxysss://docs",
         "/healthz" => "proxysss://healthz",
         "/admin" => "proxysss://admin",
         path if path.starts_with("/static/") => {
@@ -3533,7 +5349,7 @@ fn configured_domain_route(
         .iter()
         .filter(|route| domain_route_matches(route, host, uri.path()))
         .max_by_key(|route| route.path_prefix.len())
-        .map(|route| domain_route_config(route, uri))
+        .map(|route| domain_route_config(config, route, uri))
 }
 
 fn configured_reverse_proxy_route(
@@ -3549,9 +5365,14 @@ fn configured_reverse_proxy_route(
         .filter(|route| reverse_proxy_route_matches(route, host, uri.path()))
         .max_by_key(|route| route.path_prefix.len())
         .map(|route| HttpRouteConfig {
+            runtime_scope: Some(route.name.clone()),
             decision: reverse_proxy_route_decision(route, uri),
-            compression: ResponseCompressionConfig::default(),
-            cache: ResponseCacheConfig::default(),
+            compression: merge_compression_policy(
+                &config.services.response_policy.compression,
+                &route.compression,
+            ),
+            cache: merge_cache_policy(&config.services.response_policy.cache, &route.cache),
+            rate_limit: merge_rate_limit_policy(&config.services.rate_limit.http, &route.rate_limit),
         })
 }
 
@@ -3591,6 +5412,50 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     host == pattern
 }
 
+fn strip_default_port(host: &str, default_port: u16) -> String {
+    match host.rsplit_once(':') {
+        Some((name, port)) if port == default_port.to_string() => name.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+fn should_redirect_http_to_https(config: &GatewayConfig, host: &str, uri: &Uri) -> bool {
+    if uri.path().starts_with("/.well-known/acme-challenge/") {
+        return false;
+    }
+    if config.http.tls_bind.trim().is_empty() {
+        return false;
+    }
+    let normalized_host = strip_default_port(host, 80).to_ascii_lowercase();
+
+    if matches!(config.http.tls.mode, TlsMode::AcmeManaged | TlsMode::AcmeExternal)
+        && config
+            .http
+            .tls
+            .acme
+            .domains
+            .iter()
+            .any(|domain| host_matches(domain, &normalized_host))
+    {
+        return true;
+    }
+
+    if config
+        .http
+        .tls
+        .certificates
+        .iter()
+        .any(|cert| cert.domains.iter().any(|domain| host_matches(domain, &normalized_host)))
+    {
+        return true;
+    }
+
+    config.services.domain_routes.iter().any(|route| {
+        domain_route_matches(route, &normalized_host, uri.path())
+            && route.ssl.effective_mode() != DomainTlsMode::Disabled
+    })
+}
+
 fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> RouteDecision {
     let rewrite_path = route.strip_prefix.then(|| {
         let prefix = normalize_route_prefix(&route.path_prefix);
@@ -3620,8 +5485,13 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
     }
 }
 
-fn domain_route_config(route: &DomainRouteConfig, uri: &Uri) -> HttpRouteConfig {
+fn domain_route_config(
+    config: &GatewayConfig,
+    route: &DomainRouteConfig,
+    uri: &Uri,
+) -> HttpRouteConfig {
     HttpRouteConfig {
+        runtime_scope: Some(route.name.clone()),
         decision: RouteDecision {
             upstream: route.upstream.clone(),
             upstreams: route.upstreams.clone(),
@@ -3646,8 +5516,88 @@ fn domain_route_config(route: &DomainRouteConfig, uri: &Uri) -> HttpRouteConfig 
             status: None,
             content_type: None,
         },
-        compression: route.compression.clone(),
-        cache: route.cache.clone(),
+        compression: merge_compression_policy(
+            &config.services.response_policy.compression,
+            &route.compression,
+        ),
+        cache: merge_cache_policy(&config.services.response_policy.cache, &route.cache),
+        rate_limit: merge_rate_limit_policy(&config.services.rate_limit.http, &route.rate_limit),
+    }
+}
+
+fn resolve_active_health_config(
+    base: &ActiveHealthConfig,
+    override_config: &ActiveHealthOverrideConfig,
+) -> ResolvedActiveHealthConfig {
+    ResolvedActiveHealthConfig {
+        enabled: override_config.enabled.unwrap_or(base.enabled && base.http_enabled),
+        path: override_config
+            .path
+            .clone()
+            .unwrap_or_else(|| base.path.clone()),
+        timeout_ms: override_config.timeout_ms.unwrap_or(base.timeout_ms),
+        expected_statuses: override_config
+            .expected_statuses
+            .clone()
+            .unwrap_or_else(|| base.expected_statuses.clone()),
+        failure_threshold: override_config
+            .failure_threshold
+            .unwrap_or(base.failure_threshold),
+        success_threshold: override_config
+            .success_threshold
+            .unwrap_or(base.success_threshold),
+        jitter_percent: override_config.jitter_percent.unwrap_or(base.jitter_percent),
+        alert_webhooks: if override_config.alert_webhooks.is_empty() {
+            base.alert_webhooks.clone()
+        } else {
+            override_config.alert_webhooks.clone()
+        },
+    }
+}
+
+fn resolve_global_active_health_config(base: &ActiveHealthConfig) -> ResolvedActiveHealthConfig {
+    ResolvedActiveHealthConfig {
+        enabled: base.enabled,
+        path: base.path.clone(),
+        timeout_ms: base.timeout_ms,
+        expected_statuses: base.expected_statuses.clone(),
+        failure_threshold: base.failure_threshold,
+        success_threshold: base.success_threshold,
+        jitter_percent: base.jitter_percent,
+        alert_webhooks: base.alert_webhooks.clone(),
+    }
+}
+
+fn merge_compression_policy(
+    base: &ResponseCompressionConfig,
+    override_policy: &ResponseCompressionConfig,
+) -> ResponseCompressionConfig {
+    if override_policy.enabled {
+        override_policy.clone()
+    } else {
+        base.clone()
+    }
+}
+
+fn merge_cache_policy(
+    base: &ResponseCacheConfig,
+    override_policy: &ResponseCacheConfig,
+) -> ResponseCacheConfig {
+    if override_policy.enabled {
+        override_policy.clone()
+    } else {
+        base.clone()
+    }
+}
+
+fn merge_rate_limit_policy(
+    base: &HttpRateLimitConfig,
+    override_policy: &HttpRateLimitConfig,
+) -> HttpRateLimitConfig {
+    if override_policy.enabled {
+        override_policy.clone()
+    } else {
+        base.clone()
     }
 }
 
@@ -4326,6 +6276,9 @@ fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> Gate
         "proxysss://welcome" => {
             GatewayHttpResponse::html(render_welcome_html(config), "proxysss://welcome")
         }
+        "proxysss://docs" => {
+            GatewayHttpResponse::html(render_docs_html(config), "proxysss://docs")
+        }
         "proxysss://healthz" => GatewayHttpResponse::bytes(
             StatusCode::OK,
             "application/json",
@@ -4812,7 +6765,7 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
                         <div class="version">v__VERSION__</div>
                     </div>
                 </div>
-                <a class="docs-btn" href="https://github.com/neko233-com/proxysss#readme" target="_blank" rel="noreferrer">Docs</a>
+                <a class="docs-btn" href="/docs.html">Docs</a>
             </div>
             <div class="hero-main">
                 <h1>proxysss</h1>
@@ -4825,7 +6778,7 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
                 <div class="protocol"><strong>WebSocket</strong><span>ws and wss upgrade tunneling</span></div>
                 <div class="protocol"><strong>TCP</strong><span>Declarative stream listener routing</span></div>
                 <div class="protocol"><strong>UDP</strong><span>YAML upstream and upstream pool support</span></div>
-                <div class="protocol"><strong>FTP</strong><span>Control-channel passthrough routing</span></div>
+                <div class="protocol"><strong>FTP</strong><span>Control-channel proxy with passive data-channel bridging</span></div>
                 <div class="protocol"><strong>WebDAV</strong><span>Built-in file methods in Rust hot path</span></div>
             </div>
             <div class="notes">
@@ -4901,6 +6854,212 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
     html.replace("__VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
+fn render_docs_html(_config: &GatewayConfig) -> String {
+    let reverse_proxy = docs_template_reverse_proxy();
+    let static_site = docs_template_static_site();
+    let webdav = docs_template_webdav();
+    let streams = docs_template_streams();
+    let ftp = docs_template_ftp();
+    let health = docs_template_health();
+    let maintenance = docs_template_maintenance();
+    let error_pages = docs_template_error_pages();
+
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>proxysss docs</title>
+    <style>
+        :root {{
+            --bg: #08131d;
+            --bg-2: #0d1d2d;
+            --panel: rgba(11, 21, 36, 0.88);
+            --line: rgba(140, 192, 255, 0.12);
+            --text: #eef6ff;
+            --muted: #93a8c4;
+            --accent: #59d0ff;
+            --accent-2: #7ef4b0;
+            --gold: #f3d27c;
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(89, 208, 255, 0.18), transparent 28%),
+                linear-gradient(160deg, var(--bg), var(--bg-2));
+        }}
+        .shell {{ width: min(1400px, calc(100vw - 28px)); margin: 14px auto; display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; }}
+        .nav, .content {{ background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: 0 24px 70px rgba(0,0,0,.24); backdrop-filter: blur(16px); }}
+        .nav {{ padding: 22px; position: sticky; top: 14px; align-self: start; display: grid; gap: 18px; }}
+        .content {{ padding: 22px; display: grid; gap: 18px; }}
+        h1, h2, h3, p {{ margin: 0; }}
+        h1 {{ font-size: 34px; letter-spacing: -0.04em; }}
+        h2 {{ font-size: 24px; margin-bottom: 10px; }}
+        h3 {{ font-size: 17px; margin-bottom: 8px; }}
+        .eyebrow {{ font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--accent-2); }}
+        .muted {{ color: var(--muted); }}
+        nav a {{ display: block; padding: 10px 12px; margin-top: 6px; border-radius: 12px; color: var(--text); text-decoration: none; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.04); }}
+        section {{ padding: 18px; border-radius: 20px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05); }}
+        .cards {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+        .card {{ padding: 14px; border-radius: 16px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05); }}
+        .list {{ display: grid; gap: 8px; color: var(--muted); }}
+        .list strong {{ color: var(--text); }}
+        pre {{ margin: 0; padding: 16px; border-radius: 18px; overflow: auto; background: rgba(3, 9, 18, .78); border: 1px solid rgba(255,255,255,.05); color: #d7e9ff; font-size: 12px; line-height: 1.5; }}
+        .table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        .table th, .table td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: top; }}
+        .table th {{ color: var(--muted); }}
+        .pill {{ display: inline-flex; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; background: rgba(255,255,255,.08); }}
+        .pill.good {{ color: var(--accent-2); background: rgba(126,244,176,.14); }}
+        .pill.warn {{ color: var(--gold); background: rgba(243,210,124,.14); }}
+        .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .actions a {{ display: inline-flex; align-items: center; text-decoration: none; padding: 12px 16px; border-radius: 999px; font-weight: 800; }}
+        .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04111a; }}
+        .ghost {{ background: rgba(255,255,255,.06); color: var(--text); }}
+        @media (max-width: 1080px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ position: static; }} .cards {{ grid-template-columns: 1fr; }} }}
+    </style>
+</head>
+<body>
+    <main class="shell">
+        <aside class="nav">
+            <div>
+                <div class="eyebrow">documentation</div>
+                <h1>proxysss</h1>
+                <p class="muted">Built-in manual, operational guide, config templates, and parity notes.</p>
+            </div>
+            <nav>
+                <a href="#quickstart">Quick Start</a>
+                <a href="#operations">Operations</a>
+                <a href="#templates">Templates</a>
+                <a href="#parity">Nginx Parity</a>
+                <a href="#gaps">Tracked Gaps</a>
+            </nav>
+            <div class="actions">
+                <a class="primary" href="/">Back to Welcome</a>
+                <a class="ghost" href="/admin">Open Admin</a>
+            </div>
+        </aside>
+
+        <section class="content">
+            <section id="quickstart">
+                <div class="eyebrow">Quick Start</div>
+                <h2>Default Behavior</h2>
+                <div class="cards">
+                    <article class="card"><strong>Public HTTP</strong><p class="muted">Port 80 with a built-in welcome page and optional automatic redirect to HTTPS for managed TLS domains.</p></article>
+                    <article class="card"><strong>Public TLS</strong><p class="muted">Port 443 for HTTPS/HTTP2, optional HTTP3 on the same public edge, managed ACME, SNI certs, and WebSocket tunneling.</p></article>
+                    <article class="card"><strong>Admin</strong><p class="muted">Port 7777 with stats, upstream health, maintenance mode toggles, and live runtime inspection.</p></article>
+                </div>
+            </section>
+
+            <section id="operations">
+                <div class="eyebrow">Operations</div>
+                <h2>Built-in Control Plane</h2>
+                <div class="list">
+                    <div><strong>Health:</strong> active HTTP/TCP health probes plus passive quarantine and manual drain state.</div>
+                    <div><strong>Reload:</strong> config, includes, scripts, plugins, and route-level health policy reload without a full process restart where supported.</div>
+                    <div><strong>Maintenance:</strong> upstream disable/restore can be persisted on disk through runtime maintenance state.</div>
+                    <div><strong>Error Pages:</strong> configurable status-page bodies/files plus polished built-in browser-facing 404/403/5xx pages.</div>
+                    <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>.</div>
+                </div>
+            </section>
+
+            <section id="templates">
+                <div class="eyebrow">Templates</div>
+                <h2>Configuration Templates</h2>
+                <h3>HTTP Reverse Proxy</h3>
+                <pre>{}</pre>
+                <h3>Static Site</h3>
+                <pre>{}</pre>
+                <h3>WebDAV</h3>
+                <pre>{}</pre>
+                <h3>TCP / UDP Streams</h3>
+                <pre>{}</pre>
+                <h3>FTP Native Control + Data Channels</h3>
+                <pre>{}</pre>
+                <h3>Active Health, Maintenance Persistence, Alerts</h3>
+                <pre>{}</pre>
+                <h3>Custom Error Pages</h3>
+                <pre>{}</pre>
+                <h3>Maintenance Persistence</h3>
+                <pre>{}</pre>
+            </section>
+
+            <section id="parity">
+                <div class="eyebrow">Parity</div>
+                <h2>Regular Gateway Behavior</h2>
+                <table class="table">
+                    <thead><tr><th>Surface</th><th>Status</th><th>Notes</th></tr></thead>
+                    <tbody>
+                        <tr><td>HTTP reverse proxy</td><td><span class="pill good">supported</span></td><td>host/path matching, upstream pools, strip prefix, header set/strip, retry, health, maintenance drain</td></tr>
+                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME, WebSocket, automatic redirect for managed domains</td></tr>
+                        <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
+                        <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
+                        <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
+                        <tr><td>FTP</td><td><span class="pill warn">partial</span></td><td>control channel proxy, passive and active data channel rewriting, still evolving richer command-aware policy</td></tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <section id="gaps">
+                <div class="eyebrow">Tracked Gaps</div>
+                <h2>Still Honest About What Remains</h2>
+                <div class="list">
+                    <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
+                    <div><strong>Advanced cache semantics:</strong> background revalidation and richer cache key variants remain future work.</div>
+                    <div><strong>Advanced rate shaping:</strong> token-bucket/leaky-bucket shaping is still beyond the current fixed-window controls.</div>
+                    <div><strong>FTP deep policy:</strong> native command-aware policy and observability can still go deeper.</div>
+                </div>
+            </section>
+        </section>
+    </main>
+</body>
+</html>"##,
+        reverse_proxy,
+        static_site,
+        webdav,
+        streams,
+        ftp,
+        health,
+        error_pages,
+        maintenance,
+    )
+}
+
+fn docs_template_reverse_proxy() -> &'static str {
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9000\n        - http://127.0.0.1:9001\n      strip_prefix: false\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 200\n        burst: 100\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
+}
+
+fn docs_template_static_site() -> &'static str {
+    "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
+}
+
+fn docs_template_webdav() -> &'static str {
+    "services:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: ./webdav\n    allow_write: true\n"
+}
+
+fn docs_template_streams() -> &'static str {
+    "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstreams: [127.0.0.1:9000, 127.0.0.1:9001]\nudp:\n  listeners:\n    - name: realtime\n      bind: 0.0.0.0:7001\n      upstreams: [127.0.0.1:9100, 127.0.0.1:9101]\n"
+}
+
+fn docs_template_ftp() -> &'static str {
+    "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n"
+}
+
+fn docs_template_health() -> &'static str {
+    "load_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    interval_secs: 10\n    timeout_ms: 2000\n    path: /healthz\n    expected_statuses: [200, 204]\n    failure_threshold: 2\n    success_threshold: 2\n    jitter_percent: 20\n    alert_webhooks:\n      - https://ops.example.com/webhooks/proxysss\n"
+}
+
+fn docs_template_error_pages() -> &'static str {
+    "http:\n  error_pages:\n    enabled: true\n    show_details: false\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>The requested route does not exist.</p></body></html>\n"
+}
+
+fn docs_template_maintenance() -> &'static str {
+    "runtime:\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\n"
+}
+
 fn render_admin_console_html(config: &GatewayConfig) -> String {
     let html = r#"<!doctype html>
 <html lang="en">
@@ -4909,46 +7068,678 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>proxysss admin</title>
     <style>
-        body { margin: 0; font-family: "Segoe UI", "PingFang SC", sans-serif; background: linear-gradient(160deg, #07111d, #0e1a2f); color: #eef5ff; }
-        .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 40px; }
-        .panel { background: rgba(10, 23, 40, 0.82); border: 1px solid rgba(123, 176, 255, 0.16); border-radius: 22px; padding: 22px; margin-bottom: 18px; }
-        h1, h2 { margin-top: 0; }
-        input { width: 100%; padding: 12px 14px; margin-top: 8px; margin-bottom: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #eef5ff; }
-        button { padding: 12px 16px; border: 0; border-radius: 12px; cursor: pointer; font-weight: 700; background: linear-gradient(135deg, #56d7ff, #7cffb6); color: #04111a; }
-        pre { background: rgba(2, 8, 18, 0.72); border-radius: 16px; padding: 16px; overflow: auto; min-height: 180px; }
-        .muted { color: #9eb4d1; }
+        :root {
+            --bg: #06111b;
+            --bg-2: #0c1b2b;
+            --panel: rgba(10, 20, 34, 0.86);
+            --panel-2: rgba(14, 28, 46, 0.92);
+            --line: rgba(146, 191, 255, 0.14);
+            --text: #eef6ff;
+            --muted: #93a8c4;
+            --accent: #59d0ff;
+            --accent-2: #7ef4b0;
+            --warn: #ffbf5f;
+            --bad: #ff7b7b;
+            --good: #7ef4b0;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Segoe UI", "PingFang SC", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(89, 208, 255, 0.18), transparent 30%),
+                radial-gradient(circle at top right, rgba(126, 244, 176, 0.16), transparent 28%),
+                linear-gradient(160deg, var(--bg), var(--bg-2));
+        }
+        .shell {
+            width: min(1440px, calc(100vw - 28px));
+            margin: 14px auto;
+            display: grid;
+            grid-template-columns: 340px minmax(0, 1fr);
+            gap: 14px;
+        }
+        .sidebar, .content {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+            backdrop-filter: blur(16px);
+        }
+        .sidebar {
+            padding: 22px;
+            display: grid;
+            align-content: start;
+            gap: 18px;
+        }
+        .brand {
+            display: grid;
+            gap: 8px;
+        }
+        .eyebrow {
+            font-size: 11px;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--accent-2);
+        }
+        h1, h2, h3, p { margin: 0; }
+        h1 { font-size: 30px; letter-spacing: -0.04em; }
+        .muted { color: var(--muted); }
+        .login-card, .meta-card {
+            padding: 16px;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            display: grid;
+            gap: 10px;
+        }
+        label {
+            font-size: 12px;
+            color: var(--muted);
+        }
+        input {
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(255,255,255,0.05);
+            color: var(--text);
+            padding: 12px 14px;
+            border-radius: 12px;
+            outline: none;
+        }
+        select {
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(255,255,255,0.05);
+            color: var(--text);
+            padding: 12px 14px;
+            border-radius: 12px;
+            outline: none;
+        }
+        .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        button {
+            border: 0;
+            border-radius: 12px;
+            padding: 12px 14px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04111a; }
+        .ghost { background: rgba(255,255,255,0.06); color: var(--text); }
+        .danger { background: rgba(255, 123, 123, 0.16); color: var(--bad); }
+        .success { background: rgba(126, 244, 176, 0.16); color: var(--good); }
+        .content {
+            padding: 18px;
+            display: grid;
+            gap: 14px;
+            min-width: 0;
+        }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            gap: 16px;
+        }
+        .status-dot {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: var(--muted);
+        }
+        .status-dot::before {
+            content: "";
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: var(--warn);
+            box-shadow: 0 0 0 6px rgba(255, 191, 95, 0.16);
+        }
+        .status-dot.ok::before { background: var(--good); box-shadow: 0 0 0 6px rgba(126, 244, 176, 0.14); }
+        .status-dot.bad::before { background: var(--bad); box-shadow: 0 0 0 6px rgba(255, 123, 123, 0.14); }
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .card {
+            padding: 16px;
+            border-radius: 18px;
+            background: var(--panel-2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            min-width: 0;
+        }
+        .card strong {
+            display: block;
+            font-size: 28px;
+            line-height: 1;
+            margin-top: 8px;
+            letter-spacing: -0.04em;
+        }
+        .surface {
+            padding: 16px;
+            border-radius: 20px;
+            background: var(--panel-2);
+            border: 1px solid rgba(255,255,255,0.05);
+            min-width: 0;
+        }
+        .surface-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .filters {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .filter {
+            display: grid;
+            gap: 8px;
+        }
+        .group-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .group-card {
+            padding: 14px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.05);
+            display: grid;
+            gap: 8px;
+        }
+        .group-card strong {
+            font-size: 18px;
+            letter-spacing: -0.03em;
+        }
+        .group-meta {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th, td {
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            vertical-align: top;
+        }
+        th { color: var(--muted); font-weight: 600; }
+        td code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: #d8ecff;
+            word-break: break-all;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 9px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            background: rgba(255,255,255,0.08);
+        }
+        .pill.good { background: rgba(126, 244, 176, 0.14); color: var(--good); }
+        .pill.bad { background: rgba(255, 123, 123, 0.14); color: var(--bad); }
+        .pill.warn { background: rgba(255, 191, 95, 0.16); color: var(--warn); }
+        .table-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .table-actions button {
+            padding: 8px 10px;
+            font-size: 12px;
+            border-radius: 10px;
+        }
+        .raw-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        pre {
+            margin: 0;
+            min-height: 220px;
+            padding: 14px;
+            border-radius: 16px;
+            overflow: auto;
+            background: rgba(2, 8, 18, 0.82);
+            border: 1px solid rgba(255,255,255,0.05);
+            color: #d6e8ff;
+            font-size: 12px;
+        }
+        .empty {
+            padding: 28px;
+            border-radius: 16px;
+            border: 1px dashed rgba(255,255,255,0.10);
+            text-align: center;
+            color: var(--muted);
+        }
+        @media (max-width: 1180px) {
+            .shell { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 860px) {
+            .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .group-grid { grid-template-columns: 1fr; }
+            .raw-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+            .shell { width: calc(100vw - 16px); margin: 8px auto; }
+            .sidebar, .content { border-radius: 20px; }
+            .cards { grid-template-columns: 1fr; }
+            .filters { grid-template-columns: 1fr; }
+            th:nth-child(2), td:nth-child(2), th:nth-child(6), td:nth-child(6), th:nth-child(7), td:nth-child(7), th:nth-child(10), td:nth-child(10), th:nth-child(11), td:nth-child(11) { display: none; }
+        }
     </style>
 </head>
 <body>
-    <div class="wrap">
-        <div class="panel">
-            <h1>proxysss admin console</h1>
-            <p class="muted">Use the default credentials from your config to inspect stats, upstream state, and loaded plugins.</p>
-        </div>
-        <div class="panel">
-            <h2>Quick Login</h2>
-            <label>Username</label>
-            <input id="username" value="__ADMIN_USER__" />
-            <label>Password</label>
-            <input id="password" type="password" value="__ADMIN_PASS__" />
-            <button id="load">Load /v1/stats</button>
-        </div>
-        <div class="panel">
-            <h2>Response</h2>
-            <pre id="output">Click the button to query /v1/stats</pre>
-        </div>
-    </div>
+    <main class="shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="eyebrow">admin console</div>
+                <h1>proxysss</h1>
+                <p class="muted">Reverse proxy health, live upstream state, and runtime stats in one place.</p>
+            </div>
+
+            <section class="login-card">
+                <h3>Quick Login</h3>
+                <label for="username">Username</label>
+                <input id="username" value="__ADMIN_USER__" />
+                <label for="password">Password</label>
+                <input id="password" type="password" value="__ADMIN_PASS__" />
+                <div class="button-row">
+                    <button id="load" class="primary">Refresh Dashboard</button>
+                    <button id="toggle-auto" class="ghost">Auto Refresh: Off</button>
+                </div>
+            </section>
+
+            <section class="meta-card">
+                <h3>Endpoints</h3>
+                <p class="muted">Stats: <strong>/v1/stats</strong></p>
+                <p class="muted">Upstreams: <strong>/v1/upstreams</strong></p>
+                <p class="muted">Config: <strong>/v1/config</strong></p>
+            </section>
+
+            <section class="meta-card">
+                <h3>Tips</h3>
+                <p class="muted">Green means passive and active health are both passing.</p>
+                <p class="muted">Amber means the upstream has no active probe result yet.</p>
+                <p class="muted">Red means active probe failed or the upstream is quarantined.</p>
+            </section>
+
+            <section class="meta-card">
+                <h3>View Controls</h3>
+                <div class="filter">
+                    <label for="search">Search</label>
+                    <input id="search" placeholder="route, upstream, listener" />
+                </div>
+                <div class="filter">
+                    <label for="health-filter">Health</label>
+                    <select id="health-filter">
+                        <option value="all">All</option>
+                        <option value="healthy">Healthy</option>
+                        <option value="degraded">Degraded</option>
+                        <option value="manual">Manual Offline</option>
+                    </select>
+                </div>
+                <div class="filter">
+                    <label for="group-by">Group By</label>
+                    <select id="group-by">
+                        <option value="route">Route</option>
+                        <option value="listener">Listener</option>
+                        <option value="protocol">Protocol</option>
+                        <option value="none">Flat Table</option>
+                    </select>
+                </div>
+            </section>
+        </aside>
+
+        <section class="content">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow">Runtime Overview</div>
+                    <h2>Reverse Proxy Health</h2>
+                </div>
+                <div id="load-state" class="status-dot">Waiting for refresh</div>
+            </div>
+
+            <section class="cards">
+                <article class="card">
+                    <span class="muted">HTTP Requests</span>
+                    <strong id="card-http-requests">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted">HTTP Errors</span>
+                    <strong id="card-http-errors">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted">Healthy Upstreams</span>
+                    <strong id="card-healthy">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted">Degraded Upstreams</span>
+                    <strong id="card-degraded">0</strong>
+                </article>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head">
+                    <div>
+                        <h3>Grouped View</h3>
+                        <p class="muted">Aggregate by route name, listener, or protocol for quick triage.</p>
+                    </div>
+                    <span class="muted" id="group-count">0 groups</span>
+                </div>
+                <div id="group-view-wrap" class="empty">Refresh the dashboard to build aggregated health groups.</div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head">
+                    <div>
+                        <h3>Upstream Health Table</h3>
+                        <p class="muted">Passive quarantine, active probe result, route aggregation, TCP/HTTP liveness, and manual drain controls.</p>
+                    </div>
+                    <span class="muted" id="upstream-count">0 upstreams</span>
+                </div>
+                <div id="upstream-table-wrap" class="empty">Refresh the dashboard to load upstream health data.</div>
+            </section>
+
+            <section class="raw-grid">
+                <article class="surface">
+                    <div class="surface-head">
+                        <h3>Stats JSON</h3>
+                        <span class="muted">/v1/stats</span>
+                    </div>
+                    <pre id="stats-json">{}</pre>
+                </article>
+                <article class="surface">
+                    <div class="surface-head">
+                        <h3>Upstreams JSON</h3>
+                        <span class="muted">/v1/upstreams</span>
+                    </div>
+                    <pre id="upstreams-json">[]</pre>
+                </article>
+            </section>
+        </section>
+    </main>
+
     <script>
-        const output = document.getElementById('output');
-        document.getElementById('load').addEventListener('click', async () => {
+        const stateNode = document.getElementById('load-state');
+        const statsJson = document.getElementById('stats-json');
+        const upstreamsJson = document.getElementById('upstreams-json');
+        const upstreamWrap = document.getElementById('upstream-table-wrap');
+        const groupWrap = document.getElementById('group-view-wrap');
+        const upstreamCount = document.getElementById('upstream-count');
+        const groupCount = document.getElementById('group-count');
+        const autoToggle = document.getElementById('toggle-auto');
+        const searchInput = document.getElementById('search');
+        const healthFilter = document.getElementById('health-filter');
+        const groupBy = document.getElementById('group-by');
+        let autoRefresh = false;
+        let autoTimer = null;
+        let latestUpstreams = [];
+
+        function authHeader() {
             const user = document.getElementById('username').value;
             const pass = document.getElementById('password').value;
-            const auth = 'Basic ' + btoa(user + ':' + pass);
+            return 'Basic ' + btoa(user + ':' + pass);
+        }
+
+        function setState(message, kind) {
+            stateNode.textContent = message;
+            stateNode.className = 'status-dot ' + (kind || '');
+        }
+
+        function formatNumber(value) {
+            return new Intl.NumberFormat().format(value || 0);
+        }
+
+        function formatTimestamp(value) {
+            if (!value) return 'never';
             try {
-                const response = await fetch('/v1/stats', { headers: { Authorization: auth } });
-                output.textContent = await response.text();
+                return new Date(value).toLocaleString();
+            } catch {
+                return 'invalid';
+            }
+        }
+
+        function renderSummary(stats, upstreams) {
+            const healthy = upstreams.filter(item => item.healthy).length;
+            const degraded = upstreams.length - healthy;
+            document.getElementById('card-http-requests').textContent = formatNumber(stats.http_requests);
+            document.getElementById('card-http-errors').textContent = formatNumber(stats.http_errors);
+            document.getElementById('card-healthy').textContent = formatNumber(healthy);
+            document.getElementById('card-degraded').textContent = formatNumber(degraded);
+            upstreamCount.textContent = `${upstreams.length} upstreams`;
+        }
+
+        function healthPill(item) {
+            if (item.manually_disabled) return '<span class="pill warn">manual offline</span>';
+            if (item.healthy) return '<span class="pill good">healthy</span>';
+            if (item.active_healthy === null || item.active_healthy === undefined) return '<span class="pill warn">warming</span>';
+            return '<span class="pill bad">degraded</span>';
+        }
+
+        function probePill(item) {
+            if (item.active_healthy === true) return '<span class="pill good">pass</span>';
+            if (item.active_healthy === false) return '<span class="pill bad">fail</span>';
+            return '<span class="pill warn">unknown</span>';
+        }
+
+        function routeLabel(item) {
+            return (item.route_names && item.route_names.length ? item.route_names.join(', ') : 'unmapped');
+        }
+
+        function filteredUpstreams() {
+            const query = searchInput.value.trim().toLowerCase();
+            const filter = healthFilter.value;
+
+            return latestUpstreams.filter(item => {
+                if (filter === 'healthy' && !item.healthy) return false;
+                if (filter === 'degraded' && item.healthy) return false;
+                if (filter === 'manual' && !item.manually_disabled) return false;
+
+                if (!query) return true;
+                const haystack = [
+                    item.protocol,
+                    item.listener,
+                    item.upstream,
+                    routeLabel(item),
+                    item.key,
+                ].join(' ').toLowerCase();
+                return haystack.includes(query);
+            });
+        }
+
+        function groupKey(item) {
+            switch (groupBy.value) {
+                case 'protocol': return item.protocol || 'unknown';
+                case 'listener': return item.listener || 'default';
+                case 'none': return item.key;
+                case 'route':
+                default:
+                    return (item.route_names && item.route_names.length ? item.route_names[0] : `${item.protocol}:${item.listener}`);
+            }
+        }
+
+        function renderGroups(upstreams) {
+            if (!upstreams.length) {
+                groupWrap.className = 'empty';
+                groupWrap.textContent = 'No upstreams match the current filters.';
+                groupCount.textContent = '0 groups';
+                return;
+            }
+
+            const grouped = new Map();
+            for (const item of upstreams) {
+                const key = groupKey(item);
+                if (!grouped.has(key)) grouped.set(key, []);
+                grouped.get(key).push(item);
+            }
+
+            groupCount.textContent = `${grouped.size} groups`;
+            groupWrap.className = 'group-grid';
+            groupWrap.innerHTML = Array.from(grouped.entries()).map(([key, items]) => {
+                const healthy = items.filter(item => item.healthy).length;
+                const manual = items.filter(item => item.manually_disabled).length;
+                const protocols = Array.from(new Set(items.map(item => item.protocol))).join(', ');
+                return `
+                    <article class="group-card">
+                        <strong>${key}</strong>
+                        <div class="group-meta">
+                            <span class="pill ${healthy === items.length ? 'good' : healthy === 0 ? 'bad' : 'warn'}">${healthy}/${items.length} healthy</span>
+                            ${manual ? `<span class="pill warn">${manual} manual offline</span>` : ''}
+                            <span class="pill">${protocols}</span>
+                        </div>
+                        <div class="muted">${items.map(item => item.upstream).join('<br/>')}</div>
+                    </article>`;
+            }).join('');
+        }
+
+        async function toggleUpstream(action, key) {
+            const reason = action === 'disable' ? window.prompt('Reason for taking this upstream offline', 'manual drain') : null;
+            const response = await fetch(`/v1/upstreams/${action}`, {
+                method: 'POST',
+                headers: {
+                    Authorization: authHeader(),
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ key, reason }),
+            });
+            if (!response.ok) {
+                throw new Error(`/v1/upstreams/${action} -> ${response.status} ${response.statusText}`);
+            }
+            await refreshDashboard();
+        }
+
+        function renderUpstreams(upstreams) {
+            if (!upstreams.length) {
+                upstreamWrap.className = 'empty';
+                upstreamWrap.textContent = 'No upstream runtime state recorded yet. Send traffic or enable active health checks.';
+                return;
+            }
+
+            const rows = upstreams.map(item => {
+                const status = item.active_probe_status ?? '-';
+                const error = item.active_probe_error ? `<div class="muted">${item.active_probe_error}</div>` : '';
+                const quarantine = item.quarantine_remaining_secs > 0 ? `${item.quarantine_remaining_secs}s` : '-';
+                const rtt = item.active_probe_rtt_ms ?? '-';
+                const routeNames = routeLabel(item);
+                const actionButton = item.manually_disabled
+                    ? `<button class="success" data-action="enable" data-key="${item.key}">Restore</button>`
+                    : `<button class="danger" data-action="disable" data-key="${item.key}">Take Offline</button>`;
+                return `
+                    <tr>
+                        <td>${healthPill(item)}</td>
+                        <td>${item.protocol}</td>
+                        <td>${item.listener}</td>
+                        <td><code>${item.upstream}</code><div class="muted">${routeNames}</div>${error}</td>
+                        <td>${item.active_connections}</td>
+                        <td>${probePill(item)}</td>
+                        <td>${item.passive_healthy ? '<span class="pill good">pass</span>' : '<span class="pill bad">quarantined</span>'}</td>
+                        <td>${item.active_probe_kind ?? '-'}</td>
+                        <td>${status}</td>
+                        <td>${rtt}</td>
+                        <td>${item.consecutive_failures}</td>
+                        <td>${quarantine}</td>
+                        <td>${item.manual_reason ?? '-'}</td>
+                        <td><div class="table-actions">${actionButton}</div></td>
+                        <td>${formatTimestamp(item.active_probe_checked_at_unix_ms)}</td>
+                    </tr>`;
+            }).join('');
+
+            upstreamWrap.className = '';
+            upstreamWrap.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Health</th>
+                            <th>Protocol</th>
+                            <th>Listener</th>
+                            <th>Upstream</th>
+                            <th>Active</th>
+                            <th>Active Probe</th>
+                            <th>Passive</th>
+                            <th>Probe Kind</th>
+                            <th>HTTP</th>
+                            <th>RTT ms</th>
+                            <th>Failures</th>
+                            <th>Quarantine</th>
+                            <th>Manual</th>
+                            <th>Action</th>
+                            <th>Last Check</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>`;
+        }
+
+        async function loadJson(path) {
+            const response = await fetch(path, {
+                headers: { Authorization: authHeader() },
+            });
+            if (!response.ok) {
+                throw new Error(`${path} -> ${response.status} ${response.statusText}`);
+            }
+            return response.json();
+        }
+
+        async function refreshDashboard() {
+            setState('Refreshing dashboard', '');
+            try {
+                const [stats, upstreamsPayload] = await Promise.all([
+                    loadJson('/v1/stats'),
+                    loadJson('/v1/upstreams'),
+                ]);
+                latestUpstreams = upstreamsPayload.items || [];
+                const upstreams = filteredUpstreams();
+                statsJson.textContent = JSON.stringify(stats, null, 2);
+                upstreamsJson.textContent = JSON.stringify(upstreamsPayload, null, 2);
+                renderSummary(stats, latestUpstreams);
+                renderGroups(upstreams);
+                renderUpstreams(upstreams);
+                setState('Dashboard fresh', upstreams.every(item => item.healthy) ? 'ok' : 'bad');
             } catch (error) {
-                output.textContent = String(error);
+                setState('Refresh failed', 'bad');
+                statsJson.textContent = String(error);
+                upstreamsJson.textContent = String(error);
+                upstreamWrap.className = 'empty';
+                upstreamWrap.textContent = String(error);
+                groupWrap.className = 'empty';
+                groupWrap.textContent = String(error);
+            }
+        }
+
+        document.getElementById('load').addEventListener('click', refreshDashboard);
+        [searchInput, healthFilter, groupBy].forEach(node => {
+            node.addEventListener('input', refreshDashboard);
+            node.addEventListener('change', refreshDashboard);
+        });
+        upstreamWrap.addEventListener('click', async (event) => {
+            const button = event.target.closest('button[data-action]');
+            if (!button) return;
+            try {
+                await toggleUpstream(button.dataset.action, button.dataset.key);
+            } catch (error) {
+                setState(String(error), 'bad');
+            }
+        });
+        autoToggle.addEventListener('click', () => {
+            autoRefresh = !autoRefresh;
+            autoToggle.textContent = `Auto Refresh: ${autoRefresh ? 'On' : 'Off'}`;
+            clearInterval(autoTimer);
+            if (autoRefresh) {
+                autoTimer = setInterval(refreshDashboard, 5000);
+                refreshDashboard();
             }
         });
     </script>
@@ -5144,6 +7935,13 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         .context("failed to parse certificate pem")
 }
 
+fn load_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
+    rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse in-memory certificate pem")
+}
+
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed to open private key {}", path.display()))?;
@@ -5151,6 +7949,13 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .context("failed to parse private key pem")?
         .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
+}
+
+fn load_private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
+    rustls_pemfile::private_key(&mut reader)
+        .context("failed to parse in-memory private key pem")?
+        .ok_or_else(|| anyhow!("no private key found in in-memory pem"))
 }
 
 fn reload_fingerprint(config_path: &Path) -> Result<String> {
@@ -5367,6 +8172,10 @@ mod tests {
             strip_prefix: true,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
         };
         let uri: Uri = "/api/v1/users?q=1".parse().expect("valid uri");
 
@@ -5393,6 +8202,10 @@ mod tests {
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
+                    compression: ResponseCompressionConfig::default(),
+                    cache: ResponseCacheConfig::default(),
+                    rate_limit: HttpRateLimitConfig::default(),
+                    active_health: ActiveHealthOverrideConfig::default(),
                 },
                 ReverseProxyRouteConfig {
                     name: "admin-api".to_string(),
@@ -5403,6 +8216,10 @@ mod tests {
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
+                    compression: ResponseCompressionConfig::default(),
+                    cache: ResponseCacheConfig::default(),
+                    rate_limit: HttpRateLimitConfig::default(),
+                    active_health: ActiveHealthOverrideConfig::default(),
                 },
             ],
         };
@@ -5427,15 +8244,20 @@ mod tests {
             strip_headers: Vec::new(),
             compression: ResponseCompressionConfig {
                 enabled: true,
+                algorithms: crate::config::ResponseCompressionConfig::default().algorithms,
                 min_length: 128,
                 content_types: vec!["application/json".to_string()],
             },
             cache: ResponseCacheConfig {
                 enabled: true,
+                zone: "default".to_string(),
                 ttl_secs: 5,
                 statuses: vec![200],
                 max_body_bytes: 4096,
+                allow_purge: true,
             },
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
             ssl: crate::config::DomainTlsConfig::default(),
         });
 
@@ -5458,6 +8280,7 @@ mod tests {
         );
         let compression = ResponseCompressionConfig {
             enabled: true,
+            algorithms: vec![CompressionAlgorithm::Brotli, CompressionAlgorithm::Gzip],
             min_length: 128,
             content_types: vec!["application/json".to_string()],
         };
@@ -5485,6 +8308,7 @@ mod tests {
         );
         let compression = ResponseCompressionConfig {
             enabled: true,
+            algorithms: vec![CompressionAlgorithm::Gzip],
             min_length: 128,
             content_types: vec!["application/json".to_string()],
         };
@@ -5514,10 +8338,12 @@ mod tests {
     fn http_rate_limit_key_can_use_header() {
         let config = HttpRateLimitConfig {
             enabled: true,
+            zone: "default".to_string(),
             key: RateLimitKey::Header("x-api-key".to_string()),
             requests: 1,
             window_ms: 1000,
             burst: 0,
+            max_connections: 0,
             status: 429,
         };
         let mut headers = HeaderMap::new();
@@ -5525,7 +8351,7 @@ mod tests {
         let remote: SocketAddr = "127.0.0.1:12345".parse().expect("remote addr");
 
         let key = http_rate_limit_key(&config, "example.com", &headers, remote);
-        assert_eq!(key.as_deref(), Some("header:x-api-key:abc"));
+        assert_eq!(key.as_deref(), Some("default:header:x-api-key:abc"));
     }
 
     #[test]
@@ -5595,10 +8421,12 @@ mod tests {
     fn http_rate_limit_blocks_after_limit() {
         let config = HttpRateLimitConfig {
             enabled: true,
+            zone: "default".to_string(),
             key: RateLimitKey::RemoteAddr,
             requests: 1,
             window_ms: 60_000,
             burst: 0,
+            max_connections: 0,
             status: 429,
         };
         let store = DashMap::new();
@@ -5894,16 +8722,29 @@ mod tests {
     }
 
     #[test]
+    fn builtin_http_route_serves_docs_on_docs_html() {
+        let route = builtin_http_route("/docs.html").expect("docs route");
+        assert_eq!(route.upstream, "proxysss://docs");
+    }
+
+    #[test]
     fn welcome_page_stays_brand_focused() {
         let config = GatewayConfig::default();
         let html = render_welcome_html(&config);
         assert!(html.contains("<h1>proxysss</h1>"));
         assert!(html.contains("Supported Protocols"));
         assert!(html.contains("Benchmark Snapshot"));
-        assert!(html.contains("https://github.com/neko233-com/proxysss#readme"));
+        assert!(html.contains("/docs.html"));
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));
         assert!(html.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn default_error_page_links_back_to_docs() {
+        let html = render_default_error_html(StatusCode::NOT_FOUND, "");
+        assert!(html.contains("/docs.html"));
+        assert!(html.contains("404"));
     }
 
     #[test]

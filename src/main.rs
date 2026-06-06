@@ -7,6 +7,7 @@ mod script;
 mod ts_transpile;
 
 use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -129,6 +130,10 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    Tune {
+        #[command(subcommand)]
+        action: TuneCommands,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -155,6 +160,10 @@ enum ConfigCommands {
     Routes,
     ReloadPlan,
     NginxParity {
+        #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
+        format: ConfigOutputFormat,
+    },
+    CaddyParity {
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
         format: ConfigOutputFormat,
     },
@@ -218,6 +227,11 @@ enum ScriptCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum TuneCommands {
+    Tcp,
+}
+
 struct AdminClientContext {
     base_url: String,
     username: String,
@@ -242,7 +256,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "static files",
         "built-in services.static_sites runtime for GET/HEAD, index files, and optional autoindex",
     ),
-    ("ftp", "supported via services.ftp TCP passthrough"),
+    (
+        "ftp",
+        "services.ftp now proxies the control channel and rewrites passive data channels through a local port pool",
+    ),
     (
         "webdav",
         "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
@@ -273,15 +290,15 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "auto https",
-        "proxysss YAML style http.tls.auto_https expands to ACME external certificate issue/renew",
+        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01 issue/renew without external binaries",
     ),
     (
         "multi-cert sni",
         "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname",
     ),
     (
-        "gzip/brotli compression",
-        "services.domain_routes[*].compression negotiates br/gzip for matching responses",
+        "zstd/gzip/brotli compression",
+        "services.response_policy plus per-route overrides negotiate zstd/br/gzip for matching responses",
     ),
     (
         "ip allow/deny blacklist",
@@ -289,7 +306,19 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "http cache",
-        "services.domain_routes[*].cache enables bounded in-memory GET response caching",
+        "services.response_policy/routes support shared cache zones, optional disk-backed entries, and PURGE for active invalidation",
+    ),
+    (
+        "active health checks",
+        "load_balance.active_health performs periodic HTTP/TCP upstream probes and exposes results plus manual drain state in /v1/upstreams and the admin dashboard",
+    ),
+    (
+        "manual upstream drain",
+        "admin API and the 7777 dashboard can take individual upstreams offline or restore them without changing config",
+    ),
+    (
+        "tcp tuning assistant",
+        "proxysss tune tcp launches an interactive Linux-oriented sysctl tuning flow based on workload and hardware",
     ),
     (
         "admin api/console",
@@ -311,6 +340,14 @@ enum ParityStatus {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct NginxParityItem {
+    capability: &'static str,
+    status: ParityStatus,
+    evidence: &'static str,
+    next_gap: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CaddyFeatureItem {
     capability: &'static str,
     status: ParityStatus,
     evidence: &'static str,
@@ -357,20 +394,20 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "FTP",
         status: ParityStatus::Partial,
-        evidence: "services.ftp TCP passthrough listener",
-        next_gap: "native FTP control/passive data channel awareness",
+        evidence: "services.ftp proxies the control channel and rewrites both passive and active data channels through a configurable local port pool",
+        next_gap: "richer FTP policy controls and command-aware observability",
     },
     NginxParityItem {
         capability: "TLS certificates",
         status: ParityStatus::Supported,
-        evidence: "self_signed/manual/acme_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
+        evidence: "self_signed/manual/acme_managed/acme_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
         next_gap: "",
     },
     NginxParityItem {
         capability: "self-contained auto ssl",
-        status: ParityStatus::Missing,
-        evidence: "auto https still relies on external ACME client invocation",
-        next_gap: "embed native ACME issue/renew flow so auto ssl has zero external dependency",
+        status: ParityStatus::Partial,
+        evidence: "auto https now uses managed ACME HTTP-01/TLS-ALPN-01 issue/renew without acme.sh; acme_external remains available for legacy flows",
+        next_gap: "add richer account/provider selection and DNS challenge support",
     },
     NginxParityItem {
         capability: "access/error logging",
@@ -388,8 +425,8 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "compression",
         status: ParityStatus::Partial,
-        evidence: "services.domain_routes compression provides configurable brotli/gzip response compression",
-        next_gap: "add zstd and wider policy coverage outside domain routes",
+        evidence: "services.response_policy plus route-level overrides provide configurable zstd/brotli/gzip response compression",
+        next_gap: "extend response policy into cache zones and protocol-specific tuning surfaces",
     },
     NginxParityItem {
         capability: "IP allow/deny / blacklist",
@@ -400,14 +437,20 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "cache/proxy cache",
         status: ParityStatus::Partial,
-        evidence: "services.domain_routes cache provides bounded in-memory GET response caching",
-        next_gap: "add shared cache zones, purge controls, and on-disk cache tiers",
+        evidence: "services.response_policy/routes provide shared cache zones, disk-backed cache files, and PURGE-based invalidation",
+        next_gap: "add background revalidation and more advanced cache key/variant controls",
+    },
+    NginxParityItem {
+        capability: "active health checks",
+        status: ParityStatus::Supported,
+        evidence: "load_balance.active_health probes reverse proxy HTTP upstreams and stream TCP upstreams on a schedule and feeds runtime health state into selection and admin APIs",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "rate limiting",
         status: ParityStatus::Partial,
-        evidence: "services.rate_limit.http fixed-window request limiter",
-        next_gap: "add connection limiting and shared-zone style policies",
+        evidence: "services.rate_limit.http plus route-level overrides provide fixed-window shared-zone request limiting and concurrent connection caps",
+        next_gap: "add leaky-bucket/token-bucket shaping and stream-layer shared policies",
     },
     NginxParityItem {
         capability: "forwarding header semantics",
@@ -428,6 +471,69 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         status: ParityStatus::Supported,
         evidence:
             "auto-loaded plugins read <name>.plugin.yaml/.yml/.json for enabled/priority/config while remaining default-off",
+        next_gap: "",
+    },
+];
+
+const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
+    CaddyFeatureItem {
+        capability: "automatic HTTPS",
+        status: ParityStatus::Supported,
+        evidence: "http.tls.auto_https now expands to managed ACME HTTP-01/TLS-ALPN-01 issuance/renewal without external binaries",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "automatic HTTP to HTTPS redirects",
+        status: ParityStatus::Supported,
+        evidence: "plain HTTP requests for TLS-managed domains are automatically 308 redirected to HTTPS except ACME challenge paths",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "admin API and hot reload",
+        status: ParityStatus::Supported,
+        evidence: "admin API on 127.0.0.1:7777 plus config/script/plugin hot reload fingerprinting",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "file server",
+        status: ParityStatus::Supported,
+        evidence: "services.static_sites handles file serving, index files, and autoindex",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "reverse proxy",
+        status: ParityStatus::Supported,
+        evidence: "services.reverse_proxy and services.domain_routes provide matcher-based reverse proxying",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "response encoding",
+        status: ParityStatus::Supported,
+        evidence: "services.response_policy and per-route overrides negotiate zstd/br/gzip",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "request matchers and header manipulation",
+        status: ParityStatus::Supported,
+        evidence: "host/path matchers, header strip/set, and access control rules are built into the route layer",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "Ubuntu/Debian-friendly TCP tuning",
+        status: ParityStatus::Supported,
+        evidence: "proxysss tune tcp emits an interactive Linux sysctl profile targeting /etc/sysctl.d/99-proxysss-tcp.conf",
+        next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "on-demand TLS",
+        status: ParityStatus::Missing,
+        evidence: "certificate issuance currently uses configured domain sets rather than first-hit on-demand policy",
+        next_gap: "add policy-gated on-demand issuance and storage controls",
+    },
+    CaddyFeatureItem {
+        capability: "active upstream health checks",
+        status: ParityStatus::Supported,
+        evidence: "load_balance.active_health periodically probes HTTP and TCP upstreams and surfaces the result plus manual drain state in the admin API/dashboard",
         next_gap: "",
     },
 ];
@@ -642,6 +748,17 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
+                ConfigCommands::CaddyParity { format } => {
+                    match format {
+                        ConfigOutputFormat::Yaml => {
+                            print!("{}", serde_yaml::to_string(CADDY_FEATURE_MATRIX)?)
+                        }
+                        ConfigOutputFormat::Json => {
+                            print!("{}", serde_json::to_string_pretty(CADDY_FEATURE_MATRIX)?)
+                        }
+                    }
+                    Ok(())
+                }
                 ConfigCommands::Explain => {
                     let config_path = install::resolve_run_config_path(config)?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
@@ -724,12 +841,202 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Tune { action } => {
+            init_cli_logging();
+            match action {
+                TuneCommands::Tcp => run_interactive_tcp_tune(),
+            }
+        }
     }
 }
 
 enum ScriptInvocation {
     File(PathBuf),
     Snippet(String),
+}
+
+#[derive(Clone, Copy)]
+enum TcpTuneProfile {
+    Edge,
+    Bulk,
+    Latency,
+}
+
+struct TcpTuneSurvey {
+    profile: TcpTuneProfile,
+    memory_gb: u32,
+    cpu_cores: u32,
+    nic_gbps: u32,
+    max_connections: u32,
+}
+
+fn run_interactive_tcp_tune() -> Result<()> {
+    println!("proxysss tcp tune interactive");
+    println!("target os       : {}", std::env::consts::OS);
+    println!("target distro   : Ubuntu/Debian first");
+
+    let survey = TcpTuneSurvey {
+        profile: prompt_profile()?,
+        memory_gb: prompt_u32("RAM (GiB)", 16)?,
+        cpu_cores: prompt_u32("CPU cores", 8)?,
+        nic_gbps: prompt_u32("NIC speed (Gbps)", 10)?,
+        max_connections: prompt_u32("Peak concurrent connections", 20000)?,
+    };
+
+    let profile_name = match survey.profile {
+        TcpTuneProfile::Edge => "edge",
+        TcpTuneProfile::Bulk => "bulk",
+        TcpTuneProfile::Latency => "latency",
+    };
+    let content = render_linux_tcp_sysctl_profile(&survey);
+
+    println!("profile         : {profile_name}");
+    println!("generated sysctl :");
+    println!("{content}");
+
+    if std::env::consts::OS != "linux" {
+        println!("linux-specific apply is not available on this platform; copy the profile to an Ubuntu/Debian host and load it with sysctl.");
+        return Ok(());
+    }
+
+    if !prompt_yes_no("Write/apply this profile now", false)? {
+        return Ok(());
+    }
+
+    let target = PathBuf::from("/etc/sysctl.d/99-proxysss-tcp.conf");
+    match fs::write(&target, &content) {
+        Ok(()) => {
+            let status = Command::new("sysctl").arg("--system").status();
+            match status {
+                Ok(status) if status.success() => {
+                    println!("applied sysctl profile at {}", target.display());
+                }
+                Ok(status) => {
+                    println!(
+                        "wrote {}, but sysctl --system exited with status {}",
+                        target.display(),
+                        status
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "wrote {}, but failed to run sysctl --system: {}",
+                        target.display(),
+                        error
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let fallback = PathBuf::from("proxysss-tcp.sysctl.conf");
+            fs::write(&fallback, &content)
+                .with_context(|| format!("failed to write {}", fallback.display()))?;
+            println!(
+                "could not write {}: {}",
+                target.display(),
+                error
+            );
+            println!(
+                "wrote fallback profile to {}. on Ubuntu/Debian apply with: sudo cp {} {} && sudo sysctl --system",
+                fallback.display(),
+                fallback.display(),
+                target.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn prompt_profile() -> Result<TcpTuneProfile> {
+    println!("workload profile: 1=edge reverse proxy, 2=bulk transfer, 3=latency sensitive API");
+    let value = prompt_string("Profile", "1")?;
+    Ok(match value.trim() {
+        "2" | "bulk" => TcpTuneProfile::Bulk,
+        "3" | "latency" => TcpTuneProfile::Latency,
+        _ => TcpTuneProfile::Edge,
+    })
+}
+
+fn prompt_u32(label: &str, default: u32) -> Result<u32> {
+    let raw = prompt_string(label, &default.to_string())?;
+    raw.trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid numeric value for {label}"))
+}
+
+fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "Y" } else { "N" };
+    let raw = prompt_string(label, default_text)?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(default);
+    }
+    Ok(matches!(normalized.as_str(), "y" | "yes" | "1" | "true"))
+}
+
+fn prompt_string(label: &str, default: &str) -> Result<String> {
+    print!("{label} [{default}]: ");
+    io::stdout().flush().context("failed flushing stdout")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed reading stdin")?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn render_linux_tcp_sysctl_profile(survey: &TcpTuneSurvey) -> String {
+    let connection_factor = survey.max_connections.max(1024);
+    let somaxconn = (connection_factor / 4).clamp(4096, 65_535);
+    let syn_backlog = (connection_factor / 2).clamp(4096, 262_144);
+    let netdev_backlog = (survey.nic_gbps.saturating_mul(8192)).clamp(8192, 262_144);
+    let memory_factor = survey.memory_gb.max(4) * 1024 * 1024;
+    let rmem_max = (memory_factor * 2).clamp(16 * 1024 * 1024, 256 * 1024 * 1024);
+    let wmem_max = rmem_max;
+    let fin_timeout = match survey.profile {
+        TcpTuneProfile::Latency => 10,
+        TcpTuneProfile::Bulk => 20,
+        TcpTuneProfile::Edge => 15,
+    };
+    let keepalive_time = match survey.profile {
+        TcpTuneProfile::Latency => 60,
+        TcpTuneProfile::Bulk => 120,
+        TcpTuneProfile::Edge => 90,
+    };
+    let busy_poll = if matches!(survey.profile, TcpTuneProfile::Latency) {
+        50
+    } else {
+        0
+    };
+
+    format!(
+        "# proxysss linux tcp tuning\n# profile={} memory_gb={} cpu_cores={} nic_gbps={} max_connections={}\nnet.core.somaxconn={}\nnet.ipv4.tcp_max_syn_backlog={}\nnet.core.netdev_max_backlog={}\nnet.core.rmem_max={}\nnet.core.wmem_max={}\nnet.ipv4.tcp_rmem=4096 87380 {}\nnet.ipv4.tcp_wmem=4096 65536 {}\nnet.ipv4.ip_local_port_range=10240 65535\nnet.ipv4.tcp_fin_timeout={}\nnet.ipv4.tcp_tw_reuse=1\nnet.ipv4.tcp_keepalive_time={}\nnet.ipv4.tcp_keepalive_intvl=15\nnet.ipv4.tcp_keepalive_probes=5\nnet.ipv4.tcp_mtu_probing=1\nnet.ipv4.tcp_fastopen=3\nnet.ipv4.tcp_slow_start_after_idle=0\nnet.ipv4.tcp_window_scaling=1\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\nnet.core.busy_poll={}\nnet.core.busy_read={}\n",
+        match survey.profile {
+            TcpTuneProfile::Edge => "edge",
+            TcpTuneProfile::Bulk => "bulk",
+            TcpTuneProfile::Latency => "latency",
+        },
+        survey.memory_gb,
+        survey.cpu_cores,
+        survey.nic_gbps,
+        survey.max_connections,
+        somaxconn,
+        syn_backlog,
+        netdev_backlog,
+        rmem_max,
+        wmem_max,
+        rmem_max,
+        wmem_max,
+        fin_timeout,
+        keepalive_time,
+        busy_poll,
+        busy_poll,
+    )
 }
 
 fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
@@ -775,8 +1082,9 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.logging.error_log_path.display()
     );
     println!(
-        "auto https        : enabled={}, domains={}, production={}",
+        "auto https        : enabled={}, mode={:?}, domains={}, production={}",
         config.http.tls.auto_https.enabled,
+        config.http.tls.mode,
         if config.http.tls.auto_https.domains.is_empty() {
             "[]".to_string()
         } else {
@@ -789,15 +1097,45 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.reverse_proxy.routes.len()
     );
     println!(
+        "active health     : enabled={}, http_enabled={}, tcp_enabled={}, path={}, interval_secs={}, timeout_ms={}, expected_statuses={}",
+        config.load_balance.active_health.enabled,
+        config.load_balance.active_health.http_enabled,
+        config.load_balance.active_health.tcp_enabled,
+        config.load_balance.active_health.path,
+        config.load_balance.active_health.interval_secs,
+        config.load_balance.active_health.timeout_ms,
+        config
+            .load_balance
+            .active_health
+            .expected_statuses
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "error pages       : enabled={}, show_details={}, custom_pages={}",
+        config.http.error_pages.enabled,
+        config.http.error_pages.show_details,
+        config.http.error_pages.pages.len()
+    );
+    println!(
+        "maintenance state : enabled={}, path={}",
+        config.runtime.maintenance_state.enabled,
+        config.runtime.maintenance_state.path.display()
+    );
+    println!(
         "domain routes     : routes={}",
         config.services.domain_routes.len()
     );
     println!(
-        "rate limit        : http.enabled={}, requests={}, window_ms={}, burst={}",
+        "rate limit        : http.enabled={}, zone={}, requests={}, window_ms={}, burst={}, max_connections={}",
         config.services.rate_limit.http.enabled,
+        config.services.rate_limit.http.zone,
         config.services.rate_limit.http.requests,
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst
+        ,config.services.rate_limit.http.max_connections
     );
     println!(
         "access control    : http.enabled={}, allow={}, deny={}, status={}",
@@ -848,7 +1186,7 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     } else {
         for route in &config.services.reverse_proxy.routes {
             output.push_str(&format!(
-                "{} hosts={} path={} upstream={} upstreams={} strip_prefix={}\n",
+                "{} hosts={} path={} upstream={} upstreams={} strip_prefix={} active_health={}\n",
                 route.name,
                 if route.hosts.is_empty() {
                     "*".to_string()
@@ -858,7 +1196,8 @@ fn render_route_topology(config: &GatewayConfig) -> String {
                 route.path_prefix,
                 route.upstream,
                 route.upstreams.len(),
-                route.strip_prefix
+                route.strip_prefix,
+                config.load_balance.active_health.enabled
             ));
         }
 
@@ -868,7 +1207,7 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         } else {
             for route in &config.services.domain_routes {
                 output.push_str(&format!(
-                    "{} domains={} path={} upstream={} upstreams={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={}\n",
+                    "{} domains={} path={} upstream={} upstreams={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={} cache_zone={} rate_limit={} rate_limit_zone={} max_connections={}\n",
                     route.name,
                     route.domains.join(","),
                     route.path_prefix,
@@ -878,7 +1217,11 @@ fn render_route_topology(config: &GatewayConfig) -> String {
                     route.ssl.mode,
                     route.ssl.is_auto_ssl,
                     route.compression.enabled,
-                    route.cache.enabled
+                    route.cache.enabled,
+                    route.cache.zone,
+                    route.rate_limit.enabled,
+                    route.rate_limit.zone,
+                    route.rate_limit.max_connections
                 ));
             }
         }
@@ -886,12 +1229,32 @@ fn render_route_topology(config: &GatewayConfig) -> String {
 
     output.push_str("[rate_limit]\n");
     output.push_str(&format!(
-        "http enabled={} requests={} window_ms={} burst={} status={}\n",
+        "http enabled={} zone={} requests={} window_ms={} burst={} max_connections={} status={}\n",
         config.services.rate_limit.http.enabled,
+        config.services.rate_limit.http.zone,
         config.services.rate_limit.http.requests,
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst,
+        config.services.rate_limit.http.max_connections,
         config.services.rate_limit.http.status
+    ));
+    output.push_str("[active_health]\n");
+    output.push_str(&format!(
+        "enabled={} http_enabled={} tcp_enabled={} path={} interval_secs={} timeout_ms={} expected_statuses={}\n",
+        config.load_balance.active_health.enabled,
+        config.load_balance.active_health.http_enabled,
+        config.load_balance.active_health.tcp_enabled,
+        config.load_balance.active_health.path,
+        config.load_balance.active_health.interval_secs,
+        config.load_balance.active_health.timeout_ms,
+        config
+            .load_balance
+            .active_health
+            .expected_statuses
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     ));
     output.push_str("[access_control]\n");
     output.push_str(&format!(
@@ -944,8 +1307,17 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         }
         if config.services.ftp.enabled {
             output.push_str(&format!(
-                "ftp bind={} upstream={}\n",
-                config.services.ftp.bind, config.services.ftp.upstream
+                "ftp bind={} upstream={} native_control={} public_ip={} passive_ports={}-{}\n",
+                config.services.ftp.bind,
+                config.services.ftp.upstream,
+                config.services.ftp.native_control,
+                if config.services.ftp.public_ip.is_empty() {
+                    "auto".to_string()
+                } else {
+                    config.services.ftp.public_ip.clone()
+                },
+                config.services.ftp.passive_port_start,
+                config.services.ftp.passive_port_end
             ));
         }
     }
@@ -1034,10 +1406,10 @@ fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
 fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
     match kind {
         ConfigTemplateKind::Full => {
-            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n"
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  error_pages:\n    enabled: true\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>proxysss could not match this route.</p></body></html>\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    path: /healthz\n    failure_threshold: 2\n    success_threshold: 2\nruntime:\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      active_health:\n        path: /healthz\n"
         }
         ConfigTemplateKind::Http => {
-            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n"
+            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n      active_health:\n        path: /readyz\n        failure_threshold: 2\n        success_threshold: 2\n"
         }
         ConfigTemplateKind::Tcp => {
             "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
@@ -1588,6 +1960,8 @@ mod tests {
             "plugin sidecar config",
             "ai api compatibility",
             "auto https",
+            "active health checks",
+            "manual upstream drain",
             "ip allow/deny blacklist",
             "admin api/console",
             "agent install skill",
@@ -1627,6 +2001,10 @@ mod tests {
                 strip_prefix: true,
                 set_headers: std::collections::BTreeMap::new(),
                 strip_headers: Vec::new(),
+                compression: crate::config::ResponseCompressionConfig::default(),
+                cache: crate::config::ResponseCacheConfig::default(),
+                rate_limit: crate::config::HttpRateLimitConfig::default(),
+                active_health: crate::config::ActiveHealthOverrideConfig::default(),
             });
         config
             .services
@@ -1728,6 +2106,7 @@ mod tests {
             "ai api passthrough",
             "plugin sidecar configuration",
             "compression",
+            "active health checks",
             "IP allow/deny / blacklist",
             "cache/proxy cache",
             "rate limiting",
@@ -1743,7 +2122,33 @@ mod tests {
         assert!(NGINX_PARITY_MATRIX
             .iter()
             .any(|item| item.status == ParityStatus::Partial));
-        assert!(NGINX_PARITY_MATRIX
+    }
+
+    #[test]
+    fn caddy_feature_matrix_tracks_useful_surface_and_gaps() {
+        for required in [
+            "automatic HTTPS",
+            "automatic HTTP to HTTPS redirects",
+            "admin API and hot reload",
+            "file server",
+            "reverse proxy",
+            "response encoding",
+            "active upstream health checks",
+            "request matchers and header manipulation",
+            "Ubuntu/Debian-friendly TCP tuning",
+        ] {
+            assert!(
+                CADDY_FEATURE_MATRIX
+                    .iter()
+                    .any(|item| item.capability == required),
+                "missing caddy feature item: {required}"
+            );
+        }
+
+        assert!(CADDY_FEATURE_MATRIX
+            .iter()
+            .any(|item| item.status == ParityStatus::Supported));
+        assert!(CADDY_FEATURE_MATRIX
             .iter()
             .any(|item| item.status == ParityStatus::Missing));
     }

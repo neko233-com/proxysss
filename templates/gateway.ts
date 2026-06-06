@@ -1,3 +1,5 @@
+/// <reference path="./proxysss-script.d.ts" />
+
 // proxysss main gateway script — embedded TypeScript engine (proxysss + TS = nginx + Lua).
 //
 // This file is the "house" router. It is loaded by the in-process TypeScript

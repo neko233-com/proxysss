@@ -112,7 +112,30 @@ pub struct HttpConfig {
     #[serde(default = "default_true")]
     pub allow_insecure_upstreams: bool,
     #[serde(default)]
+    pub error_pages: HttpErrorPagesConfig,
+    #[serde(default)]
     pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpErrorPagesConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub show_details: bool,
+    #[serde(default)]
+    pub pages: Vec<HttpErrorPageConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpErrorPageConfig {
+    pub status: u16,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub file_path: PathBuf,
+    #[serde(default = "default_error_page_content_type")]
+    pub content_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +184,7 @@ pub enum TlsMode {
     #[default]
     SelfSigned,
     Manual,
+    AcmeManaged,
     AcmeExternal,
 }
 
@@ -272,6 +296,8 @@ pub struct LoadBalanceConfig {
     #[serde(default)]
     pub retries: RetryPolicyConfig,
     #[serde(default)]
+    pub active_health: ActiveHealthConfig,
+    #[serde(default)]
     pub passive_health: PassiveHealthConfig,
 }
 
@@ -301,6 +327,52 @@ pub struct PassiveHealthConfig {
     pub fail_threshold: u32,
     #[serde(default = "default_lb_quarantine_secs")]
     pub quarantine_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveHealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub http_enabled: bool,
+    #[serde(default = "default_true")]
+    pub tcp_enabled: bool,
+    #[serde(default = "default_active_health_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_active_health_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_active_health_path")]
+    pub path: String,
+    #[serde(default = "default_active_health_expected_statuses")]
+    pub expected_statuses: Vec<u16>,
+    #[serde(default = "default_active_health_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_active_health_success_threshold")]
+    pub success_threshold: u32,
+    #[serde(default)]
+    pub jitter_percent: u8,
+    #[serde(default)]
+    pub alert_webhooks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActiveHealthOverrideConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub expected_statuses: Option<Vec<u16>>,
+    #[serde(default)]
+    pub failure_threshold: Option<u32>,
+    #[serde(default)]
+    pub success_threshold: Option<u32>,
+    #[serde(default)]
+    pub jitter_percent: Option<u8>,
+    #[serde(default)]
+    pub alert_webhooks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +439,8 @@ pub struct MonitoringConfig {
 pub struct RuntimeConfig {
     #[serde(default)]
     pub hot_reload: HotReloadConfig,
+    #[serde(default)]
+    pub maintenance_state: MaintenanceStateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,10 +451,22 @@ pub struct HotReloadConfig {
     pub interval_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceStateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_maintenance_state_path")]
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServicesConfig {
     #[serde(default)]
     pub reverse_proxy: ReverseProxyConfig,
+    #[serde(default)]
+    pub response_policy: HttpResponsePolicyConfig,
+    #[serde(default)]
+    pub cache_zones: Vec<CacheZoneConfig>,
     #[serde(default)]
     pub domain_routes: Vec<DomainRouteConfig>,
     #[serde(default)]
@@ -423,6 +509,8 @@ pub struct HttpAccessControlConfig {
 pub struct HttpRateLimitConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_rate_limit_zone")]
+    pub zone: String,
     #[serde(default)]
     pub key: RateLimitKey,
     #[serde(default = "default_rate_limit_requests")]
@@ -431,6 +519,8 @@ pub struct HttpRateLimitConfig {
     pub window_ms: u64,
     #[serde(default)]
     pub burst: u32,
+    #[serde(default)]
+    pub max_connections: u32,
     #[serde(default = "default_rate_limit_status")]
     pub status: u16,
 }
@@ -450,6 +540,14 @@ pub struct ReverseProxyConfig {
     pub routes: Vec<ReverseProxyRouteConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpResponsePolicyConfig {
+    #[serde(default)]
+    pub compression: ResponseCompressionConfig,
+    #[serde(default)]
+    pub cache: ResponseCacheConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxyRouteConfig {
     pub name: String,
@@ -462,10 +560,18 @@ pub struct ReverseProxyRouteConfig {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub strip_prefix: bool,
-    #[serde(default)]
+    #[serde(default, alias = "add_headers")]
     pub set_headers: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "remove_headers")]
     pub strip_headers: Vec<String>,
+    #[serde(default)]
+    pub compression: ResponseCompressionConfig,
+    #[serde(default)]
+    pub cache: ResponseCacheConfig,
+    #[serde(default)]
+    pub rate_limit: HttpRateLimitConfig,
+    #[serde(default)]
+    pub active_health: ActiveHealthOverrideConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,14 +586,18 @@ pub struct DomainRouteConfig {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub strip_prefix: bool,
-    #[serde(default)]
+    #[serde(default, alias = "add_headers")]
     pub set_headers: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "remove_headers")]
     pub strip_headers: Vec<String>,
     #[serde(default)]
     pub compression: ResponseCompressionConfig,
     #[serde(default)]
     pub cache: ResponseCacheConfig,
+    #[serde(default)]
+    pub rate_limit: HttpRateLimitConfig,
+    #[serde(default)]
+    pub active_health: ActiveHealthOverrideConfig,
     #[serde(default)]
     pub ssl: DomainTlsConfig,
 }
@@ -496,22 +606,45 @@ pub struct DomainRouteConfig {
 pub struct ResponseCompressionConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_compression_algorithms")]
+    pub algorithms: Vec<CompressionAlgorithm>,
     #[serde(default = "default_compression_min_length")]
     pub min_length: usize,
     #[serde(default = "default_compression_types")]
     pub content_types: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionAlgorithm {
+    Zstd,
+    Brotli,
+    Gzip,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCacheConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_cache_zone")]
+    pub zone: String,
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
     #[serde(default = "default_cache_statuses")]
     pub statuses: Vec<u16>,
     #[serde(default = "default_cache_max_body_bytes")]
     pub max_body_bytes: usize,
+    #[serde(default = "default_true")]
+    pub allow_purge: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheZoneConfig {
+    pub name: String,
+    #[serde(default = "default_cache_zone_max_entries")]
+    pub max_entries: usize,
+    #[serde(default)]
+    pub disk_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +705,14 @@ pub struct FtpConfig {
     #[serde(default = "default_ftp_upstream")]
     pub upstream: String,
     #[serde(default = "default_true")]
+    pub native_control: bool,
+    #[serde(default)]
+    pub public_ip: String,
+    #[serde(default = "default_ftp_passive_port_start")]
+    pub passive_port_start: u16,
+    #[serde(default = "default_ftp_passive_port_end")]
+    pub passive_port_end: u16,
+    #[serde(default = "default_true")]
     pub passive_hint: bool,
 }
 
@@ -609,12 +750,36 @@ impl GatewayConfig {
             errors.push("http.request_timeout_ms must be greater than 0".to_string());
         }
 
+        for (index, page) in self.http.error_pages.pages.iter().enumerate() {
+            if !(400..=599).contains(&page.status) {
+                errors.push(format!(
+                    "http.error_pages.pages.{index}.status must be in 400..=599"
+                ));
+            }
+            if page.body.trim().is_empty() && page.file_path.as_os_str().is_empty() {
+                errors.push(format!(
+                    "http.error_pages.pages.{index} requires body or file_path"
+                ));
+            }
+            if page.content_type.trim().is_empty() {
+                errors.push(format!(
+                    "http.error_pages.pages.{index}.content_type cannot be empty"
+                ));
+            }
+        }
+
         if self.logging.access_sample_rate <= 0.0 || self.logging.access_sample_rate > 1.0 {
             errors.push("logging.access_sample_rate must be in (0, 1]".to_string());
         }
 
         if self.runtime.hot_reload.interval_ms < 200 {
             errors.push("runtime.hot_reload.interval_ms must be >= 200".to_string());
+        }
+
+        if self.runtime.maintenance_state.enabled
+            && self.runtime.maintenance_state.path.as_os_str().is_empty()
+        {
+            errors.push("runtime.maintenance_state.path cannot be empty".to_string());
         }
 
         if self.include.enabled && self.include.files.is_empty() {
@@ -651,6 +816,66 @@ impl GatewayConfig {
             }
         }
 
+        if self.load_balance.active_health.enabled {
+            if !self.load_balance.active_health.http_enabled
+                && !self.load_balance.active_health.tcp_enabled
+            {
+                errors.push(
+                    "load_balance.active_health requires http_enabled or tcp_enabled"
+                        .to_string(),
+                );
+            }
+            if self.load_balance.active_health.interval_secs == 0 {
+                errors.push(
+                    "load_balance.active_health.interval_secs must be greater than 0"
+                        .to_string(),
+                );
+            }
+            if self.load_balance.active_health.timeout_ms < 100 {
+                errors.push(
+                    "load_balance.active_health.timeout_ms must be >= 100".to_string(),
+                );
+            }
+            if self.load_balance.active_health.http_enabled
+                && !self.load_balance.active_health.path.starts_with('/')
+            {
+                errors.push(
+                    "load_balance.active_health.path must start with /".to_string(),
+                );
+            }
+            if self.load_balance.active_health.http_enabled
+                && self.load_balance.active_health.expected_statuses.is_empty()
+            {
+                errors.push(
+                    "load_balance.active_health.expected_statuses cannot be empty".to_string(),
+                );
+            }
+            if self.load_balance.active_health.failure_threshold == 0 {
+                errors.push(
+                    "load_balance.active_health.failure_threshold must be greater than 0"
+                        .to_string(),
+                );
+            }
+            if self.load_balance.active_health.success_threshold == 0 {
+                errors.push(
+                    "load_balance.active_health.success_threshold must be greater than 0"
+                        .to_string(),
+                );
+            }
+            if self.load_balance.active_health.jitter_percent > 100 {
+                errors.push(
+                    "load_balance.active_health.jitter_percent must be <= 100".to_string(),
+                );
+            }
+            for (index, webhook) in self.load_balance.active_health.alert_webhooks.iter().enumerate() {
+                if !looks_like_url(webhook) {
+                    errors.push(format!(
+                        "load_balance.active_health.alert_webhooks.{index} must be an http/https URL"
+                    ));
+                }
+            }
+        }
+
         if self.plugins.enabled {
             if !self.script.enabled {
                 errors.push(
@@ -670,24 +895,11 @@ impl GatewayConfig {
         }
 
         if self.services.rate_limit.http.enabled {
-            if self.services.rate_limit.http.requests == 0 {
-                errors.push("services.rate_limit.http.requests must be greater than 0".to_string());
-            }
-            if self.services.rate_limit.http.window_ms < 100 {
-                errors.push("services.rate_limit.http.window_ms must be >= 100".to_string());
-            }
-            if !(100..=599).contains(&self.services.rate_limit.http.status) {
-                errors.push(
-                    "services.rate_limit.http.status must be a valid HTTP status".to_string(),
-                );
-            }
-            if let RateLimitKey::Header(name) = &self.services.rate_limit.http.key {
-                if name.trim().is_empty() {
-                    errors.push(
-                        "services.rate_limit.http.key header name cannot be empty".to_string(),
-                    );
-                }
-            }
+            validate_http_rate_limit_config(
+                &self.services.rate_limit.http,
+                "services.rate_limit.http",
+                &mut errors,
+            );
         }
 
         if self.services.access_control.http.enabled {
@@ -742,6 +954,65 @@ impl GatewayConfig {
                     route.name
                 ));
             }
+            validate_compression_config(
+                &route.compression,
+                &format!("services.reverse_proxy.routes.{}.compression", route.name),
+                &mut errors,
+            );
+            validate_cache_config(
+                &route.cache,
+                &format!("services.reverse_proxy.routes.{}.cache", route.name),
+                &mut errors,
+            );
+            validate_cache_zone_reference(
+                &route.cache,
+                &self.services.cache_zones,
+                &format!("services.reverse_proxy.routes.{}.cache", route.name),
+                &mut errors,
+            );
+            validate_http_rate_limit_config(
+                &route.rate_limit,
+                &format!("services.reverse_proxy.routes.{}.rate_limit", route.name),
+                &mut errors,
+            );
+            validate_active_health_override(
+                &route.active_health,
+                &format!("services.reverse_proxy.routes.{}.active_health", route.name),
+                &mut errors,
+            );
+        }
+
+        validate_compression_config(
+            &self.services.response_policy.compression,
+            "services.response_policy.compression",
+            &mut errors,
+        );
+        validate_cache_config(
+            &self.services.response_policy.cache,
+            "services.response_policy.cache",
+            &mut errors,
+        );
+        validate_cache_zone_reference(
+            &self.services.response_policy.cache,
+            &self.services.cache_zones,
+            "services.response_policy.cache",
+            &mut errors,
+        );
+
+        let mut cache_zone_names = HashSet::<String>::new();
+        for zone in &self.services.cache_zones {
+            if zone.name.trim().is_empty() {
+                errors.push("services.cache_zones.name cannot be empty".to_string());
+            }
+            if !cache_zone_names.insert(zone.name.clone()) {
+                errors.push(format!("duplicate cache zone name {}", zone.name));
+            }
+            if zone.max_entries == 0 {
+                errors.push(format!(
+                    "services.cache_zones.{}.max_entries must be greater than 0",
+                    zone.name
+                ));
+            }
         }
 
         let mut domain_route_names = HashSet::<String>::new();
@@ -776,40 +1047,32 @@ impl GatewayConfig {
                     route.name
                 ));
             }
-            if route.compression.enabled {
-                if route.compression.min_length == 0 {
-                    errors.push(format!(
-                        "services.domain_routes.{}.compression.min_length must be greater than 0",
-                        route.name
-                    ));
-                }
-                if route.compression.content_types.is_empty() {
-                    errors.push(format!(
-                        "services.domain_routes.{}.compression.content_types cannot be empty",
-                        route.name
-                    ));
-                }
-            }
-            if route.cache.enabled {
-                if route.cache.ttl_secs == 0 {
-                    errors.push(format!(
-                        "services.domain_routes.{}.cache.ttl_secs must be greater than 0",
-                        route.name
-                    ));
-                }
-                if route.cache.statuses.is_empty() {
-                    errors.push(format!(
-                        "services.domain_routes.{}.cache.statuses cannot be empty",
-                        route.name
-                    ));
-                }
-                if route.cache.max_body_bytes == 0 {
-                    errors.push(format!(
-                        "services.domain_routes.{}.cache.max_body_bytes must be greater than 0",
-                        route.name
-                    ));
-                }
-            }
+            validate_compression_config(
+                &route.compression,
+                &format!("services.domain_routes.{}.compression", route.name),
+                &mut errors,
+            );
+            validate_cache_config(
+                &route.cache,
+                &format!("services.domain_routes.{}.cache", route.name),
+                &mut errors,
+            );
+            validate_cache_zone_reference(
+                &route.cache,
+                &self.services.cache_zones,
+                &format!("services.domain_routes.{}.cache", route.name),
+                &mut errors,
+            );
+            validate_http_rate_limit_config(
+                &route.rate_limit,
+                &format!("services.domain_routes.{}.rate_limit", route.name),
+                &mut errors,
+            );
+            validate_active_health_override(
+                &route.active_health,
+                &format!("services.domain_routes.{}.active_health", route.name),
+                &mut errors,
+            );
             match route.ssl.effective_mode() {
                 DomainTlsMode::Manual => {
                     if route.ssl.cert_path.as_os_str().is_empty() {
@@ -889,6 +1152,19 @@ impl GatewayConfig {
             if self.services.ftp.upstream.trim().is_empty() {
                 errors
                     .push("services.ftp.upstream cannot be empty when ftp is enabled".to_string());
+            }
+            if self.services.ftp.native_control
+                && self.services.ftp.passive_port_start > self.services.ftp.passive_port_end
+            {
+                errors.push(
+                    "services.ftp.passive_port_start must be <= services.ftp.passive_port_end"
+                        .to_string(),
+                );
+            }
+            if !self.services.ftp.public_ip.trim().is_empty()
+                && self.services.ftp.public_ip.parse::<IpAddr>().is_err()
+            {
+                errors.push("services.ftp.public_ip must be a valid IP address".to_string());
             }
         }
 
@@ -992,7 +1268,7 @@ impl GatewayConfig {
                     ));
                 }
             }
-            TlsMode::AcmeExternal => {
+            TlsMode::AcmeManaged | TlsMode::AcmeExternal => {
                 if self.http.tls.auto_https.enabled {
                     if self.http.tls.auto_https.domains.is_empty() {
                         errors.push(
@@ -1006,7 +1282,9 @@ impl GatewayConfig {
                                 .to_string(),
                         );
                     }
-                    if self.http.tls.auto_https.client.trim().is_empty() {
+                    if self.http.tls.mode == TlsMode::AcmeExternal
+                        && self.http.tls.auto_https.client.trim().is_empty()
+                    {
                         errors.push(
                             "http.tls.auto_https.client cannot be empty when auto_https.enabled=true"
                                 .to_string(),
@@ -1021,17 +1299,19 @@ impl GatewayConfig {
                 }
                 if self.http.tls.acme.domains.is_empty() {
                     errors.push(
-                        "http.tls.acme.domains cannot be empty when mode is acme_external"
+                        "http.tls.acme.domains cannot be empty when mode is acme_managed/acme_external"
                             .to_string(),
                     );
                 }
                 if self.http.tls.acme.email.trim().is_empty() {
                     errors.push(
-                        "http.tls.acme.email cannot be empty when mode is acme_external"
+                        "http.tls.acme.email cannot be empty when mode is acme_managed/acme_external"
                             .to_string(),
                     );
                 }
-                if self.http.tls.acme.client.trim().is_empty() {
+                if self.http.tls.mode == TlsMode::AcmeExternal
+                    && self.http.tls.acme.client.trim().is_empty()
+                {
                     errors.push(
                         "http.tls.acme.client cannot be empty when mode is acme_external"
                             .to_string(),
@@ -1096,7 +1376,7 @@ impl GatewayConfig {
         }
 
         if self.http.tls.mode == TlsMode::SelfSigned {
-            warnings.push("tls.mode=self_signed is for development or internal environments; use acme_external for public traffic".to_string());
+            warnings.push("tls.mode=self_signed is for development or internal environments; use acme_managed or acme_external for public traffic".to_string());
         }
 
         if self.http.plain_bind.trim().is_empty() {
@@ -1132,7 +1412,24 @@ impl GatewayConfig {
         self.http.tls.cert_path = absolutize(&root_dir, &self.http.tls.cert_path);
         self.http.tls.key_path = absolutize(&root_dir, &self.http.tls.key_path);
         self.http.tls.acme.cache_dir = absolutize(&root_dir, &self.http.tls.acme.cache_dir);
+        for page in &mut self.http.error_pages.pages {
+            page.file_path = absolutize_if_not_empty(&root_dir, &page.file_path);
+        }
+        self.runtime.maintenance_state.path =
+            absolutize(&root_dir, &self.runtime.maintenance_state.path);
         normalize_vec_lowercase(&mut self.http.tls.auto_https.domains);
+        normalize_vec_lowercase(&mut self.services.response_policy.compression.content_types);
+        self.services.response_policy.compression.algorithms =
+            normalize_compression_algorithms(&self.services.response_policy.compression.algorithms);
+        if self.services.response_policy.cache.zone.trim().is_empty() {
+            self.services.response_policy.cache.zone = default_cache_zone();
+        }
+        if self.services.rate_limit.http.zone.trim().is_empty() {
+            self.services.rate_limit.http.zone = default_rate_limit_zone();
+        }
+        for zone in &mut self.services.cache_zones {
+            zone.disk_path = absolutize_if_not_empty(&root_dir, &zone.disk_path);
+        }
         for certificate in &mut self.http.tls.certificates {
             normalize_vec_lowercase(&mut certificate.domains);
             certificate.cert_path = absolutize(&root_dir, &certificate.cert_path);
@@ -1158,9 +1455,30 @@ impl GatewayConfig {
     fn normalize_domain_tls(&mut self, root_dir: &Path) {
         let mut auto_domains = BTreeMap::<String, String>::new();
         let mut certificates = Vec::<TlsCertificateConfig>::new();
+        for route in &mut self.services.reverse_proxy.routes {
+            normalize_vec_lowercase(&mut route.compression.content_types);
+            route.compression.algorithms =
+                normalize_compression_algorithms(&route.compression.algorithms);
+            if route.cache.zone.trim().is_empty() {
+                route.cache.zone = default_cache_zone();
+            }
+            if route.rate_limit.zone.trim().is_empty() {
+                route.rate_limit.zone = default_rate_limit_zone();
+            }
+            normalize_active_health_override(&mut route.active_health);
+        }
         for route in &mut self.services.domain_routes {
             normalize_vec_lowercase(&mut route.domains);
             normalize_vec_lowercase(&mut route.compression.content_types);
+            route.compression.algorithms =
+                normalize_compression_algorithms(&route.compression.algorithms);
+            if route.cache.zone.trim().is_empty() {
+                route.cache.zone = default_cache_zone();
+            }
+            if route.rate_limit.zone.trim().is_empty() {
+                route.rate_limit.zone = default_rate_limit_zone();
+            }
+            normalize_active_health_override(&mut route.active_health);
             route.ssl.cert_path = absolutize_if_not_empty(root_dir, &route.ssl.cert_path);
             route.ssl.key_path = absolutize_if_not_empty(root_dir, &route.ssl.key_path);
 
@@ -1214,7 +1532,7 @@ impl GatewayConfig {
             return;
         }
 
-        self.http.tls.mode = TlsMode::AcmeExternal;
+        self.http.tls.mode = TlsMode::AcmeManaged;
         self.http.tls.acme.domains = self.http.tls.auto_https.domains.clone();
         self.http.tls.acme.email = self.http.tls.auto_https.email.clone();
         self.http.tls.acme.client = self.http.tls.auto_https.client.clone();
@@ -1276,7 +1594,29 @@ impl Default for HttpConfig {
             h3_bind: default_tls_gateway_bind(),
             request_timeout_ms: default_request_timeout_ms(),
             allow_insecure_upstreams: false,
+            error_pages: HttpErrorPagesConfig::default(),
             tls: TlsConfig::default(),
+        }
+    }
+}
+
+impl Default for HttpErrorPagesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            show_details: false,
+            pages: Vec::new(),
+        }
+    }
+}
+
+impl Default for HttpErrorPageConfig {
+    fn default() -> Self {
+        Self {
+            status: 404,
+            body: String::new(),
+            file_path: PathBuf::new(),
+            content_type: default_error_page_content_type(),
         }
     }
 }
@@ -1380,6 +1720,24 @@ impl Default for PassiveHealthConfig {
     }
 }
 
+impl Default for ActiveHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            http_enabled: default_true(),
+            tcp_enabled: default_true(),
+            interval_secs: default_active_health_interval_secs(),
+            timeout_ms: default_active_health_timeout_ms(),
+            path: default_active_health_path(),
+            expected_statuses: default_active_health_expected_statuses(),
+            failure_threshold: default_active_health_failure_threshold(),
+            success_threshold: default_active_health_success_threshold(),
+            jitter_percent: 0,
+            alert_webhooks: Vec::new(),
+        }
+    }
+}
+
 impl Default for AffinityConfig {
     fn default() -> Self {
         Self {
@@ -1444,6 +1802,15 @@ impl Default for HotReloadConfig {
     }
 }
 
+impl Default for MaintenanceStateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            path: default_maintenance_state_path(),
+        }
+    }
+}
+
 impl Default for WebDavConfig {
     fn default() -> Self {
         Self {
@@ -1478,6 +1845,10 @@ impl Default for ReverseProxyRouteConfig {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
         }
     }
 }
@@ -1495,6 +1866,8 @@ impl Default for DomainRouteConfig {
             strip_headers: Vec::new(),
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
             ssl: DomainTlsConfig::default(),
         }
     }
@@ -1504,9 +1877,16 @@ impl Default for ResponseCompressionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            algorithms: default_compression_algorithms(),
             min_length: default_compression_min_length(),
             content_types: default_compression_types(),
         }
+    }
+}
+
+impl Default for CompressionAlgorithm {
+    fn default() -> Self {
+        Self::Zstd
     }
 }
 
@@ -1514,9 +1894,21 @@ impl Default for ResponseCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            zone: default_cache_zone(),
             ttl_secs: default_cache_ttl_secs(),
             statuses: default_cache_statuses(),
             max_body_bytes: default_cache_max_body_bytes(),
+            allow_purge: default_true(),
+        }
+    }
+}
+
+impl Default for CacheZoneConfig {
+    fn default() -> Self {
+        Self {
+            name: default_cache_zone(),
+            max_entries: default_cache_zone_max_entries(),
+            disk_path: PathBuf::new(),
         }
     }
 }
@@ -1547,10 +1939,12 @@ impl Default for HttpRateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            zone: default_rate_limit_zone(),
             key: RateLimitKey::default(),
             requests: default_rate_limit_requests(),
             window_ms: default_rate_limit_window_ms(),
             burst: 0,
+            max_connections: 0,
             status: default_rate_limit_status(),
         }
     }
@@ -1573,6 +1967,10 @@ impl Default for FtpConfig {
             enabled: false,
             bind: default_ftp_bind(),
             upstream: default_ftp_upstream(),
+            native_control: default_true(),
+            public_ip: String::new(),
+            passive_port_start: default_ftp_passive_port_start(),
+            passive_port_end: default_ftp_passive_port_end(),
             passive_hint: default_true(),
         }
     }
@@ -1917,6 +2315,45 @@ fn default_lb_quarantine_secs() -> u64 {
     15
 }
 
+fn default_maintenance_state_path() -> PathBuf {
+    PathBuf::from("runtime/maintenance-state.json")
+}
+
+fn default_active_health_interval_secs() -> u64 {
+    10
+}
+
+fn default_active_health_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_active_health_path() -> String {
+    "/healthz".to_string()
+}
+
+fn default_error_page_content_type() -> String {
+    "text/html; charset=utf-8".to_string()
+}
+
+fn default_active_health_expected_statuses() -> Vec<u16> {
+    vec![200, 204]
+}
+
+fn default_active_health_failure_threshold() -> u32 {
+    2
+}
+
+fn default_active_health_success_threshold() -> u32 {
+    2
+}
+
+fn normalize_active_health_override(config: &mut ActiveHealthOverrideConfig) {
+    if let Some(path) = &mut config.path {
+        *path = path.trim().to_string();
+    }
+    config.alert_webhooks.retain(|value| !value.trim().is_empty());
+}
+
 fn default_reload_interval_ms() -> u64 {
     1500
 }
@@ -1949,6 +2386,14 @@ fn default_compression_min_length() -> usize {
     1024
 }
 
+fn default_compression_algorithms() -> Vec<CompressionAlgorithm> {
+    vec![
+        CompressionAlgorithm::Zstd,
+        CompressionAlgorithm::Brotli,
+        CompressionAlgorithm::Gzip,
+    ]
+}
+
 fn default_compression_types() -> Vec<String> {
     vec![
         "text/".to_string(),
@@ -1963,6 +2408,14 @@ fn default_cache_ttl_secs() -> u64 {
     30
 }
 
+fn default_cache_zone() -> String {
+    "default".to_string()
+}
+
+fn default_cache_zone_max_entries() -> usize {
+    4096
+}
+
 fn default_cache_statuses() -> Vec<u16> {
     vec![200, 203, 204, 301, 302, 404]
 }
@@ -1971,8 +2424,155 @@ fn default_cache_max_body_bytes() -> usize {
     2 * 1024 * 1024
 }
 
+fn normalize_compression_algorithms(
+    algorithms: &[CompressionAlgorithm],
+) -> Vec<CompressionAlgorithm> {
+    let mut normalized = Vec::new();
+    for algorithm in algorithms {
+        if !normalized.contains(algorithm) {
+            normalized.push(*algorithm);
+        }
+    }
+    if normalized.is_empty() {
+        default_compression_algorithms()
+    } else {
+        normalized
+    }
+}
+
+fn validate_compression_config(
+    config: &ResponseCompressionConfig,
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if !config.enabled {
+        return;
+    }
+    if config.algorithms.is_empty() {
+        errors.push(format!("{prefix}.algorithms cannot be empty"));
+    }
+    if config.min_length == 0 {
+        errors.push(format!("{prefix}.min_length must be greater than 0"));
+    }
+    if config.content_types.is_empty() {
+        errors.push(format!("{prefix}.content_types cannot be empty"));
+    }
+}
+
+fn validate_cache_config(config: &ResponseCacheConfig, prefix: &str, errors: &mut Vec<String>) {
+    if !config.enabled {
+        return;
+    }
+    if config.zone.trim().is_empty() {
+        errors.push(format!("{prefix}.zone cannot be empty"));
+    }
+    if config.ttl_secs == 0 {
+        errors.push(format!("{prefix}.ttl_secs must be greater than 0"));
+    }
+    if config.statuses.is_empty() {
+        errors.push(format!("{prefix}.statuses cannot be empty"));
+    }
+    if config.max_body_bytes == 0 {
+        errors.push(format!("{prefix}.max_body_bytes must be greater than 0"));
+    }
+}
+
+fn validate_cache_zone_reference(
+    config: &ResponseCacheConfig,
+    zones: &[CacheZoneConfig],
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if !config.enabled || config.zone == default_cache_zone() {
+        return;
+    }
+    if !zones.iter().any(|zone| zone.name == config.zone) {
+        errors.push(format!(
+            "{prefix}.zone references undefined cache zone {}",
+            config.zone
+        ));
+    }
+}
+
+fn validate_http_rate_limit_config(
+    config: &HttpRateLimitConfig,
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if !config.enabled {
+        return;
+    }
+    if config.zone.trim().is_empty() {
+        errors.push(format!("{prefix}.zone cannot be empty"));
+    }
+    if config.requests == 0 {
+        errors.push(format!("{prefix}.requests must be greater than 0"));
+    }
+    if config.window_ms < 100 {
+        errors.push(format!("{prefix}.window_ms must be >= 100"));
+    }
+    if !(100..=599).contains(&config.status) {
+        errors.push(format!("{prefix}.status must be a valid HTTP status"));
+    }
+    if let RateLimitKey::Header(name) = &config.key {
+        if name.trim().is_empty() {
+            errors.push(format!("{prefix}.key header name cannot be empty"));
+        }
+    }
+}
+
+fn validate_active_health_override(
+    config: &ActiveHealthOverrideConfig,
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if let Some(path) = &config.path {
+        if !path.starts_with('/') {
+            errors.push(format!("{prefix}.path must start with /"));
+        }
+    }
+    if let Some(timeout_ms) = config.timeout_ms {
+        if timeout_ms < 100 {
+            errors.push(format!("{prefix}.timeout_ms must be >= 100"));
+        }
+    }
+    if let Some(statuses) = &config.expected_statuses {
+        if statuses.is_empty() {
+            errors.push(format!("{prefix}.expected_statuses cannot be empty"));
+        }
+    }
+    if let Some(value) = config.failure_threshold {
+        if value == 0 {
+            errors.push(format!("{prefix}.failure_threshold must be greater than 0"));
+        }
+    }
+    if let Some(value) = config.success_threshold {
+        if value == 0 {
+            errors.push(format!("{prefix}.success_threshold must be greater than 0"));
+        }
+    }
+    if let Some(value) = config.jitter_percent {
+        if value > 100 {
+            errors.push(format!("{prefix}.jitter_percent must be <= 100"));
+        }
+    }
+    for (index, webhook) in config.alert_webhooks.iter().enumerate() {
+        if !looks_like_url(webhook) {
+            errors.push(format!("{prefix}.alert_webhooks.{index} must be an http/https URL"));
+        }
+    }
+}
+
+fn looks_like_url(value: &str) -> bool {
+    matches!(value.trim(), v if v.starts_with("http://") || v.starts_with("https://"))
+}
+
 fn default_rate_limit_requests() -> u32 {
     60
+}
+
+fn default_rate_limit_zone() -> String {
+    "default".to_string()
 }
 
 fn default_rate_limit_window_ms() -> u64 {
@@ -2024,6 +2624,14 @@ fn default_ftp_upstream() -> String {
     "127.0.0.1:2121".to_string()
 }
 
+fn default_ftp_passive_port_start() -> u16 {
+    50_000
+}
+
+fn default_ftp_passive_port_end() -> u16 {
+    50_100
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2062,8 +2670,29 @@ mod tests {
             LoadBalanceAlgorithm::Rendezvous
         ));
         assert_eq!(config.load_balance.retries.max_retries, 2);
+        assert!(config.load_balance.active_health.enabled);
+        assert!(config.load_balance.active_health.http_enabled);
+        assert!(config.load_balance.active_health.tcp_enabled);
+        assert_eq!(config.load_balance.active_health.interval_secs, 10);
+        assert_eq!(config.load_balance.active_health.timeout_ms, 2000);
+        assert_eq!(config.load_balance.active_health.path, "/healthz");
         assert_eq!(config.load_balance.passive_health.fail_threshold, 3);
         assert_eq!(config.load_balance.passive_health.quarantine_secs, 15);
+    }
+
+    #[test]
+    fn validate_rejects_active_health_without_any_probe_kind() {
+        let mut config = GatewayConfig::default();
+        config.load_balance.active_health.enabled = true;
+        config.load_balance.active_health.http_enabled = false;
+        config.load_balance.active_health.tcp_enabled = false;
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid active health protocol selection");
+        assert!(error
+            .to_string()
+            .contains("load_balance.active_health requires http_enabled or tcp_enabled"));
     }
 
     #[test]
@@ -2135,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_https_expands_to_acme_external_config() {
+    fn auto_https_expands_to_managed_acme_config() {
         let base_dir =
             std::env::temp_dir().join(format!("proxysss-auto-https-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
@@ -2147,7 +2776,7 @@ mod tests {
         .expect("write config");
 
         let config = GatewayConfig::load(&config_path).expect("load config");
-        assert_eq!(config.http.tls.mode, TlsMode::AcmeExternal);
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
         assert_eq!(config.http.tls.server_name, "example.com");
         assert_eq!(
             config.http.tls.acme.domains,
@@ -2187,7 +2816,7 @@ mod tests {
 
         let config = GatewayConfig::load(&config_path).expect("load config");
         assert!(config.http.tls.auto_https.enabled);
-        assert_eq!(config.http.tls.mode, TlsMode::AcmeExternal);
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
         assert_eq!(config.http.tls.auto_https.email, "admin@example.com");
         assert!(config
             .http
@@ -2299,6 +2928,10 @@ mod tests {
                 strip_prefix: false,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+                rate_limit: HttpRateLimitConfig::default(),
+                active_health: ActiveHealthOverrideConfig::default(),
             });
 
         let error = config
@@ -2401,6 +3034,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("load_balance.passive_health.fail_threshold"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_active_health_path() {
+        let mut config = GatewayConfig::default();
+        config.load_balance.active_health.enabled = true;
+        config.load_balance.active_health.path = "healthz".to_string();
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid active health path");
+        assert!(error
+            .to_string()
+            .contains("load_balance.active_health.path"));
     }
 
     #[test]

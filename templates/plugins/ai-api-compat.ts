@@ -1,3 +1,5 @@
+/// <reference path="../proxysss-script.d.ts" />
+
 type ProviderRule = {
   name: string;
   upstream: string;

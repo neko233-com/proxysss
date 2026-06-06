@@ -76,9 +76,9 @@ pub struct RouteDecision {
     pub affinity_key: Option<String>,
     #[serde(default)]
     pub rewrite_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "add_headers")]
     pub set_headers: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "remove_headers")]
     pub strip_headers: Vec<String>,
     #[serde(default)]
     pub status: Option<u16>,
@@ -119,9 +119,9 @@ struct PartialRoute {
     affinity_key: Option<String>,
     #[serde(default)]
     rewrite_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "add_headers")]
     set_headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, alias = "remove_headers")]
     strip_headers: Option<Vec<String>>,
     #[serde(default)]
     status: Option<u16>,

@@ -1,3 +1,5 @@
+/// <reference path="../proxysss-script.d.ts" />
+
 type GatewayMessage = {
   id: string;
   kind: "http" | "tcp" | "udp" | string;

@@ -40,6 +40,9 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     let plugin_dir = base_dir.join("plugins");
     let config_path = base_dir.join(DEFAULT_CONFIG_FILE_NAME);
     let script_path = base_dir.join(DEFAULT_SCRIPT_FILE_NAME);
+    let dts_path = base_dir.join("proxysss-script.d.ts");
+    let ts_how_to_use_path = base_dir.join("ts-how-to-use.md");
+    let nginx_mapping_path = base_dir.join("nginx-to-proxysss.md");
     let plugin_path = plugin_dir.join("player-affinity.ts");
     let traffic_stats_plugin_path = plugin_dir.join("traffic-stats.ts");
     let structured_log_plugin_path = plugin_dir.join("structured-log.ts");
@@ -60,6 +63,9 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     );
     write_if_needed(&config_path, &config_yaml, overwrite)?;
     write_if_needed(&script_path, DEFAULT_GATEWAY_SCRIPT, overwrite)?;
+    write_if_needed(&dts_path, DEFAULT_TYPESCRIPT_DECLARATIONS, overwrite)?;
+    write_if_needed(&ts_how_to_use_path, DEFAULT_TS_HOW_TO_USE, overwrite)?;
+    write_if_needed(&nginx_mapping_path, DEFAULT_NGINX_TO_PROXYSSS, overwrite)?;
     write_if_needed(&plugin_path, DEFAULT_PLUGIN_PLAYER_AFFINITY, overwrite)?;
     write_if_needed(
         &traffic_stats_plugin_path,
@@ -781,6 +787,9 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
 }
 
 const DEFAULT_GATEWAY_SCRIPT: &str = include_str!("../templates/gateway.ts");
+const DEFAULT_TYPESCRIPT_DECLARATIONS: &str = include_str!("../proxysss-script.d.ts");
+const DEFAULT_TS_HOW_TO_USE: &str = include_str!("../ts-how-to-use.md");
+const DEFAULT_NGINX_TO_PROXYSSS: &str = include_str!("../nginx-to-proxysss.md");
 const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
     include_str!("../templates/plugins/player-affinity.ts");
 const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/traffic-stats.ts");
