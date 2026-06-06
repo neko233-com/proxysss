@@ -238,7 +238,7 @@ impl Gateway {
     }
 
     async fn run_hot_reload_loop(self: Arc<Self>) -> Result<()> {
-        let mut last_hash = reload_fingerprint(&self.config_path).unwrap_or(0);
+        let mut last_hash = reload_fingerprint(&self.config_path).unwrap_or_default();
 
         loop {
             let interval_ms = {
@@ -2006,10 +2006,17 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         .context("failed to build upstream http client")?;
 
     let script = if config.script.enabled {
-        Some(Arc::new(ScriptRuntime::spawn(
-            &config.script,
-            &default_script_env(&config),
-        )?))
+        match ScriptRuntime::spawn(&config.script, &default_script_env(&config)) {
+            Ok(runtime) => Some(Arc::new(runtime)),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    command = %config.script.command,
+                    "script runtime failed to start; continuing with YAML-only routing and skipping TypeScript extensions"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -2074,7 +2081,7 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
             .map(|value| value.to_string())
             .unwrap_or_else(|| "plugin".to_string());
 
-        script
+        match script
             .load_plugin(ScriptPluginSpec {
                 name: name.clone(),
                 module_path: path.to_string_lossy().to_string(),
@@ -2083,9 +2090,19 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
                 config: serde_json::Value::Null,
             })
             .await
-            .with_context(|| format!("failed to auto-load plugin {}", path.display()))?;
-
-        tracing::info!(plugin = %name, path = %path.display(), "plugin auto-loaded");
+        {
+            Ok(_) => {
+                tracing::info!(plugin = %name, path = %path.display(), "plugin auto-loaded");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    plugin = %name,
+                    path = %path.display(),
+                    "plugin auto-load failed; plugin will be ignored until the next reload"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -4468,19 +4485,19 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow!("no private key found in {}", path.display()))
 }
 
-fn reload_fingerprint(config_path: &Path) -> Result<u64> {
+fn reload_fingerprint(config_path: &Path) -> Result<String> {
     let config = GatewayConfig::load(config_path)?;
-    let mut hasher = DefaultHasher::new();
-    serde_json::to_vec(&config)
-        .context("failed serializing reload config fingerprint")?
-        .hash(&mut hasher);
+    let mut context = md5::Context::new();
+    context.consume(
+        serde_json::to_vec(&config).context("failed serializing reload config fingerprint")?,
+    );
 
     for path in watched_script_paths(&config) {
-        path.display().to_string().hash(&mut hasher);
+        context.consume(path.display().to_string().as_bytes());
         match std::fs::read(&path) {
-            Ok(bytes) => bytes.hash(&mut hasher),
+            Ok(bytes) => context.consume(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                "missing".hash(&mut hasher);
+                context.consume(b"missing");
             }
             Err(error) => {
                 return Err(error)
@@ -4489,7 +4506,7 @@ fn reload_fingerprint(config_path: &Path) -> Result<u64> {
         }
     }
 
-    Ok(hasher.finish())
+    Ok(format!("{:x}", context.compute()))
 }
 
 pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
@@ -5032,9 +5049,23 @@ mod tests {
         std::fs::write(&script_path, "console.log('v2');").expect("write script v2");
         let after = reload_fingerprint(&config_path).expect("fingerprint after");
 
+        assert_eq!(before.len(), 32);
+        assert_eq!(after.len(), 32);
         assert_ne!(before, after);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn build_dynamic_state_disables_broken_script_runtime() {
+        let mut config = GatewayConfig::default();
+        config.script.enabled = true;
+        config.script.command = "/definitely/missing/proxysss-ts-runtime".to_string();
+        config.script.args = vec!["run".to_string(), "-A".to_string(), "gateway.ts".to_string()];
+        config.plugins.enabled = false;
+
+        let state = build_dynamic_state(config).await.expect("dynamic state without script runtime");
+        assert!(state.script.is_none());
     }
 
     #[test]
