@@ -48,6 +48,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.runner }}-${{ matrix.target }}
+
       - name: Install Linux ARM64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -58,11 +62,11 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package bundle (Unix)
         if: runner.os != 'Windows'
@@ -90,6 +94,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
+          compression-level: 0
           path: ${{ matrix.asset }}
 
   publish:

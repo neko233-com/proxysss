@@ -39,6 +39,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-quality-ubuntu-latest
+
       - name: Rustfmt check
         run: cargo fmt --all -- --check
 
@@ -64,5 +68,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-build-${{ matrix.os }}
+
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release

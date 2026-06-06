@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.5 - 2026-06-07
+
+- Optimized GitHub Actions build/package workflows by adding Rust dependency/target caching across CI, deploy, and release jobs.
+- Avoided recompressing already packaged `.tar.gz` / `.zip` release artifacts during artifact upload to cut avoidable CPU time in Actions packaging jobs.
+- Switched workflow build invocations to `cargo build --locked` so package/release jobs reuse the checked-in lockfile consistently.
+
 ## v0.3.4 - 2026-06-07
 
 - Added global CLI config path support for both `-c <file>` and compatibility-style `-config <file>`, while keeping the default fallback to `proxysss.yaml` when no path is supplied.
