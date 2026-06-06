@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.3 - 2026-06-07
+
+- Added bilingual Chinese/English annotations to `proxysss-script.d.ts` so embedded TypeScript hooks, contexts, and route fields are easier to use without guessing the runtime contract.
+
 ## v0.3.2 - 2026-06-07
 
 - Added managed ACME renewal flows for both HTTP-01 and TLS-ALPN-01 without requiring an external ACME binary on the default path.
