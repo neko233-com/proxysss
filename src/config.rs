@@ -1115,8 +1115,8 @@ impl GatewayConfig {
         for route in &mut self.services.domain_routes {
             normalize_vec_lowercase(&mut route.domains);
             normalize_vec_lowercase(&mut route.compression.content_types);
-            route.ssl.cert_path = absolutize_optional(root_dir, &route.ssl.cert_path);
-            route.ssl.key_path = absolutize_optional(root_dir, &route.ssl.key_path);
+            route.ssl.cert_path = absolutize_if_not_empty(root_dir, &route.ssl.cert_path);
+            route.ssl.key_path = absolutize_if_not_empty(root_dir, &route.ssl.key_path);
 
             match route.ssl.effective_mode() {
                 DomainTlsMode::Manual => {
@@ -1615,7 +1615,7 @@ fn absolutize(root: &Path, path: &Path) -> PathBuf {
     normalize_path_lexically(&path)
 }
 
-fn absolutize_optional(root: &Path, path: &Path) -> PathBuf {
+fn absolutize_if_not_empty(root: &Path, path: &Path) -> PathBuf {
     if path.as_os_str().is_empty() {
         PathBuf::new()
     } else {

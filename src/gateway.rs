@@ -2718,7 +2718,10 @@ fn append_or_insert_header(
         .iter_mut()
         .find(|(header_name, _)| *header_name == existing_name)
     {
-        let merged = format!("{}, {}", existing.to_str().unwrap_or_default(), value);
+        let existing_value = existing
+            .to_str()
+            .with_context(|| format!("invalid existing header value for {}", name.as_str()))?;
+        let merged = format!("{existing_value}, {value}");
         *existing = HeaderValue::from_str(merged.trim_matches(|c| c == ',' || c == ' '))
             .with_context(|| format!("invalid header value for {}", name.as_str()))?;
     } else {
@@ -2816,10 +2819,11 @@ fn append_forwarded_header(
     host: &str,
     scheme: &str,
 ) -> String {
+    let safe_host = sanitize_forwarded_host(host);
     let next = format!(
         "for={};host=\"{}\";proto={scheme}",
         forwarded_for_value(remote_ip),
-        host.replace('"', "")
+        safe_host
     );
     match existing
         .and_then(|value| value.to_str().ok())
@@ -2831,11 +2835,19 @@ fn append_forwarded_header(
 }
 
 fn forwarded_for_value(remote_ip: &str) -> String {
-    if remote_ip.contains(':') {
-        format!("\"[{remote_ip}]\"")
-    } else {
-        remote_ip.to_string()
-    }
+    remote_ip
+        .parse::<std::net::IpAddr>()
+        .map(|ip| match ip {
+            std::net::IpAddr::V4(_) => remote_ip.to_string(),
+            std::net::IpAddr::V6(_) => format!("\"[{remote_ip}]\""),
+        })
+        .unwrap_or_else(|_| remote_ip.to_string())
+}
+
+fn sanitize_forwarded_host(host: &str) -> String {
+    host.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']'))
+        .collect()
 }
 
 fn header_map_to_btree(headers: &HeaderMap) -> BTreeMap<String, String> {
