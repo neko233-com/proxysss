@@ -229,6 +229,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "http reverse proxy",
         "built-in services.reverse_proxy routes with host/path matching, upstream pools, and strip_prefix",
     ),
+    (
+        "domain-centric reverse proxy",
+        "services.domain_routes treats domain as the primary HTTP reverse proxy unit with per-domain ssl/compression/cache",
+    ),
     ("https/http2 termination", "supported"),
     ("http3/quic", "supported"),
     ("websocket/ws/wss", "supported"),
@@ -252,12 +256,40 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "configuration, explicit includes, main script, and auto-loaded plugins are fingerprinted",
     ),
     (
+        "forwarded headers",
+        "x-real-ip, x-forwarded-for, x-forwarded-host, x-forwarded-proto, and forwarded are injected on upstream requests",
+    ),
+    (
         "logging levels",
         "debug/info/warn/error with info as default, debug reserved for internal diagnostics, file sinks at logs/access.log and logs/error.log",
     ),
     (
+        "plugin sidecar config",
+        "auto-loaded plugins may read <name>.plugin.yaml/.yml/.json for enabled/priority/config without external runtime",
+    ),
+    (
+        "ai api compatibility",
+        "generic HTTP proxying works for OpenAI-compatible/New API style traffic; optional default-off plugin templates add host/path rewrite and audit headers",
+    ),
+    (
         "auto https",
         "proxysss YAML style http.tls.auto_https expands to ACME external certificate issue/renew",
+    ),
+    (
+        "multi-cert sni",
+        "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname",
+    ),
+    (
+        "gzip/brotli compression",
+        "services.domain_routes[*].compression negotiates br/gzip for matching responses",
+    ),
+    (
+        "ip allow/deny blacklist",
+        "services.access_control.http supports built-in allow/deny IP and CIDR filtering",
+    ),
+    (
+        "http cache",
+        "services.domain_routes[*].cache enables bounded in-memory GET response caching",
     ),
     (
         "admin api/console",
@@ -330,9 +362,15 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "TLS certificates",
-        status: ParityStatus::Partial,
-        evidence: "self_signed/manual/acme_external modes plus proxysss YAML auto_https sugar",
-        next_gap: "first-class multi-cert/SNI certificate selection",
+        status: ParityStatus::Supported,
+        evidence: "self_signed/manual/acme_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "self-contained auto ssl",
+        status: ParityStatus::Missing,
+        evidence: "auto https still relies on external ACME client invocation",
+        next_gap: "embed native ACME issue/renew flow so auto ssl has zero external dependency",
     },
     NginxParityItem {
         capability: "access/error logging",
@@ -349,21 +387,48 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "compression",
-        status: ParityStatus::Missing,
-        evidence: "no gzip/brotli response filter yet",
-        next_gap: "add configurable gzip/brotli response compression",
+        status: ParityStatus::Partial,
+        evidence: "services.domain_routes compression provides configurable brotli/gzip response compression",
+        next_gap: "add zstd and wider policy coverage outside domain routes",
+    },
+    NginxParityItem {
+        capability: "IP allow/deny / blacklist",
+        status: ParityStatus::Supported,
+        evidence: "services.access_control.http provides built-in IP/CIDR allow and deny lists",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "cache/proxy cache",
-        status: ParityStatus::Missing,
-        evidence: "no on-disk or memory proxy cache yet",
-        next_gap: "add proxy cache zones and cache key policy",
+        status: ParityStatus::Partial,
+        evidence: "services.domain_routes cache provides bounded in-memory GET response caching",
+        next_gap: "add shared cache zones, purge controls, and on-disk cache tiers",
     },
     NginxParityItem {
         capability: "rate limiting",
         status: ParityStatus::Partial,
         evidence: "services.rate_limit.http fixed-window request limiter",
         next_gap: "add connection limiting and shared-zone style policies",
+    },
+    NginxParityItem {
+        capability: "forwarding header semantics",
+        status: ParityStatus::Supported,
+        evidence:
+            "proxy layer injects x-real-ip, x-forwarded-for, x-forwarded-host, x-forwarded-proto, and forwarded",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "ai api passthrough",
+        status: ParityStatus::Supported,
+        evidence:
+            "generic reverse proxy routes handle bearer/api-key headers and optional plugin rewrite/audit hooks for OpenAI-compatible and New API traffic",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "plugin sidecar configuration",
+        status: ParityStatus::Supported,
+        evidence:
+            "auto-loaded plugins read <name>.plugin.yaml/.yml/.json for enabled/priority/config while remaining default-off",
+        next_gap: "",
     },
 ];
 
@@ -724,11 +789,22 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.reverse_proxy.routes.len()
     );
     println!(
+        "domain routes     : routes={}",
+        config.services.domain_routes.len()
+    );
+    println!(
         "rate limit        : http.enabled={}, requests={}, window_ms={}, burst={}",
         config.services.rate_limit.http.enabled,
         config.services.rate_limit.http.requests,
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst
+    );
+    println!(
+        "access control    : http.enabled={}, allow={}, deny={}, status={}",
+        config.services.access_control.http.enabled,
+        config.services.access_control.http.allow.len(),
+        config.services.access_control.http.deny.len(),
+        config.services.access_control.http.status
     );
     println!("static sites      : {}", config.services.static_sites.len());
     println!(
@@ -785,6 +861,27 @@ fn render_route_topology(config: &GatewayConfig) -> String {
                 route.strip_prefix
             ));
         }
+
+        output.push_str("[domain_routes]\n");
+        if config.services.domain_routes.is_empty() {
+            output.push_str("none\n");
+        } else {
+            for route in &config.services.domain_routes {
+                output.push_str(&format!(
+                    "{} domains={} path={} upstream={} upstreams={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={}\n",
+                    route.name,
+                    route.domains.join(","),
+                    route.path_prefix,
+                    route.upstream,
+                    route.upstreams.len(),
+                    route.strip_prefix,
+                    route.ssl.mode,
+                    route.ssl.is_auto_ssl,
+                    route.compression.enabled,
+                    route.cache.enabled
+                ));
+            }
+        }
     }
 
     output.push_str("[rate_limit]\n");
@@ -795,6 +892,14 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst,
         config.services.rate_limit.http.status
+    ));
+    output.push_str("[access_control]\n");
+    output.push_str(&format!(
+        "http enabled={} allow={} deny={} status={}\n",
+        config.services.access_control.http.enabled,
+        config.services.access_control.http.allow.join(","),
+        config.services.access_control.http.deny.join(","),
+        config.services.access_control.http.status
     ));
 
     output.push_str("[static_sites]\n");
@@ -929,10 +1034,10 @@ fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
 fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
     match kind {
         ConfigTemplateKind::Full => {
-            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: app\n        hosts: [example.com]\n        path_prefix: /\n        upstream: http://127.0.0.1:9000\n"
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n"
         }
         ConfigTemplateKind::Http => {
-            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: api\n        hosts: [api.example.com]\n        path_prefix: /api\n        upstream: http://127.0.0.1:8080\n        upstreams:\n          - http://127.0.0.1:8080\n          - http://127.0.0.1:8081\n        strip_prefix: true\n"
+            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n"
         }
         ConfigTemplateKind::Tcp => {
             "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
@@ -1478,8 +1583,12 @@ mod tests {
             "webdav",
             "explicit sub-config",
             "hot reload",
+            "forwarded headers",
             "logging levels",
+            "plugin sidecar config",
+            "ai api compatibility",
             "auto https",
+            "ip allow/deny blacklist",
             "admin api/console",
             "agent install skill",
         ];
@@ -1531,6 +1640,13 @@ mod tests {
             });
         config.services.webdav.enabled = true;
         config.services.ftp.enabled = true;
+        config.services.access_control.http.enabled = true;
+        config
+            .services
+            .access_control
+            .http
+            .deny
+            .push("203.0.113.0/24".to_string());
         config.tcp.listeners.push(crate::config::TcpListenerConfig {
             name: "chat".to_string(),
             bind: "0.0.0.0:7000".to_string(),
@@ -1550,6 +1666,8 @@ mod tests {
         assert!(topology.contains("api hosts=api.example.com path=/api"));
         assert!(topology.contains("public path=/assets"));
         assert!(topology.contains("[webdav]"));
+        assert!(topology.contains("[access_control]"));
+        assert!(topology.contains("deny=203.0.113.0/24"));
         assert!(topology.contains("chat bind=0.0.0.0:7000 upstream=127.0.0.1:9000"));
         assert!(topology.contains("realtime bind=0.0.0.0:7001 upstream=disabled upstreams=1"));
         assert!(topology.contains("ftp bind=0.0.0.0:21"));
@@ -1580,7 +1698,7 @@ mod tests {
     #[test]
     fn config_templates_cover_http_and_stream_learning_paths() {
         assert!(render_config_template(ConfigTemplateKind::Http).contains("services:"));
-        assert!(render_config_template(ConfigTemplateKind::Http).contains("reverse_proxy"));
+        assert!(render_config_template(ConfigTemplateKind::Http).contains("domain_routes"));
         assert!(render_config_template(ConfigTemplateKind::Tcp).contains("tcp:"));
         assert!(render_config_template(ConfigTemplateKind::Udp).contains("udp:"));
         assert!(render_config_template(ConfigTemplateKind::Script).contains("script:"));
@@ -1606,7 +1724,11 @@ mod tests {
             "static file service",
             "WebDAV",
             "hot reload",
+            "forwarding header semantics",
+            "ai api passthrough",
+            "plugin sidecar configuration",
             "compression",
+            "IP allow/deny / blacklist",
             "cache/proxy cache",
             "rate limiting",
         ] {

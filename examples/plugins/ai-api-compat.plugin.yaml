@@ -1,0 +1,19 @@
+enabled: true
+priority: 220
+config:
+  header_prefix: proxysss-
+  rules:
+    - name: openai-chat
+      provider: openai-compatible
+      match_host: ai.local
+      path_prefix: /v1/chat/completions
+      rewrite_base_path: /v1/chat/completions
+      upstream: https://api.openai.com
+      add_headers:
+        proxysss-ai-profile: openai-chat
+    - name: embeddings
+      provider: internal-new-api
+      match_host: ai.local
+      path_prefix: /v1/embeddings
+      rewrite_base_path: /v1/embeddings
+      upstream: http://127.0.0.1:9001

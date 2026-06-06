@@ -22,7 +22,7 @@ function isLoginPath(path: string): boolean {
 export default {
   name: "player-affinity",
   priority: 100,
-  enabled: true,
+  enabled: false,
 
   access(message: { ctx: { path?: string; player_id?: string } }) {
     const path = message.ctx.path ?? "";

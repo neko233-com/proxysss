@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.1 - 2026-06-06
+
+- Added built-in HTTP access control with IP / CIDR allow and deny lists via `services.access_control.http`, including `blacklist` / `denylist` aliases for direct YAML use.
+- Enforced access-control checks in the native HTTP request path before proxying so blacklisted clients are rejected without needing any script/plugin layer.
+- Expanded README automatic HTTPS guidance to call out no DNS-token requirements, built-in renewal behavior, and the current external ACME client dependency.
+- Reworked README nginx parity coverage into a per-capability checklist with explicit checkmarks, and documented blacklist + rate-limit + compression examples alongside auto HTTPS.
+- Prepared the next release metadata by bumping the project version to `v0.3.1` and refreshing install/update examples.
+
 ## v0.3.0 - 2026-06-06
 
 - Replaced the external `deno` script sidecar with an embedded TypeScript/JavaScript engine compiled directly into the proxysss binary (QuickJS via `rquickjs`, TypeScript stripped in-process with `swc_ts_fast_strip`); there is no longer any external `deno`/`node`/`tsc` dependency or bundled runtime directory.
@@ -9,6 +17,9 @@
 - Reworked `proxysss script run-file` / `proxysss script eval` to execute through the embedded engine instead of spawning deno.
 - Removed deno download/bundling from release, deploy, and install packaging; release artifacts are now a single self-contained binary.
 - Added `specs/embedded-ts-runtime.md` documenting the engine decision, isolation model, host/script contract, and verification plan.
+- Added auto-loaded plugin sidecar configuration (`<name>.plugin.yaml/.yml/.json`) so bundled plugins can stay default-off while still receiving enabled/priority/config values without any external runtime.
+- Injected `x-real-ip`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, and `forwarded` on upstream requests to better match nginx-style forwarding semantics.
+- Added default-off built-in plugin templates/examples for geo header injection (`geo-headers`) and AI API compatibility routing (`ai-api-compat`), plus README coverage for real business scenarios and AI API forwarding.
 
 ## v0.2.7 - 2026-06-06
 

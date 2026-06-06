@@ -43,6 +43,8 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     let plugin_path = plugin_dir.join("player-affinity.ts");
     let traffic_stats_plugin_path = plugin_dir.join("traffic-stats.ts");
     let structured_log_plugin_path = plugin_dir.join("structured-log.ts");
+    let geo_headers_plugin_path = plugin_dir.join("geo-headers.ts");
+    let ai_api_compat_plugin_path = plugin_dir.join("ai-api-compat.ts");
 
     fs::create_dir_all(&cert_dir)
         .with_context(|| format!("failed to create {}", cert_dir.display()))?;
@@ -67,6 +69,16 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
     write_if_needed(
         &structured_log_plugin_path,
         DEFAULT_PLUGIN_STRUCTURED_LOG,
+        overwrite,
+    )?;
+    write_if_needed(
+        &geo_headers_plugin_path,
+        DEFAULT_PLUGIN_GEO_HEADERS,
+        overwrite,
+    )?;
+    write_if_needed(
+        &ai_api_compat_plugin_path,
+        DEFAULT_PLUGIN_AI_API_COMPAT,
         overwrite,
     )?;
 
@@ -773,6 +785,8 @@ const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
     include_str!("../templates/plugins/player-affinity.ts");
 const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/traffic-stats.ts");
 const DEFAULT_PLUGIN_STRUCTURED_LOG: &str = include_str!("../templates/plugins/structured-log.ts");
+const DEFAULT_PLUGIN_GEO_HEADERS: &str = include_str!("../templates/plugins/geo-headers.ts");
+const DEFAULT_PLUGIN_AI_API_COMPAT: &str = include_str!("../templates/plugins/ai-api-compat.ts");
 
 #[cfg(test)]
 mod tests {
