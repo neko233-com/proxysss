@@ -508,7 +508,11 @@ async fn main() -> Result<()> {
                     overwrite,
                 } => {
                     write_config_template(kind, &output, overwrite)?;
-                    println!("wrote {} template to {}", config_template_name(kind), output.display());
+                    println!(
+                        "wrote {} template to {}",
+                        config_template_name(kind),
+                        output.display()
+                    );
                     Ok(())
                 }
                 ConfigCommands::Show { format } => {

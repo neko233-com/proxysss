@@ -537,8 +537,7 @@ impl GatewayConfig {
 
             if self.script.timeout_ms == 0 {
                 errors.push(
-                    "script.timeout_ms must be greater than 0 when script.enabled=true"
-                        .to_string(),
+                    "script.timeout_ms must be greater than 0 when script.enabled=true".to_string(),
                 );
             }
         }
