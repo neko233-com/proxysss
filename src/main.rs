@@ -280,8 +280,8 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname",
     ),
     (
-        "gzip compression",
-        "services.domain_routes[*].compression enables gzip for matching responses",
+        "gzip/brotli compression",
+        "services.domain_routes[*].compression negotiates br/gzip for matching responses",
     ),
     (
         "ip allow/deny blacklist",
@@ -388,8 +388,8 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "compression",
         status: ParityStatus::Partial,
-        evidence: "services.domain_routes compression provides configurable gzip response compression",
-        next_gap: "add brotli/zstd and wider policy coverage outside domain routes",
+        evidence: "services.domain_routes compression provides configurable brotli/gzip response compression",
+        next_gap: "add zstd and wider policy coverage outside domain routes",
     },
     NginxParityItem {
         capability: "IP allow/deny / blacklist",

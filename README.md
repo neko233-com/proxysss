@@ -501,7 +501,7 @@ config:
 | 自动 HTTPS 完全内置零外部依赖 | ⬜ | 未完成 | 当前仍默认调用外部 `acme.sh` |
 | 访问日志 / 错误日志 | ✅ | 已完成 | `logs/access.log` / `logs/error.log` |
 | 热重载 | ✅ | 已完成 | 配置、include、脚本、插件都进 fingerprint |
-| 压缩 | ⬜ | 部分完成 | 已支持 gzip；brotli/zstd 待补齐 |
+| 压缩 | ⬜ | 部分完成 | 已支持 gzip+brotli；zstd 待补齐 |
 | IP 黑名单 / 白名单 | ✅ | 已完成 | `services.access_control.http.allow/deny` 支持 IP / CIDR |
 | 缓存 / proxy cache | ⬜ | 部分完成 | 已支持内存 GET 缓存，未做共享区/磁盘层 |
 | 限流 | ⬜ | 部分完成 | 已支持请求速率限制，未做连接数限制/共享区风格策略 |
@@ -526,7 +526,7 @@ config:
 | IP 黑名单 / 白名单 | 已支持 | `services.access_control.http` 支持单 IP 和 CIDR |
 | 热重载 | 已支持 | 配置、主脚本、自动加载插件脚本与 sidecar 一起进入 fingerprint |
 | AI API / New API 转发 | 已支持基础入口 + 可选插件 | 核心先保证 HTTP 代理；插件负责路径兼容、审计 header、地理 header |
-| 压缩 | 部分支持 | `services.domain_routes[*].compression` 已支持 gzip，brotli/zstd 仍待补齐 |
+| 压缩 | 部分支持 | `services.domain_routes[*].compression` 已支持 gzip+brotli，zstd 仍待补齐 |
 | 缓存 | 部分支持 | `services.domain_routes[*].cache` 已支持内存 GET 缓存，磁盘缓存/共享缓存区仍待补齐 |
 | 多证书 / SNI 细粒度选择 | 已增强 | `http.tls.certificates` 与域名级 manual SSL 已支持按 SNI 选证书 |
 

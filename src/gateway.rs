@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
+use brotli::CompressorWriter;
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use flate2::write::GzEncoder;
@@ -80,6 +81,12 @@ struct GatewayHttpResponse {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
     upstream: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionEncoding {
+    Brotli,
+    Gzip,
 }
 
 #[derive(Clone)]
@@ -2665,23 +2672,26 @@ fn finalize_http_response(
     mut response: GatewayHttpResponse,
 ) -> Result<GatewayHttpResponse> {
     if !compression.enabled
-        || !accepts_gzip(request_headers)
         || !response_allows_compression(&response)
     {
         return Ok(response);
     }
+    let Some(encoding) = select_compression_encoding(request_headers) else {
+        return Ok(response);
+    };
     if response.body.len() < compression.min_length
         || !content_type_matches(&response, &compression.content_types)
     {
         return Ok(response);
     }
 
-    let compressed = gzip_bytes(&response.body)?;
+    let (compressed, encoding_header) = match encoding {
+        CompressionEncoding::Brotli => (brotli_bytes(&response.body)?, HeaderValue::from_static("br")),
+        CompressionEncoding::Gzip => (gzip_bytes(&response.body)?, HeaderValue::from_static("gzip")),
+    };
     response.body = Bytes::from(compressed);
     response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
-    response
-        .headers
-        .push((CONTENT_ENCODING, HeaderValue::from_static("gzip")));
+    response.headers.push((CONTENT_ENCODING, encoding_header));
     append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
     response.headers.push((
         CONTENT_LENGTH,
@@ -2697,12 +2707,62 @@ fn gzip_bytes(body: &[u8]) -> Result<Vec<u8>> {
     encoder.finish().context("failed to finalize gzip response")
 }
 
-fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
-        .get(ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(',').any(|item| item.trim().starts_with("gzip")))
-        .unwrap_or(false)
+fn brotli_bytes(body: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = CompressorWriter::new(Vec::new(), 4096, 5, 22);
+    std::io::Write::write_all(&mut encoder, body).context("failed to brotli-compress response body")?;
+    Ok(encoder.into_inner())
+}
+
+fn select_compression_encoding(headers: &HeaderMap) -> Option<CompressionEncoding> {
+    let accepted = headers.get(ACCEPT_ENCODING)?.to_str().ok()?;
+    let mut br_q: Option<f32> = None;
+    let mut gzip_q: Option<f32> = None;
+    let mut wildcard_q: Option<f32> = None;
+
+    for item in accepted.split(',') {
+        let mut segments = item.split(';');
+        let encoding = segments.next()?.trim().to_ascii_lowercase();
+        if encoding.is_empty() {
+            continue;
+        }
+        let mut q = 1.0f32;
+        for param in segments {
+            let mut kv = param.trim().splitn(2, '=');
+            let Some(k) = kv.next() else {
+                continue;
+            };
+            let Some(v) = kv.next() else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case("q") {
+                if let Ok(parsed) = v.trim().parse::<f32>() {
+                    q = parsed.clamp(0.0, 1.0);
+                }
+            }
+        }
+        if q <= 0.0 {
+            continue;
+        }
+
+        match encoding.as_str() {
+            "br" => br_q = Some(br_q.map_or(q, |existing| existing.max(q))),
+            "gzip" => gzip_q = Some(gzip_q.map_or(q, |existing| existing.max(q))),
+            "*" => wildcard_q = Some(wildcard_q.map_or(q, |existing| existing.max(q))),
+            _ => {}
+        }
+    }
+
+    let br = br_q.or(wildcard_q).unwrap_or(0.0);
+    let gzip = gzip_q.or(wildcard_q).unwrap_or(0.0);
+    if br <= 0.0 && gzip <= 0.0 {
+        return None;
+    }
+
+    if br >= gzip {
+        Some(CompressionEncoding::Brotli)
+    } else {
+        Some(CompressionEncoding::Gzip)
+    }
 }
 
 fn response_allows_compression(response: &GatewayHttpResponse) -> bool {
@@ -5382,9 +5442,33 @@ mod tests {
     }
 
     #[test]
-    fn finalize_http_response_gzips_compressible_payloads() {
+    fn finalize_http_response_prefers_brotli_for_compressible_payloads() {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
+        let response = GatewayHttpResponse::bytes(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(vec![b'a'; 2048]),
+            "http://127.0.0.1:9000",
+        );
+        let compression = ResponseCompressionConfig {
+            enabled: true,
+            min_length: 128,
+            content_types: vec!["application/json".to_string()],
+        };
+
+        let response = finalize_http_response(&request_headers, &compression, response)
+            .expect("finalize response");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == CONTENT_ENCODING && value == "br"));
+    }
+
+    #[test]
+    fn finalize_http_response_falls_back_to_gzip_when_brotli_disabled() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br;q=0, gzip;q=1"));
         let response = GatewayHttpResponse::bytes(
             StatusCode::OK,
             "application/json",
