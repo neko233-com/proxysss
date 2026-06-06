@@ -284,6 +284,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "services.domain_routes[*].compression enables gzip for matching responses",
     ),
     (
+        "ip allow/deny blacklist",
+        "services.access_control.http supports built-in allow/deny IP and CIDR filtering",
+    ),
+    (
         "http cache",
         "services.domain_routes[*].cache enables bounded in-memory GET response caching",
     ),
@@ -386,6 +390,12 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         status: ParityStatus::Partial,
         evidence: "services.domain_routes compression provides configurable gzip response compression",
         next_gap: "add brotli/zstd and wider policy coverage outside domain routes",
+    },
+    NginxParityItem {
+        capability: "IP allow/deny / blacklist",
+        status: ParityStatus::Supported,
+        evidence: "services.access_control.http provides built-in IP/CIDR allow and deny lists",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "cache/proxy cache",
@@ -789,6 +799,13 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst
     );
+    println!(
+        "access control    : http.enabled={}, allow={}, deny={}, status={}",
+        config.services.access_control.http.enabled,
+        config.services.access_control.http.allow.len(),
+        config.services.access_control.http.deny.len(),
+        config.services.access_control.http.status
+    );
     println!("static sites      : {}", config.services.static_sites.len());
     println!(
         "webdav            : enabled={}, prefix={}, root={}",
@@ -875,6 +892,14 @@ fn render_route_topology(config: &GatewayConfig) -> String {
         config.services.rate_limit.http.window_ms,
         config.services.rate_limit.http.burst,
         config.services.rate_limit.http.status
+    ));
+    output.push_str("[access_control]\n");
+    output.push_str(&format!(
+        "http enabled={} allow={} deny={} status={}\n",
+        config.services.access_control.http.enabled,
+        config.services.access_control.http.allow.join(","),
+        config.services.access_control.http.deny.join(","),
+        config.services.access_control.http.status
     ));
 
     output.push_str("[static_sites]\n");
@@ -1563,6 +1588,7 @@ mod tests {
             "plugin sidecar config",
             "ai api compatibility",
             "auto https",
+            "ip allow/deny blacklist",
             "admin api/console",
             "agent install skill",
         ];
@@ -1614,6 +1640,13 @@ mod tests {
             });
         config.services.webdav.enabled = true;
         config.services.ftp.enabled = true;
+        config.services.access_control.http.enabled = true;
+        config
+            .services
+            .access_control
+            .http
+            .deny
+            .push("203.0.113.0/24".to_string());
         config.tcp.listeners.push(crate::config::TcpListenerConfig {
             name: "chat".to_string(),
             bind: "0.0.0.0:7000".to_string(),
@@ -1633,6 +1666,8 @@ mod tests {
         assert!(topology.contains("api hosts=api.example.com path=/api"));
         assert!(topology.contains("public path=/assets"));
         assert!(topology.contains("[webdav]"));
+        assert!(topology.contains("[access_control]"));
+        assert!(topology.contains("deny=203.0.113.0/24"));
         assert!(topology.contains("chat bind=0.0.0.0:7000 upstream=127.0.0.1:9000"));
         assert!(topology.contains("realtime bind=0.0.0.0:7001 upstream=disabled upstreams=1"));
         assert!(topology.contains("ftp bind=0.0.0.0:21"));
@@ -1693,6 +1728,7 @@ mod tests {
             "ai api passthrough",
             "plugin sidecar configuration",
             "compression",
+            "IP allow/deny / blacklist",
             "cache/proxy cache",
             "rate limiting",
         ] {

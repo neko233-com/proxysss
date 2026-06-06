@@ -4,12 +4,13 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 
 产品目标：作为 nginx 同级通用网关完整替代 nginx 的常见入口职责，同时提供更适合人类和 agent 接管的配置、查询和输出体验。默认 HTTP 端口与 nginx 一致为 80，首页是更友好的 `Welcome to proxysss`。proxysss 不是“业务网关优先”的产品；脚本/插件扩展层类似 nginx + Lua，用来承载可选的业务逻辑。
 
-当前版本：v0.2.6
+当前版本：v0.3.1
 
 ## 核心能力
 
 - 多协议统一入口：HTTP/1.1、HTTP/2（TCP）+ HTTP/3（UDP）+ TCP + UDP
 - 声明式反向代理：`services.domain_routes` 以域名为核心组织 HTTP 反代，支持 per-domain SSL/压缩/缓存；`services.reverse_proxy.routes` 继续兼容 host/path 匹配
+- IP 黑名单/白名单：`services.access_control.http` 支持按 IP / CIDR 内建 allow/deny
 - 限流：`services.rate_limit.http` 支持按 IP、Host 或 Header 的请求速率限制
 - TS/JS 可编程路由：显式开启 script/plugins 后才进入 TypeScript 运行时，默认 HTTP/HTTPS 走 YAML 内建能力
 - 插件机制：作为可选扩展层，支持自动加载、动态 load/unload/list、插件 sidecar YAML/JSON 配置，默认模板插件全部默认关闭
@@ -32,7 +33,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 
 - Windows / Linux / macOS
 - x86_64(amd64) / arm64
-- 脚本运行时：由 proxysss 发布包内置并随安装一起解包，用户不需要额外安装任何解释器或运行时
+- 脚本运行时：内嵌在 proxysss 二进制内，用户不需要额外安装任何解释器或运行时
 
 ## 快速开始
 
@@ -94,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/i
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.2.6
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- v0.3.1
 ```
 
 ### Windows PowerShell
@@ -107,7 +108,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 ```powershell
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.2.6
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version v0.3.1
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action downgrade -Version v0.1.0
 ```
 
@@ -122,9 +123,8 @@ install.ps1 支持参数：
 
 安装脚本会完成：
 
-- 下载对应平台 bundle（内含 proxysss 二进制和内置 TypeScript 运行时）
+- 下载对应平台 bundle（内含 proxysss 单文件二进制）
 - 安装到 PATH 可访问位置
-- 把内置 TypeScript 运行时解包到 proxysss 运行目录
 - 执行 init/check-config
 - 安装并启用服务（开机自启动）
 
@@ -134,7 +134,7 @@ install.ps1 支持参数：
 
 ```bash
 proxysss update --version latest
-proxysss update --version v0.2.6
+proxysss update --version v0.3.1
 proxysss switch-version v0.1.4 --allow-downgrade
 ```
 
@@ -143,7 +143,7 @@ proxysss switch-version v0.1.4 --allow-downgrade
 升级到指定版本：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.2.6
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action upgrade -Version v0.3.1
 ```
 
 降级到指定版本：
@@ -155,7 +155,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 演练模式（不落盘，不修改服务）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.2.6 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Action update -Version v0.3.1 -DryRun
 ```
 
 ### Linux / macOS
@@ -163,7 +163,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Actio
 当前 install.sh 使用版本参数重装目标版本（可用于升级/降级）：
 
 ```bash
-bash ./scripts/install.sh v0.2.6
+bash ./scripts/install.sh v0.3.1
 bash ./scripts/install.sh v0.1.0
 ```
 
@@ -228,6 +228,10 @@ proxysss script eval "console.log('proxysss ts runtime ok')"
 
 目标效果：像 Caddy 那样省心地自动拿证书和续期，但配置风格必须是 proxysss 自己的 YAML，不搬其他产品的配置格式。公网服务器只需要写域名、邮箱和 upstream，proxysss 会把 `services.domain_routes[*].ssl.type=auto` / `is_auto_ssl=true` 与 `http.tls.auto_https` 汇总展开到 ACME 签发/续期流程。
 
+- 自动 HTTPS 当前走 HTTP-01 / TLS-ALPN-01，不需要 CF token、DNS API token 这类额外凭证。
+- 自动续期由网关后台循环触发，默认按 `renew_interval_hours` 周期执行。
+- 当前签发/续期仍调用外部 ACME 客户端（默认 `acme.sh`），所以“零外部依赖”这一项还没做完。
+
 最小生产配置：
 
 ```yaml
@@ -245,6 +249,10 @@ http:
       challenge: tls_alpn01
 
 services:
+  access_control:
+    http:
+      enabled: true
+      blacklist: [203.0.113.10, 198.51.100.0/24]
   domain_routes:
     - name: app
       domains: [example.com, www.example.com]
@@ -258,6 +266,12 @@ services:
       cache:
         enabled: true
         ttl_secs: 30
+  rate_limit:
+    http:
+      enabled: true
+      requests: 120
+      window_ms: 60000
+      burst: 30
 ```
 
 推荐上线顺序：
@@ -283,7 +297,7 @@ sudo setcap cap_net_bind_service=+ep "$(which proxysss)"
 - `auto_https.production: false` 用于测试，避免频繁打正式 ACME CA 触发限流；确认无误后再改成 `true`。
 - 证书和 ACME 缓存目录必须持久化，容器部署时不要放到临时文件系统。
 
-`http.tls.auto_https` 是 proxysss 风格的高层入口；`services.domain_routes[*].ssl.type` / `is_auto_ssl` 则是更贴近“域名即配置核心”的入口。当前底层仍映射到现有 ACME 外部客户端签发/续期流程；`self_signed` 只适合开发或内网。
+`http.tls.auto_https` 是 proxysss 风格的高层入口；`services.domain_routes[*].ssl.type` / `is_auto_ssl` 则是更贴近“域名即配置核心”的入口。当前底层仍映射到现有 ACME 外部客户端签发/续期流程；`self_signed` 只适合开发或内网。`services.access_control.http` 可直接补上公网 IP 黑名单 / 白名单，`services.rate_limit.http` 可直接补上内建请求限流。
 
 手动泛域名 / 多证书 SNI 示例：
 
@@ -469,6 +483,32 @@ config:
         proxysss-ai-profile: openai-chat
 ```
 
+## Nginx 功能对照清单
+
+下面这张表按常见 nginx 入口职责逐项打勾，方便直接看哪些已经落地、哪些还在补齐：
+
+| Nginx 常见入口能力 | 是否做完 | 当前状态 | proxysss 对应能力 / 差距 |
+| --- | --- | --- | --- |
+| 默认 HTTP 80 端口接管 | ✅ | 已完成 | 默认 `http.plain_bind=0.0.0.0:80` |
+| 默认 HTTPS / HTTP3 443 端口接管 | ✅ | 已完成 | 默认 `http.tls_bind/http.h3_bind=0.0.0.0:443` |
+| 声明式反向代理 | ✅ | 已完成 | `services.reverse_proxy.routes` |
+| 静态文件服务 | ✅ | 已完成 | `services.static_sites` |
+| WebDAV | ✅ | 已完成 | 内建常见 WebDAV 方法 |
+| TCP / UDP 四层转发 | ✅ | 已完成 | `tcp.listeners` / `udp.listeners` |
+| FTP 入口 | ⬜ | 部分完成 | 当前是 `services.ftp` TCP passthrough，未做原生 FTP 控制/被动通道感知 |
+| TLS 证书加载 / 多证书 SNI | ✅ | 已完成 | `http.tls.certificates` + 域名级 manual SSL |
+| 自动 HTTPS（无需 CF token / DNS token） | ✅ | 已完成 | `http.tls.auto_https` + HTTP-01/TLS-ALPN-01，写域名和邮箱即可 |
+| 自动 HTTPS 完全内置零外部依赖 | ⬜ | 未完成 | 当前仍默认调用外部 `acme.sh` |
+| 访问日志 / 错误日志 | ✅ | 已完成 | `logs/access.log` / `logs/error.log` |
+| 热重载 | ✅ | 已完成 | 配置、include、脚本、插件都进 fingerprint |
+| 压缩 | ⬜ | 部分完成 | 已支持 gzip；brotli/zstd 待补齐 |
+| IP 黑名单 / 白名单 | ✅ | 已完成 | `services.access_control.http.allow/deny` 支持 IP / CIDR |
+| 缓存 / proxy cache | ⬜ | 部分完成 | 已支持内存 GET 缓存，未做共享区/磁盘层 |
+| 限流 | ⬜ | 部分完成 | 已支持请求速率限制，未做连接数限制/共享区风格策略 |
+| 转发头语义 | ✅ | 已完成 | 自动补齐 `x-real-ip`、`x-forwarded-*`、`forwarded` |
+| AI API / 通用 HTTP 透传 | ✅ | 已完成 | 核心 HTTP 反代 + 可选兼容插件 |
+| 插件 sidecar 配置 | ✅ | 已完成 | `<name>.plugin.yaml/.yml/.json` |
+
 ## 真实业务场景对标补充
 
 下面这组场景是 proxysss 当前版本重点对齐 nginx/通用入口职责时的真实业务视角清单：
@@ -481,7 +521,9 @@ config:
 | WebDAV | 已支持 | 内建常见方法集 |
 | TCP / UDP / FTP 透传 | 已支持 / FTP 部分支持 | FTP 目前仍是 TCP passthrough |
 | HTTP/2 / HTTP/3 入口 | 已支持 | HTTP/2 over TLS/TCP，HTTP/3 over QUIC |
+| 自动 HTTPS + 自动续期 | 已支持 | 无需 CF token / DNS token，当前默认外部 ACME 客户端负责签发/续期 |
 | 真实客户端 IP 透传 | 已增强 | 自动补齐 `x-real-ip`、`x-forwarded-*`、`forwarded` |
+| IP 黑名单 / 白名单 | 已支持 | `services.access_control.http` 支持单 IP 和 CIDR |
 | 热重载 | 已支持 | 配置、主脚本、自动加载插件脚本与 sidecar 一起进入 fingerprint |
 | AI API / New API 转发 | 已支持基础入口 + 可选插件 | 核心先保证 HTTP 代理；插件负责路径兼容、审计 header、地理 header |
 | 压缩 | 部分支持 | `services.domain_routes[*].compression` 已支持 gzip，brotli/zstd 仍待补齐 |

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -384,6 +384,8 @@ pub struct ServicesConfig {
     #[serde(default)]
     pub domain_routes: Vec<DomainRouteConfig>,
     #[serde(default)]
+    pub access_control: AccessControlConfig,
+    #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub webdav: WebDavConfig,
@@ -397,6 +399,29 @@ pub struct ServicesConfig {
 pub struct RateLimitConfig {
     #[serde(default)]
     pub http: HttpRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccessControlConfig {
+    #[serde(default)]
+    pub http: HttpAccessControlConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpAccessControlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, alias = "allowlist", alias = "whitelist")]
+    pub allow: Vec<String>,
+    #[serde(
+        default,
+        alias = "denylist",
+        alias = "blacklist",
+        alias = "blocklist"
+    )]
+    pub deny: Vec<String>,
+    #[serde(default = "default_access_control_status")]
+    pub status: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,6 +691,32 @@ impl GatewayConfig {
                     errors.push(
                         "services.rate_limit.http.key header name cannot be empty".to_string(),
                     );
+                }
+            }
+        }
+
+        if self.services.access_control.http.enabled {
+            if !(100..=599).contains(&self.services.access_control.http.status) {
+                errors.push(
+                    "services.access_control.http.status must be a valid HTTP status".to_string(),
+                );
+            }
+            for (kind, entries) in [
+                ("allow", &self.services.access_control.http.allow),
+                ("deny", &self.services.access_control.http.deny),
+            ] {
+                for (index, entry) in entries.iter().enumerate() {
+                    if entry.trim().is_empty() {
+                        errors.push(format!(
+                            "services.access_control.http.{kind}.{index} cannot be empty"
+                        ));
+                        continue;
+                    }
+                    if !is_valid_ip_rule(entry) {
+                        errors.push(format!(
+                            "services.access_control.http.{kind}.{index} must be an IP or CIDR block: {entry}"
+                        ));
+                    }
                 }
             }
         }
@@ -1510,6 +1561,17 @@ impl Default for HttpRateLimitConfig {
     }
 }
 
+impl Default for HttpAccessControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            status: default_access_control_status(),
+        }
+    }
+}
+
 impl Default for FtpConfig {
     fn default() -> Self {
         Self {
@@ -1926,6 +1988,39 @@ fn default_rate_limit_status() -> u16 {
     429
 }
 
+fn default_access_control_status() -> u16 {
+    403
+}
+
+fn is_valid_ip_rule(value: &str) -> bool {
+    parse_ip_rule(value).is_some()
+}
+
+fn parse_ip_rule(value: &str) -> Option<(IpAddr, u8)> {
+    let value = value.trim();
+    let (ip, prefix) = match value.split_once('/') {
+        Some((addr, prefix)) => {
+            let ip = addr.trim().parse::<IpAddr>().ok()?;
+            let prefix = prefix.trim().parse::<u8>().ok()?;
+            (ip, prefix)
+        }
+        None => {
+            let ip = value.parse::<IpAddr>().ok()?;
+            let prefix = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            (ip, prefix)
+        }
+    };
+
+    match ip {
+        IpAddr::V4(_) if prefix <= 32 => Some((ip, prefix)),
+        IpAddr::V6(_) if prefix <= 128 => Some((ip, prefix)),
+        _ => None,
+    }
+}
+
 fn default_ftp_bind() -> String {
     "0.0.0.0:21".to_string()
 }
@@ -2132,6 +2227,46 @@ mod tests {
         assert!(config.http.tls.certificates[0].key_path.is_absolute());
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn access_control_accepts_blacklist_alias_and_cidr_rules() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-access-control-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "services:\n  access_control:\n    http:\n      enabled: true\n      blacklist: [203.0.113.0/24, 2001:db8::/32]\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(
+            config.services.access_control.http.deny,
+            vec!["203.0.113.0/24".to_string(), "2001:db8::/32".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_access_control_rule() {
+        let mut config = GatewayConfig::default();
+        config.services.access_control.http.enabled = true;
+        config
+            .services
+            .access_control
+            .http
+            .deny
+            .push("203.0.113.1/99".to_string());
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid access control rule");
+        assert!(error.to_string().contains("services.access_control.http.deny.0"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,10 +47,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::config::{
-    AcmeChallengeType, AdminConfig, DomainRouteConfig, GatewayConfig, HttpAffinityConfig,
-    HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey, ResponseCacheConfig,
-    ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig,
-    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    AcmeChallengeType, AdminConfig, DomainRouteConfig, GatewayConfig, HttpAccessControlConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
+    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
+    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
+    WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -1409,6 +1410,12 @@ impl Gateway {
             ));
         }
 
+        if let Some(response) =
+            self.apply_http_access_control(&state.config.services.access_control.http, remote_addr)
+        {
+            return Ok(response);
+        }
+
         if let Some(response) = self.apply_http_rate_limit(
             &state.config.services.rate_limit.http,
             &host,
@@ -1748,6 +1755,21 @@ impl Gateway {
             HeaderValue::from_str(&retry_after).unwrap_or_else(|_| HeaderValue::from_static("1")),
         ));
         Some(response)
+    }
+
+    fn apply_http_access_control(
+        &self,
+        config: &HttpAccessControlConfig,
+        remote_addr: SocketAddr,
+    ) -> Option<GatewayHttpResponse> {
+        let denied = http_access_is_denied(config, remote_addr.ip())?;
+        let status = StatusCode::from_u16(config.status).unwrap_or(StatusCode::FORBIDDEN);
+        Some(GatewayHttpResponse::bytes(
+            status,
+            "text/plain; charset=utf-8",
+            Bytes::from(format!("access denied for {}", denied)),
+            "proxysss://access-control",
+        ))
     }
 
     fn select_upstream_plan(
@@ -3153,6 +3175,83 @@ fn websocket_upgrade_requested(headers: &HeaderMap) -> bool {
 
 fn websocket_upstream_requested(route: &RouteDecision) -> bool {
     route.upstream.starts_with("ws://") || route.upstream.starts_with("wss://")
+}
+
+fn http_access_is_denied(config: &HttpAccessControlConfig, ip: IpAddr) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+
+    if !config.allow.is_empty()
+        && !config
+            .allow
+            .iter()
+            .any(|entry| ip_matches_rule(ip, entry).unwrap_or(false))
+    {
+        return Some(ip.to_string());
+    }
+
+    if config
+        .deny
+        .iter()
+        .any(|entry| ip_matches_rule(ip, entry).unwrap_or(false))
+    {
+        return Some(ip.to_string());
+    }
+
+    None
+}
+
+fn ip_matches_rule(ip: IpAddr, rule: &str) -> Option<bool> {
+    let (base, prefix) = parse_ip_rule(rule)?;
+    match (ip, base) {
+        (IpAddr::V4(ip), IpAddr::V4(base)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            let ip = u32::from_be_bytes(ip.octets());
+            let base = u32::from_be_bytes(base.octets());
+            Some((ip & mask) == (base & mask))
+        }
+        (IpAddr::V6(ip), IpAddr::V6(base)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            let ip = u128::from_be_bytes(ip.octets());
+            let base = u128::from_be_bytes(base.octets());
+            Some((ip & mask) == (base & mask))
+        }
+        _ => Some(false),
+    }
+}
+
+fn parse_ip_rule(rule: &str) -> Option<(IpAddr, u8)> {
+    let rule = rule.trim();
+    let (ip, prefix) = match rule.split_once('/') {
+        Some((addr, prefix)) => {
+            let ip = addr.trim().parse::<IpAddr>().ok()?;
+            let prefix = prefix.trim().parse::<u8>().ok()?;
+            (ip, prefix)
+        }
+        None => {
+            let ip = rule.parse::<IpAddr>().ok()?;
+            let prefix = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            (ip, prefix)
+        }
+    };
+
+    match ip {
+        IpAddr::V4(_) if prefix <= 32 => Some((ip, prefix)),
+        IpAddr::V6(_) if prefix <= 128 => Some((ip, prefix)),
+        _ => None,
+    }
 }
 
 fn http_rate_limit_key(
@@ -5420,6 +5519,44 @@ mod tests {
             apply_http_rate_limit_to_store(&store, &config, "remote:127.0.0.1".to_string())
                 .expect("second request blocked");
         assert!(retry_after.parse::<u64>().expect("retry-after number") > 0);
+    }
+
+    #[test]
+    fn http_access_control_blocks_blacklisted_ip() {
+        let config = HttpAccessControlConfig {
+            enabled: true,
+            allow: Vec::new(),
+            deny: vec!["203.0.113.0/24".to_string()],
+            status: 403,
+        };
+
+        assert_eq!(
+            http_access_is_denied(&config, "203.0.113.20".parse().expect("ip")),
+            Some("203.0.113.20".to_string())
+        );
+        assert_eq!(
+            http_access_is_denied(&config, "198.51.100.20".parse().expect("ip")),
+            None
+        );
+    }
+
+    #[test]
+    fn http_access_control_allowlist_blocks_unknown_ip() {
+        let config = HttpAccessControlConfig {
+            enabled: true,
+            allow: vec!["2001:db8::/32".to_string()],
+            deny: Vec::new(),
+            status: 403,
+        };
+
+        assert_eq!(
+            http_access_is_denied(&config, "2001:db8::1".parse().expect("ip")),
+            None
+        );
+        assert_eq!(
+            http_access_is_denied(&config, "2001:db9::1".parse().expect("ip")),
+            Some("2001:db9::1".to_string())
+        );
     }
 
     #[test]
