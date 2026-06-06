@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.7 - 2026-06-06
+
+- Hardened TypeScript extension execution so startup and hot reload now fall back to YAML-only routing when the script runtime cannot start.
+- Changed auto-loaded plugin handling to warn and skip broken TypeScript plugins instead of aborting gateway startup or reload.
+- Switched script hot reload fingerprints to explicit MD5 content hashing across config and watched script/plugin files.
+- Documented the embedded single-binary TypeScript runtime target in `AGENTS.md` as a required end-state rather than an optional direction.
+
 ## v0.2.6 - 2026-06-06
 
 - Reworked the default port 80 landing page into a compact, single-screen project page with no admin address exposure, protocol coverage, and benchmark highlights.
