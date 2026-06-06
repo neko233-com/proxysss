@@ -2671,9 +2671,7 @@ fn finalize_http_response(
     compression: &ResponseCompressionConfig,
     mut response: GatewayHttpResponse,
 ) -> Result<GatewayHttpResponse> {
-    if !compression.enabled
-        || !response_allows_compression(&response)
-    {
+    if !compression.enabled || !response_allows_compression(&response) {
         return Ok(response);
     }
     let Some(encoding) = select_compression_encoding(request_headers) else {
@@ -2686,8 +2684,14 @@ fn finalize_http_response(
     }
 
     let (compressed, encoding_header) = match encoding {
-        CompressionEncoding::Brotli => (brotli_bytes(&response.body)?, HeaderValue::from_static("br")),
-        CompressionEncoding::Gzip => (gzip_bytes(&response.body)?, HeaderValue::from_static("gzip")),
+        CompressionEncoding::Brotli => (
+            brotli_bytes(&response.body)?,
+            HeaderValue::from_static("br"),
+        ),
+        CompressionEncoding::Gzip => (
+            gzip_bytes(&response.body)?,
+            HeaderValue::from_static("gzip"),
+        ),
     };
     response.body = Bytes::from(compressed);
     response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
@@ -2709,7 +2713,8 @@ fn gzip_bytes(body: &[u8]) -> Result<Vec<u8>> {
 
 fn brotli_bytes(body: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = CompressorWriter::new(Vec::new(), 4096, 5, 22);
-    std::io::Write::write_all(&mut encoder, body).context("failed to brotli-compress response body")?;
+    std::io::Write::write_all(&mut encoder, body)
+        .context("failed to brotli-compress response body")?;
     Ok(encoder.into_inner())
 }
 
@@ -5468,7 +5473,10 @@ mod tests {
     #[test]
     fn finalize_http_response_falls_back_to_gzip_when_brotli_disabled() {
         let mut request_headers = HeaderMap::new();
-        request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br;q=0, gzip;q=1"));
+        request_headers.insert(
+            ACCEPT_ENCODING,
+            HeaderValue::from_static("br;q=0, gzip;q=1"),
+        );
         let response = GatewayHttpResponse::bytes(
             StatusCode::OK,
             "application/json",
