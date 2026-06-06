@@ -121,6 +121,8 @@ pub struct TlsConfig {
     pub mode: TlsMode,
     #[serde(default)]
     pub auto_https: AutoHttpsConfig,
+    #[serde(default)]
+    pub certificates: Vec<TlsCertificateConfig>,
     #[serde(default = "default_cert_path")]
     pub cert_path: PathBuf,
     #[serde(default = "default_key_path")]
@@ -180,6 +182,14 @@ pub struct AcmeExternalConfig {
     pub renew_interval_hours: u64,
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsCertificateConfig {
+    #[serde(default)]
+    pub domains: Vec<String>,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -372,6 +382,8 @@ pub struct ServicesConfig {
     #[serde(default)]
     pub reverse_proxy: ReverseProxyConfig,
     #[serde(default)]
+    pub domain_routes: Vec<DomainRouteConfig>,
+    #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub webdav: WebDavConfig,
@@ -434,6 +446,76 @@ pub struct ReverseProxyRouteConfig {
     pub set_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub strip_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainRouteConfig {
+    pub name: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default = "default_route_path_prefix")]
+    pub path_prefix: String,
+    pub upstream: String,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub strip_prefix: bool,
+    #[serde(default)]
+    pub set_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub strip_headers: Vec<String>,
+    #[serde(default)]
+    pub compression: ResponseCompressionConfig,
+    #[serde(default)]
+    pub cache: ResponseCacheConfig,
+    #[serde(default)]
+    pub ssl: DomainTlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseCompressionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_compression_min_length")]
+    pub min_length: usize,
+    #[serde(default = "default_compression_types")]
+    pub content_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default = "default_cache_statuses")]
+    pub statuses: Vec<u16>,
+    #[serde(default = "default_cache_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainTlsConfig {
+    #[serde(default, rename = "type")]
+    pub mode: DomainTlsMode,
+    #[serde(default)]
+    pub is_auto_ssl: bool,
+    #[serde(default)]
+    pub cert_path: PathBuf,
+    #[serde(default)]
+    pub key_path: PathBuf,
+    #[serde(default)]
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainTlsMode {
+    #[default]
+    Inherit,
+    Disabled,
+    Auto,
+    Manual,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,6 +695,101 @@ impl GatewayConfig {
                     "services.reverse_proxy.routes.{}.hosts cannot contain empty items",
                     route.name
                 ));
+            }
+        }
+
+        let mut domain_route_names = HashSet::<String>::new();
+        for route in &self.services.domain_routes {
+            if route.name.trim().is_empty() {
+                errors.push("services.domain_routes.name cannot be empty".to_string());
+            }
+            if !domain_route_names.insert(route.name.clone()) {
+                errors.push(format!("duplicate domain route name {}", route.name));
+            }
+            if route.domains.is_empty() {
+                errors.push(format!(
+                    "services.domain_routes.{}.domains cannot be empty",
+                    route.name
+                ));
+            }
+            if route.domains.iter().any(|host| host.trim().is_empty()) {
+                errors.push(format!(
+                    "services.domain_routes.{}.domains cannot contain empty items",
+                    route.name
+                ));
+            }
+            if route.path_prefix.trim().is_empty() || !route.path_prefix.starts_with('/') {
+                errors.push(format!(
+                    "services.domain_routes.{}.path_prefix must start with /",
+                    route.name
+                ));
+            }
+            if route.upstream.trim().is_empty() {
+                errors.push(format!(
+                    "services.domain_routes.{}.upstream cannot be empty",
+                    route.name
+                ));
+            }
+            if route.compression.enabled {
+                if route.compression.min_length == 0 {
+                    errors.push(format!(
+                        "services.domain_routes.{}.compression.min_length must be greater than 0",
+                        route.name
+                    ));
+                }
+                if route.compression.content_types.is_empty() {
+                    errors.push(format!(
+                        "services.domain_routes.{}.compression.content_types cannot be empty",
+                        route.name
+                    ));
+                }
+            }
+            if route.cache.enabled {
+                if route.cache.ttl_secs == 0 {
+                    errors.push(format!(
+                        "services.domain_routes.{}.cache.ttl_secs must be greater than 0",
+                        route.name
+                    ));
+                }
+                if route.cache.statuses.is_empty() {
+                    errors.push(format!(
+                        "services.domain_routes.{}.cache.statuses cannot be empty",
+                        route.name
+                    ));
+                }
+                if route.cache.max_body_bytes == 0 {
+                    errors.push(format!(
+                        "services.domain_routes.{}.cache.max_body_bytes must be greater than 0",
+                        route.name
+                    ));
+                }
+            }
+            match route.ssl.effective_mode() {
+                DomainTlsMode::Manual => {
+                    if route.ssl.cert_path.as_os_str().is_empty() {
+                        errors.push(format!(
+                            "services.domain_routes.{}.ssl.cert_path cannot be empty when ssl.type=manual",
+                            route.name
+                        ));
+                    }
+                    if route.ssl.key_path.as_os_str().is_empty() {
+                        errors.push(format!(
+                            "services.domain_routes.{}.ssl.key_path cannot be empty when ssl.type=manual",
+                            route.name
+                        ));
+                    }
+                }
+                DomainTlsMode::Auto => {
+                    if self.http.tls.auto_https.email.trim().is_empty()
+                        && route.ssl.email.trim().is_empty()
+                    {
+                        errors.push(format!(
+                            "services.domain_routes.{}.ssl.email or http.tls.auto_https.email is required when ssl.type=auto",
+                            route.name
+                        ));
+                    }
+                }
+                DomainTlsMode::Disabled | DomainTlsMode::Inherit => {}
             }
         }
 
@@ -823,6 +1000,33 @@ impl GatewayConfig {
             TlsMode::SelfSigned => {}
         }
 
+        for (index, certificate) in self.http.tls.certificates.iter().enumerate() {
+            if certificate.domains.is_empty() {
+                errors.push(format!("http.tls.certificates.{index}.domains cannot be empty"));
+            }
+            if certificate
+                .domains
+                .iter()
+                .any(|domain| domain.trim().is_empty())
+            {
+                errors.push(format!(
+                    "http.tls.certificates.{index}.domains cannot contain empty items"
+                ));
+            }
+            if !certificate.cert_path.exists() {
+                errors.push(format!(
+                    "http.tls.certificates.{index}.cert_path does not exist: {}",
+                    certificate.cert_path.display()
+                ));
+            }
+            if !certificate.key_path.exists() {
+                errors.push(format!(
+                    "http.tls.certificates.{index}.key_path does not exist: {}",
+                    certificate.key_path.display()
+                ));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -869,6 +1073,7 @@ impl GatewayConfig {
     fn normalize(&mut self, root_dir: &Path) {
         let root_dir = normalize_root_dir(root_dir);
         self.root_dir = root_dir.clone();
+        self.normalize_domain_tls(&root_dir);
         self.apply_auto_https();
 
         if self.logging.filter.trim().is_empty() {
@@ -879,6 +1084,12 @@ impl GatewayConfig {
         self.http.tls.cert_path = absolutize(&root_dir, &self.http.tls.cert_path);
         self.http.tls.key_path = absolutize(&root_dir, &self.http.tls.key_path);
         self.http.tls.acme.cache_dir = absolutize(&root_dir, &self.http.tls.acme.cache_dir);
+        normalize_vec_lowercase(&mut self.http.tls.auto_https.domains);
+        for certificate in &mut self.http.tls.certificates {
+            normalize_vec_lowercase(&mut certificate.domains);
+            certificate.cert_path = absolutize(&root_dir, &certificate.cert_path);
+            certificate.key_path = absolutize(&root_dir, &certificate.key_path);
+        }
         self.plugins.auto_load_dir = absolutize(&root_dir, &self.plugins.auto_load_dir);
         self.logging.access_log_path = absolutize(&root_dir, &self.logging.access_log_path);
         self.logging.error_log_path = absolutize(&root_dir, &self.logging.error_log_path);
@@ -894,6 +1105,51 @@ impl GatewayConfig {
 
         normalize_vec_lowercase(&mut self.affinity.http.header_keys);
         normalize_vec_lowercase(&mut self.logging.redact_headers);
+    }
+
+    fn normalize_domain_tls(&mut self, root_dir: &Path) {
+        let mut auto_domains = BTreeMap::<String, String>::new();
+        let mut certificates = Vec::<TlsCertificateConfig>::new();
+        for route in &mut self.services.domain_routes {
+            normalize_vec_lowercase(&mut route.domains);
+            normalize_vec_lowercase(&mut route.compression.content_types);
+            route.ssl.cert_path = absolutize_optional(root_dir, &route.ssl.cert_path);
+            route.ssl.key_path = absolutize_optional(root_dir, &route.ssl.key_path);
+
+            match route.ssl.effective_mode() {
+                DomainTlsMode::Manual => {
+                    let domains = if route.domains.is_empty() {
+                        Vec::new()
+                    } else {
+                        route.domains.clone()
+                    };
+                    certificates.push(TlsCertificateConfig {
+                        domains,
+                        cert_path: route.ssl.cert_path.clone(),
+                        key_path: route.ssl.key_path.clone(),
+                    });
+                }
+                DomainTlsMode::Auto => {
+                    for domain in &route.domains {
+                        auto_domains.entry(domain.clone()).or_insert_with(|| route.ssl.email.clone());
+                    }
+                }
+                DomainTlsMode::Disabled | DomainTlsMode::Inherit => {}
+            }
+        }
+        self.http.tls.certificates.extend(certificates);
+
+        if !auto_domains.is_empty() {
+            self.http.tls.auto_https.enabled = true;
+            for (domain, email) in auto_domains {
+                if !self.http.tls.auto_https.domains.iter().any(|item| item == &domain) {
+                    self.http.tls.auto_https.domains.push(domain);
+                }
+                if self.http.tls.auto_https.email.trim().is_empty() && !email.trim().is_empty() {
+                    self.http.tls.auto_https.email = email;
+                }
+            }
+        }
     }
 
     fn apply_auto_https(&mut self) {
@@ -973,6 +1229,7 @@ impl Default for TlsConfig {
         Self {
             mode: TlsMode::default(),
             auto_https: AutoHttpsConfig::default(),
+            certificates: Vec::new(),
             cert_path: default_cert_path(),
             key_path: default_key_path(),
             generate_self_signed_if_missing: default_true(),
@@ -1008,6 +1265,16 @@ impl Default for AcmeExternalConfig {
             directory_production: false,
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
+        }
+    }
+
+    impl Default for TlsCertificateConfig {
+        fn default() -> Self {
+            Self {
+                domains: Vec::new(),
+                cert_path: default_cert_path(),
+                key_path: default_key_path(),
+            }
         }
     }
 }
@@ -1156,6 +1423,67 @@ impl Default for ReverseProxyRouteConfig {
             strip_headers: Vec::new(),
         }
     }
+
+    impl Default for DomainRouteConfig {
+        fn default() -> Self {
+            Self {
+                name: "app".to_string(),
+                domains: vec!["example.com".to_string()],
+                path_prefix: default_route_path_prefix(),
+                upstream: "http://127.0.0.1:8080".to_string(),
+                upstreams: Vec::new(),
+                strip_prefix: false,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+                ssl: DomainTlsConfig::default(),
+            }
+        }
+    }
+
+    impl Default for ResponseCompressionConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                min_length: default_compression_min_length(),
+                content_types: default_compression_types(),
+            }
+        }
+    }
+
+    impl Default for ResponseCacheConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                ttl_secs: default_cache_ttl_secs(),
+                statuses: default_cache_statuses(),
+                max_body_bytes: default_cache_max_body_bytes(),
+            }
+        }
+    }
+
+    impl Default for DomainTlsConfig {
+        fn default() -> Self {
+            Self {
+                mode: DomainTlsMode::default(),
+                is_auto_ssl: false,
+                cert_path: PathBuf::new(),
+                key_path: PathBuf::new(),
+                email: String::new(),
+            }
+        }
+    }
+
+    impl DomainTlsConfig {
+        pub fn effective_mode(&self) -> DomainTlsMode {
+            if self.is_auto_ssl {
+                DomainTlsMode::Auto
+            } else {
+                self.mode
+            }
+        }
+    }
 }
 
 impl Default for HttpRateLimitConfig {
@@ -1274,6 +1602,14 @@ fn absolutize(root: &Path, path: &Path) -> PathBuf {
         root.join(path)
     };
     normalize_path_lexically(&path)
+}
+
+fn absolutize_optional(root: &Path, path: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        absolutize(root, path)
+    }
 }
 
 fn normalize_root_dir(root_dir: &Path) -> PathBuf {
@@ -1541,6 +1877,32 @@ fn default_route_path_prefix() -> String {
     "/".to_string()
 }
 
+fn default_compression_min_length() -> usize {
+    1024
+}
+
+fn default_compression_types() -> Vec<String> {
+    vec![
+        "text/".to_string(),
+        "application/json".to_string(),
+        "application/javascript".to_string(),
+        "application/xml".to_string(),
+        "image/svg+xml".to_string(),
+    ]
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    30
+}
+
+fn default_cache_statuses() -> Vec<u16> {
+    vec![200, 203, 204, 301, 302, 404]
+}
+
+fn default_cache_max_body_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
 fn default_rate_limit_requests() -> u32 {
     60
 }
@@ -1706,6 +2068,55 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("http.tls.auto_https.domains"));
         assert!(message.contains("http.tls.auto_https.email"));
+    }
+
+    #[test]
+    fn domain_auto_ssl_expands_into_global_auto_https() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-domain-auto-ssl-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "services:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      ssl:\n        type: auto\n        email: admin@example.com\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert!(config.http.tls.auto_https.enabled);
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeExternal);
+        assert_eq!(config.http.tls.auto_https.email, "admin@example.com");
+        assert!(config
+            .http
+            .tls
+            .auto_https
+            .domains
+            .contains(&"example.com".to_string()));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn domain_manual_ssl_paths_are_absolutized_into_sni_certificates() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-domain-manual-ssl-test-{}", std::process::id()));
+        let cert_dir = base_dir.join("certs");
+        fs::create_dir_all(&cert_dir).expect("create temp config dir");
+        fs::write(cert_dir.join("edge.pem"), "test").expect("write cert");
+        fs::write(cert_dir.join("edge.key"), "test").expect("write key");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "services:\n  domain_routes:\n    - name: edge\n      domains: [edge.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      ssl:\n        type: manual\n        cert_path: ./certs/edge.pem\n        key_path: ./certs/edge.key\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(config.http.tls.certificates.len(), 1);
+        assert!(config.http.tls.certificates[0].cert_path.is_absolute());
+        assert!(config.http.tls.certificates[0].key_path.is_absolute());
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

@@ -229,6 +229,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "http reverse proxy",
         "built-in services.reverse_proxy routes with host/path matching, upstream pools, and strip_prefix",
     ),
+    (
+        "domain-centric reverse proxy",
+        "services.domain_routes treats domain as the primary HTTP reverse proxy unit with per-domain ssl/compression/cache",
+    ),
     ("https/http2 termination", "supported"),
     ("http3/quic", "supported"),
     ("websocket/ws/wss", "supported"),
@@ -270,6 +274,18 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     (
         "auto https",
         "proxysss YAML style http.tls.auto_https expands to ACME external certificate issue/renew",
+    ),
+    (
+        "multi-cert sni",
+        "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname",
+    ),
+    (
+        "gzip compression",
+        "services.domain_routes[*].compression enables gzip for matching responses",
+    ),
+    (
+        "http cache",
+        "services.domain_routes[*].cache enables bounded in-memory GET response caching",
     ),
     (
         "admin api/console",
@@ -342,9 +358,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "TLS certificates",
-        status: ParityStatus::Partial,
-        evidence: "self_signed/manual/acme_external modes plus proxysss YAML auto_https sugar",
-        next_gap: "first-class multi-cert/SNI certificate selection",
+        status: ParityStatus::Supported,
+        evidence: "self_signed/manual/acme_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "access/error logging",
@@ -361,15 +377,15 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "compression",
-        status: ParityStatus::Missing,
-        evidence: "no gzip/brotli response filter yet",
-        next_gap: "add configurable gzip/brotli response compression",
+        status: ParityStatus::Partial,
+        evidence: "services.domain_routes compression provides configurable gzip response compression",
+        next_gap: "add brotli/zstd and wider policy coverage outside domain routes",
     },
     NginxParityItem {
         capability: "cache/proxy cache",
-        status: ParityStatus::Missing,
-        evidence: "no on-disk or memory proxy cache yet",
-        next_gap: "add proxy cache zones and cache key policy",
+        status: ParityStatus::Partial,
+        evidence: "services.domain_routes cache provides bounded in-memory GET response caching",
+        next_gap: "add shared cache zones, purge controls, and on-disk cache tiers",
     },
     NginxParityItem {
         capability: "rate limiting",
@@ -757,6 +773,10 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.reverse_proxy.routes.len()
     );
     println!(
+        "domain routes     : routes={}",
+        config.services.domain_routes.len()
+    );
+    println!(
         "rate limit        : http.enabled={}, requests={}, window_ms={}, burst={}",
         config.services.rate_limit.http.enabled,
         config.services.rate_limit.http.requests,
@@ -817,6 +837,27 @@ fn render_route_topology(config: &GatewayConfig) -> String {
                 route.upstreams.len(),
                 route.strip_prefix
             ));
+        }
+
+        output.push_str("[domain_routes]\n");
+        if config.services.domain_routes.is_empty() {
+            output.push_str("none\n");
+        } else {
+            for route in &config.services.domain_routes {
+                output.push_str(&format!(
+                    "{} domains={} path={} upstream={} upstreams={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={}\n",
+                    route.name,
+                    route.domains.join(","),
+                    route.path_prefix,
+                    route.upstream,
+                    route.upstreams.len(),
+                    route.strip_prefix,
+                    route.ssl.mode,
+                    route.ssl.is_auto_ssl,
+                    route.compression.enabled,
+                    route.cache.enabled
+                ));
+            }
         }
     }
 
@@ -962,10 +1003,10 @@ fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
 fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
     match kind {
         ConfigTemplateKind::Full => {
-            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: app\n        hosts: [example.com]\n        path_prefix: /\n        upstream: http://127.0.0.1:9000\n"
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n"
         }
         ConfigTemplateKind::Http => {
-            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  reverse_proxy:\n    routes:\n      - name: api\n        hosts: [api.example.com]\n        path_prefix: /api\n        upstream: http://127.0.0.1:8080\n        upstreams:\n          - http://127.0.0.1:8080\n          - http://127.0.0.1:8081\n        strip_prefix: true\n"
+            "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n"
         }
         ConfigTemplateKind::Tcp => {
             "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"

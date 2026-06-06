@@ -13,8 +13,13 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use h3::server::Connection as H3Connection;
-use http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, LOCATION};
+use http::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    COOKIE, HOST, LOCATION, SET_COOKIE, VARY,
+};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
@@ -28,7 +33,9 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::ClientConfig;
+use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::Deserialize;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,9 +47,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::config::{
-    AcmeChallengeType, AdminConfig, GatewayConfig, HttpAffinityConfig, HttpRateLimitConfig,
-    LoadBalanceAlgorithm, RateLimitKey, ReverseProxyRouteConfig, StaticSiteConfig,
-    StreamAffinityConfig, TcpListenerConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    AcmeChallengeType, AdminConfig, DomainRouteConfig, DomainTlsMode, GatewayConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
+    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
+    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
+    WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -57,6 +66,7 @@ pub struct Gateway {
     round_robin_state: Arc<DashMap<String, u64>>,
     upstream_runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
     http_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
+    http_cache: Arc<DashMap<String, CachedHttpEntry>>,
 }
 
 struct DynamicState {
@@ -89,6 +99,27 @@ struct UpstreamRuntimeState {
 struct RateLimitBucket {
     window_start: Instant,
     count: u32,
+}
+
+#[derive(Clone)]
+struct CachedHttpEntry {
+    expires_at: Instant,
+    status: StatusCode,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Bytes,
+    upstream: String,
+}
+
+#[derive(Clone)]
+struct HttpRouteConfig {
+    decision: RouteDecision,
+    compression: ResponseCompressionConfig,
+    cache: ResponseCacheConfig,
+}
+
+struct SniResolver {
+    default: Arc<CertifiedKey>,
+    by_name: BTreeMap<String, Arc<CertifiedKey>>,
 }
 
 #[derive(Default)]
@@ -189,6 +220,25 @@ impl ServerCertVerifier for InsecureUpstreamVerifier {
     }
 }
 
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name()?.to_ascii_lowercase();
+        if let Some(certified) = self.by_name.get(&server_name) {
+            return Some(certified.clone());
+        }
+
+        let labels = server_name.split('.').collect::<Vec<_>>();
+        for index in 1..labels.len() {
+            let suffix = format!(".{}", labels[index..].join("."));
+            if let Some(certified) = self.by_name.get(&suffix) {
+                return Some(certified.clone());
+            }
+        }
+
+        Some(self.default.clone())
+    }
+}
+
 impl UpstreamLease {
     fn acquire(runtime: Arc<DashMap<String, UpstreamRuntimeState>>, key: String) -> Self {
         {
@@ -223,6 +273,7 @@ impl Gateway {
             round_robin_state: Arc::new(DashMap::new()),
             upstream_runtime: Arc::new(DashMap::new()),
             http_rate_limits: Arc::new(DashMap::new()),
+            http_cache: Arc::new(DashMap::new()),
         }))
     }
 
@@ -1388,12 +1439,12 @@ impl Gateway {
             return Ok(dispatch_internal_http(&state.config, &route));
         }
 
-        let route = if let Some(route) = configured_reverse_proxy_route(&state.config, &host, &uri)
-        {
+        let route = if let Some(route) = configured_http_route(&state.config, &host, &uri) {
             route
         } else if let Some(script) = &state.script {
-            script
-                .route_http(HttpContext {
+            HttpRouteConfig {
+                decision: script
+                    .route_http(HttpContext {
                     request_id: request_id.clone(),
                     host: host.clone(),
                     method: method.as_str().to_string(),
@@ -1409,7 +1460,10 @@ impl Gateway {
                 .await
                 .inspect_err(|_| {
                     self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                })?
+                })?,
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+            }
         } else {
             return Ok(GatewayHttpResponse::error(
                 StatusCode::NOT_FOUND,
@@ -1417,11 +1471,12 @@ impl Gateway {
             ));
         };
 
-        if route.upstream.starts_with("proxysss://") {
-            return Ok(dispatch_internal_http(&state.config, &route));
+        if route.decision.upstream.starts_with("proxysss://") {
+            let response = dispatch_internal_http(&state.config, &route.decision);
+            return Ok(finalize_http_response(&headers, &route.compression, response)?);
         }
 
-        if websocket_upgrade_requested(&headers) || websocket_upstream_requested(&route) {
+        if websocket_upgrade_requested(&headers) || websocket_upstream_requested(&route.decision) {
             let on_upgrade = on_upgrade.ok_or_else(|| {
                 anyhow!("websocket route requires an HTTP/1.1 upgrade-capable request")
             })?;
@@ -1434,18 +1489,29 @@ impl Gateway {
                     remote_addr,
                     scheme,
                     &host,
-                    &route,
+                    &route.decision,
                     on_upgrade,
                 )
                 .await;
         }
 
+        let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
+        if let Some(cache_key) = cache_key.as_deref() {
+            if let Some(response) = self.load_cached_http_response(cache_key) {
+                return Ok(finalize_http_response(&headers, &route.compression, response)?);
+            }
+        }
+
         let upstream_plan = self.select_upstream_plan(
             &state.config,
-            &route,
+            &route.decision,
             "http",
             None,
-            route.affinity_key.as_deref().or(player_id.as_deref()),
+            route
+                .decision
+                .affinity_key
+                .as_deref()
+                .or(player_id.as_deref()),
             Some(&remote_addr.to_string()),
         );
         let max_attempts = if state.config.load_balance.retries.enabled {
@@ -1459,9 +1525,9 @@ impl Gateway {
         let mut last_error: Option<anyhow::Error> = None;
 
         for (attempt, upstream) in upstream_plan.iter().take(max_attempts).enumerate() {
-            let upstream_url = build_upstream_url(upstream, &route, &uri)?;
+            let upstream_url = build_upstream_url(upstream, &route.decision, &uri)?;
             let upstream_headers =
-                build_upstream_headers(&headers, &route, &host, remote_addr, scheme)?;
+                build_upstream_headers(&headers, &route.decision, &host, remote_addr, scheme)?;
             let _lease = self.acquire_upstream_lease("http", None, upstream);
 
             let send_result = state
@@ -1507,12 +1573,16 @@ impl Gateway {
             }
 
             self.on_upstream_success("http", None, upstream);
-            return Ok(GatewayHttpResponse {
+            let response = GatewayHttpResponse {
                 status,
                 headers: response_headers,
                 body: response_body,
                 upstream: upstream.clone(),
-            });
+            };
+            if let Some(cache_key) = cache_key.as_deref() {
+                self.store_cached_http_response(cache_key, &route.cache, &response);
+            }
+            return Ok(finalize_http_response(&headers, &route.compression, response)?);
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("upstream request failed after retries")))
@@ -1605,6 +1675,49 @@ impl Gateway {
 
     async fn current_state(&self) -> Arc<DynamicState> {
         self.dynamic.read().await.clone()
+    }
+
+    fn load_cached_http_response(&self, key: &str) -> Option<GatewayHttpResponse> {
+        let now = Instant::now();
+        let entry = self.http_cache.get(key)?;
+        if entry.expires_at <= now {
+            drop(entry);
+            self.http_cache.remove(key);
+            return None;
+        }
+        Some(GatewayHttpResponse {
+            status: entry.status,
+            headers: entry.headers.clone(),
+            body: entry.body.clone(),
+            upstream: entry.upstream.clone(),
+        })
+    }
+
+    fn store_cached_http_response(
+        &self,
+        key: &str,
+        config: &ResponseCacheConfig,
+        response: &GatewayHttpResponse,
+    ) {
+        if !config.enabled
+            || response.body.len() > config.max_body_bytes
+            || !config.statuses.iter().any(|status| *status == response.status.as_u16())
+            || response.headers.iter().any(|(name, _)| name == SET_COOKIE)
+            || cache_control_prevents_storage(&response.headers)
+        {
+            return;
+        }
+
+        self.http_cache.insert(
+            key.to_string(),
+            CachedHttpEntry {
+                expires_at: Instant::now() + Duration::from_secs(config.ttl_secs),
+                status: response.status,
+                headers: response.headers.clone(),
+                body: response.body.clone(),
+                upstream: response.upstream.clone(),
+            },
+        );
     }
 
     fn apply_http_rate_limit(
@@ -2306,6 +2419,16 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
         }
     }
 
+    for certificate in &config.http.tls.certificates {
+        if !certificate.cert_path.exists() || !certificate.key_path.exists() {
+            return Err(anyhow!(
+                "configured sni cert/key files are missing: {} {}",
+                certificate.cert_path.display(),
+                certificate.key_path.display()
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -2313,15 +2436,53 @@ fn build_rustls_server_config(
     config: &GatewayConfig,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<rustls::ServerConfig> {
-    let certs = load_certs(&config.http.tls.cert_path)?;
-    let key = load_private_key(&config.http.tls.key_path)?;
-
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("failed building rustls server config")?;
+        .with_cert_resolver(build_tls_resolver(config)?);
     server_config.alpn_protocols = alpn_protocols;
     Ok(server_config)
+}
+
+fn build_tls_resolver(config: &GatewayConfig) -> Result<Arc<dyn ResolvesServerCert>> {
+    let default = Arc::new(build_certified_key(
+        &config.http.tls.cert_path,
+        &config.http.tls.key_path,
+    )?);
+    let mut by_name = BTreeMap::<String, Arc<CertifiedKey>>::new();
+
+    for certificate in &config.http.tls.certificates {
+        let certified = Arc::new(build_certified_key(
+            &certificate.cert_path,
+            &certificate.key_path,
+        )?);
+        insert_certificate_domains(&mut by_name, certified, certificate);
+    }
+
+    Ok(Arc::new(SniResolver { default, by_name }))
+}
+
+fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|error| anyhow!("failed loading private key {}: {error}", key_path.display()))?;
+    Ok(CertifiedKey::new(certs, signing_key))
+}
+
+fn insert_certificate_domains(
+    by_name: &mut BTreeMap<String, Arc<CertifiedKey>>,
+    certified: Arc<CertifiedKey>,
+    certificate: &TlsCertificateConfig,
+) {
+    for domain in &certificate.domains {
+        by_name.insert(domain.to_ascii_lowercase(), certified.clone());
+        if let Some(suffix) = domain.strip_prefix("*.") {
+            by_name.insert(format!(".{}", suffix.to_ascii_lowercase()), certified.clone());
+        }
+    }
 }
 
 fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<()> {
@@ -2468,6 +2629,128 @@ fn build_upstream_headers(
     apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
 
     Ok(headers)
+}
+
+fn finalize_http_response(
+    request_headers: &HeaderMap,
+    compression: &ResponseCompressionConfig,
+    mut response: GatewayHttpResponse,
+) -> Result<GatewayHttpResponse> {
+    if !compression.enabled || !accepts_gzip(request_headers) || !response_allows_compression(&response) {
+        return Ok(response);
+    }
+    if response.body.len() < compression.min_length || !content_type_matches(&response, &compression.content_types) {
+        return Ok(response);
+    }
+
+    let compressed = gzip_bytes(&response.body)?;
+    response.body = Bytes::from(compressed);
+    response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
+    response.headers.push((CONTENT_ENCODING, HeaderValue::from_static("gzip")));
+    append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
+    response.headers.push((
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&response.body.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    ));
+    Ok(response)
+}
+
+fn gzip_bytes(body: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    std::io::Write::write_all(&mut encoder, body).context("failed to gzip response body")?;
+    encoder.finish().context("failed to finalize gzip response")
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|item| item.trim().starts_with("gzip")))
+        .unwrap_or(false)
+}
+
+fn response_allows_compression(response: &GatewayHttpResponse) -> bool {
+    !response.body.is_empty()
+        && response.status != StatusCode::NO_CONTENT
+        && response.status != StatusCode::NOT_MODIFIED
+        && !response
+            .headers
+            .iter()
+            .any(|(name, _)| name == CONTENT_ENCODING)
+}
+
+fn content_type_matches(response: &GatewayHttpResponse, patterns: &[String]) -> bool {
+    let content_type = response
+        .headers
+        .iter()
+        .find(|(name, _)| name == CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        if pattern.ends_with('/') {
+            content_type.starts_with(&pattern)
+        } else {
+            content_type.starts_with(&pattern)
+        }
+    })
+}
+
+fn append_or_insert_header(
+    headers: &mut Vec<(HeaderName, HeaderValue)>,
+    name: HeaderName,
+    value: &str,
+) -> Result<()> {
+    if let Some((_, existing)) = headers.iter_mut().find(|(header_name, _)| *header_name == name) {
+        let merged = format!("{}, {}", existing.to_str().unwrap_or_default(), value);
+        *existing = HeaderValue::from_str(merged.trim_matches(|c| c == ',' || c == ' '))
+            .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+    } else {
+        headers.push((
+            name,
+            HeaderValue::from_str(value)
+                .with_context(|| format!("invalid header value for {}", name.as_str()))?,
+        ));
+    }
+    Ok(())
+}
+
+fn cache_lookup_key(
+    config: &ResponseCacheConfig,
+    method: &Method,
+    host: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if !config.enabled
+        || *method != Method::GET
+        || headers.contains_key(AUTHORIZATION)
+        || headers.contains_key(COOKIE)
+    {
+        return None;
+    }
+
+    Some(format!(
+        "{}:{}:{}",
+        method.as_str(),
+        host.to_ascii_lowercase(),
+        uri.path_and_query().map(|value| value.as_str()).unwrap_or("/")
+    ))
+}
+
+fn cache_control_prevents_storage(headers: &[(HeaderName, HeaderValue)]) -> bool {
+    headers
+        .iter()
+        .find(|(name, _)| name == CACHE_CONTROL)
+        .and_then(|(_, value)| value.to_str().ok())
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("no-store") || value.contains("private")
+        })
+        .unwrap_or(false)
 }
 
 fn apply_forwarding_headers(
@@ -3045,11 +3328,29 @@ pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, Str
     env
 }
 
+fn configured_http_route(config: &GatewayConfig, host: &str, uri: &Uri) -> Option<HttpRouteConfig> {
+    configured_domain_route(config, host, uri).or_else(|| configured_reverse_proxy_route(config, host, uri))
+}
+
+fn configured_domain_route(
+    config: &GatewayConfig,
+    host: &str,
+    uri: &Uri,
+) -> Option<HttpRouteConfig> {
+    config
+        .services
+        .domain_routes
+        .iter()
+        .filter(|route| domain_route_matches(route, host, uri.path()))
+        .max_by_key(|route| route.path_prefix.len())
+        .map(|route| domain_route_config(route, uri))
+}
+
 fn configured_reverse_proxy_route(
     config: &GatewayConfig,
     host: &str,
     uri: &Uri,
-) -> Option<RouteDecision> {
+) -> Option<HttpRouteConfig> {
     config
         .services
         .reverse_proxy
@@ -3057,7 +3358,16 @@ fn configured_reverse_proxy_route(
         .iter()
         .filter(|route| reverse_proxy_route_matches(route, host, uri.path()))
         .max_by_key(|route| route.path_prefix.len())
-        .map(|route| reverse_proxy_route_decision(route, uri))
+        .map(|route| HttpRouteConfig {
+            decision: reverse_proxy_route_decision(route, uri),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+        })
+}
+
+fn domain_route_matches(route: &DomainRouteConfig, host: &str, path: &str) -> bool {
+    route.domains.iter().any(|item| host_matches(item, host))
+        && reverse_proxy_path_matches(&route.path_prefix, path)
 }
 
 fn reverse_proxy_route_matches(route: &ReverseProxyRouteConfig, host: &str, path: &str) -> bool {
@@ -3065,7 +3375,11 @@ fn reverse_proxy_route_matches(route: &ReverseProxyRouteConfig, host: &str, path
         return false;
     }
 
-    let prefix = normalize_route_prefix(&route.path_prefix);
+    reverse_proxy_path_matches(&route.path_prefix, path)
+}
+
+fn reverse_proxy_path_matches(prefix: &str, path: &str) -> bool {
+    let prefix = normalize_route_prefix(prefix);
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
@@ -3101,6 +3415,37 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
         match uri.query() {
             Some(query) => format!("{path}?{query}"),
             None => path,
+        }
+
+        fn domain_route_config(route: &DomainRouteConfig, uri: &Uri) -> HttpRouteConfig {
+            HttpRouteConfig {
+                decision: RouteDecision {
+                    upstream: route.upstream.clone(),
+                    upstreams: route.upstreams.clone(),
+                    affinity_key: None,
+                    rewrite_path: route.strip_prefix.then(|| {
+                        let prefix = normalize_route_prefix(&route.path_prefix);
+                        let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
+                        let path = if suffix.is_empty() {
+                            "/".to_string()
+                        } else if suffix.starts_with('/') {
+                            suffix.to_string()
+                        } else {
+                            format!("/{suffix}")
+                        };
+                        match uri.query() {
+                            Some(query) => format!("{path}?{query}"),
+                            None => path,
+                        }
+                    }),
+                    set_headers: route.set_headers.clone(),
+                    strip_headers: route.strip_headers.clone(),
+                    status: None,
+                    content_type: None,
+                },
+                compression: route.compression.clone(),
+                cache: route.cache.clone(),
+            }
         }
     });
 
@@ -4875,7 +5220,64 @@ mod tests {
         let uri: Uri = "/api/admin/users".parse().expect("valid uri");
         let decision =
             configured_reverse_proxy_route(&config, "example.com", &uri).expect("matched route");
-        assert_eq!(decision.upstream, "http://127.0.0.1:9090");
+        assert_eq!(decision.decision.upstream, "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn configured_domain_route_matches_host_and_enables_features() {
+        let mut config = GatewayConfig::default();
+        config.services.domain_routes.push(DomainRouteConfig {
+            name: "app".to_string(),
+            domains: vec!["example.com".to_string()],
+            path_prefix: "/".to_string(),
+            upstream: "http://127.0.0.1:9000".to_string(),
+            upstreams: vec!["http://127.0.0.1:9001".to_string()],
+            strip_prefix: false,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig {
+                enabled: true,
+                min_length: 128,
+                content_types: vec!["application/json".to_string()],
+            },
+            cache: ResponseCacheConfig {
+                enabled: true,
+                ttl_secs: 5,
+                statuses: vec![200],
+                max_body_bytes: 4096,
+            },
+            ssl: crate::config::DomainTlsConfig::default(),
+        });
+
+        let uri: Uri = "/".parse().expect("valid uri");
+        let route = configured_http_route(&config, "example.com", &uri).expect("matched route");
+        assert_eq!(route.decision.upstream, "http://127.0.0.1:9000");
+        assert!(route.compression.enabled);
+        assert!(route.cache.enabled);
+    }
+
+    #[test]
+    fn finalize_http_response_gzips_compressible_payloads() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
+        let response = GatewayHttpResponse::bytes(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(vec![b'a'; 2048]),
+            "http://127.0.0.1:9000",
+        );
+        let compression = ResponseCompressionConfig {
+            enabled: true,
+            min_length: 128,
+            content_types: vec!["application/json".to_string()],
+        };
+
+        let response = finalize_http_response(&request_headers, &compression, response)
+            .expect("finalize response");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == CONTENT_ENCODING && value == "gzip"));
     }
 
     #[test]
