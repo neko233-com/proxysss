@@ -38,7 +38,7 @@ function emit(
 export default {
   name: "structured-log",
   priority: -150,
-  enabled: true,
+  enabled: false,
 
   log({ message, route }: { message: GatewayMessage; route: RouteDecision }) {
     if (!route.upstream) {

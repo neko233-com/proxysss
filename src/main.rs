@@ -252,8 +252,20 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "configuration, explicit includes, main script, and auto-loaded plugins are fingerprinted",
     ),
     (
+        "forwarded headers",
+        "x-real-ip, x-forwarded-for, x-forwarded-host, x-forwarded-proto, and forwarded are injected on upstream requests",
+    ),
+    (
         "logging levels",
         "debug/info/warn/error with info as default, debug reserved for internal diagnostics, file sinks at logs/access.log and logs/error.log",
+    ),
+    (
+        "plugin sidecar config",
+        "auto-loaded plugins may read <name>.plugin.yaml/.yml/.json for enabled/priority/config without external runtime",
+    ),
+    (
+        "ai api compatibility",
+        "generic HTTP proxying works for OpenAI-compatible/New API style traffic; optional default-off plugin templates add host/path rewrite and audit headers",
     ),
     (
         "auto https",
@@ -364,6 +376,27 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         status: ParityStatus::Partial,
         evidence: "services.rate_limit.http fixed-window request limiter",
         next_gap: "add connection limiting and shared-zone style policies",
+    },
+    NginxParityItem {
+        capability: "forwarding header semantics",
+        status: ParityStatus::Supported,
+        evidence:
+            "proxy layer injects x-real-ip, x-forwarded-for, x-forwarded-host, x-forwarded-proto, and forwarded",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "ai api passthrough",
+        status: ParityStatus::Supported,
+        evidence:
+            "generic reverse proxy routes handle bearer/api-key headers and optional plugin rewrite/audit hooks for OpenAI-compatible and New API traffic",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "plugin sidecar configuration",
+        status: ParityStatus::Supported,
+        evidence:
+            "auto-loaded plugins read <name>.plugin.yaml/.yml/.json for enabled/priority/config while remaining default-off",
+        next_gap: "",
     },
 ];
 
@@ -1478,7 +1511,10 @@ mod tests {
             "webdav",
             "explicit sub-config",
             "hot reload",
+            "forwarded headers",
             "logging levels",
+            "plugin sidecar config",
+            "ai api compatibility",
             "auto https",
             "admin api/console",
             "agent install skill",
@@ -1606,6 +1642,9 @@ mod tests {
             "static file service",
             "WebDAV",
             "hot reload",
+            "forwarding header semantics",
+            "ai api passthrough",
+            "plugin sidecar configuration",
             "compression",
             "cache/proxy cache",
             "rate limiting",

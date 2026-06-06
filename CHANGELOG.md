@@ -9,6 +9,9 @@
 - Reworked `proxysss script run-file` / `proxysss script eval` to execute through the embedded engine instead of spawning deno.
 - Removed deno download/bundling from release, deploy, and install packaging; release artifacts are now a single self-contained binary.
 - Added `specs/embedded-ts-runtime.md` documenting the engine decision, isolation model, host/script contract, and verification plan.
+- Added auto-loaded plugin sidecar configuration (`<name>.plugin.yaml/.yml/.json`) so bundled plugins can stay default-off while still receiving enabled/priority/config values without any external runtime.
+- Injected `x-real-ip`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, and `forwarded` on upstream requests to better match nginx-style forwarding semantics.
+- Added default-off built-in plugin templates/examples for geo header injection (`geo-headers`) and AI API compatibility routing (`ai-api-compat`), plus README coverage for real business scenarios and AI API forwarding.
 
 ## v0.2.7 - 2026-06-06
 

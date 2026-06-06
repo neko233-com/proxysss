@@ -45,7 +45,7 @@ function log(level: "debug" | "info" | "warn" | "error", event: Record<string, u
 export default {
   name: "traffic-stats",
   priority: -100,
-  enabled: true,
+  enabled: false,
 
   log({ message, route }: { message: GatewayMessage; route: RouteDecision }) {
     stats.total += 1;

@@ -91,9 +91,9 @@ pub struct ScriptPluginSpec {
     pub name: String,
     pub module_path: String,
     #[serde(default)]
-    pub priority: i32,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub config: JsonValue,
 }
@@ -708,8 +708,14 @@ impl<'a, 'js> Engine<'a, 'js> {
         *module_counter += 1;
         let object = self.load_plugin_object(*module_counter, &spec.name, &path)?;
 
-        let priority = read_meta_i32(&object, "priority").unwrap_or(spec.priority);
-        let enabled = read_meta_bool(&object, "enabled").unwrap_or(spec.enabled);
+        let priority = spec
+            .priority
+            .or_else(|| read_meta_i32(&object, "priority"))
+            .unwrap_or(0);
+        let enabled = spec
+            .enabled
+            .or_else(|| read_meta_bool(&object, "enabled"))
+            .unwrap_or(true);
         let loaded_at = now_iso();
 
         self.run_lifecycle_hook(
@@ -1249,8 +1255,8 @@ mod tests {
             .load_plugin(ScriptPluginSpec {
                 name: "affinity".into(),
                 module_path: plugin_path,
-                priority: 0,
-                enabled: true,
+                priority: None,
+                enabled: None,
                 config: JsonValue::Null,
             })
             .await
@@ -1259,8 +1265,8 @@ mod tests {
             .load_plugin(ScriptPluginSpec {
                 name: "broken".into(),
                 module_path: broken_path,
-                priority: 0,
-                enabled: true,
+                priority: None,
+                enabled: None,
                 config: JsonValue::Null,
             })
             .await
@@ -1298,8 +1304,8 @@ mod tests {
             .load_plugin(ScriptPluginSpec {
                 name: "loop".into(),
                 module_path: loop_path,
-                priority: 0,
-                enabled: true,
+                priority: None,
+                enabled: None,
                 config: JsonValue::Null,
             })
             .await

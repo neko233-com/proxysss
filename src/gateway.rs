@@ -111,6 +111,18 @@ struct UpstreamLease {
     key: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AutoLoadPluginMetadata {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
 #[derive(Clone, Debug)]
 enum ListenerSpec {
     PlainHttp {
@@ -2076,20 +2088,21 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
     candidates.sort();
 
     for path in candidates {
-        let name = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "plugin".to_string());
+        let spec = match load_auto_plugin_spec(&path) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    path = %path.display(),
+                    "plugin sidecar metadata load failed; plugin will be ignored until the next reload"
+                );
+                continue;
+            }
+        };
+        let name = spec.name.clone();
 
         match script
-            .load_plugin(ScriptPluginSpec {
-                name: name.clone(),
-                module_path: path.to_string_lossy().to_string(),
-                priority: 0,
-                enabled: true,
-                config: serde_json::Value::Null,
-            })
+            .load_plugin(spec)
             .await
         {
             Ok(_) => {
@@ -2107,6 +2120,62 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
     }
 
     Ok(())
+}
+
+fn load_auto_plugin_spec(path: &Path) -> Result<ScriptPluginSpec> {
+    let metadata = load_auto_plugin_metadata(path)?;
+    let name = metadata.name.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "plugin".to_string())
+    });
+
+    Ok(ScriptPluginSpec {
+        name,
+        module_path: path.to_string_lossy().to_string(),
+        priority: metadata.priority,
+        enabled: metadata.enabled,
+        config: metadata.config,
+    })
+}
+
+fn load_auto_plugin_metadata(path: &Path) -> Result<AutoLoadPluginMetadata> {
+    for sidecar in plugin_sidecar_paths(path) {
+        if !sidecar.exists() {
+            continue;
+        }
+
+        let body = std::fs::read_to_string(&sidecar)
+            .with_context(|| format!("failed to read plugin sidecar {}", sidecar.display()))?;
+        let ext = sidecar
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let metadata = match ext.as_str() {
+            "json" => serde_json::from_str(&body),
+            "yaml" | "yml" => serde_yaml::from_str(&body),
+            _ => continue,
+        }
+        .with_context(|| format!("failed to parse plugin sidecar {}", sidecar.display()))?;
+
+        return Ok(metadata);
+    }
+
+    Ok(AutoLoadPluginMetadata::default())
+}
+
+fn plugin_sidecar_paths(path: &Path) -> Vec<PathBuf> {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+
+    ["yaml", "yml", "json"]
+        .into_iter()
+        .map(|ext| path.with_file_name(format!("{stem}.plugin.{ext}")))
+        .collect()
 }
 
 fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
@@ -2398,10 +2467,28 @@ fn build_upstream_headers(
         headers.insert(name, value);
     }
 
+    apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+
+    Ok(headers)
+}
+
+fn apply_forwarding_headers(
+    headers: &mut HeaderMap,
+    host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+) -> Result<()> {
+    let remote_ip = remote_addr.ip().to_string();
+    let xff = append_csv_header(headers.get("x-forwarded-for"), &remote_ip);
+    let forwarded = append_forwarded_header(headers.get("forwarded"), &remote_ip, host, scheme);
+
+    headers.insert(
+        HeaderName::from_static("x-real-ip"),
+        HeaderValue::from_str(&remote_ip).context("invalid x-real-ip header")?,
+    );
     headers.insert(
         HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_str(&remote_addr.ip().to_string())
-            .context("invalid x-forwarded-for header")?,
+        HeaderValue::from_str(&xff).context("invalid x-forwarded-for header")?,
     );
     headers.insert(
         HeaderName::from_static("x-forwarded-host"),
@@ -2411,8 +2498,44 @@ fn build_upstream_headers(
         HeaderName::from_static("x-forwarded-proto"),
         HeaderValue::from_str(scheme).context("invalid x-forwarded-proto header")?,
     );
+    headers.insert(
+        HeaderName::from_static("forwarded"),
+        HeaderValue::from_str(&forwarded).context("invalid forwarded header")?,
+    );
 
-    Ok(headers)
+    Ok(())
+}
+
+fn append_csv_header(existing: Option<&HeaderValue>, next: &str) -> String {
+    match existing.and_then(|value| value.to_str().ok()).map(str::trim) {
+        Some(value) if !value.is_empty() => format!("{value}, {next}"),
+        _ => next.to_string(),
+    }
+}
+
+fn append_forwarded_header(
+    existing: Option<&HeaderValue>,
+    remote_ip: &str,
+    host: &str,
+    scheme: &str,
+) -> String {
+    let next = format!(
+        "for={};host=\"{}\";proto={scheme}",
+        forwarded_for_value(remote_ip),
+        host.replace('"', "")
+    );
+    match existing.and_then(|value| value.to_str().ok()).map(str::trim) {
+        Some(value) if !value.is_empty() => format!("{value}, {next}"),
+        _ => next,
+    }
+}
+
+fn forwarded_for_value(remote_ip: &str) -> String {
+    if remote_ip.contains(':') {
+        format!("\"[{remote_ip}]\"")
+    } else {
+        remote_ip.to_string()
+    }
 }
 
 fn header_map_to_btree(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -4416,18 +4539,7 @@ fn build_websocket_upstream_headers(
     }
 
     headers.insert(HOST, HeaderValue::from_str(upstream_host)?);
-    headers.insert(
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_str(&remote_addr.ip().to_string())?,
-    );
-    headers.insert(
-        HeaderName::from_static("x-forwarded-host"),
-        HeaderValue::from_str(original_host)?,
-    );
-    headers.insert(
-        HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_str(scheme)?,
-    );
+    apply_forwarding_headers(&mut headers, original_host, remote_addr, scheme)?;
 
     Ok(headers)
 }
@@ -4561,6 +4673,11 @@ pub(crate) fn watched_script_paths(config: &GatewayConfig) -> Vec<PathBuf> {
                         .unwrap_or(false)
                 {
                     paths.push(path);
+                    for sidecar in plugin_sidecar_paths(&entry.path()) {
+                        if sidecar.exists() {
+                            paths.push(sidecar);
+                        }
+                    }
                 }
             }
         }
@@ -4789,6 +4906,63 @@ mod tests {
     }
 
     #[test]
+    fn build_upstream_headers_appends_forwarding_chain() {
+        let route = RouteDecision {
+            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: Vec::new(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
+        };
+        let mut original = HeaderMap::new();
+        original.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.10, 198.51.100.11"),
+        );
+        original.insert(
+            "forwarded",
+            HeaderValue::from_static("for=198.51.100.10;proto=https"),
+        );
+
+        let headers = build_upstream_headers(
+            &original,
+            &route,
+            "api.example.com",
+            "203.0.113.20:443".parse().expect("remote addr"),
+            "https",
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok()),
+            Some("198.51.100.10, 198.51.100.11, 203.0.113.20")
+        );
+        assert_eq!(
+            headers.get("x-real-ip").and_then(|value| value.to_str().ok()),
+            Some("203.0.113.20")
+        );
+        assert_eq!(
+            headers.get("x-forwarded-host").and_then(|value| value.to_str().ok()),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok()),
+            Some("https")
+        );
+        assert_eq!(
+            headers.get("forwarded").and_then(|value| value.to_str().ok()),
+            Some(
+                "for=198.51.100.10;proto=https, for=203.0.113.20;host=\"api.example.com\";proto=https"
+            )
+        );
+    }
+
+    #[test]
     fn http_rate_limit_blocks_after_limit() {
         let config = HttpRateLimitConfig {
             enabled: true,
@@ -4992,6 +5166,11 @@ mod tests {
         std::fs::create_dir_all(&plugins).expect("create plugin dir");
         std::fs::write(root.join("gateway.ts"), "// gateway").expect("write gateway");
         std::fs::write(plugins.join("traffic-stats.ts"), "// plugin").expect("write plugin");
+        std::fs::write(
+            plugins.join("traffic-stats.plugin.yaml"),
+            "enabled: true\npriority: 220\nconfig:\n  mode: sample\n",
+        )
+        .expect("write plugin sidecar");
 
         let config = GatewayConfig {
             root_dir: root.clone(),
@@ -5012,6 +5191,27 @@ mod tests {
         let paths = watched_script_paths(&config);
         assert!(paths.contains(&root.join("gateway.ts")));
         assert!(paths.contains(&plugins.join("traffic-stats.ts")));
+        assert!(paths.contains(&plugins.join("traffic-stats.plugin.yaml")));
+    }
+
+    #[test]
+    fn auto_load_plugin_spec_reads_sidecar_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-plugin-spec-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let plugin = root.join("geo-headers.ts");
+        std::fs::write(&plugin, "// plugin").expect("write plugin");
+        std::fs::write(
+            root.join("geo-headers.plugin.json"),
+            r#"{"enabled":true,"priority":180,"config":{"mode":"geo_headers","header_prefix":"proxysss-"}}"#,
+        )
+        .expect("write sidecar");
+
+        let spec = load_auto_plugin_spec(&plugin).expect("load sidecar metadata");
+        assert_eq!(spec.name, "geo-headers");
+        assert_eq!(spec.priority, Some(180));
+        assert_eq!(spec.enabled, Some(true));
+        assert_eq!(spec.config["mode"], "geo_headers");
 
         let _ = std::fs::remove_dir_all(root);
     }
