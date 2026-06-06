@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.6 - 2026-06-07
+
+- Fixed the release/cold-build dependency lock by downgrading the locked `getrandom` crate from `0.3.5` to `0.3.4`, restoring reproducible builds on clean GitHub Actions runners.
+- Kept the `-c` / `-config` global config-path support and workflow caching improvements from the previous patch while repairing the failed `v0.3.5` tag line.
+
 ## v0.3.5 - 2026-06-07
 
 - Optimized GitHub Actions build/package workflows by adding Rust dependency/target caching across CI, deploy, and release jobs.
