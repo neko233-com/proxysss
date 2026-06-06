@@ -877,10 +877,10 @@ impl GatewayConfig {
         config.script.command.clear();
         config.script.args.clear();
         if !script_command.trim().is_empty() {
-            config
-                .script
-                .env
-                .insert("PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(), script_command.to_string());
+            config.script.env.insert(
+                "PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(),
+                script_command.to_string(),
+            );
         }
         serde_yaml::to_string(&config).unwrap_or_else(|_| "".to_string())
     }
@@ -890,10 +890,10 @@ impl GatewayConfig {
         config.script.command.clear();
         config.script.args.clear();
         if !script_command.trim().is_empty() {
-            config
-                .script
-                .env
-                .insert("PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(), script_command.to_string());
+            config.script.env.insert(
+                "PROXYSSS_SCRIPT_RUNTIME_HINT".to_string(),
+                script_command.to_string(),
+            );
         }
         serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".to_string())
     }
