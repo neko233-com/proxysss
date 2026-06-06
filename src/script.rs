@@ -1142,10 +1142,6 @@ fn js_to_json(value: Value) -> Result<JsonValue> {
     Ok(JsonValue::Null)
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

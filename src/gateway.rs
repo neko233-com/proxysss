@@ -2101,10 +2101,7 @@ async fn auto_load_plugins(config: &GatewayConfig, script: &Arc<ScriptRuntime>) 
         };
         let name = spec.name.clone();
 
-        match script
-            .load_plugin(spec)
-            .await
-        {
+        match script.load_plugin(spec).await {
             Ok(_) => {
                 tracing::info!(plugin = %name, path = %path.display(), "plugin auto-loaded");
             }
@@ -2154,12 +2151,13 @@ fn load_auto_plugin_metadata(path: &Path) -> Result<AutoLoadPluginMetadata> {
             .map(|value| value.to_ascii_lowercase())
             .unwrap_or_default();
 
-        let metadata = match ext.as_str() {
-            "json" => serde_json::from_str(&body),
-            "yaml" | "yml" => serde_yaml::from_str(&body),
+        let metadata: anyhow::Result<AutoLoadPluginMetadata> = match ext.as_str() {
+            "json" => serde_json::from_str(&body).map_err(Into::into),
+            "yaml" | "yml" => serde_yaml::from_str(&body).map_err(Into::into),
             _ => continue,
-        }
-        .with_context(|| format!("failed to parse plugin sidecar {}", sidecar.display()))?;
+        };
+        let metadata = metadata
+            .with_context(|| format!("failed to parse plugin sidecar {}", sidecar.display()))?;
 
         return Ok(metadata);
     }
@@ -2507,7 +2505,10 @@ fn apply_forwarding_headers(
 }
 
 fn append_csv_header(existing: Option<&HeaderValue>, next: &str) -> String {
-    match existing.and_then(|value| value.to_str().ok()).map(str::trim) {
+    match existing
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
         Some(value) if !value.is_empty() => format!("{value}, {next}"),
         _ => next.to_string(),
     }
@@ -2524,7 +2525,10 @@ fn append_forwarded_header(
         forwarded_for_value(remote_ip),
         host.replace('"', "")
     );
-    match existing.and_then(|value| value.to_str().ok()).map(str::trim) {
+    match existing
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
         Some(value) if !value.is_empty() => format!("{value}, {next}"),
         _ => next,
     }
@@ -4943,15 +4947,21 @@ mod tests {
             Some("198.51.100.10, 198.51.100.11, 203.0.113.20")
         );
         assert_eq!(
-            headers.get("x-real-ip").and_then(|value| value.to_str().ok()),
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok()),
             Some("203.0.113.20")
         );
         assert_eq!(
-            headers.get("x-forwarded-host").and_then(|value| value.to_str().ok()),
+            headers
+                .get("x-forwarded-host")
+                .and_then(|value| value.to_str().ok()),
             Some("api.example.com")
         );
         assert_eq!(
-            headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok()),
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok()),
             Some("https")
         );
         assert_eq!(

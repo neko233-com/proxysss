@@ -786,8 +786,7 @@ const DEFAULT_PLUGIN_PLAYER_AFFINITY: &str =
 const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/traffic-stats.ts");
 const DEFAULT_PLUGIN_STRUCTURED_LOG: &str = include_str!("../templates/plugins/structured-log.ts");
 const DEFAULT_PLUGIN_GEO_HEADERS: &str = include_str!("../templates/plugins/geo-headers.ts");
-const DEFAULT_PLUGIN_AI_API_COMPAT: &str =
-    include_str!("../templates/plugins/ai-api-compat.ts");
+const DEFAULT_PLUGIN_AI_API_COMPAT: &str = include_str!("../templates/plugins/ai-api-compat.ts");
 
 #[cfg(test)]
 mod tests {
