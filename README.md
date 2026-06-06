@@ -9,7 +9,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 ## 核心能力
 
 - 多协议统一入口：HTTP/1.1、HTTP/2（TCP）+ HTTP/3（UDP）+ TCP + UDP
-- 声明式反向代理：`services.reverse_proxy.routes` 支持 host/path 匹配、upstream 池、strip_prefix
+- 声明式反向代理：`services.domain_routes` 以域名为核心组织 HTTP 反代，支持 per-domain SSL/压缩/缓存；`services.reverse_proxy.routes` 继续兼容 host/path 匹配
 - 限流：`services.rate_limit.http` 支持按 IP、Host 或 Header 的请求速率限制
 - TS/JS 可编程路由：显式开启 script/plugins 后才进入 TypeScript 运行时，默认 HTTP/HTTPS 走 YAML 内建能力
 - 插件机制：作为可选扩展层，支持自动加载、动态 load/unload/list、插件 sidecar YAML/JSON 配置，默认模板插件全部默认关闭
@@ -21,7 +21,7 @@ proxysss 是一个 nginx 同级的通用 Rust 网关，统一支持 HTTP/1.1、H
 - AI API 入口：支持 OpenAI 兼容 / New API / 聚合转发这类 HTTP API 作为普通反向代理入口，并提供默认关闭的 AI API 兼容插件模板
 - 管理端：内置 admin API（可关闭）
 - 配置热重载：配置文件变更后自动校验并重载
-- TLS 模式：self_signed / manual / acme_external，以及 proxysss YAML 风格 `http.tls.auto_https`
+- TLS 模式：self_signed / manual / acme_external，以及 proxysss YAML 风格 `http.tls.auto_https`、多证书 SNI、域名级 `ssl.type`
 - 显式子配置：通过 `include.enabled` + `include.files` 声明子配置，不自动扫目录
 - 扩展服务：内建 `services.static_sites` 静态文件服务、`services.ftp` TCP 透传、内建 `services.webdav` 运行时
 - 热重载：配置、显式 include、主扩展脚本、自动加载插件脚本均参与热重载 fingerprint
@@ -226,7 +226,7 @@ proxysss script eval "console.log('proxysss ts runtime ok')"
 
 ## proxysss 自动 SSL 配置
 
-目标效果：像 Caddy 那样省心地自动拿证书和续期，但配置风格必须是 proxysss 自己的 YAML，不搬其他产品的配置格式。公网服务器只需要写域名、邮箱和 upstream，proxysss 会把 `http.tls.auto_https` 展开到 ACME 签发/续期流程。
+目标效果：像 Caddy 那样省心地自动拿证书和续期，但配置风格必须是 proxysss 自己的 YAML，不搬其他产品的配置格式。公网服务器只需要写域名、邮箱和 upstream，proxysss 会把 `services.domain_routes[*].ssl.type=auto` / `is_auto_ssl=true` 与 `http.tls.auto_https` 汇总展开到 ACME 签发/续期流程。
 
 最小生产配置：
 
@@ -245,12 +245,19 @@ http:
       challenge: tls_alpn01
 
 services:
-  reverse_proxy:
-    routes:
-      - name: app
-        hosts: [example.com, www.example.com]
-        path_prefix: /
-        upstream: http://127.0.0.1:9000
+  domain_routes:
+    - name: app
+      domains: [example.com, www.example.com]
+      path_prefix: /
+      upstream: http://127.0.0.1:9000
+      ssl:
+        type: auto
+        email: admin@example.com
+      compression:
+        enabled: true
+      cache:
+        enabled: true
+        ttl_secs: 30
 ```
 
 推荐上线顺序：
@@ -276,7 +283,36 @@ sudo setcap cap_net_bind_service=+ep "$(which proxysss)"
 - `auto_https.production: false` 用于测试，避免频繁打正式 ACME CA 触发限流；确认无误后再改成 `true`。
 - 证书和 ACME 缓存目录必须持久化，容器部署时不要放到临时文件系统。
 
-`http.tls.auto_https` 是 proxysss 风格的高层入口；底层会映射到现有 ACME 外部客户端签发/续期流程。`self_signed` 只适合开发或内网。
+`http.tls.auto_https` 是 proxysss 风格的高层入口；`services.domain_routes[*].ssl.type` / `is_auto_ssl` 则是更贴近“域名即配置核心”的入口。当前底层仍映射到现有 ACME 外部客户端签发/续期流程；`self_signed` 只适合开发或内网。
+
+手动泛域名 / 多证书 SNI 示例：
+
+```yaml
+http:
+  tls:
+    mode: manual
+    cert_path: ./certs/default-fullchain.pem
+    key_path: ./certs/default-key.pem
+
+services:
+  domain_routes:
+    - name: panel
+      domains: [panel.example.com]
+      path_prefix: /
+      upstream: http://127.0.0.1:9001
+      ssl:
+        type: manual
+        cert_path: ./certs/panel-fullchain.pem
+        key_path: ./certs/panel-key.pem
+    - name: wildcard-app
+      domains: ["*.example.com"]
+      path_prefix: /
+      upstream: http://127.0.0.1:9002
+      ssl:
+        type: manual
+        cert_path: ./certs/wildcard-fullchain.pem
+        key_path: ./certs/wildcard-key.pem
+```
 
 显式子配置示例：
 
@@ -448,9 +484,9 @@ config:
 | 真实客户端 IP 透传 | 已增强 | 自动补齐 `x-real-ip`、`x-forwarded-*`、`forwarded` |
 | 热重载 | 已支持 | 配置、主脚本、自动加载插件脚本与 sidecar 一起进入 fingerprint |
 | AI API / New API 转发 | 已支持基础入口 + 可选插件 | 核心先保证 HTTP 代理；插件负责路径兼容、审计 header、地理 header |
-| 压缩 | 缺口 | 尚无 gzip/brotli 响应压缩 |
-| 缓存 | 缺口 | 尚无 proxy cache |
-| 多证书 / SNI 细粒度选择 | 部分支持 | 仍需继续增强 |
+| 压缩 | 部分支持 | `services.domain_routes[*].compression` 已支持 gzip，brotli/zstd 仍待补齐 |
+| 缓存 | 部分支持 | `services.domain_routes[*].cache` 已支持内存 GET 缓存，磁盘缓存/共享缓存区仍待补齐 |
+| 多证书 / SNI 细粒度选择 | 已增强 | `http.tls.certificates` 与域名级 manual SSL 已支持按 SNI 选证书 |
 
 ## AI API / New API 转发说明
 

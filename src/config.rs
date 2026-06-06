@@ -1002,7 +1002,9 @@ impl GatewayConfig {
 
         for (index, certificate) in self.http.tls.certificates.iter().enumerate() {
             if certificate.domains.is_empty() {
-                errors.push(format!("http.tls.certificates.{index}.domains cannot be empty"));
+                errors.push(format!(
+                    "http.tls.certificates.{index}.domains cannot be empty"
+                ));
             }
             if certificate
                 .domains
@@ -1131,7 +1133,9 @@ impl GatewayConfig {
                 }
                 DomainTlsMode::Auto => {
                     for domain in &route.domains {
-                        auto_domains.entry(domain.clone()).or_insert_with(|| route.ssl.email.clone());
+                        auto_domains
+                            .entry(domain.clone())
+                            .or_insert_with(|| route.ssl.email.clone());
                     }
                 }
                 DomainTlsMode::Disabled | DomainTlsMode::Inherit => {}
@@ -1142,7 +1146,14 @@ impl GatewayConfig {
         if !auto_domains.is_empty() {
             self.http.tls.auto_https.enabled = true;
             for (domain, email) in auto_domains {
-                if !self.http.tls.auto_https.domains.iter().any(|item| item == &domain) {
+                if !self
+                    .http
+                    .tls
+                    .auto_https
+                    .domains
+                    .iter()
+                    .any(|item| item == &domain)
+                {
                     self.http.tls.auto_https.domains.push(domain);
                 }
                 if self.http.tls.auto_https.email.trim().is_empty() && !email.trim().is_empty() {
@@ -1267,14 +1278,14 @@ impl Default for AcmeExternalConfig {
             extra_args: Vec::new(),
         }
     }
+}
 
-    impl Default for TlsCertificateConfig {
-        fn default() -> Self {
-            Self {
-                domains: Vec::new(),
-                cert_path: default_cert_path(),
-                key_path: default_key_path(),
-            }
+impl Default for TlsCertificateConfig {
+    fn default() -> Self {
+        Self {
+            domains: Vec::new(),
+            cert_path: default_cert_path(),
+            key_path: default_key_path(),
         }
     }
 }
@@ -1423,65 +1434,65 @@ impl Default for ReverseProxyRouteConfig {
             strip_headers: Vec::new(),
         }
     }
+}
 
-    impl Default for DomainRouteConfig {
-        fn default() -> Self {
-            Self {
-                name: "app".to_string(),
-                domains: vec!["example.com".to_string()],
-                path_prefix: default_route_path_prefix(),
-                upstream: "http://127.0.0.1:8080".to_string(),
-                upstreams: Vec::new(),
-                strip_prefix: false,
-                set_headers: BTreeMap::new(),
-                strip_headers: Vec::new(),
-                compression: ResponseCompressionConfig::default(),
-                cache: ResponseCacheConfig::default(),
-                ssl: DomainTlsConfig::default(),
-            }
+impl Default for DomainRouteConfig {
+    fn default() -> Self {
+        Self {
+            name: "app".to_string(),
+            domains: vec!["example.com".to_string()],
+            path_prefix: default_route_path_prefix(),
+            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: Vec::new(),
+            strip_prefix: false,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+            ssl: DomainTlsConfig::default(),
         }
     }
+}
 
-    impl Default for ResponseCompressionConfig {
-        fn default() -> Self {
-            Self {
-                enabled: false,
-                min_length: default_compression_min_length(),
-                content_types: default_compression_types(),
-            }
+impl Default for ResponseCompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_length: default_compression_min_length(),
+            content_types: default_compression_types(),
         }
     }
+}
 
-    impl Default for ResponseCacheConfig {
-        fn default() -> Self {
-            Self {
-                enabled: false,
-                ttl_secs: default_cache_ttl_secs(),
-                statuses: default_cache_statuses(),
-                max_body_bytes: default_cache_max_body_bytes(),
-            }
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: default_cache_ttl_secs(),
+            statuses: default_cache_statuses(),
+            max_body_bytes: default_cache_max_body_bytes(),
         }
     }
+}
 
-    impl Default for DomainTlsConfig {
-        fn default() -> Self {
-            Self {
-                mode: DomainTlsMode::default(),
-                is_auto_ssl: false,
-                cert_path: PathBuf::new(),
-                key_path: PathBuf::new(),
-                email: String::new(),
-            }
+impl Default for DomainTlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: DomainTlsMode::default(),
+            is_auto_ssl: false,
+            cert_path: PathBuf::new(),
+            key_path: PathBuf::new(),
+            email: String::new(),
         }
     }
+}
 
-    impl DomainTlsConfig {
-        pub fn effective_mode(&self) -> DomainTlsMode {
-            if self.is_auto_ssl {
-                DomainTlsMode::Auto
-            } else {
-                self.mode
-            }
+impl DomainTlsConfig {
+    pub fn effective_mode(&self) -> DomainTlsMode {
+        if self.is_auto_ssl {
+            DomainTlsMode::Auto
+        } else {
+            self.mode
         }
     }
 }
@@ -2072,8 +2083,10 @@ mod tests {
 
     #[test]
     fn domain_auto_ssl_expands_into_global_auto_https() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-domain-auto-ssl-test-{}", std::process::id()));
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-domain-auto-ssl-test-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.yaml");
         fs::write(
@@ -2098,8 +2111,10 @@ mod tests {
 
     #[test]
     fn domain_manual_ssl_paths_are_absolutized_into_sni_certificates() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-domain-manual-ssl-test-{}", std::process::id()));
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-domain-manual-ssl-test-{}",
+            std::process::id()
+        ));
         let cert_dir = base_dir.join("certs");
         fs::create_dir_all(&cert_dir).expect("create temp config dir");
         fs::write(cert_dir.join("edge.pem"), "test").expect("write cert");

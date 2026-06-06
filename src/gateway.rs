@@ -34,8 +34,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::ClientConfig;
 use rustls::sign::CertifiedKey;
+use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::Deserialize;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -47,11 +47,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::config::{
-    AcmeChallengeType, AdminConfig, DomainRouteConfig, DomainTlsMode, GatewayConfig,
-    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
-    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
-    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
-    WebDavConfig,
+    AcmeChallengeType, AdminConfig, DomainRouteConfig, GatewayConfig, HttpAffinityConfig,
+    HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey, ResponseCacheConfig,
+    ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig,
+    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -117,6 +116,7 @@ struct HttpRouteConfig {
     cache: ResponseCacheConfig,
 }
 
+#[derive(Debug)]
 struct SniResolver {
     default: Arc<CertifiedKey>,
     by_name: BTreeMap<String, Arc<CertifiedKey>>,
@@ -1445,22 +1445,22 @@ impl Gateway {
             HttpRouteConfig {
                 decision: script
                     .route_http(HttpContext {
-                    request_id: request_id.clone(),
-                    host: host.clone(),
-                    method: method.as_str().to_string(),
-                    path: uri.path().to_string(),
-                    query: uri.query().map(|value| value.to_string()),
-                    scheme: scheme.to_string(),
-                    version: version.to_string(),
-                    remote_addr: remote_addr.to_string(),
-                    player_id: player_id.clone(),
-                    headers: header_map_to_btree(&headers),
-                    body_len: body.len(),
-                })
-                .await
-                .inspect_err(|_| {
-                    self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                })?,
+                        request_id: request_id.clone(),
+                        host: host.clone(),
+                        method: method.as_str().to_string(),
+                        path: uri.path().to_string(),
+                        query: uri.query().map(|value| value.to_string()),
+                        scheme: scheme.to_string(),
+                        version: version.to_string(),
+                        remote_addr: remote_addr.to_string(),
+                        player_id: player_id.clone(),
+                        headers: header_map_to_btree(&headers),
+                        body_len: body.len(),
+                    })
+                    .await
+                    .inspect_err(|_| {
+                        self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
+                    })?,
                 compression: ResponseCompressionConfig::default(),
                 cache: ResponseCacheConfig::default(),
             }
@@ -1473,7 +1473,7 @@ impl Gateway {
 
         if route.decision.upstream.starts_with("proxysss://") {
             let response = dispatch_internal_http(&state.config, &route.decision);
-            return Ok(finalize_http_response(&headers, &route.compression, response)?);
+            return finalize_http_response(&headers, &route.compression, response);
         }
 
         if websocket_upgrade_requested(&headers) || websocket_upstream_requested(&route.decision) {
@@ -1498,7 +1498,7 @@ impl Gateway {
         let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
         if let Some(cache_key) = cache_key.as_deref() {
             if let Some(response) = self.load_cached_http_response(cache_key) {
-                return Ok(finalize_http_response(&headers, &route.compression, response)?);
+                return finalize_http_response(&headers, &route.compression, response);
             }
         }
 
@@ -1582,7 +1582,7 @@ impl Gateway {
             if let Some(cache_key) = cache_key.as_deref() {
                 self.store_cached_http_response(cache_key, &route.cache, &response);
             }
-            return Ok(finalize_http_response(&headers, &route.compression, response)?);
+            return finalize_http_response(&headers, &route.compression, response);
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("upstream request failed after retries")))
@@ -1701,7 +1701,10 @@ impl Gateway {
     ) {
         if !config.enabled
             || response.body.len() > config.max_body_bytes
-            || !config.statuses.iter().any(|status| *status == response.status.as_u16())
+            || !config
+                .statuses
+                .iter()
+                .any(|status| *status == response.status.as_u16())
             || response.headers.iter().any(|(name, _)| name == SET_COOKIE)
             || cache_control_prevents_storage(&response.headers)
         {
@@ -2480,7 +2483,10 @@ fn insert_certificate_domains(
     for domain in &certificate.domains {
         by_name.insert(domain.to_ascii_lowercase(), certified.clone());
         if let Some(suffix) = domain.strip_prefix("*.") {
-            by_name.insert(format!(".{}", suffix.to_ascii_lowercase()), certified.clone());
+            by_name.insert(
+                format!(".{}", suffix.to_ascii_lowercase()),
+                certified.clone(),
+            );
         }
     }
 }
@@ -2636,17 +2642,24 @@ fn finalize_http_response(
     compression: &ResponseCompressionConfig,
     mut response: GatewayHttpResponse,
 ) -> Result<GatewayHttpResponse> {
-    if !compression.enabled || !accepts_gzip(request_headers) || !response_allows_compression(&response) {
+    if !compression.enabled
+        || !accepts_gzip(request_headers)
+        || !response_allows_compression(&response)
+    {
         return Ok(response);
     }
-    if response.body.len() < compression.min_length || !content_type_matches(&response, &compression.content_types) {
+    if response.body.len() < compression.min_length
+        || !content_type_matches(&response, &compression.content_types)
+    {
         return Ok(response);
     }
 
     let compressed = gzip_bytes(&response.body)?;
     response.body = Bytes::from(compressed);
     response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
-    response.headers.push((CONTENT_ENCODING, HeaderValue::from_static("gzip")));
+    response
+        .headers
+        .push((CONTENT_ENCODING, HeaderValue::from_static("gzip")));
     append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
     response.headers.push((
         CONTENT_LENGTH,
@@ -2689,14 +2702,10 @@ fn content_type_matches(response: &GatewayHttpResponse, patterns: &[String]) -> 
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    patterns.iter().any(|pattern| {
-        let pattern = pattern.to_ascii_lowercase();
-        if pattern.ends_with('/') {
-            content_type.starts_with(&pattern)
-        } else {
-            content_type.starts_with(&pattern)
-        }
-    })
+    patterns
+        .iter()
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .any(|pattern| content_type.starts_with(&pattern))
 }
 
 fn append_or_insert_header(
@@ -2704,16 +2713,18 @@ fn append_or_insert_header(
     name: HeaderName,
     value: &str,
 ) -> Result<()> {
-    if let Some((_, existing)) = headers.iter_mut().find(|(header_name, _)| *header_name == name) {
+    let existing_name = name.clone();
+    if let Some((_, existing)) = headers
+        .iter_mut()
+        .find(|(header_name, _)| *header_name == existing_name)
+    {
         let merged = format!("{}, {}", existing.to_str().unwrap_or_default(), value);
         *existing = HeaderValue::from_str(merged.trim_matches(|c| c == ',' || c == ' '))
             .with_context(|| format!("invalid header value for {}", name.as_str()))?;
     } else {
-        headers.push((
-            name,
-            HeaderValue::from_str(value)
-                .with_context(|| format!("invalid header value for {}", name.as_str()))?,
-        ));
+        let header_value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+        headers.push((name, header_value));
     }
     Ok(())
 }
@@ -2737,7 +2748,9 @@ fn cache_lookup_key(
         "{}:{}:{}",
         method.as_str(),
         host.to_ascii_lowercase(),
-        uri.path_and_query().map(|value| value.as_str()).unwrap_or("/")
+        uri.path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
     ))
 }
 
@@ -3329,7 +3342,8 @@ pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, Str
 }
 
 fn configured_http_route(config: &GatewayConfig, host: &str, uri: &Uri) -> Option<HttpRouteConfig> {
-    configured_domain_route(config, host, uri).or_else(|| configured_reverse_proxy_route(config, host, uri))
+    configured_domain_route(config, host, uri)
+        .or_else(|| configured_reverse_proxy_route(config, host, uri))
 }
 
 fn configured_domain_route(
@@ -3416,37 +3430,6 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
             Some(query) => format!("{path}?{query}"),
             None => path,
         }
-
-        fn domain_route_config(route: &DomainRouteConfig, uri: &Uri) -> HttpRouteConfig {
-            HttpRouteConfig {
-                decision: RouteDecision {
-                    upstream: route.upstream.clone(),
-                    upstreams: route.upstreams.clone(),
-                    affinity_key: None,
-                    rewrite_path: route.strip_prefix.then(|| {
-                        let prefix = normalize_route_prefix(&route.path_prefix);
-                        let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
-                        let path = if suffix.is_empty() {
-                            "/".to_string()
-                        } else if suffix.starts_with('/') {
-                            suffix.to_string()
-                        } else {
-                            format!("/{suffix}")
-                        };
-                        match uri.query() {
-                            Some(query) => format!("{path}?{query}"),
-                            None => path,
-                        }
-                    }),
-                    set_headers: route.set_headers.clone(),
-                    strip_headers: route.strip_headers.clone(),
-                    status: None,
-                    content_type: None,
-                },
-                compression: route.compression.clone(),
-                cache: route.cache.clone(),
-            }
-        }
     });
 
     RouteDecision {
@@ -3458,6 +3441,37 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
         strip_headers: route.strip_headers.clone(),
         status: None,
         content_type: None,
+    }
+}
+
+fn domain_route_config(route: &DomainRouteConfig, uri: &Uri) -> HttpRouteConfig {
+    HttpRouteConfig {
+        decision: RouteDecision {
+            upstream: route.upstream.clone(),
+            upstreams: route.upstreams.clone(),
+            affinity_key: None,
+            rewrite_path: route.strip_prefix.then(|| {
+                let prefix = normalize_route_prefix(&route.path_prefix);
+                let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
+                let path = if suffix.is_empty() {
+                    "/".to_string()
+                } else if suffix.starts_with('/') {
+                    suffix.to_string()
+                } else {
+                    format!("/{suffix}")
+                };
+                match uri.query() {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path,
+                }
+            }),
+            set_headers: route.set_headers.clone(),
+            strip_headers: route.strip_headers.clone(),
+            status: None,
+            content_type: None,
+        },
+        compression: route.compression.clone(),
+        cache: route.cache.clone(),
     }
 }
 

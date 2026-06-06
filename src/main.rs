@@ -363,6 +363,12 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         next_gap: "",
     },
     NginxParityItem {
+        capability: "self-contained auto ssl",
+        status: ParityStatus::Missing,
+        evidence: "auto https still relies on external ACME client invocation",
+        next_gap: "embed native ACME issue/renew flow so auto ssl has zero external dependency",
+    },
+    NginxParityItem {
         capability: "access/error logging",
         status: ParityStatus::Supported,
         evidence:
@@ -1657,7 +1663,7 @@ mod tests {
     #[test]
     fn config_templates_cover_http_and_stream_learning_paths() {
         assert!(render_config_template(ConfigTemplateKind::Http).contains("services:"));
-        assert!(render_config_template(ConfigTemplateKind::Http).contains("reverse_proxy"));
+        assert!(render_config_template(ConfigTemplateKind::Http).contains("domain_routes"));
         assert!(render_config_template(ConfigTemplateKind::Tcp).contains("tcp:"));
         assert!(render_config_template(ConfigTemplateKind::Udp).contains("udp:"));
         assert!(render_config_template(ConfigTemplateKind::Script).contains("script:"));
