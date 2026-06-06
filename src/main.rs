@@ -983,8 +983,11 @@ fn run_script_runtime(
     let gateway_config = if config_path.exists() {
         GatewayConfig::load(&config_path)?
     } else {
-        let mut config = GatewayConfig::default();
-        config.root_dir = std::env::current_dir().context("failed to resolve current directory")?;
+        let root_dir = std::env::current_dir().context("failed to resolve current directory")?;
+        let mut config = GatewayConfig {
+            root_dir: root_dir.clone(),
+            ..GatewayConfig::default()
+        };
         config.script.cwd = Some(config.root_dir.clone());
         config
     };
