@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.12 - 2026-06-07
+
+- Expanded token-authenticated automation endpoints beyond domain routes to also support `services.reverse_proxy.routes`, `tcp.listeners`, and `udp.listeners` upserts over HTTP, with persistence back into the main YAML file and in-process reload.
+- Added an internal cluster automation integration guide covering the agent-facing HTTP API workflow for HTTP, WebSocket, TCP, and UDP onboarding.
+
 ## v0.3.11 - 2026-06-07
 
 - Added bearer-token admin authentication support for automation and cluster control-plane calls.

@@ -13,7 +13,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Default FTP control port is `21` when `services.ftp.enabled=true`.
 - Configuration must be more human-friendly than nginx while still covering nginx-level gateway duties.
 - Runtime configuration should live in a single YAML file by default, normally `proxysss.yaml`; custom locations are selected with `-config`, `--config`, or `-c`.
-- Admin API automation may update `services.domain_routes` over token-authenticated HTTP, but the source of truth still persists back into the main YAML file.
+- Admin API automation may update `services.domain_routes`, `services.reverse_proxy.routes`, `tcp.listeners`, and `udp.listeners` over token-authenticated HTTP, but the source of truth still persists back into the main YAML file.
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
 - The main YAML config, the main extension script, and auto-loaded plugin scripts must participate in hot reload.
@@ -32,7 +32,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 | --- | --- |
 | Core gateway (Rust) | nginx-equivalent protocol termination, routing, static files, WebDAV, stream proxy, TLS, rate limits, logging, reload |
 | Extension scripts (TS/JS via embedded proxysss runtime target) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
-| Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload, token-authenticated domain-route upsert |
+| Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload, token-authenticated route/listener upsert |
 
 Do **not** describe proxysss as "more business gateway than nginx". Describe it as a **general gateway with script/plugin extension hooks**.
 

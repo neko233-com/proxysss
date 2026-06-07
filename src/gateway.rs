@@ -787,6 +787,169 @@ impl Gateway {
             }
         }
 
+        if method == Method::POST && path == "/v1/reverse-proxy-routes/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+
+            let route = match serde_json::from_slice::<ReverseProxyRouteConfig>(&body) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid reverse proxy payload: {error}")}),
+                    ));
+                }
+            };
+
+            match self
+                .persist_reverse_proxy_route_and_reload(&state.config, route)
+                .await
+            {
+                Ok(result) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": result.action,
+                            "name": result.route.name,
+                            "hosts": result.route.hosts,
+                            "path_prefix": result.route.path_prefix,
+                            "upstream": result.route.upstream,
+                            "upstreams": result.route.upstreams,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tcp-listeners/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+
+            let listener = match serde_json::from_slice::<TcpListenerConfig>(&body) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid tcp listener payload: {error}")}),
+                    ));
+                }
+            };
+
+            match self
+                .persist_tcp_listener_and_reload(&state.config, listener)
+                .await
+            {
+                Ok(result) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": result.action,
+                            "name": result.listener.name,
+                            "bind": result.listener.bind,
+                            "upstream": result.listener.upstream,
+                            "upstreams": result.listener.upstreams,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/udp-listeners/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+
+            let listener = match serde_json::from_slice::<UdpListenerConfig>(&body) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid udp listener payload: {error}")}),
+                    ));
+                }
+            };
+
+            match self
+                .persist_udp_listener_and_reload(&state.config, listener)
+                .await
+            {
+                Ok(result) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": result.action,
+                            "name": result.listener.name,
+                            "bind": result.listener.bind,
+                            "upstream": result.listener.upstream,
+                            "upstreams": result.listener.upstreams,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
         if method == Method::GET && path == "/v1/plugins" {
             if !state.config.plugins.enabled {
                 return Ok(text_response(
@@ -1015,6 +1178,87 @@ impl Gateway {
         }
 
         Ok(DomainRouteUpsertResult { action, route })
+    }
+
+    async fn persist_reverse_proxy_route_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        route: ReverseProxyRouteConfig,
+    ) -> Result<ReverseProxyRouteUpsertResult> {
+        let mut candidate = current_config.clone();
+        let action = upsert_reverse_proxy_route_config(
+            &mut candidate.services.reverse_proxy.routes,
+            route.clone(),
+        );
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_reverse_proxy_route(&original, &route)?;
+
+        fs::write(&self.config_path, &updated)
+            .with_context(|| format!("failed to write {}", self.config_path.display()))?;
+
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = fs::write(&self.config_path, &original);
+            return Err(error.context(
+                "updated config was written but reload failed; original file was restored",
+            ));
+        }
+
+        Ok(ReverseProxyRouteUpsertResult { action, route })
+    }
+
+    async fn persist_tcp_listener_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        listener: TcpListenerConfig,
+    ) -> Result<TcpListenerUpsertResult> {
+        let mut candidate = current_config.clone();
+        let action = upsert_tcp_listener_config(&mut candidate.tcp.listeners, listener.clone());
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_tcp_listener(&original, &listener)?;
+
+        fs::write(&self.config_path, &updated)
+            .with_context(|| format!("failed to write {}", self.config_path.display()))?;
+
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = fs::write(&self.config_path, &original);
+            return Err(error.context(
+                "updated config was written but reload failed; original file was restored",
+            ));
+        }
+
+        Ok(TcpListenerUpsertResult { action, listener })
+    }
+
+    async fn persist_udp_listener_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        listener: UdpListenerConfig,
+    ) -> Result<UdpListenerUpsertResult> {
+        let mut candidate = current_config.clone();
+        let action = upsert_udp_listener_config(&mut candidate.udp.listeners, listener.clone());
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_udp_listener(&original, &listener)?;
+
+        fs::write(&self.config_path, &updated)
+            .with_context(|| format!("failed to write {}", self.config_path.display()))?;
+
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = fs::write(&self.config_path, &original);
+            return Err(error.context(
+                "updated config was written but reload failed; original file was restored",
+            ));
+        }
+
+        Ok(UdpListenerUpsertResult { action, listener })
     }
 
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
@@ -5103,6 +5347,21 @@ struct DomainRouteUpsertResult {
     route: DomainRouteConfig,
 }
 
+struct ReverseProxyRouteUpsertResult {
+    action: &'static str,
+    route: ReverseProxyRouteConfig,
+}
+
+struct TcpListenerUpsertResult {
+    action: &'static str,
+    listener: TcpListenerConfig,
+}
+
+struct UdpListenerUpsertResult {
+    action: &'static str,
+    listener: UdpListenerConfig,
+}
+
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -5129,6 +5388,45 @@ fn upsert_domain_route_config(
         "updated"
     } else {
         routes.push(route);
+        "created"
+    }
+}
+
+fn upsert_reverse_proxy_route_config(
+    routes: &mut Vec<ReverseProxyRouteConfig>,
+    route: ReverseProxyRouteConfig,
+) -> &'static str {
+    if let Some(existing) = routes.iter_mut().find(|item| item.name == route.name) {
+        *existing = route;
+        "updated"
+    } else {
+        routes.push(route);
+        "created"
+    }
+}
+
+fn upsert_tcp_listener_config(
+    listeners: &mut Vec<TcpListenerConfig>,
+    listener: TcpListenerConfig,
+) -> &'static str {
+    if let Some(existing) = listeners.iter_mut().find(|item| item.name == listener.name) {
+        *existing = listener;
+        "updated"
+    } else {
+        listeners.push(listener);
+        "created"
+    }
+}
+
+fn upsert_udp_listener_config(
+    listeners: &mut Vec<UdpListenerConfig>,
+    listener: UdpListenerConfig,
+) -> &'static str {
+    if let Some(existing) = listeners.iter_mut().find(|item| item.name == listener.name) {
+        *existing = listener;
+        "updated"
+    } else {
+        listeners.push(listener);
         "created"
     }
 }
@@ -5175,6 +5473,168 @@ fn render_config_with_upserted_domain_route(
         *existing = route_value;
     } else {
         routes.push(route_value);
+    }
+
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_upserted_reverse_proxy_route(
+    original: &str,
+    route: &ReverseProxyRouteConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+
+    let services_key = serde_yaml::Value::String("services".to_string());
+    if !root.contains_key(&services_key) {
+        root.insert(
+            services_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let services = root
+        .get_mut(&services_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("services must be a mapping"))?;
+
+    let reverse_key = serde_yaml::Value::String("reverse_proxy".to_string());
+    if !services.contains_key(&reverse_key) {
+        services.insert(
+            reverse_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let reverse_proxy = services
+        .get_mut(&reverse_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("services.reverse_proxy must be a mapping"))?;
+
+    let routes_key = serde_yaml::Value::String("routes".to_string());
+    if !reverse_proxy.contains_key(&routes_key) {
+        reverse_proxy.insert(routes_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let routes = reverse_proxy
+        .get_mut(&routes_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("services.reverse_proxy.routes must be a sequence"))?;
+
+    let route_value =
+        serde_yaml::to_value(route).context("failed to serialize reverse proxy route")?;
+    if let Some(existing) = routes.iter_mut().find(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value == route.name)
+            .unwrap_or(false)
+    }) {
+        *existing = route_value;
+    } else {
+        routes.push(route_value);
+    }
+
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_upserted_tcp_listener(
+    original: &str,
+    listener: &TcpListenerConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+
+    let tcp_key = serde_yaml::Value::String("tcp".to_string());
+    if !root.contains_key(&tcp_key) {
+        root.insert(
+            tcp_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let tcp = root
+        .get_mut(&tcp_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("tcp must be a mapping"))?;
+
+    let listeners_key = serde_yaml::Value::String("listeners".to_string());
+    if !tcp.contains_key(&listeners_key) {
+        tcp.insert(
+            listeners_key.clone(),
+            serde_yaml::Value::Sequence(Vec::new()),
+        );
+    }
+    let listeners = tcp
+        .get_mut(&listeners_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("tcp.listeners must be a sequence"))?;
+
+    let listener_value =
+        serde_yaml::to_value(listener).context("failed to serialize tcp listener")?;
+    if let Some(existing) = listeners.iter_mut().find(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value == listener.name)
+            .unwrap_or(false)
+    }) {
+        *existing = listener_value;
+    } else {
+        listeners.push(listener_value);
+    }
+
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_upserted_udp_listener(
+    original: &str,
+    listener: &UdpListenerConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+
+    let udp_key = serde_yaml::Value::String("udp".to_string());
+    if !root.contains_key(&udp_key) {
+        root.insert(
+            udp_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let udp = root
+        .get_mut(&udp_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("udp must be a mapping"))?;
+
+    let listeners_key = serde_yaml::Value::String("listeners".to_string());
+    if !udp.contains_key(&listeners_key) {
+        udp.insert(
+            listeners_key.clone(),
+            serde_yaml::Value::Sequence(Vec::new()),
+        );
+    }
+    let listeners = udp
+        .get_mut(&listeners_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("udp.listeners must be a sequence"))?;
+
+    let listener_value =
+        serde_yaml::to_value(listener).context("failed to serialize udp listener")?;
+    if let Some(existing) = listeners.iter_mut().find(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value == listener.name)
+            .unwrap_or(false)
+    }) {
+        *existing = listener_value;
+    } else {
+        listeners.push(listener_value);
     }
 
     serde_yaml::to_string(&value).context("failed to render updated YAML config")
@@ -8402,6 +8862,66 @@ mod tests {
         assert!(updated.contains("new.example.com"));
         assert!(updated.contains("path_prefix: /api"));
         assert!(updated.contains("strip_prefix: true"));
+    }
+
+    #[test]
+    fn render_config_with_upserted_reverse_proxy_route_replaces_by_name() {
+        let updated = render_config_with_upserted_reverse_proxy_route(
+            "services:\n  reverse_proxy:\n    routes:\n      - name: api\n        path_prefix: /api\n        hosts: [api.old.example.com]\n        upstream: http://127.0.0.1:8000\n",
+            &ReverseProxyRouteConfig {
+                name: "api".to_string(),
+                path_prefix: "/v2".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+                upstream: "http://127.0.0.1:9000".to_string(),
+                upstreams: vec!["http://127.0.0.1:9001".to_string()],
+                strip_prefix: true,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+                rate_limit: HttpRateLimitConfig::default(),
+                active_health: ActiveHealthOverrideConfig::default(),
+            },
+        )
+        .expect("render updated config");
+
+        assert!(!updated.contains("api.old.example.com"));
+        assert!(updated.contains("api.example.com"));
+        assert!(updated.contains("path_prefix: /v2"));
+    }
+
+    #[test]
+    fn render_config_with_upserted_tcp_listener_replaces_by_name() {
+        let updated = render_config_with_upserted_tcp_listener(
+            "tcp:\n  listeners:\n    - name: game\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n",
+            &TcpListenerConfig {
+                name: "game".to_string(),
+                bind: "0.0.0.0:7001".to_string(),
+                upstream: "127.0.0.1:9100".to_string(),
+                upstreams: vec!["127.0.0.1:9101".to_string()],
+            },
+        )
+        .expect("render updated config");
+
+        assert!(updated.contains("bind: 0.0.0.0:7001"));
+        assert!(updated.contains("127.0.0.1:9101"));
+    }
+
+    #[test]
+    fn render_config_with_upserted_udp_listener_replaces_by_name() {
+        let updated = render_config_with_upserted_udp_listener(
+            "udp:\n  listeners:\n    - name: realtime\n      bind: 0.0.0.0:8000\n      upstreams: [127.0.0.1:9200]\n",
+            &UdpListenerConfig {
+                name: "realtime".to_string(),
+                bind: "0.0.0.0:8001".to_string(),
+                upstream: String::new(),
+                upstreams: vec!["127.0.0.1:9300".to_string()],
+            },
+        )
+        .expect("render updated config");
+
+        assert!(updated.contains("bind: 0.0.0.0:8001"));
+        assert!(updated.contains("127.0.0.1:9300"));
     }
 
     #[test]

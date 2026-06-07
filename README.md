@@ -2,7 +2,7 @@
 
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v0.3.11
+Current version: v0.3.12
 
 ## Why proxysss
 
@@ -11,7 +11,7 @@ Current version: v0.3.11
 - YAML-only gateway config: JSON config files are intentionally unsupported.
 - Domain-first reverse proxying: `services.domain_routes` is the primary grouping unit for multi-domain HTTP services.
 - Built-in control plane: admin API and dashboard on `127.0.0.1:7777` by default.
-- Cluster automation API: token-authenticated HTTP calls can register or update domain routes and persist them back to the main YAML file.
+- Cluster automation API: token-authenticated HTTP calls can register or update domain routes, reverse proxy routes, and TCP/UDP listeners and persist them back to the main YAML file.
 - Hot reload: the main YAML config, the main script, and auto-loaded plugins participate in reload fingerprinting.
 - Optional scripting: TypeScript plugins are for custom business logic, not for ordinary gateway setup.
 
@@ -211,7 +211,7 @@ admin:
   enable_write_ops: true
 ```
 
-Example route registration call:
+Example domain-route registration call:
 
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/domain-routes/upsert \
@@ -235,6 +235,14 @@ That API call:
 - reloads the gateway in process so the route becomes live immediately
 
 This is the intended path when a node or service instance should self-register into the cluster edge layer.
+
+Other automation endpoints follow the same pattern:
+
+- `POST /v1/reverse-proxy-routes/upsert`
+- `POST /v1/tcp-listeners/upsert`
+- `POST /v1/udp-listeners/upsert`
+
+WebSocket and WSS flows continue to live on the HTTP route layer, so they are covered by `domain-routes` or `reverse-proxy-routes` automation.
 
 ## Plugin sidecar metadata
 
@@ -260,7 +268,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 Upgrade to a specific version:
 
 ```bash
-proxysss update --version v0.3.11
+proxysss update --version v0.3.12
 ```
 
 ## Operational defaults

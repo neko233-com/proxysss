@@ -333,7 +333,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "cluster automation api",
-        "admin API supports bearer-token authenticated /v1/domain-routes/upsert writes persisted back into proxysss.yaml and reloaded in process",
+        "admin API supports bearer-token authenticated /v1/domain-routes/upsert, /v1/reverse-proxy-routes/upsert, /v1/tcp-listeners/upsert, and /v1/udp-listeners/upsert writes persisted back into proxysss.yaml and reloaded in process",
     ),
     (
         "agent install skill",
