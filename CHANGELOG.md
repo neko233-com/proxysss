@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.8 - 2026-06-07
+
+- Moved Windows amd64 and Windows arm64 release/deploy builds off hosted Windows runners onto Ubuntu-based MSVC cross-compilation with `cargo-xwin`, targeting the same `.zip` outputs while cutting the slowest build lane.
+- Added first-class Windows arm64 assets to both deploy artifacts and GitHub Releases.
+- Updated CI build coverage to compile both Windows MSVC targets on Ubuntu as well, so pre-release validation no longer waits on the slower hosted Windows build path.
+
 ## v0.3.7 - 2026-06-07
 
 - Further reduced packaging overhead by trimming deploy/release bundle contents to the binary, README, key offline docs, and install scripts instead of copying the full templates/scripts trees.

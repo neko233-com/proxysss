@@ -62,9 +62,10 @@ gh run list -R neko233-com/proxysss --workflow=release.yml --limit 3
 gh release view vX.Y.Z -R neko233-com/proxysss
 ```
 
-Verify all five assets exist:
+Verify all six assets exist:
 
 - `proxysss-windows-amd64.zip`
+- `proxysss-windows-arm64.zip`
 - `proxysss-linux-amd64.tar.gz`
 - `proxysss-linux-arm64.tar.gz`
 - `proxysss-darwin-amd64.tar.gz`

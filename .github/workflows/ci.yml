@@ -57,20 +57,41 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_xwin: false
+          - runner: ubuntu-latest
+            target: x86_64-pc-windows-msvc
+            use_xwin: true
+          - runner: ubuntu-latest
+            target: aarch64-pc-windows-msvc
+            use_xwin: true
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            use_xwin: false
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        if: matrix.use_xwin
+        with:
+          tool: cargo-xwin@0.22.0
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-host-${{ matrix.os }}
+          shared-key: rust-host-${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --locked --release
+        if: ${{ !matrix.use_xwin }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build release (Windows MSVC cross)
+        if: matrix.use_xwin
+        run: cargo xwin build --locked --release --target ${{ matrix.target }}
