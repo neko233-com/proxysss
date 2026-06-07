@@ -21,7 +21,7 @@ Current version: v0.3.12
 - TCP and UDP stream proxying
 - FTP control-channel proxying with passive and active data-channel rewriting
 - WebDAV and static file serving
-- Managed ACME with HTTP-01 and TLS-ALPN-01
+- Managed ACME with HTTP-01 and TLS-ALPN-01, plus explicit acme.sh DNS-01 for wildcard certificates
 - Shared cache zones, compression, access control, rate limiting, retries, and active health checks
 
 ## Configuration model
@@ -145,6 +145,7 @@ Automatic certificate issuance and renewal are built in.
 - Challenge types: HTTP-01 and TLS-ALPN-01
 - No external ACME binary is required for the managed path
 - Domain-level `ssl.type: auto` and global `http.tls.auto_https` both expand into the managed ACME flow
+- Wildcard certificates use the non-default `http.tls.mode: acme_dns_external` path and delegate DNS-01 to `acme.sh`
 
 Minimal public setup:
 
@@ -168,6 +169,30 @@ services:
       path_prefix: /
       upstream: http://127.0.0.1:9000
 ```
+
+Wildcard setup through acme.sh DNS-01:
+
+```yaml
+http:
+  tls:
+    mode: acme_dns_external
+    cert_path: certs/proxysss-cert.pem
+    key_path: certs/proxysss-key.pem
+    generate_self_signed_if_missing: false
+    server_name: example.com
+    acme:
+      client: acme.sh
+      email: admin@example.com
+      domains: [example.com, "*.example.com"]
+      directory_production: true
+      renew_interval_hours: 12
+      dns:
+        provider: dns_cf
+        credentials:
+          CF_Token: your-cloudflare-api-token
+```
+
+`provider` is the acme.sh DNS API name passed to `acme.sh --dns`, for example `dns_cf`, `dns_ali`, or `dns_dp`. `credentials` are exported as environment variables for the acme.sh process, so use the exact variable names required by the selected provider. See the official acme.sh DNS API reference: <https://github.com/acmesh-official/acme.sh/wiki/dnsapi>.
 
 ## Commands you will actually use
 

@@ -383,7 +383,7 @@ impl Gateway {
                 let gateway = self.clone();
                 tasks.spawn(async move { gateway.run_managed_acme_renew_loop().await });
             }
-            TlsMode::AcmeExternal => {
+            TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal => {
                 let gateway = self.clone();
                 tasks.spawn(async move { gateway.run_acme_renew_loop().await });
             }
@@ -466,12 +466,17 @@ impl Gateway {
     }
 
     async fn run_acme_renew_loop(self: Arc<Self>) -> Result<()> {
-        let tls = self.bootstrap_config.http.tls.clone();
-        let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
-
         loop {
+            let tls = {
+                let state = self.current_state().await;
+                state.config.http.tls.clone()
+            };
+            let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
             tokio::time::sleep(renew_every).await;
-            let tls = tls.clone();
+            let tls = {
+                let state = self.current_state().await;
+                state.config.http.tls.clone()
+            };
             let renew_result =
                 tokio::task::spawn_blocking(move || run_acme_command(&tls, true)).await;
 
@@ -484,10 +489,11 @@ impl Gateway {
     }
 
     async fn run_managed_acme_renew_loop(self: Arc<Self>) -> Result<()> {
-        let tls = self.bootstrap_config.http.tls.clone();
-        let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
-
         loop {
+            let tls = {
+                let state = self.current_state().await;
+                state.config.http.tls.clone()
+            };
             match issue_managed_acme_certificate(
                 &tls,
                 &self.acme_http_challenges,
@@ -505,6 +511,11 @@ impl Gateway {
                 Err(error) => tracing::warn!(?error, "managed acme renewal failed"),
             }
 
+            let tls = {
+                let state = self.current_state().await;
+                state.config.http.tls.clone()
+            };
+            let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
             tokio::time::sleep(renew_every).await;
         }
     }
@@ -4103,7 +4114,7 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
                 ));
             }
         }
-        TlsMode::AcmeExternal => {
+        TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal => {
             if !config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists() {
                 run_acme_command(&config.http.tls, false)?;
             }
@@ -4400,7 +4411,9 @@ fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<
         issue.arg("--renew");
     } else {
         issue.arg("--issue");
-        issue.arg("--standalone");
+        if tls.mode != TlsMode::AcmeDnsExternal {
+            issue.arg("--standalone");
+        }
     }
 
     for domain in &acme.domains {
@@ -4417,12 +4430,19 @@ fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<
         issue.arg("--server").arg("letsencrypt_test");
     }
 
-    match acme.challenge {
-        AcmeChallengeType::TlsAlpn01 => {
-            issue.arg("--alpn");
+    if tls.mode == TlsMode::AcmeDnsExternal {
+        for (name, value) in &acme.dns.credentials {
+            issue.env(name.trim(), value);
         }
-        AcmeChallengeType::Http01 => {
-            issue.arg("--standalone");
+        issue.arg("--dns").arg(acme.dns.provider.trim());
+    } else {
+        match acme.challenge {
+            AcmeChallengeType::TlsAlpn01 => {
+                issue.arg("--alpn");
+            }
+            AcmeChallengeType::Http01 => {
+                issue.arg("--standalone");
+            }
         }
     }
 
@@ -5375,6 +5395,18 @@ fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
             serde_json::Value::String("***".to_string()),
         );
     }
+    if let Some(credentials) = value
+        .get_mut("http")
+        .and_then(|item| item.get_mut("tls"))
+        .and_then(|item| item.get_mut("acme"))
+        .and_then(|item| item.get_mut("dns"))
+        .and_then(|item| item.get_mut("credentials"))
+        .and_then(|item| item.as_object_mut())
+    {
+        for value in credentials.values_mut() {
+            *value = serde_json::Value::String("***".to_string());
+        }
+    }
 
     value
 }
@@ -6131,7 +6163,7 @@ fn should_redirect_http_to_https(config: &GatewayConfig, host: &str, uri: &Uri) 
 
     if matches!(
         config.http.tls.mode,
-        TlsMode::AcmeManaged | TlsMode::AcmeExternal
+        TlsMode::AcmeManaged | TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
     ) && config
         .http
         .tls
@@ -7557,6 +7589,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
     let webdav = docs_template_webdav();
     let streams = docs_template_streams();
     let ftp = docs_template_ftp();
+    let acme_dns = docs_template_acme_dns();
     let health = docs_template_health();
     let maintenance = docs_template_maintenance();
     let error_pages = docs_template_error_pages();
@@ -7631,6 +7664,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                 <a href="#quickstart">Quick Start</a>
                 <a href="#operations">Operations</a>
                 <a href="#templates">Templates</a>
+                <a href="#wildcard-ssl">Wildcard SSL</a>
                 <a href="#parity">Nginx Parity</a>
                 <a href="#gaps">Tracked Gaps</a>
             </nav>
@@ -7677,6 +7711,9 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                 <pre>{}</pre>
                 <h3>FTP Native Control + Data Channels</h3>
                 <pre>{}</pre>
+                <h3 id="wildcard-ssl">Wildcard SSL with acme.sh DNS-01</h3>
+                <p class="muted">Use <code>http.tls.mode: acme_dns_external</code> only when wildcard certificates require DNS-01. The provider is passed to <code>acme.sh --dns</code>, and credentials are exported as environment variables. See <a class="ghost" href="https://github.com/acmesh-official/acme.sh/wiki/dnsapi">acme.sh DNS API</a>.</p>
+                <pre>{}</pre>
                 <h3>Active Health, Maintenance Persistence, Alerts</h3>
                 <pre>{}</pre>
                 <h3>Custom Error Pages</h3>
@@ -7692,7 +7729,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                     <thead><tr><th>Surface</th><th>Status</th><th>Notes</th></tr></thead>
                     <tbody>
                         <tr><td>HTTP reverse proxy</td><td><span class="pill good">supported</span></td><td>host/path matching, upstream pools, strip prefix, header set/strip, retry, health, maintenance drain</td></tr>
-                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME, WebSocket, automatic redirect for managed domains</td></tr>
+                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME, acme.sh DNS-01 wildcard certificates, WebSocket, automatic redirect for managed domains</td></tr>
                         <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
                         <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
                         <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
@@ -7715,7 +7752,15 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
     </main>
 </body>
 </html>"##,
-        reverse_proxy, static_site, webdav, streams, ftp, health, error_pages, maintenance,
+        reverse_proxy,
+        static_site,
+        webdav,
+        streams,
+        ftp,
+        acme_dns,
+        health,
+        error_pages,
+        maintenance,
     )
 }
 
@@ -7737,6 +7782,10 @@ fn docs_template_streams() -> &'static str {
 
 fn docs_template_ftp() -> &'static str {
     "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n"
+}
+
+fn docs_template_acme_dns() -> &'static str {
+    "http:\n  tls:\n    mode: acme_dns_external\n    cert_path: certs/proxysss-cert.pem\n    key_path: certs/proxysss-key.pem\n    generate_self_signed_if_missing: false\n    server_name: example.com\n    acme:\n      client: acme.sh\n      email: admin@example.com\n      domains: [example.com, \"*.example.com\"]\n      directory_production: true\n      renew_interval_hours: 12\n      dns:\n        provider: dns_cf\n        credentials:\n          CF_Token: your-cloudflare-api-token\n"
 }
 
 fn docs_template_health() -> &'static str {

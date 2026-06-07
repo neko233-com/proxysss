@@ -265,6 +265,30 @@ http:
       production: true
 ```
 
+泛域名证书走单独的非默认模式，依赖外部 `acme.sh` 做 DNS-01：
+
+```yaml
+http:
+  tls:
+    mode: acme_dns_external
+    cert_path: certs/proxysss-cert.pem
+    key_path: certs/proxysss-key.pem
+    generate_self_signed_if_missing: false
+    server_name: example.com
+    acme:
+      client: acme.sh
+      email: admin@example.com
+      domains: [example.com, "*.example.com"]
+      directory_production: true
+      renew_interval_hours: 12
+      dns:
+        provider: dns_cf
+        credentials:
+          CF_Token: your-cloudflare-api-token
+```
+
+`provider` 对应 `acme.sh --dns` 的 DNS API 名称，`credentials` 会作为环境变量传给 `acme.sh`。不同云厂商变量名不同，按官方文档填写：<https://github.com/acmesh-official/acme.sh/wiki/dnsapi>。
+
 ## 8. 健康检查与维护态
 
 proxysss 可直接在配置里打开：

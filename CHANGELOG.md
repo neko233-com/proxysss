@@ -2,6 +2,8 @@
 
 ## v0.3.12 - 2026-06-07
 
+- Added non-default `http.tls.mode: acme_dns_external` for wildcard certificate issuance and renewal through external `acme.sh` DNS-01 providers, with DNS credentials redacted from config display paths.
+- Documented acme.sh wildcard DNS-01 setup in README, built-in docs, nginx migration notes, lab examples, and agent guidance.
 - Expanded token-authenticated automation endpoints beyond domain routes to also support `services.reverse_proxy.routes`, `tcp.listeners`, and `udp.listeners` upserts over HTTP, with persistence back into the main YAML file and in-process reload.
 - Added an internal cluster automation integration guide covering the agent-facing HTTP API workflow for HTTP, WebSocket, TCP, and UDP onboarding.
 

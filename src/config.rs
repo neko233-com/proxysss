@@ -193,6 +193,7 @@ pub enum TlsMode {
     Manual,
     AcmeManaged,
     AcmeExternal,
+    AcmeDnsExternal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +214,16 @@ pub struct AcmeExternalConfig {
     pub renew_interval_hours: u64,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub dns: AcmeDnsExternalConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AcmeDnsExternalConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub credentials: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1281,7 +1292,7 @@ impl GatewayConfig {
                     ));
                 }
             }
-            TlsMode::AcmeManaged | TlsMode::AcmeExternal => {
+            TlsMode::AcmeManaged | TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal => {
                 if self.http.tls.auto_https.enabled {
                     if self.http.tls.auto_https.domains.is_empty() {
                         errors.push(
@@ -1295,8 +1306,10 @@ impl GatewayConfig {
                                 .to_string(),
                         );
                     }
-                    if self.http.tls.mode == TlsMode::AcmeExternal
-                        && self.http.tls.auto_https.client.trim().is_empty()
+                    if matches!(
+                        self.http.tls.mode,
+                        TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
+                    ) && self.http.tls.auto_https.client.trim().is_empty()
                     {
                         errors.push(
                             "http.tls.auto_https.client cannot be empty when auto_https.enabled=true"
@@ -1312,21 +1325,23 @@ impl GatewayConfig {
                 }
                 if self.http.tls.acme.domains.is_empty() {
                     errors.push(
-                        "http.tls.acme.domains cannot be empty when mode is acme_managed/acme_external"
+                        "http.tls.acme.domains cannot be empty when mode is acme_managed/acme_external/acme_dns_external"
                             .to_string(),
                     );
                 }
                 if self.http.tls.acme.email.trim().is_empty() {
                     errors.push(
-                        "http.tls.acme.email cannot be empty when mode is acme_managed/acme_external"
+                        "http.tls.acme.email cannot be empty when mode is acme_managed/acme_external/acme_dns_external"
                             .to_string(),
                     );
                 }
-                if self.http.tls.mode == TlsMode::AcmeExternal
-                    && self.http.tls.acme.client.trim().is_empty()
+                if matches!(
+                    self.http.tls.mode,
+                    TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
+                ) && self.http.tls.acme.client.trim().is_empty()
                 {
                     errors.push(
-                        "http.tls.acme.client cannot be empty when mode is acme_external"
+                        "http.tls.acme.client cannot be empty when mode is acme_external/acme_dns_external"
                             .to_string(),
                     );
                 }
@@ -1334,6 +1349,46 @@ impl GatewayConfig {
                     errors.push(
                         "http.tls.acme.renew_interval_hours must be greater than 0".to_string(),
                     );
+                }
+                if self.http.tls.mode == TlsMode::AcmeDnsExternal {
+                    if !self
+                        .http
+                        .tls
+                        .acme
+                        .domains
+                        .iter()
+                        .any(|domain| domain.trim().starts_with("*."))
+                    {
+                        errors.push(
+                            "http.tls.acme.domains must include at least one wildcard domain when mode is acme_dns_external"
+                                .to_string(),
+                        );
+                    }
+                    if self.http.tls.acme.dns.provider.trim().is_empty() {
+                        errors.push(
+                            "http.tls.acme.dns.provider cannot be empty when mode is acme_dns_external"
+                                .to_string(),
+                        );
+                    }
+                    if self.http.tls.acme.dns.credentials.is_empty() {
+                        errors.push(
+                            "http.tls.acme.dns.credentials cannot be empty when mode is acme_dns_external"
+                                .to_string(),
+                        );
+                    }
+                    for (key, value) in &self.http.tls.acme.dns.credentials {
+                        if key.trim().is_empty() {
+                            errors.push(
+                                "http.tls.acme.dns.credentials cannot contain empty environment variable names"
+                                    .to_string(),
+                            );
+                        }
+                        if value.trim().is_empty() {
+                            errors.push(format!(
+                                "http.tls.acme.dns.credentials.{key} cannot be empty when mode is acme_dns_external"
+                            ));
+                        }
+                    }
                 }
             }
             TlsMode::SelfSigned => {}
@@ -1389,7 +1444,7 @@ impl GatewayConfig {
         }
 
         if self.http.tls.mode == TlsMode::SelfSigned {
-            warnings.push("tls.mode=self_signed is for development or internal environments; use acme_managed or acme_external for public traffic".to_string());
+            warnings.push("tls.mode=self_signed is for development or internal environments; use acme_managed, acme_external, or acme_dns_external for public traffic".to_string());
         }
 
         if self.http.plain_bind.trim().is_empty() {
@@ -1670,6 +1725,7 @@ impl Default for AcmeExternalConfig {
             directory_production: false,
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
+            dns: AcmeDnsExternalConfig::default(),
         }
     }
 }
@@ -2800,6 +2856,54 @@ mod tests {
             .auto_https
             .domains
             .contains(&"example.com".to_string()));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn acme_dns_external_requires_dns_provider_credentials_and_wildcard_domain() {
+        let mut config = GatewayConfig::default();
+        config.http.tls.mode = TlsMode::AcmeDnsExternal;
+        config.http.tls.acme.email = "admin@example.com".to_string();
+        config.http.tls.acme.domains = vec!["example.com".to_string()];
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid acme dns config");
+        let message = error.to_string();
+        assert!(message.contains("http.tls.acme.domains must include at least one wildcard"));
+        assert!(message.contains("http.tls.acme.dns.provider"));
+        assert!(message.contains("http.tls.acme.dns.credentials"));
+    }
+
+    #[test]
+    fn acme_dns_external_accepts_acme_sh_dns_provider_credentials() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-acme-dns-external-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "http:\n  tls:\n    mode: acme_dns_external\n    generate_self_signed_if_missing: false\n    acme:\n      client: acme.sh\n      email: admin@example.com\n      domains: [example.com, '*.example.com']\n      dns:\n        provider: dns_cf\n        credentials:\n          CF_Token: secret-token\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeDnsExternal);
+        assert_eq!(config.http.tls.acme.dns.provider, "dns_cf");
+        assert_eq!(
+            config
+                .http
+                .tls
+                .acme
+                .dns
+                .credentials
+                .get("CF_Token")
+                .map(String::as_str),
+            Some("secret-token")
+        );
 
         let _ = fs::remove_dir_all(base_dir);
     }

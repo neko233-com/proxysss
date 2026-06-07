@@ -309,7 +309,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "auto https",
-        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01 issue/renew without external binaries",
+        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; http.tls.mode=acme_dns_external delegates wildcard DNS-01 to acme.sh",
     ),
     (
         "multi-cert sni",
@@ -423,14 +423,14 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TLS certificates",
         status: ParityStatus::Supported,
-        evidence: "self_signed/manual/acme_managed/acme_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
+        evidence: "self_signed/manual/acme_managed/acme_external/acme_dns_external plus http.tls.certificates and domain-route manual SSL for multi-cert SNI",
         next_gap: "",
     },
     NginxParityItem {
         capability: "self-contained auto ssl",
         status: ParityStatus::Partial,
-        evidence: "auto https now uses managed ACME HTTP-01/TLS-ALPN-01 issue/renew without acme.sh; acme_external remains available for legacy flows",
-        next_gap: "add richer account/provider selection and DNS challenge support",
+        evidence: "auto https uses managed ACME HTTP-01/TLS-ALPN-01 without acme.sh; wildcard DNS-01 is supported through explicit acme_dns_external acme.sh provider credentials",
+        next_gap: "native DNS provider integrations remain external by design",
     },
     NginxParityItem {
         capability: "access/error logging",
@@ -502,7 +502,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     CaddyFeatureItem {
         capability: "automatic HTTPS",
         status: ParityStatus::Supported,
-        evidence: "http.tls.auto_https now expands to managed ACME HTTP-01/TLS-ALPN-01 issuance/renewal without external binaries",
+        evidence: "http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard certificates use explicit acme_dns_external through acme.sh DNS-01",
         next_gap: "",
     },
     CaddyFeatureItem {
@@ -936,6 +936,18 @@ fn render_redacted_config_yaml(config: &GatewayConfig) -> Result<String> {
             serde_yaml::Value::String("bearer_token".to_string()),
             serde_yaml::Value::String("***".to_string()),
         );
+    }
+    if let Some(credentials) = value
+        .get_mut("http")
+        .and_then(|item| item.get_mut("tls"))
+        .and_then(|item| item.get_mut("acme"))
+        .and_then(|item| item.get_mut("dns"))
+        .and_then(|item| item.get_mut("credentials"))
+        .and_then(|item| item.as_mapping_mut())
+    {
+        for value in credentials.values_mut() {
+            *value = serde_yaml::Value::String("***".to_string());
+        }
     }
     serde_yaml::to_string(&value).context("failed to render redacted config")
 }
@@ -2371,6 +2383,13 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.admin.password = "super-secret".to_string();
         config.admin.bearer_token = "cluster-secret".to_string();
+        config
+            .http
+            .tls
+            .acme
+            .dns
+            .credentials
+            .insert("CF_Token".to_string(), "cloudflare-secret".to_string());
 
         let rendered = render_redacted_config_yaml(&config).expect("render redacted yaml");
         assert!(
@@ -2385,5 +2404,7 @@ mod tests {
         );
         assert!(!rendered.contains("super-secret"));
         assert!(!rendered.contains("cluster-secret"));
+        assert!(!rendered.contains("cloudflare-secret"));
+        assert!(rendered.contains("CF_Token"));
     }
 }

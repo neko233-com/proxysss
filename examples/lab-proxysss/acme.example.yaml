@@ -19,3 +19,25 @@ http:
       challenge: http01
       directory_production: false
       renew_interval_hours: 12
+
+# Wildcard certificates are intentionally non-default. Install acme.sh first, then
+# use the DNS provider name and environment variables documented by acme.sh:
+# https://github.com/acmesh-official/acme.sh/wiki/dnsapi
+#
+# http:
+#   tls:
+#     mode: acme_dns_external
+#     cert_path: certs/proxysss-cert.pem
+#     key_path: certs/proxysss-key.pem
+#     generate_self_signed_if_missing: false
+#     server_name: example.com
+#     acme:
+#       client: acme.sh
+#       email: ops@example.com
+#       domains: [example.com, "*.example.com"]
+#       directory_production: false
+#       renew_interval_hours: 12
+#       dns:
+#         provider: dns_cf
+#         credentials:
+#           CF_Token: your-cloudflare-api-token
