@@ -3621,7 +3621,6 @@ fn load_auto_plugin_metadata(path: &Path) -> Result<AutoLoadPluginMetadata> {
             .unwrap_or_default();
 
         let metadata: anyhow::Result<AutoLoadPluginMetadata> = match ext.as_str() {
-            "json" => serde_json::from_str(&body).map_err(Into::into),
             "yaml" | "yml" => serde_yaml::from_str(&body).map_err(Into::into),
             _ => continue,
         };
@@ -3639,7 +3638,7 @@ fn plugin_sidecar_paths(path: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
 
-    ["yaml", "yml", "json"]
+    ["yaml", "yml"]
         .into_iter()
         .map(|ext| path.with_file_name(format!("{stem}.plugin.{ext}")))
         .collect()
@@ -7048,7 +7047,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Built-in Control Plane</h2>
                 <div class="list">
                     <div><strong>Health:</strong> active HTTP/TCP health probes plus passive quarantine and manual drain state.</div>
-                    <div><strong>Reload:</strong> config, includes, scripts, plugins, and route-level health policy reload without a full process restart where supported.</div>
+                    <div><strong>Reload:</strong> the main YAML config, scripts, plugins, and route-level health policy reload without a full process restart where supported.</div>
                     <div><strong>Maintenance:</strong> upstream disable/restore can be persisted on disk through runtime maintenance state.</div>
                     <div><strong>Error Pages:</strong> configurable status-page bodies/files plus polished built-in browser-facing 404/403/5xx pages.</div>
                     <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>.</div>
@@ -7111,7 +7110,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
 }
 
 fn docs_template_reverse_proxy() -> &'static str {
-    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9000\n        - http://127.0.0.1:9001\n      strip_prefix: false\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 200\n        burst: 100\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  access_control:\n    http:\n      enabled: true\n      blacklist: [203.0.113.10, 198.51.100.0/24]\n  domain_routes:\n    - name: example-site\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n    - name: neko233-store\n      domains: [neko233.store]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9001\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 120\n        window_ms: 60000\n        burst: 30\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
 }
 
 fn docs_template_static_site() -> &'static str {
@@ -8351,6 +8350,56 @@ mod tests {
     }
 
     #[test]
+    fn configured_domain_route_uses_domain_as_primary_service_group() {
+        let mut config = GatewayConfig::default();
+        config.services.domain_routes.push(DomainRouteConfig {
+            name: "example-site".to_string(),
+            domains: vec!["example.com".to_string()],
+            path_prefix: "/".to_string(),
+            upstream: "http://127.0.0.1:9000".to_string(),
+            upstreams: Vec::new(),
+            strip_prefix: false,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
+            ssl: crate::config::DomainTlsConfig::default(),
+        });
+        config.services.domain_routes.push(DomainRouteConfig {
+            name: "store".to_string(),
+            domains: vec!["neko233.store".to_string()],
+            path_prefix: "/".to_string(),
+            upstream: "http://127.0.0.1:9000".to_string(),
+            upstreams: vec!["http://127.0.0.1:9001".to_string()],
+            strip_prefix: false,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            compression: ResponseCompressionConfig::default(),
+            cache: ResponseCacheConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
+            active_health: ActiveHealthOverrideConfig::default(),
+            ssl: crate::config::DomainTlsConfig::default(),
+        });
+
+        let uri: Uri = "/".parse().expect("valid uri");
+        let example = configured_http_route(&config, "example.com", &uri).expect("example route");
+        let store = configured_http_route(&config, "neko233.store", &uri).expect("store route");
+
+        assert_eq!(example.runtime_scope.as_deref(), Some("example-site"));
+        assert_eq!(example.decision.upstream, "http://127.0.0.1:9000");
+        assert!(example.decision.upstreams.is_empty());
+
+        assert_eq!(store.runtime_scope.as_deref(), Some("store"));
+        assert_eq!(store.decision.upstream, "http://127.0.0.1:9000");
+        assert_eq!(
+            store.decision.upstreams,
+            vec!["http://127.0.0.1:9001".to_string()]
+        );
+    }
+
+    #[test]
     fn finalize_http_response_prefers_brotli_for_compressible_payloads() {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
@@ -8779,8 +8828,8 @@ mod tests {
         let plugin = root.join("geo-headers.ts");
         std::fs::write(&plugin, "// plugin").expect("write plugin");
         std::fs::write(
-            root.join("geo-headers.plugin.json"),
-            r#"{"enabled":true,"priority":180,"config":{"mode":"geo_headers","header_prefix":"proxysss-"}}"#,
+            root.join("geo-headers.plugin.yaml"),
+            "enabled: true\npriority: 180\nconfig:\n  mode: geo_headers\n  header_prefix: proxysss-\n",
         )
         .expect("write sidecar");
 

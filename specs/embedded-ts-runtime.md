@@ -142,9 +142,9 @@ Retained: `script.enabled`, `script.entry`, `script.cwd`, `script.env`,
 `plugins.extensions`, `plugins.allow_admin_manage`. New optional safety knobs:
 `script.memory_limit_mb` (default 64), `script.max_stack_size_kb` (default 512).
 
-Hot reload boundaries are unchanged: merged config (except listener identity),
-explicit include files, the main script, and auto-loaded plugin scripts are all
-hot-reloadable. The embedded worker is rebuilt on reload like the prior runtime.
+Hot reload boundaries are unchanged: the main config (except listener identity),
+the main script, and auto-loaded plugin scripts are all hot-reloadable. The
+embedded worker is rebuilt on reload like the prior runtime.
 
 ## 6. Public Rust API (preserved)
 

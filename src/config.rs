@@ -17,7 +17,7 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
 pub struct GatewayConfig {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IncludeConfig::is_disabled")]
     pub include: IncludeConfig,
     #[serde(default = "default_log_filter")]
     pub log_filter: String,
@@ -57,6 +57,12 @@ pub struct IncludeConfig {
     pub required: bool,
     #[serde(default)]
     pub files: Vec<PathBuf>,
+}
+
+impl IncludeConfig {
+    fn is_disabled(&self) -> bool {
+        !self.enabled && !self.required && self.files.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -719,8 +725,7 @@ pub struct FtpConfig {
 
 impl GatewayConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut visited = HashSet::new();
-        let value = load_config_value_recursive(path, &mut visited)?;
+        let value = load_config_value(path)?;
         let mut config: GatewayConfig = serde_yaml::from_value(value)
             .with_context(|| format!("failed to decode merged config {}", path.display()))?;
 
@@ -783,8 +788,11 @@ impl GatewayConfig {
             errors.push("runtime.maintenance_state.path cannot be empty".to_string());
         }
 
-        if self.include.enabled && self.include.files.is_empty() {
-            errors.push("include.files cannot be empty when include.enabled=true".to_string());
+        if !self.include.is_disabled() {
+            errors.push(
+                "include is no longer supported; keep all gateway settings in a single proxysss.yaml file"
+                    .to_string(),
+            );
         }
 
         if self.script.enabled {
@@ -1392,11 +1400,6 @@ impl GatewayConfig {
         serde_yaml::to_string(&config).unwrap_or_else(|_| "".to_string())
     }
 
-    pub fn render_default_json() -> String {
-        let config = Self::default();
-        serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".to_string())
-    }
-
     fn normalize(&mut self, root_dir: &Path) {
         let root_dir = normalize_root_dir(root_dir);
         self.root_dir = root_dir.clone();
@@ -1969,43 +1972,17 @@ impl Default for FtpConfig {
     }
 }
 
-fn load_config_value_recursive(
-    path: &Path,
-    visited: &mut HashSet<PathBuf>,
-) -> Result<serde_yaml::Value> {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical.clone()) {
-        return Err(anyhow!(
-            "configuration include cycle detected at {}",
-            canonical.display()
-        ));
-    }
-
+fn load_config_value(path: &Path) -> Result<serde_yaml::Value> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let mut base = parse_value_by_extension(&raw, path)?;
+    let base = parse_value_by_extension(&raw, path)?;
     let include = read_include_config(&base)?;
-
-    if include.enabled {
-        let root_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        for child in include.files {
-            let child_path = absolutize(root_dir, &child);
-            if !child_path.exists() {
-                if include.required {
-                    return Err(anyhow!(
-                        "required include file does not exist: {}",
-                        child_path.display()
-                    ));
-                }
-                continue;
-            }
-
-            let child_value = load_config_value_recursive(&child_path, visited)?;
-            merge_value(&mut base, child_value);
-        }
+    if !include.is_disabled() {
+        return Err(anyhow!(
+            "config include is unsupported; keep all runtime settings in a single YAML file: {}",
+            path.display()
+        ));
     }
-
-    visited.remove(&canonical);
     Ok(base)
 }
 
@@ -2017,12 +1994,9 @@ fn parse_value_by_extension(raw: &str, path: &Path) -> Result<serde_yaml::Value>
         .map(|value| value.to_ascii_lowercase());
 
     match ext.as_deref() {
-        Some("json") => {
-            let json: serde_json::Value = serde_json::from_str(raw)
-                .with_context(|| format!("failed to parse json config {}", path.display()))?;
-            serde_yaml::to_value(json)
-                .with_context(|| format!("failed to convert json config {}", path.display()))
-        }
+        Some("json") => Err(anyhow!(
+            "JSON config files are unsupported; use YAML and keep the default name proxysss.yaml or pass -config/--config/-c"
+        )),
         _ => serde_yaml::from_str(raw)
             .with_context(|| format!("failed to parse yaml config {}", path.display())),
     }
@@ -2034,24 +2008,6 @@ fn read_include_config(value: &serde_yaml::Value) -> Result<IncludeConfig> {
         .cloned()
         .unwrap_or(serde_yaml::Value::Null);
     Ok(serde_yaml::from_value(include).unwrap_or_default())
-}
-
-fn merge_value(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
-    match (base, overlay) {
-        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
-            for (key, value) in overlay_map {
-                match base_map.get_mut(&key) {
-                    Some(base_value) => merge_value(base_value, value),
-                    None => {
-                        base_map.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base_value, overlay_value) => {
-            *base_value = overlay_value;
-        }
-    }
 }
 
 fn absolutize(root: &Path, path: &Path) -> PathBuf {
@@ -2982,22 +2938,21 @@ mod tests {
 
     #[test]
     fn explicit_include_merges_child_config() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-include-test-{}", std::process::id()));
-        let conf_dir = base_dir.join("conf.d");
-        fs::create_dir_all(&conf_dir).expect("create temp config dir");
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-include-unsupported-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
         let base = base_dir.join("proxysss.yaml");
-        let child = conf_dir.join("admin.yaml");
 
         fs::write(
             &base,
             "include:\n  enabled: true\n  required: true\n  files:\n    - ./conf.d/admin.yaml\n",
         )
         .expect("write base config");
-        fs::write(&child, "admin:\n  bind: 127.0.0.1:7778\n").expect("write child config");
 
-        let config = GatewayConfig::load(&base).expect("load merged config");
-        assert_eq!(config.admin.bind, "127.0.0.1:7778");
+        let error = GatewayConfig::load(&base).expect_err("include should be rejected");
+        assert!(error.to_string().contains("single YAML file"));
 
         let _ = fs::remove_dir_all(base_dir);
     }
@@ -3006,9 +2961,28 @@ mod tests {
     fn include_enabled_requires_files() {
         let mut config = GatewayConfig::default();
         config.include.enabled = true;
-        config.include.files.clear();
-        let error = config.validate().expect_err("expected invalid include");
-        assert!(error.to_string().contains("include.files"));
+        config
+            .include
+            .files
+            .push(PathBuf::from("conf.d/extra.yaml"));
+        let error = config.validate().expect_err("expected unsupported include");
+        assert!(error.to_string().contains("single proxysss.yaml file"));
+    }
+
+    #[test]
+    fn json_config_files_are_rejected() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-json-config-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.json");
+        fs::write(&config_path, "{\"plugins\":{\"enabled\":false}}").expect("write json config");
+
+        let error = GatewayConfig::load(&config_path).expect_err("json config should fail");
+        assert!(error
+            .to_string()
+            .contains("JSON config files are unsupported"));
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

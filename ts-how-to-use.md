@@ -1,6 +1,6 @@
 # proxysss TypeScript How To Use
 
-proxysss 的 TS 脚本运行在内嵌 QuickJS 引擎里，不依赖 node、deno 或 tsc。脚本是可选扩展层，不是主配置面；HTTP/HTTPS/TCP/UDP/FTP/WebDAV 的常规入口能力优先建议走 YAML。
+proxysss 的 TS 脚本运行在内嵌 QuickJS 引擎里，不依赖 node、deno 或 tsc。脚本是可选扩展层，不是主配置面；HTTP/HTTPS/TCP/UDP/FTP/WebDAV 的常规入口能力优先建议走单个 YAML 配置文件。
 
 ## 推荐文件
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.9 - 2026-06-07
+
+- Enforced a single-YAML runtime configuration model: `proxysss.yaml` remains the default, `-config` / `--config` / `-c` select custom YAML paths, and runtime `include` files are now rejected.
+- Removed JSON runtime config support and narrowed auto-loaded plugin sidecar metadata to YAML-only files.
+- Clarified and tested domain-first service grouping so one YAML file can define multiple domains, each with its own upstream pool while still reusing shared backend machines.
+- Rewrote the README in English and updated built-in docs, examples, AGENTS guidance, and supporting docs to match the new config model.
+
 ## v0.3.8 - 2026-06-07
 
 - Moved Windows amd64 and Windows arm64 release/deploy builds off hosted Windows runners onto Ubuntu-based MSVC cross-compilation with `cargo-xwin`, targeting the same `.zip` outputs while cutting the slowest build lane.

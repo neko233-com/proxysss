@@ -147,7 +147,6 @@ enum Commands {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ConfigOutputFormat {
     Yaml,
-    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -273,12 +272,12 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
     ),
     (
-        "explicit sub-config",
-        "supported via include.enabled + include.files",
+        "single yaml config",
+        "recommended and enforced: keep runtime settings in one proxysss.yaml file and use -config/--config/-c only to point at a different YAML path",
     ),
     (
         "hot reload",
-        "configuration, explicit includes, main script, and auto-loaded plugins are fingerprinted",
+        "the main YAML config, the main script, and auto-loaded plugins are fingerprinted",
     ),
     (
         "forwarded headers",
@@ -290,7 +289,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "plugin sidecar config",
-        "auto-loaded plugins may read <name>.plugin.yaml/.yml/.json for enabled/priority/config without external runtime",
+        "auto-loaded plugins may read <name>.plugin.yaml/.yml for enabled/priority/config without external runtime",
     ),
     (
         "ai api compatibility",
@@ -427,7 +426,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "hot reload",
         status: ParityStatus::Supported,
-        evidence: "reload fingerprint covers config, includes, main script, auto-loaded plugins",
+        evidence: "reload fingerprint covers the main YAML config, the main script, and auto-loaded plugins",
         next_gap: "",
     },
     NginxParityItem {
@@ -478,7 +477,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         capability: "plugin sidecar configuration",
         status: ParityStatus::Supported,
         evidence:
-            "auto-loaded plugins read <name>.plugin.yaml/.yml/.json for enabled/priority/config while remaining default-off",
+            "auto-loaded plugins read <name>.plugin.yaml/.yml for enabled/priority/config while remaining default-off",
         next_gap: "",
     },
 ];
@@ -666,9 +665,6 @@ async fn main() -> Result<()> {
                 ConfigOutputFormat::Yaml => {
                     print!("{}", config::GatewayConfig::render_default_yaml())
                 }
-                ConfigOutputFormat::Json => {
-                    print!("{}", config::GatewayConfig::render_default_json())
-                }
             }
             Ok(())
         }
@@ -696,26 +692,14 @@ async fn main() -> Result<()> {
                         ConfigOutputFormat::Yaml => {
                             print!("{}", serde_yaml::to_string(&gateway_config)?)
                         }
-                        ConfigOutputFormat::Json => {
-                            print!("{}", serde_json::to_string_pretty(&gateway_config)?)
-                        }
                     }
                     Ok(())
                 }
                 ConfigCommands::Includes => {
                     let config_path = install::resolve_run_config_path(command_config.clone())?;
-                    let gateway_config = GatewayConfig::load(&config_path)?;
                     println!("config: {}", config_path.display());
-                    println!("include.enabled: {}", gateway_config.include.enabled);
-                    println!("include.required: {}", gateway_config.include.required);
-                    if gateway_config.include.files.is_empty() {
-                        println!("include.files: []");
-                    } else {
-                        println!("include.files:");
-                        for file in &gateway_config.include.files {
-                            println!(" - {}", file.display());
-                        }
-                    }
+                    println!("include: unsupported");
+                    println!("recommendation: keep all runtime settings in a single YAML file");
                     Ok(())
                 }
                 ConfigCommands::WatchedScripts => {
@@ -754,9 +738,6 @@ async fn main() -> Result<()> {
                         ConfigOutputFormat::Yaml => {
                             print!("{}", serde_yaml::to_string(NGINX_PARITY_MATRIX)?)
                         }
-                        ConfigOutputFormat::Json => {
-                            print!("{}", serde_json::to_string_pretty(NGINX_PARITY_MATRIX)?)
-                        }
                     }
                     Ok(())
                 }
@@ -764,9 +745,6 @@ async fn main() -> Result<()> {
                     match format {
                         ConfigOutputFormat::Yaml => {
                             print!("{}", serde_yaml::to_string(CADDY_FEATURE_MATRIX)?)
-                        }
-                        ConfigOutputFormat::Json => {
-                            print!("{}", serde_json::to_string_pretty(CADDY_FEATURE_MATRIX)?)
                         }
                     }
                     Ok(())
@@ -1102,10 +1080,7 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         }
     );
     println!(
-        "include           : enabled={}, required={}, files={}",
-        config.include.enabled,
-        config.include.required,
-        config.include.files.len()
+        "config model      : single YAML file (default proxysss.yaml, custom via -config/--config/-c)"
     );
     println!(
         "tcp listeners     : {}",
@@ -1245,13 +1220,16 @@ fn render_route_topology(config: &GatewayConfig) -> String {
             output.push_str("none\n");
         } else {
             for route in &config.services.domain_routes {
+                let backend_pool = route_backend_pool(&route.upstream, &route.upstreams).join(",");
                 output.push_str(&format!(
-                    "{} domains={} path={} upstream={} upstreams={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={} cache_zone={} rate_limit={} rate_limit_zone={} max_connections={}\n",
+                    "{} domains={} primary_domain={} path={} upstream={} upstreams={} backend_pool={} strip_prefix={} ssl={:?} auto_ssl={} compression={} cache={} cache_zone={} rate_limit={} rate_limit_zone={} max_connections={}\n",
                     route.name,
                     route.domains.join(","),
+                    route.domains.first().map(String::as_str).unwrap_or("-"),
                     route.path_prefix,
                     route.upstream,
                     route.upstreams.len(),
+                    backend_pool,
                     route.strip_prefix,
                     route.ssl.mode,
                     route.ssl.is_auto_ssl,
@@ -1392,7 +1370,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     ));
     output.push_str("[hot_reload]\n");
     output.push_str("configuration values except listener identity\n");
-    output.push_str("explicit include files from include.files\n");
+    output.push_str("the main proxysss.yaml file\n");
     output.push_str("main extension script from script.entry\n");
     output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
     output.push_str("reverse_proxy routes\n");
@@ -1428,6 +1406,20 @@ fn blank_as_disabled(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn route_backend_pool(primary: &str, extras: &[String]) -> Vec<String> {
+    let mut backends = Vec::new();
+    if !primary.trim().is_empty() {
+        backends.push(primary.to_string());
+    }
+    for upstream in extras {
+        if upstream.trim().is_empty() || backends.iter().any(|item| item == upstream) {
+            continue;
+        }
+        backends.push(upstream.clone());
+    }
+    backends
 }
 
 fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
@@ -1992,7 +1984,7 @@ mod tests {
             "static files",
             "ftp",
             "webdav",
-            "explicit sub-config",
+            "single yaml config",
             "hot reload",
             "forwarded headers",
             "logging levels",
@@ -2095,6 +2087,7 @@ mod tests {
         let plan = render_reload_plan(&GatewayConfig::default());
         assert!(plan.contains("reverse_proxy routes"));
         assert!(plan.contains("auto-loaded plugin scripts"));
+        assert!(plan.contains("the main proxysss.yaml file"));
         assert!(plan.contains("services.ftp.enabled/services.ftp.bind"));
         assert!(plan.contains("http.plain_bind/http.tls_bind/http.h3_bind"));
         assert!(plan.contains("logging.access_log_path/logging.error_log_path"));
@@ -2220,5 +2213,23 @@ mod tests {
         ]);
         assert_eq!(args[1], OsString::from("--config"));
         assert_eq!(args[2], OsString::from("custom.yaml"));
+    }
+
+    #[test]
+    fn route_backend_pool_keeps_primary_and_deduplicates_extras() {
+        let pool = route_backend_pool(
+            "http://127.0.0.1:9000",
+            &[
+                "http://127.0.0.1:9000".to_string(),
+                "http://127.0.0.1:9001".to_string(),
+            ],
+        );
+        assert_eq!(
+            pool,
+            vec![
+                "http://127.0.0.1:9000".to_string(),
+                "http://127.0.0.1:9001".to_string()
+            ]
+        );
     }
 }

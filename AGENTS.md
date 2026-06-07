@@ -12,10 +12,10 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Default HTTPS/HTTP2/HTTP3 port is `443`.
 - Default FTP control port is `21` when `services.ftp.enabled=true`.
 - Configuration must be more human-friendly than nginx while still covering nginx-level gateway duties.
-- Sub-config support must be explicit through `include.enabled` and `include.files`; do not silently scan include directories.
-- CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config includes`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
+- Runtime configuration should live in a single YAML file by default, normally `proxysss.yaml`; custom locations are selected with `-config`, `--config`, or `-c`.
+- CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
-- Config, explicit include files, the main extension script, and auto-loaded plugin scripts must participate in hot reload.
+- The main YAML config, the main extension script, and auto-loaded plugin scripts must participate in hot reload.
 - Logging must expose access logs (`logs/access.log`), error logs (`logs/error.log`), and level control for `debug`, `info`, `warn`, and `error`; default to `info`, with `debug` reserved for internal diagnostics.
 - Official demo plugins ship with `proxysss init`: `structured-log` (log hook demo), `traffic-stats` (traffic/error counters), and `player-affinity` (affinity routing demo).
 - Automated tests should protect nginx-parity defaults and capability declarations whenever related code changes.
@@ -70,7 +70,7 @@ proxysss config nginx-parity --format yaml
 **Hot-reloadable (fingerprinted):**
 
 - Merged configuration values except listener identity
-- Explicit `include.files`
+- The main `proxysss.yaml` file
 - Main script (`script.args`)
 - Auto-loaded plugin scripts (`plugins.auto_load_dir`)
 - `services.reverse_proxy.routes`, `static_sites`, `webdav`, FTP upstream

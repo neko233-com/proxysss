@@ -1,6 +1,6 @@
 # proxysss routes for `D:\Server\proxysss_dir` backends
 
-proxysss itself is installed via `install.ps1` into default paths. This folder provides an **explicit include** that points the gateway at services under `D:\Server\proxysss_dir`.
+proxysss itself is installed via `install.ps1` into default paths. Keep the runtime configuration in a single `%APPDATA%\proxysss\proxysss.yaml` file and copy the route snippets from this folder into that file.
 
 ## Setup
 
@@ -10,23 +10,16 @@ proxysss itself is installed via `install.ps1` into default paths. This folder p
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version latest
 ```
 
-2. Copy include file:
+2. Copy the route snippet into your main config:
 
 ```powershell
 $configRoot = Join-Path $env:APPDATA "proxysss"
-New-Item -ItemType Directory -Force -Path (Join-Path $configRoot "conf.d") | Out-Null
-Copy-Item .\examples\lab-proxysss\lab-backends.include.yaml (Join-Path $configRoot "conf.d\lab-backends.yaml")
+Copy-Item .\examples\lab-proxysss\lab-backends.include.yaml (Join-Path $configRoot "lab-backends.yaml")
 ```
 
-3. Enable explicit include in `%APPDATA%\proxysss\proxysss.yaml`:
+3. Merge the YAML from `lab-backends.yaml` into `%APPDATA%\proxysss\proxysss.yaml` under the same top-level sections:
 
-```yaml
-include:
-  enabled: true
-  required: false
-  files:
-    - ./conf.d/lab-backends.yaml
-```
+This keeps the gateway configuration in one file, which is the recommended and supported model.
 
 4. Start backends (not proxysss):
 
@@ -50,4 +43,4 @@ proxysss run
 
 ## HTTPS / ACME
 
-Keep TLS settings in `%APPDATA%\proxysss\proxysss.yaml`. For local HTTPS use `tls.mode: self_signed`. For public domains use `tls.mode: acme_external` — see `acme.example.yaml`.
+Keep TLS settings in `%APPDATA%\proxysss\proxysss.yaml`. For local HTTPS use `tls.mode: self_signed`. For public domains merge the snippet from `acme.example.yaml` into the same main YAML file.

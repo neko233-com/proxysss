@@ -1,5 +1,5 @@
-# Explicit include: routes proxysss to D:\Server\proxysss_dir backends.
-# Copy to %APPDATA%\proxysss\conf.d\lab-backends.yaml
+# Route snippet for D:\Server\proxysss_dir backends.
+# Merge these sections into %APPDATA%\proxysss\proxysss.yaml.
 
 services:
   reverse_proxy:

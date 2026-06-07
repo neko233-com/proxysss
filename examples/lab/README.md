@@ -13,7 +13,7 @@ Use the installer CLI; binary and config stay in default paths:
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version latest
 ```
 
-Wire routes via explicit include (see `examples/lab-proxysss/`).
+Merge the route snippet from `examples/lab-proxysss/` into the main `%APPDATA%\proxysss\proxysss.yaml` file.
 
 ## Deploy backends to `D:\Server\proxysss_dir`
 

@@ -1,12 +1,38 @@
 # nginx to proxysss
 
-这个文档专门回答一个问题：现有 nginx 常见配置，在 proxysss 里该怎么写。
+This document answers one practical question: how to express common nginx configurations in proxysss.
 
-原则：
+Configuration model:
 
-- 常规入口职责优先用 YAML
-- 业务相关分流和补充 header 再交给 TS 插件
-- proxysss 追求 nginx 同级行为，但配置表达更直接
+- Keep runtime configuration in a single YAML file, usually `proxysss.yaml`.
+- Use `-config`, `--config`, or `-c` when you want a different YAML path.
+- Use YAML first for gateway behavior and reserve TypeScript plugins for optional business logic.
+
+## Domain service groups
+
+`services.domain_routes` is the primary way to model multi-domain reverse proxying in one YAML file. Each route is a domain-scoped service group with its own upstream pool.
+
+```yaml
+services:
+  domain_routes:
+    - name: example-site
+      domains: [example.com, www.example.com]
+      path_prefix: /
+      upstream: http://127.0.0.1:9000
+
+    - name: neko233-store
+      domains: [neko233.store]
+      path_prefix: /
+      upstream: http://127.0.0.1:9000
+      upstreams:
+        - http://127.0.0.1:9001
+```
+
+In that layout:
+
+- `example.com` goes to one backend machine.
+- `neko233.store` reuses that same backend and adds a second machine to the pool.
+- The grouping key is the domain route itself, not a shared global host list.
 
 ## 1. 反代某个 API 前缀
 

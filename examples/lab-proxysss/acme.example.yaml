@@ -1,4 +1,4 @@
-# Merge into %APPDATA%\proxysss\proxysss.yaml when you have a public domain.
+# Copy these keys into %APPDATA%\proxysss\proxysss.yaml when you have a public domain.
 
 http:
   plain_bind: 0.0.0.0:80
