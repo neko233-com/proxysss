@@ -427,6 +427,8 @@ pub struct AdminConfig {
     pub username: String,
     #[serde(default = "default_admin_password")]
     pub password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bearer_token: String,
     #[serde(default = "default_true")]
     pub expose_config: bool,
     #[serde(default = "default_true")]
@@ -1780,6 +1782,7 @@ impl Default for AdminConfig {
             bind: default_admin_bind(),
             username: default_admin_username(),
             password: default_admin_password(),
+            bearer_token: String::new(),
             expose_config: default_true(),
             enable_write_ops: default_true(),
         }

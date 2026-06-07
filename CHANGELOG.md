@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.11 - 2026-06-07
+
+- Added bearer-token admin authentication support for automation and cluster control-plane calls.
+- Added `POST /v1/domain-routes/upsert`, allowing services to register or update domain-based reverse proxy routes over HTTP, persist them into the main YAML config, and trigger an in-process reload.
+- Updated README, AGENTS guidance, built-in docs, and admin endpoint notes to document token-authenticated route automation.
+
 ## v0.3.10 - 2026-06-07
 
 - Fixed GitHub CI, deploy, and release Windows builds by moving the Windows amd64 and Windows arm64 jobs back to native GitHub-hosted Windows runners instead of the failing Ubuntu `cargo xwin` path.

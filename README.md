@@ -2,7 +2,7 @@
 
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v0.3.10
+Current version: v0.3.11
 
 ## Why proxysss
 
@@ -11,6 +11,7 @@ Current version: v0.3.10
 - YAML-only gateway config: JSON config files are intentionally unsupported.
 - Domain-first reverse proxying: `services.domain_routes` is the primary grouping unit for multi-domain HTTP services.
 - Built-in control plane: admin API and dashboard on `127.0.0.1:7777` by default.
+- Cluster automation API: token-authenticated HTTP calls can register or update domain routes and persist them back to the main YAML file.
 - Hot reload: the main YAML config, the main script, and auto-loaded plugins participate in reload fingerprinting.
 - Optional scripting: TypeScript plugins are for custom business logic, not for ordinary gateway setup.
 
@@ -196,6 +197,45 @@ proxysss script run-file ./examples/gateway.ts
 proxysss script eval "console.log('proxysss ts runtime ok')"
 ```
 
+## Cluster automation
+
+For cluster startup automation, configure a bearer token on the admin API and let services register themselves over HTTP.
+
+Example admin config:
+
+```yaml
+admin:
+  enabled: true
+  bind: 127.0.0.1:7777
+  bearer_token: change-this-cluster-token
+  enable_write_ops: true
+```
+
+Example route registration call:
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/domain-routes/upsert \
+  -H "Authorization: Bearer change-this-cluster-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "node-17-api",
+    "domains": ["api.example.com"],
+    "path_prefix": "/",
+    "upstream": "http://10.0.0.17:8080",
+    "upstreams": ["http://10.0.0.18:8080"],
+    "strip_prefix": false
+  }'
+```
+
+That API call:
+
+- authenticates with a bearer token
+- upserts the route by name inside the main `proxysss.yaml`
+- persists the updated YAML to disk
+- reloads the gateway in process so the route becomes live immediately
+
+This is the intended path when a node or service instance should self-register into the cluster edge layer.
+
 ## Plugin sidecar metadata
 
 If you use auto-loaded plugins, sidecar metadata is YAML-only as well.
@@ -220,7 +260,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 Upgrade to a specific version:
 
 ```bash
-proxysss update --version v0.3.10
+proxysss update --version v0.3.11
 ```
 
 ## Operational defaults

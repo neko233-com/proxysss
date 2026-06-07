@@ -732,6 +732,61 @@ impl Gateway {
             ));
         }
 
+        if method == Method::POST && path == "/v1/domain-routes/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+
+            let route = match serde_json::from_slice::<DomainRouteConfig>(&body) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid domain route payload: {error}")}),
+                    ));
+                }
+            };
+
+            match self
+                .persist_domain_route_and_reload(&state.config, route)
+                .await
+            {
+                Ok(result) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": result.action,
+                            "name": result.route.name,
+                            "domains": result.route.domains,
+                            "path_prefix": result.route.path_prefix,
+                            "upstream": result.route.upstream,
+                            "upstreams": result.route.upstreams,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
         if method == Method::GET && path == "/v1/plugins" {
             if !state.config.plugins.enabled {
                 return Ok(text_response(
@@ -933,6 +988,33 @@ impl Gateway {
 
         tracing::info!(path = %self.config_path.display(), "configuration reloaded");
         Ok(())
+    }
+
+    async fn persist_domain_route_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        route: DomainRouteConfig,
+    ) -> Result<DomainRouteUpsertResult> {
+        let mut candidate = current_config.clone();
+        let action =
+            upsert_domain_route_config(&mut candidate.services.domain_routes, route.clone());
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_domain_route(&original, &route)?;
+
+        fs::write(&self.config_path, &updated)
+            .with_context(|| format!("failed to write {}", self.config_path.display()))?;
+
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = fs::write(&self.config_path, &original);
+            return Err(error.context(
+                "updated config was written but reload failed; original file was restored",
+            ));
+        }
+
+        Ok(DomainRouteUpsertResult { action, route })
     }
 
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
@@ -4980,6 +5062,10 @@ fn is_authorized(header: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
         return false;
     };
 
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return !admin.bearer_token.is_empty() && token == admin.bearer_token;
+    }
+
     if !value.starts_with("Basic ") {
         return false;
     }
@@ -5012,6 +5098,11 @@ struct UpstreamToggleRequest {
     reason: Option<String>,
 }
 
+struct DomainRouteUpsertResult {
+    action: &'static str,
+    route: DomainRouteConfig,
+}
+
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -5020,9 +5111,73 @@ fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
             "password".to_string(),
             serde_json::Value::String("***".to_string()),
         );
+        admin.insert(
+            "bearer_token".to_string(),
+            serde_json::Value::String("***".to_string()),
+        );
     }
 
     value
+}
+
+fn upsert_domain_route_config(
+    routes: &mut Vec<DomainRouteConfig>,
+    route: DomainRouteConfig,
+) -> &'static str {
+    if let Some(existing) = routes.iter_mut().find(|item| item.name == route.name) {
+        *existing = route;
+        "updated"
+    } else {
+        routes.push(route);
+        "created"
+    }
+}
+
+fn render_config_with_upserted_domain_route(
+    original: &str,
+    route: &DomainRouteConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+
+    let services_key = serde_yaml::Value::String("services".to_string());
+    if !root.contains_key(&services_key) {
+        root.insert(
+            services_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let services = root
+        .get_mut(&services_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("services must be a mapping"))?;
+
+    let routes_key = serde_yaml::Value::String("domain_routes".to_string());
+    if !services.contains_key(&routes_key) {
+        services.insert(routes_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let routes = services
+        .get_mut(&routes_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("services.domain_routes must be a sequence"))?;
+
+    let route_value = serde_yaml::to_value(route).context("failed to serialize domain route")?;
+    if let Some(existing) = routes.iter_mut().find(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value == route.name)
+            .unwrap_or(false)
+    }) {
+        *existing = route_value;
+    } else {
+        routes.push(route_value);
+    }
+
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
 }
 
 fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Full<Bytes>> {
@@ -7042,6 +7197,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                 <div class="list">
                     <div><strong>Health:</strong> active HTTP/TCP health probes plus passive quarantine and manual drain state.</div>
                     <div><strong>Reload:</strong> the main YAML config, scripts, plugins, and route-level health policy reload without a full process restart where supported.</div>
+                    <div><strong>Route automation:</strong> token-authenticated `POST /v1/domain-routes/upsert` can persist new domain routes into the main YAML file and reload them in process.</div>
                     <div><strong>Maintenance:</strong> upstream disable/restore can be persisted on disk through runtime maintenance state.</div>
                     <div><strong>Error Pages:</strong> configurable status-page bodies/files plus polished built-in browser-facing 404/403/5xx pages.</div>
                     <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>.</div>
@@ -7442,6 +7598,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <p class="muted">Stats: <strong>/v1/stats</strong></p>
                 <p class="muted">Upstreams: <strong>/v1/upstreams</strong></p>
                 <p class="muted">Config: <strong>/v1/config</strong></p>
+                <p class="muted">Domain route upsert: <strong>/v1/domain-routes/upsert</strong></p>
+                <p class="muted">Auth: <strong>Basic</strong> or <strong>Bearer &lt;token&gt;</strong></p>
             </section>
 
             <section class="meta-card">
@@ -8178,6 +8336,72 @@ mod tests {
         let header = HeaderValue::from_str(&format!("Basic {encoded}")).expect("valid header");
 
         assert!(is_authorized(Some(&header), &admin));
+    }
+
+    #[test]
+    fn is_authorized_accepts_bearer_token() {
+        let admin = AdminConfig {
+            bearer_token: "cluster-secret".to_string(),
+            ..AdminConfig::default()
+        };
+        let header = HeaderValue::from_static("Bearer cluster-secret");
+
+        assert!(is_authorized(Some(&header), &admin));
+    }
+
+    #[test]
+    fn render_config_with_upserted_domain_route_appends_route() {
+        let updated = render_config_with_upserted_domain_route(
+            "http:\n  plain_bind: 0.0.0.0:80\nservices:\n  domain_routes: []\n",
+            &DomainRouteConfig {
+                name: "app".to_string(),
+                domains: vec!["example.com".to_string()],
+                path_prefix: "/".to_string(),
+                upstream: "http://127.0.0.1:9000".to_string(),
+                upstreams: vec!["http://127.0.0.1:9001".to_string()],
+                strip_prefix: false,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+                rate_limit: HttpRateLimitConfig::default(),
+                active_health: ActiveHealthOverrideConfig::default(),
+                ssl: crate::config::DomainTlsConfig::default(),
+            },
+        )
+        .expect("render updated config");
+
+        assert!(updated.contains("name: app"));
+        assert!(updated.contains("- example.com"));
+        assert!(updated.contains("- http://127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn render_config_with_upserted_domain_route_replaces_by_name() {
+        let updated = render_config_with_upserted_domain_route(
+            "services:\n  domain_routes:\n    - name: app\n      domains: [old.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:8000\n",
+            &DomainRouteConfig {
+                name: "app".to_string(),
+                domains: vec!["new.example.com".to_string()],
+                path_prefix: "/api".to_string(),
+                upstream: "http://127.0.0.1:9000".to_string(),
+                upstreams: Vec::new(),
+                strip_prefix: true,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                compression: ResponseCompressionConfig::default(),
+                cache: ResponseCacheConfig::default(),
+                rate_limit: HttpRateLimitConfig::default(),
+                active_health: ActiveHealthOverrideConfig::default(),
+                ssl: crate::config::DomainTlsConfig::default(),
+            },
+        )
+        .expect("render updated config");
+
+        assert!(!updated.contains("old.example.com"));
+        assert!(updated.contains("new.example.com"));
+        assert!(updated.contains("path_prefix: /api"));
+        assert!(updated.contains("strip_prefix: true"));
     }
 
     #[test]

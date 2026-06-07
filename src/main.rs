@@ -332,6 +332,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "supported on 127.0.0.1:7777 by default",
     ),
     (
+        "cluster automation api",
+        "admin API supports bearer-token authenticated /v1/domain-routes/upsert writes persisted back into proxysss.yaml and reloaded in process",
+    ),
+    (
         "agent install skill",
         "see skills/proxysss-install/SKILL.md",
     ),
@@ -1995,6 +1999,7 @@ mod tests {
             "manual upstream drain",
             "ip allow/deny blacklist",
             "admin api/console",
+            "cluster automation api",
             "agent install skill",
         ];
 
