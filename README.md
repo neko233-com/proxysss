@@ -190,6 +190,16 @@ proxysss -config ./proxysss.yaml status
 proxysss -config ./proxysss.yaml stop
 ```
 
+Inspect or rotate the local automation token:
+
+```bash
+proxysss token show
+proxysss token set
+proxysss token set my-custom-cluster-token
+```
+
+The dedicated `token` command is the supported local query path. Normal config display surfaces redact both the admin password and bearer token.
+
 Check the embedded TypeScript runtime:
 
 ```bash

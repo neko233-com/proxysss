@@ -18,6 +18,13 @@ All of them:
 - trigger in-process reload on success
 - restore the original YAML if reload fails
 
+Local token operations:
+
+- `proxysss token show` prints the effective local token for the selected config
+- `proxysss token set` resets the token to the default local value
+- `proxysss token set <value>` rotates the token in the YAML file
+- normal config display surfaces redact the token instead of printing it
+
 ## Admin token setup
 
 ```yaml

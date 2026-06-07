@@ -12,6 +12,7 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = "proxysss.yaml";
 pub const DEFAULT_SCRIPT_FILE_NAME: &str = "gateway.ts";
 pub const DEFAULT_ADMIN_USERNAME: &str = "root";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
+pub const DEFAULT_ADMIN_BEARER_TOKEN: &str = "neko233";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -427,7 +428,10 @@ pub struct AdminConfig {
     pub username: String,
     #[serde(default = "default_admin_password")]
     pub password: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default = "default_admin_bearer_token",
+        skip_serializing_if = "skip_default_admin_bearer_token"
+    )]
     pub bearer_token: String,
     #[serde(default = "default_true")]
     pub expose_config: bool,
@@ -1782,7 +1786,7 @@ impl Default for AdminConfig {
             bind: default_admin_bind(),
             username: default_admin_username(),
             password: default_admin_password(),
-            bearer_token: String::new(),
+            bearer_token: default_admin_bearer_token(),
             expose_config: default_true(),
             enable_write_ops: default_true(),
         }
@@ -2255,6 +2259,14 @@ fn default_admin_password() -> String {
     DEFAULT_ADMIN_PASSWORD.to_string()
 }
 
+fn default_admin_bearer_token() -> String {
+    DEFAULT_ADMIN_BEARER_TOKEN.to_string()
+}
+
+fn skip_default_admin_bearer_token(token: &String) -> bool {
+    token == DEFAULT_ADMIN_BEARER_TOKEN
+}
+
 fn default_lb_max_retries() -> u32 {
     2
 }
@@ -2597,6 +2609,14 @@ mod tests {
         let config = GatewayConfig::default();
         assert_eq!(config.admin.username, DEFAULT_ADMIN_USERNAME);
         assert_eq!(config.admin.password, DEFAULT_ADMIN_PASSWORD);
+        assert_eq!(config.admin.bearer_token, DEFAULT_ADMIN_BEARER_TOKEN);
+    }
+
+    #[test]
+    fn default_yaml_does_not_expose_default_bearer_token() {
+        let yaml = GatewayConfig::render_default_yaml();
+        assert!(!yaml.contains("bearer_token"));
+        assert!(!yaml.contains(DEFAULT_ADMIN_BEARER_TOKEN));
     }
 
     #[test]

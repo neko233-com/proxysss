@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use config::{GatewayConfig, LogFormat, LoggingConfig};
+use config::{GatewayConfig, LogFormat, LoggingConfig, DEFAULT_ADMIN_BEARER_TOKEN};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::json;
@@ -138,6 +138,12 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    Token {
+        #[command(subcommand)]
+        action: TokenCommands,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     Tune {
         #[command(subcommand)]
         action: TuneCommands,
@@ -232,6 +238,12 @@ enum ScriptCommands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TokenCommands {
+    Show,
+    Set { value: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -694,7 +706,7 @@ async fn main() -> Result<()> {
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     match format {
                         ConfigOutputFormat::Yaml => {
-                            print!("{}", serde_yaml::to_string(&gateway_config)?)
+                            print!("{}", render_redacted_config_yaml(&gateway_config)?)
                         }
                     }
                     Ok(())
@@ -844,6 +856,17 @@ async fn main() -> Result<()> {
                 ),
             }
         }
+        Commands::Token { action, config } => {
+            init_cli_logging();
+            match action {
+                TokenCommands::Show => {
+                    show_admin_token(merge_config_arg(global_config.clone(), config))
+                }
+                TokenCommands::Set { value } => {
+                    set_admin_token(merge_config_arg(global_config.clone(), config), value)
+                }
+            }
+        }
         Commands::Tune { action } => {
             init_cli_logging();
             match action {
@@ -858,6 +881,92 @@ fn merge_config_arg(
     local_config: Option<PathBuf>,
 ) -> Option<PathBuf> {
     local_config.or(global_config)
+}
+
+fn show_admin_token(config: Option<PathBuf>) -> Result<()> {
+    let config_path = install::resolve_run_config_path(config)?;
+    let token = if config_path.exists() {
+        GatewayConfig::load(&config_path)?.admin.bearer_token
+    } else {
+        DEFAULT_ADMIN_BEARER_TOKEN.to_string()
+    };
+
+    println!("config: {}", config_path.display());
+    println!("admin.bearer_token: {}", token);
+    Ok(())
+}
+
+fn set_admin_token(config: Option<PathBuf>, value: Option<String>) -> Result<()> {
+    let config_path = install::resolve_run_config_path(config)?;
+    let token = value.unwrap_or_else(|| DEFAULT_ADMIN_BEARER_TOKEN.to_string());
+    let raw = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?
+    } else {
+        GatewayConfig::render_default_yaml()
+    };
+    let updated = render_config_with_admin_token(&raw, &token)?;
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&config_path, updated)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    println!("updated admin.bearer_token in {}", config_path.display());
+    println!(
+        "note: if proxysss is running with hot reload enabled, the token change is applied from the YAML update"
+    );
+    Ok(())
+}
+
+fn render_redacted_config_yaml(config: &GatewayConfig) -> Result<String> {
+    let mut value =
+        serde_yaml::to_value(config).context("failed to serialize config for display")?;
+    if let Some(admin) = value
+        .get_mut("admin")
+        .and_then(|item| item.as_mapping_mut())
+    {
+        admin.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("***".to_string()),
+        );
+        admin.insert(
+            serde_yaml::Value::String("bearer_token".to_string()),
+            serde_yaml::Value::String("***".to_string()),
+        );
+    }
+    serde_yaml::to_string(&value).context("failed to render redacted config")
+}
+
+fn render_config_with_admin_token(original: &str, token: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("top-level YAML config must be a mapping"))?;
+
+    let admin_key = serde_yaml::Value::String("admin".to_string());
+    if !root.contains_key(&admin_key) {
+        root.insert(
+            admin_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let admin = root
+        .get_mut(&admin_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow::anyhow!("admin must be a mapping"))?;
+
+    let token_key = serde_yaml::Value::String("bearer_token".to_string());
+    if token == DEFAULT_ADMIN_BEARER_TOKEN {
+        admin.remove(&token_key);
+    } else {
+        admin.insert(token_key, serde_yaml::Value::String(token.to_string()));
+    }
+
+    serde_yaml::to_string(&value).context("failed to render YAML with admin token")
 }
 
 fn normalize_cli_args<I>(args: I) -> Vec<OsString>
@@ -2236,5 +2345,45 @@ mod tests {
                 "http://127.0.0.1:9001".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn render_config_with_admin_token_omits_default_token() {
+        let rendered = render_config_with_admin_token(
+            "admin:\n  bind: 127.0.0.1:7777\n",
+            DEFAULT_ADMIN_BEARER_TOKEN,
+        )
+        .expect("render token config");
+        assert!(!rendered.contains("bearer_token"));
+        assert!(!rendered.contains(DEFAULT_ADMIN_BEARER_TOKEN));
+    }
+
+    #[test]
+    fn render_config_with_admin_token_sets_custom_token() {
+        let rendered =
+            render_config_with_admin_token("admin:\n  bind: 127.0.0.1:7777\n", "cluster-secret")
+                .expect("render token config");
+        assert!(rendered.contains("bearer_token: cluster-secret"));
+    }
+
+    #[test]
+    fn render_redacted_config_yaml_masks_admin_secrets() {
+        let mut config = GatewayConfig::default();
+        config.admin.password = "super-secret".to_string();
+        config.admin.bearer_token = "cluster-secret".to_string();
+
+        let rendered = render_redacted_config_yaml(&config).expect("render redacted yaml");
+        assert!(
+            rendered.contains("password: '***'")
+                || rendered.contains("password: \"***\"")
+                || rendered.contains("password: '***'")
+        );
+        assert!(
+            rendered.contains("bearer_token: '***'")
+                || rendered.contains("bearer_token: \"***\"")
+                || rendered.contains("bearer_token: ***")
+        );
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("cluster-secret"));
     }
 }
