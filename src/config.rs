@@ -614,9 +614,10 @@ pub struct ResponseCompressionConfig {
     pub content_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionAlgorithm {
+    #[default]
     Zstd,
     Brotli,
     Gzip,
@@ -1879,12 +1880,6 @@ impl Default for ResponseCompressionConfig {
             min_length: default_compression_min_length(),
             content_types: default_compression_types(),
         }
-    }
-}
-
-impl Default for CompressionAlgorithm {
-    fn default() -> Self {
-        Self::Zstd
     }
 }
 

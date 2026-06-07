@@ -2839,10 +2839,8 @@ fn route_names_for_runtime_scope(
                 names.insert(listener.to_string());
             }
         }
-        "udp" => {
-            if !listener.is_empty() && listener != "default" {
-                names.insert(listener.to_string());
-            }
+        "udp" if !listener.is_empty() && listener != "default" => {
+            names.insert(listener.to_string());
         }
         _ => {}
     }
