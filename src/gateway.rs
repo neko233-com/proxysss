@@ -6890,49 +6890,43 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
             </article>
             <article class="panel">
                 <div class="panel-head">
-                    <h2>Benchmark Snapshot</h2>
-                    <span>Windows loopback, 2026-06-05</span>
+                    <h2>Operational Snapshot</h2>
+                    <span>Single-binary edge gateway</span>
                 </div>
                 <div class="bench-grid">
                     <section class="bench-card proxysss">
                         <div class="bench-top">
-                            <strong>proxysss</strong>
-                            <span>built-in static site runtime</span>
+                            <strong>Single YAML config</strong>
+                            <span>Default file: proxysss.yaml</span>
                         </div>
                         <div class="metric-row">
-                            <div class="metric"><em>ops/sec</em><strong>13,272</strong></div>
-                            <div class="metric"><em>success</em><strong>398,174</strong></div>
-                            <div class="metric"><em>p95</em><strong>42.178 ms</strong></div>
-                            <div class="metric"><em>p99</em><strong>44.934 ms</strong></div>
+                            <div class="metric"><em>ports</em><strong>80 / 443 / 7777</strong></div>
+                            <div class="metric"><em>config path flags</em><strong>-config / --config / -c</strong></div>
                         </div>
                     </section>
                     <section class="bench-card">
                         <div class="bench-top">
-                            <strong>Caddy</strong>
-                            <span>file-server</span>
+                            <strong>Domain service groups</strong>
+                            <span>One YAML, many domains</span>
                         </div>
                         <div class="metric-row">
-                            <div class="metric"><em>ops/sec</em><strong>11,942</strong></div>
-                            <div class="metric"><em>success</em><strong>358,264</strong></div>
-                            <div class="metric"><em>p95</em><strong>50.181 ms</strong></div>
-                            <div class="metric"><em>p99</em><strong>54.104 ms</strong></div>
+                            <div class="metric"><em>grouping</em><strong>services.domain_routes</strong></div>
+                            <div class="metric"><em>pooling</em><strong>per-domain upstream pools</strong></div>
                         </div>
                     </section>
                     <section class="bench-card">
                         <div class="bench-top">
-                            <strong>nginx</strong>
-                            <span>Windows static alias</span>
+                            <strong>Reload surface</strong>
+                            <span>Main config plus scripts</span>
                         </div>
                         <div class="metric-row">
-                            <div class="metric"><em>ops/sec</em><strong>483</strong></div>
-                            <div class="metric"><em>errors</em><strong>1,748,575</strong></div>
-                            <div class="metric"><em>p95</em><strong>70.809 ms</strong></div>
-                            <div class="metric"><em>p99</em><strong>28,958 ms</strong></div>
+                            <div class="metric"><em>hot reload</em><strong>config + scripts + plugins</strong></div>
+                            <div class="metric"><em>format</em><strong>YAML only</strong></div>
                         </div>
                     </section>
                 </div>
-                <p class="bench-note">同一静态 HTML、同一 bench 客户端、concurrency=512、duration=30s。本页展示的是仓库 README 已记录的本地 Windows loopback 数据。</p>
-                <div class="bench-source">README benchmark snapshot</div>
+                <p class="bench-note">proxysss is documented as a standalone gateway surface. Public docs emphasize direct capabilities and operational shape instead of positioning around another product's configuration model.</p>
+                <div class="bench-source">Built-in gateway overview</div>
             </article>
         </section>
     </main>
@@ -8864,7 +8858,8 @@ mod tests {
         let html = render_welcome_html(&config);
         assert!(html.contains("<h1>proxysss</h1>"));
         assert!(html.contains("Supported Protocols"));
-        assert!(html.contains("Benchmark Snapshot"));
+        assert!(html.contains("Operational Snapshot"));
+        assert!(html.contains("Single YAML config"));
         assert!(html.contains("/docs.html"));
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));

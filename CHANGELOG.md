@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.10 - 2026-06-07
+
+- Fixed GitHub CI, deploy, and release Windows builds by moving the Windows amd64 and Windows arm64 jobs back to native GitHub-hosted Windows runners instead of the failing Ubuntu `cargo xwin` path.
+- Kept first-class Windows arm64 packaging in deploy and release workflows while preserving the lighter zip artifact packaging path.
+- Refreshed remaining public docs and built-in landing copy so they consistently describe the single-YAML config model and direct proxysss capabilities.
+
 ## v0.3.9 - 2026-06-07
 
 - Enforced a single-YAML runtime configuration model: `proxysss.yaml` remains the default, `-config` / `--config` / `-c` select custom YAML paths, and runtime `include` files are now rejected.

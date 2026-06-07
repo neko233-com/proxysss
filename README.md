@@ -2,7 +2,7 @@
 
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v0.3.9
+Current version: v0.3.10
 
 ## Why proxysss
 
@@ -220,7 +220,7 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 Upgrade to a specific version:
 
 ```bash
-proxysss update --version v0.3.9
+proxysss update --version v0.3.10
 ```
 
 ## Operational defaults

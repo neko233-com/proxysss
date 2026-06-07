@@ -20,18 +20,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: windows-latest
             target: x86_64-pc-windows-msvc
             binary: proxysss.exe
             artifact: deploy-windows-amd64
             archive: deploy-windows-amd64.zip
-            use_xwin: true
-          - runner: ubuntu-latest
+            use_xwin: false
+          - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             binary: proxysss.exe
             artifact: deploy-windows-arm64
             archive: deploy-windows-arm64.zip
-            use_xwin: true
+            use_xwin: false
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: proxysss
@@ -54,22 +54,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2
-        if: matrix.use_xwin
-        with:
-          tool: cargo-xwin@0.22.0
-
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-target-${{ matrix.target }}
 
       - name: Build
-        if: ${{ !matrix.use_xwin }}
         run: cargo build --locked --release --target ${{ matrix.target }}
-
-      - name: Build (Windows MSVC cross)
-        if: matrix.use_xwin
-        run: cargo xwin build --locked --release --target ${{ matrix.target }}
 
       - name: Package bundle (tar.gz)
         if: endsWith(matrix.archive, '.tar.gz')
@@ -88,23 +78,22 @@ jobs:
 
       - name: Package bundle (zip)
         if: endsWith(matrix.archive, '.zip')
-        shell: bash
+        shell: pwsh
         run: |
-          rm -rf bundle
-          mkdir -p bundle/scripts
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
-          cp README.md bundle/
-          for doc in proxysss-script.d.ts ts-how-to-use.md nginx-to-proxysss.md; do
-            if [ -f "$doc" ]; then cp "$doc" bundle/; fi
-          done
-          for script in install.sh install.ps1; do
-            if [ -f "scripts/$script" ]; then cp "scripts/$script" bundle/scripts/; fi
-          done
-          rm -f ${{ matrix.archive }}
-          (
-            cd bundle
-            zip -qr ../${{ matrix.archive }} .
-          )
+          Remove-Item bundle -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path bundle -Force | Out-Null
+          New-Item -ItemType Directory -Path bundle/scripts -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
+          Copy-Item README.md "bundle/" -Force
+          foreach ($doc in @('proxysss-script.d.ts', 'ts-how-to-use.md', 'nginx-to-proxysss.md')) {
+            if (Test-Path $doc) { Copy-Item $doc "bundle/" -Force }
+          }
+          foreach ($script in @('install.sh', 'install.ps1')) {
+            $source = Join-Path scripts $script
+            if (Test-Path $source) { Copy-Item $source "bundle/scripts/" -Force }
+          }
+          Remove-Item "${{ matrix.archive }}" -ErrorAction SilentlyContinue
+          tar.exe -a -cf "${{ matrix.archive }}" -C bundle .
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
