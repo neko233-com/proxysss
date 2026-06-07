@@ -6,9 +6,9 @@ mod install;
 mod script;
 mod ts_transpile;
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -27,7 +27,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 #[command(about = "Programmable Rust gateway with TS/JS routing scripts")]
 #[command(version)]
 struct Cli {
-    #[arg(short = 'c', long = "config", visible_alias = "config-file", global = true)]
+    #[arg(
+        short = 'c',
+        long = "config",
+        visible_alias = "config-file",
+        global = true
+    )]
     config_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -549,7 +554,8 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Run { config: None }) {
         Commands::Run { config } => {
-            let config_path = install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
+            let config_path =
+                install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
             init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
@@ -608,7 +614,8 @@ async fn main() -> Result<()> {
         Commands::CheckConfig { config } => {
             init_cli_logging();
 
-            let config_path = install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
+            let config_path =
+                install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
             println!("configuration check passed: {}", config_path.display());
             for warning in gateway_config.warnings() {
@@ -784,7 +791,12 @@ async fn main() -> Result<()> {
             password,
         } => {
             init_cli_logging();
-            let admin = resolve_admin_context(merge_config_arg(global_config.clone(), config), admin_url, username, password)?;
+            let admin = resolve_admin_context(
+                merge_config_arg(global_config.clone(), config),
+                admin_url,
+                username,
+                password,
+            )?;
             let client = reqwest::Client::new();
 
             match action {
@@ -838,12 +850,16 @@ async fn main() -> Result<()> {
         Commands::Script { action, config } => {
             init_cli_logging();
             match action {
-                ScriptCommands::RunFile { path, args } => {
-                    run_script_runtime(merge_config_arg(global_config.clone(), config), ScriptInvocation::File(path), args)
-                }
-                ScriptCommands::Eval { code, args } => {
-                    run_script_runtime(merge_config_arg(global_config.clone(), config), ScriptInvocation::Snippet(code), args)
-                }
+                ScriptCommands::RunFile { path, args } => run_script_runtime(
+                    merge_config_arg(global_config.clone(), config),
+                    ScriptInvocation::File(path),
+                    args,
+                ),
+                ScriptCommands::Eval { code, args } => run_script_runtime(
+                    merge_config_arg(global_config.clone(), config),
+                    ScriptInvocation::Snippet(code),
+                    args,
+                ),
             }
         }
         Commands::Tune { action } => {
@@ -855,7 +871,10 @@ async fn main() -> Result<()> {
     }
 }
 
-fn merge_config_arg(global_config: Option<PathBuf>, local_config: Option<PathBuf>) -> Option<PathBuf> {
+fn merge_config_arg(
+    global_config: Option<PathBuf>,
+    local_config: Option<PathBuf>,
+) -> Option<PathBuf> {
     local_config.or(global_config)
 }
 
@@ -956,11 +975,7 @@ fn run_interactive_tcp_tune() -> Result<()> {
             let fallback = PathBuf::from("proxysss-tcp.sysctl.conf");
             fs::write(&fallback, &content)
                 .with_context(|| format!("failed to write {}", fallback.display()))?;
-            println!(
-                "could not write {}: {}",
-                target.display(),
-                error
-            );
+            println!("could not write {}: {}", target.display(), error);
             println!(
                 "wrote fallback profile to {}. on Ubuntu/Debian apply with: sudo cp {} {} && sudo sysctl --system",
                 fallback.display(),
@@ -2181,13 +2196,19 @@ mod tests {
     fn merge_config_arg_prefers_command_local_value() {
         let global = Some(PathBuf::from("global.yaml"));
         let local = Some(PathBuf::from("local.yaml"));
-        assert_eq!(merge_config_arg(global, local), Some(PathBuf::from("local.yaml")));
+        assert_eq!(
+            merge_config_arg(global, local),
+            Some(PathBuf::from("local.yaml"))
+        );
     }
 
     #[test]
     fn merge_config_arg_falls_back_to_global_value() {
         let global = Some(PathBuf::from("global.yaml"));
-        assert_eq!(merge_config_arg(global, None), Some(PathBuf::from("global.yaml")));
+        assert_eq!(
+            merge_config_arg(global, None),
+            Some(PathBuf::from("global.yaml"))
+        );
     }
 
     #[test]

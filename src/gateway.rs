@@ -32,8 +32,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
-    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
-    RetryPolicy,
+    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
@@ -58,12 +57,12 @@ use uuid::Uuid;
 use zstd::stream::encode_all as zstd_encode_all;
 
 use crate::config::{
-    ActiveHealthConfig, ActiveHealthOverrideConfig, AcmeChallengeType, AdminConfig,
-    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig,
-    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
-    RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig,
-    StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode,
-    UdpListenerConfig, WebDavConfig,
+    AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig, AdminConfig,
+    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
+    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
+    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
+    WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -288,7 +287,11 @@ impl ResolvesServerCert for SniResolver {
         let server_name = client_hello.server_name()?.to_ascii_lowercase();
         let is_acme_tls_alpn = client_hello
             .alpn()
-            .map(|protocols| protocols.into_iter().any(|protocol| protocol == b"acme-tls/1"))
+            .map(|protocols| {
+                protocols
+                    .into_iter()
+                    .any(|protocol| protocol == b"acme-tls/1")
+            })
             .unwrap_or(false);
         if is_acme_tls_alpn {
             if let Some(certified) = self.acme_tls_alpn_by_name.get(&server_name) {
@@ -1021,14 +1024,13 @@ impl Gateway {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.h3_bind address")?;
 
         let state = self.current_state().await;
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
-                build_rustls_server_config(
-                    &state.config,
-                    self.acme_tls_alpn_certs.clone(),
-                    vec![b"h3".to_vec()],
-                )?,
-            )?));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(build_rustls_server_config(
+                &state.config,
+                self.acme_tls_alpn_certs.clone(),
+                vec![b"h3".to_vec()],
+            )?)?,
+        ));
         let transport = Arc::get_mut(&mut server_config.transport)
             .context("failed to configure quic transport")?;
         transport.keep_alive_interval(Some(Duration::from_secs(15)));
@@ -1734,7 +1736,9 @@ impl Gateway {
             let target = format!(
                 "https://{}{}",
                 strip_default_port(&host, 80),
-                uri.path_and_query().map(|value| value.as_str()).unwrap_or("/")
+                uri.path_and_query()
+                    .map(|value| value.as_str())
+                    .unwrap_or("/")
             );
             return Ok(GatewayHttpResponse::redirect_with_status(
                 StatusCode::PERMANENT_REDIRECT,
@@ -1854,15 +1858,11 @@ impl Gateway {
             ));
         };
 
-        let _rate_limit_lease = match self.apply_http_rate_limit(
-            &route.rate_limit,
-            &host,
-            &headers,
-            remote_addr,
-        ) {
-            Ok(lease) => lease,
-            Err(response) => return Ok(response),
-        };
+        let _rate_limit_lease =
+            match self.apply_http_rate_limit(&route.rate_limit, &host, &headers, remote_addr) {
+                Ok(lease) => lease,
+                Err(response) => return Ok(response),
+            };
 
         if route.decision.upstream.starts_with("proxysss://") {
             let response = dispatch_internal_http(&state.config, &route.decision);
@@ -1894,7 +1894,9 @@ impl Gateway {
 
         let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
         if let Some(cache_key) = cache_key.as_deref() {
-            if let Some(response) = self.load_cached_http_response(&state.config, &route.cache, cache_key) {
+            if let Some(response) =
+                self.load_cached_http_response(&state.config, &route.cache, cache_key)
+            {
                 return finalize_http_response(&headers, &route.compression, response);
             }
         }
@@ -2189,8 +2191,7 @@ impl Gateway {
                 StatusCode::OK,
                 "application/json",
                 Bytes::from(
-                    serde_json::json!({"ok": true, "zone": cache.zone, "key": key})
-                        .to_string(),
+                    serde_json::json!({"ok": true, "zone": cache.zone, "key": key}).to_string(),
                 ),
                 "proxysss://cache-purge",
             )
@@ -2199,8 +2200,7 @@ impl Gateway {
                 StatusCode::NOT_FOUND,
                 "application/json",
                 Bytes::from(
-                    serde_json::json!({"ok": false, "zone": cache.zone, "key": key})
-                        .to_string(),
+                    serde_json::json!({"ok": false, "zone": cache.zone, "key": key}).to_string(),
                 ),
                 "proxysss://cache-purge",
             )
@@ -2247,7 +2247,10 @@ impl Gateway {
             return;
         }
 
-        let overflow = zone_keys.len().saturating_sub(max_entries).saturating_add(1);
+        let overflow = zone_keys
+            .len()
+            .saturating_sub(max_entries)
+            .saturating_add(1);
         for key in zone_keys.into_iter().take(overflow) {
             self.http_cache.remove(&key);
             self.remove_disk_cached_http_response(config, cache, &key);
@@ -2554,17 +2557,19 @@ impl Gateway {
                     if state.manually_disabled {
                         false
                     } else {
-                    let passive_healthy = match state.quarantined_until {
-                        Some(until) if config.load_balance.passive_health.enabled => until <= now,
-                        None => true,
-                        Some(_) => true,
-                    };
-                    let active_healthy = if config.load_balance.active_health.enabled {
-                        state.active_probe_healthy.unwrap_or(true)
-                    } else {
-                        true
-                    };
-                    passive_healthy && active_healthy
+                        let passive_healthy = match state.quarantined_until {
+                            Some(until) if config.load_balance.passive_health.enabled => {
+                                until <= now
+                            }
+                            None => true,
+                            Some(_) => true,
+                        };
+                        let active_healthy = if config.load_balance.active_health.enabled {
+                            state.active_probe_healthy.unwrap_or(true)
+                        } else {
+                            true
+                        };
+                        passive_healthy && active_healthy
                     }
                 }
                 None => true,
@@ -2643,7 +2648,8 @@ impl Gateway {
             .iter()
             .map(|entry| {
                 let (protocol, listener, upstream) = split_runtime_scope_key(entry.key());
-                let route_names = route_names_for_runtime_scope(config, protocol, listener, upstream);
+                let route_names =
+                    route_names_for_runtime_scope(config, protocol, listener, upstream);
                 let value = entry.value();
                 let remaining = value
                     .quarantined_until
@@ -2707,12 +2713,18 @@ impl Gateway {
                 tokio::time::sleep(jitter).await;
             }
 
-            let key = runtime_scope_key(&target.protocol, target.listener.as_deref(), &target.upstream);
+            let key = runtime_scope_key(
+                &target.protocol,
+                target.listener.as_deref(),
+                &target.upstream,
+            );
             let (healthy, status, error, rtt_ms) = match target.kind {
                 ActiveHealthKind::Http => {
                     probe_http_upstream(client, &target.upstream, &target.settings).await
                 }
-                ActiveHealthKind::Tcp => probe_tcp_upstream(&target.upstream, &target.settings).await,
+                ActiveHealthKind::Tcp => {
+                    probe_tcp_upstream(&target.upstream, &target.settings).await
+                }
             };
 
             let mut alert_payload = None;
@@ -2725,13 +2737,15 @@ impl Gateway {
             let previous_health = entry.active_probe_healthy;
 
             if healthy {
-                entry.active_probe_success_count = entry.active_probe_success_count.saturating_add(1);
+                entry.active_probe_success_count =
+                    entry.active_probe_success_count.saturating_add(1);
                 entry.active_probe_failure_count = 0;
                 if entry.active_probe_success_count >= target.settings.success_threshold {
                     entry.active_probe_healthy = Some(true);
                 }
             } else {
-                entry.active_probe_failure_count = entry.active_probe_failure_count.saturating_add(1);
+                entry.active_probe_failure_count =
+                    entry.active_probe_failure_count.saturating_add(1);
                 entry.active_probe_success_count = 0;
                 if entry.active_probe_failure_count >= target.settings.failure_threshold {
                     entry.active_probe_healthy = Some(false);
@@ -2754,7 +2768,8 @@ impl Gateway {
             drop(entry);
 
             if let Some(payload) = alert_payload {
-                dispatch_active_health_alerts(client, &target.settings.alert_webhooks, payload).await;
+                dispatch_active_health_alerts(client, &target.settings.alert_webhooks, payload)
+                    .await;
             }
         }
     }
@@ -2932,7 +2947,9 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                     listener: Some(listener.name.clone()),
                     upstream,
                     kind: ActiveHealthKind::Tcp,
-                    settings: resolve_global_active_health_config(&config.load_balance.active_health),
+                    settings: resolve_global_active_health_config(
+                        &config.load_balance.active_health,
+                    ),
                 });
             }
         }
@@ -2981,14 +2998,26 @@ async fn probe_http_upstream(
                 healthy,
                 Some(status),
                 error,
-                Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                Some(
+                    started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
             )
         }
         Err(error) => (
             false,
             None,
             Some(error.to_string()),
-            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
         ),
     }
 }
@@ -3011,20 +3040,41 @@ async fn probe_tcp_upstream(
                 true,
                 None,
                 None,
-                Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                Some(
+                    started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
             )
         }
         Ok(Err(error)) => (
             false,
             None,
             Some(error.to_string()),
-            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
         ),
         Err(_) => (
             false,
             None,
-            Some(format!("tcp connect timeout after {}ms", timeout.as_millis())),
-            Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            Some(format!(
+                "tcp connect timeout after {}ms",
+                timeout.as_millis()
+            )),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
         ),
     }
 }
@@ -3037,7 +3087,9 @@ fn tcp_probe_target(upstream: &str) -> Result<String> {
     {
         let url = Url::parse(upstream)
             .with_context(|| format!("invalid tcp probe upstream url {upstream}"))?;
-        let host = url.host_str().ok_or_else(|| anyhow!("upstream URL missing host"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("upstream URL missing host"))?;
         let port = url
             .port_or_known_default()
             .ok_or_else(|| anyhow!("upstream URL missing port"))?;
@@ -3092,92 +3144,93 @@ struct PersistedManualUpstreamEntry {
 }
 
 impl Gateway {
-fn set_manual_upstream_state(
-    &self,
-    config: &GatewayConfig,
-    key: &str,
-    disabled: bool,
-    reason: Option<String>,
-) {
-    let mut entry = self.upstream_runtime.entry(key.to_string()).or_default();
-    entry.manually_disabled = disabled;
-    entry.manual_reason = if disabled { reason } else { None };
-    entry.manual_changed_at_unix_ms = Some(current_unix_millis());
-    if !disabled {
-        entry.quarantined_until = None;
-    }
-    drop(entry);
-    let _ = self.persist_manual_upstream_state(config);
-}
-
-fn persist_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
-    if !config.runtime.maintenance_state.enabled {
-        return Ok(());
+    fn set_manual_upstream_state(
+        &self,
+        config: &GatewayConfig,
+        key: &str,
+        disabled: bool,
+        reason: Option<String>,
+    ) {
+        let mut entry = self.upstream_runtime.entry(key.to_string()).or_default();
+        entry.manually_disabled = disabled;
+        entry.manual_reason = if disabled { reason } else { None };
+        entry.manual_changed_at_unix_ms = Some(current_unix_millis());
+        if !disabled {
+            entry.quarantined_until = None;
+        }
+        drop(entry);
+        let _ = self.persist_manual_upstream_state(config);
     }
 
-    let items = self
-        .upstream_runtime
-        .iter()
-        .filter(|entry| entry.value().manually_disabled)
-        .map(|entry| {
-            (
-                entry.key().clone(),
-                PersistedManualUpstreamEntry {
-                    manually_disabled: entry.value().manually_disabled,
-                    manual_reason: entry.value().manual_reason.clone(),
-                    manual_changed_at_unix_ms: entry.value().manual_changed_at_unix_ms,
-                },
+    fn persist_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
+        if !config.runtime.maintenance_state.enabled {
+            return Ok(());
+        }
+
+        let items = self
+            .upstream_runtime
+            .iter()
+            .filter(|entry| entry.value().manually_disabled)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    PersistedManualUpstreamEntry {
+                        manually_disabled: entry.value().manually_disabled,
+                        manual_reason: entry.value().manual_reason.clone(),
+                        manual_changed_at_unix_ms: entry.value().manual_changed_at_unix_ms,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let payload = PersistedManualUpstreamState { items };
+        if let Some(parent) = config.runtime.maintenance_state.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(
+            &config.runtime.maintenance_state.path,
+            serde_json::to_vec_pretty(&payload).context("failed to serialize maintenance state")?,
+        )
+        .with_context(|| {
+            format!(
+                "failed to write {}",
+                config.runtime.maintenance_state.path.display()
             )
         })
-        .collect::<BTreeMap<_, _>>();
-
-    let payload = PersistedManualUpstreamState { items };
-    if let Some(parent) = config.runtime.maintenance_state.path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
-        &config.runtime.maintenance_state.path,
-        serde_json::to_vec_pretty(&payload).context("failed to serialize maintenance state")?,
-    )
-    .with_context(|| {
-        format!(
-            "failed to write {}",
-            config.runtime.maintenance_state.path.display()
-        )
-    })
-}
-
-fn load_persisted_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
-    if !config.runtime.maintenance_state.enabled
-        || !config.runtime.maintenance_state.path.exists()
-    {
-        return Ok(());
     }
 
-    let bytes = fs::read(&config.runtime.maintenance_state.path).with_context(|| {
-        format!(
-            "failed to read {}",
-            config.runtime.maintenance_state.path.display()
-        )
-    })?;
-    let payload: PersistedManualUpstreamState = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "failed to decode {}",
-            config.runtime.maintenance_state.path.display()
-        )
-    })?;
-
-    for (key, item) in payload.items {
-        if item.manually_disabled {
-            let mut entry = self.upstream_runtime.entry(key).or_default();
-            entry.manually_disabled = true;
-            entry.manual_reason = item.manual_reason;
-            entry.manual_changed_at_unix_ms = item.manual_changed_at_unix_ms;
+    fn load_persisted_manual_upstream_state(&self, config: &GatewayConfig) -> Result<()> {
+        if !config.runtime.maintenance_state.enabled
+            || !config.runtime.maintenance_state.path.exists()
+        {
+            return Ok(());
         }
+
+        let bytes = fs::read(&config.runtime.maintenance_state.path).with_context(|| {
+            format!(
+                "failed to read {}",
+                config.runtime.maintenance_state.path.display()
+            )
+        })?;
+        let payload: PersistedManualUpstreamState =
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "failed to decode {}",
+                    config.runtime.maintenance_state.path.display()
+                )
+            })?;
+
+        for (key, item) in payload.items {
+            if item.manually_disabled {
+                let mut entry = self.upstream_runtime.entry(key).or_default();
+                entry.manually_disabled = true;
+                entry.manual_reason = item.manual_reason;
+                entry.manual_changed_at_unix_ms = item.manual_changed_at_unix_ms;
+            }
+        }
+        Ok(())
     }
-    Ok(())
-}
 }
 
 fn build_health_check_url(upstream: &str, path: &str) -> Result<Url> {
@@ -3325,7 +3378,12 @@ fn decorate_error_response(
         .iter()
         .find(|page| page.status == response.status.as_u16())
     {
-        if let Some(body) = load_configured_error_page(page, response.status, &response.body, config.http.error_pages.show_details) {
+        if let Some(body) = load_configured_error_page(
+            page,
+            response.status,
+            &response.body,
+            config.http.error_pages.show_details,
+        ) {
             let mut replacement = response;
             replacement.headers = vec![(
                 CONTENT_TYPE,
@@ -3391,7 +3449,11 @@ fn wants_html_response(headers: &HeaderMap) -> bool {
 }
 
 fn render_default_error_html(status: StatusCode, detail: &str) -> String {
-    let title = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error"));
+    let title = format!(
+        "{} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Error")
+    );
     let detail_block = if detail.trim().is_empty() {
         "".to_string()
     } else {
@@ -3820,10 +3882,12 @@ fn build_acme_tls_alpn_certified_key(domain: &str, digest: &[u8]) -> Result<Cert
     let mut params = CertificateParams::new(vec![domain.to_string()])
         .context("failed to initialize acme tls-alpn certificate params")?;
     params.distinguished_name = DistinguishedName::new();
-    params.custom_extensions.push(CustomExtension::from_oid_content(
-        &[1, 3, 6, 1, 5, 5, 7, 1, 31],
-        acme_identifier_extension_content(digest),
-    ));
+    params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 5, 5, 7, 1, 31],
+            acme_identifier_extension_content(digest),
+        ));
 
     let key_pair = KeyPair::generate().context("failed generating acme tls-alpn key pair")?;
     let certificate = params
@@ -3890,7 +3954,8 @@ async fn issue_managed_acme_certificate(
             .context("failed to create managed acme account")?;
         fs::write(
             &credentials_path,
-            serde_json::to_vec_pretty(&credentials).context("failed to serialize acme credentials")?,
+            serde_json::to_vec_pretty(&credentials)
+                .context("failed to serialize acme credentials")?,
         )
         .with_context(|| format!("failed to write {}", credentials_path.display()))?;
         account
@@ -4202,7 +4267,9 @@ fn select_compression_encoding(
 ) -> Option<CompressionEncoding> {
     let accepted = headers.get(ACCEPT_ENCODING)?.to_str().ok()?;
     let allow_zstd = compression.algorithms.contains(&CompressionAlgorithm::Zstd);
-    let allow_br = compression.algorithms.contains(&CompressionAlgorithm::Brotli);
+    let allow_br = compression
+        .algorithms
+        .contains(&CompressionAlgorithm::Brotli);
     let allow_gzip = compression.algorithms.contains(&CompressionAlgorithm::Gzip);
     if !allow_zstd && !allow_br && !allow_gzip {
         return None;
@@ -4405,13 +4472,17 @@ async fn rewrite_ftp_passive_reply(
                 .await?
         else {
             tracing::warn!(%remote_addr, "ftp passive listener pool exhausted");
-            return Ok(Some("425 Can't open passive data connection.\r\n".to_string()));
+            return Ok(Some(
+                "425 Can't open passive data connection.\r\n".to_string(),
+            ));
         };
         spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
 
         let IpAddr::V4(public_v4) = public_ip else {
             tracing::warn!(%remote_addr, "ftp PASV rewrite requires IPv4 public_ip/local bind");
-            return Ok(Some("425 Can't expose passive IPv6 address via PASV.\r\n".to_string()));
+            return Ok(Some(
+                "425 Can't expose passive IPv6 address via PASV.\r\n".to_string(),
+            ));
         };
         let octets = public_v4.octets();
         let p1 = port / 256;
@@ -4428,7 +4499,9 @@ async fn rewrite_ftp_passive_reply(
                 .await?
         else {
             tracing::warn!(%remote_addr, "ftp EPSV listener pool exhausted");
-            return Ok(Some("425 Can't open passive data connection.\r\n".to_string()));
+            return Ok(Some(
+                "425 Can't open passive data connection.\r\n".to_string(),
+            ));
         };
         let upstream_addr = SocketAddr::new(upstream_control_ip, upstream_port);
         spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
@@ -4460,7 +4533,9 @@ async fn rewrite_ftp_active_command(
         spawn_ftp_active_bridge(listener, target_addr, remote_addr);
 
         let IpAddr::V4(ip) = public_ip else {
-            return Err(anyhow!("ftp PORT rewrite requires an IPv4 public_ip/local bind"));
+            return Err(anyhow!(
+                "ftp PORT rewrite requires an IPv4 public_ip/local bind"
+            ));
         };
         let octets = ip.octets();
         let p1 = port / 256;
@@ -4483,8 +4558,16 @@ async fn rewrite_ftp_active_command(
         let advertised_addr = match (af, public_ip) {
             (1, IpAddr::V4(ip)) => ip.to_string(),
             (2, IpAddr::V6(ip)) => ip.to_string(),
-            (1, IpAddr::V6(_)) => return Err(anyhow!("ftp EPRT IPv4 rewrite requires an IPv4 public_ip/local bind")),
-            (2, IpAddr::V4(_)) => return Err(anyhow!("ftp EPRT IPv6 rewrite requires an IPv6 public_ip/local bind")),
+            (1, IpAddr::V6(_)) => {
+                return Err(anyhow!(
+                    "ftp EPRT IPv4 rewrite requires an IPv4 public_ip/local bind"
+                ))
+            }
+            (2, IpAddr::V4(_)) => {
+                return Err(anyhow!(
+                    "ftp EPRT IPv6 rewrite requires an IPv6 public_ip/local bind"
+                ))
+            }
             _ => return Ok(None),
         };
 
@@ -4550,7 +4633,10 @@ fn parse_ftp_epsv_port(reply: &str) -> Option<u16> {
     let start = reply.find('(')?;
     let end = reply[start + 1..].find(')')? + start + 1;
     let payload = &reply[start + 1..end];
-    let digits = payload.chars().filter(|ch| ch.is_ascii_digit()).collect::<String>();
+    let digits = payload
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
     if digits.is_empty() {
         None
     } else {
@@ -4590,9 +4676,9 @@ fn spawn_ftp_passive_bridge(
                 .accept()
                 .await
                 .context("failed accepting ftp passive data connection")?;
-            let mut upstream_data = TcpStream::connect(upstream_addr)
-                .await
-                .with_context(|| format!("failed connecting ftp passive upstream {upstream_addr}"))?;
+            let mut upstream_data = TcpStream::connect(upstream_addr).await.with_context(|| {
+                format!("failed connecting ftp passive upstream {upstream_addr}")
+            })?;
             copy_bidirectional(&mut downstream_data, &mut upstream_data)
                 .await
                 .context("ftp passive data relay failed")?;
@@ -4617,9 +4703,9 @@ fn spawn_ftp_active_bridge(
                 .accept()
                 .await
                 .context("failed accepting ftp active data connection from upstream")?;
-            let mut client_data = TcpStream::connect(client_target)
-                .await
-                .with_context(|| format!("failed connecting ftp active client target {client_target}"))?;
+            let mut client_data = TcpStream::connect(client_target).await.with_context(|| {
+                format!("failed connecting ftp active client target {client_target}")
+            })?;
             copy_bidirectional(&mut server_data, &mut client_data)
                 .await
                 .context("ftp active data relay failed")?;
@@ -5372,7 +5458,10 @@ fn configured_reverse_proxy_route(
                 &route.compression,
             ),
             cache: merge_cache_policy(&config.services.response_policy.cache, &route.cache),
-            rate_limit: merge_rate_limit_policy(&config.services.rate_limit.http, &route.rate_limit),
+            rate_limit: merge_rate_limit_policy(
+                &config.services.rate_limit.http,
+                &route.rate_limit,
+            ),
         })
 }
 
@@ -5428,25 +5517,25 @@ fn should_redirect_http_to_https(config: &GatewayConfig, host: &str, uri: &Uri) 
     }
     let normalized_host = strip_default_port(host, 80).to_ascii_lowercase();
 
-    if matches!(config.http.tls.mode, TlsMode::AcmeManaged | TlsMode::AcmeExternal)
-        && config
-            .http
-            .tls
-            .acme
-            .domains
-            .iter()
-            .any(|domain| host_matches(domain, &normalized_host))
+    if matches!(
+        config.http.tls.mode,
+        TlsMode::AcmeManaged | TlsMode::AcmeExternal
+    ) && config
+        .http
+        .tls
+        .acme
+        .domains
+        .iter()
+        .any(|domain| host_matches(domain, &normalized_host))
     {
         return true;
     }
 
-    if config
-        .http
-        .tls
-        .certificates
-        .iter()
-        .any(|cert| cert.domains.iter().any(|domain| host_matches(domain, &normalized_host)))
-    {
+    if config.http.tls.certificates.iter().any(|cert| {
+        cert.domains
+            .iter()
+            .any(|domain| host_matches(domain, &normalized_host))
+    }) {
         return true;
     }
 
@@ -5530,7 +5619,9 @@ fn resolve_active_health_config(
     override_config: &ActiveHealthOverrideConfig,
 ) -> ResolvedActiveHealthConfig {
     ResolvedActiveHealthConfig {
-        enabled: override_config.enabled.unwrap_or(base.enabled && base.http_enabled),
+        enabled: override_config
+            .enabled
+            .unwrap_or(base.enabled && base.http_enabled),
         path: override_config
             .path
             .clone()
@@ -5546,7 +5637,9 @@ fn resolve_active_health_config(
         success_threshold: override_config
             .success_threshold
             .unwrap_or(base.success_threshold),
-        jitter_percent: override_config.jitter_percent.unwrap_or(base.jitter_percent),
+        jitter_percent: override_config
+            .jitter_percent
+            .unwrap_or(base.jitter_percent),
         alert_webhooks: if override_config.alert_webhooks.is_empty() {
             base.alert_webhooks.clone()
         } else {
@@ -6276,9 +6369,7 @@ fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> Gate
         "proxysss://welcome" => {
             GatewayHttpResponse::html(render_welcome_html(config), "proxysss://welcome")
         }
-        "proxysss://docs" => {
-            GatewayHttpResponse::html(render_docs_html(config), "proxysss://docs")
-        }
+        "proxysss://docs" => GatewayHttpResponse::html(render_docs_html(config), "proxysss://docs"),
         "proxysss://healthz" => GatewayHttpResponse::bytes(
             StatusCode::OK,
             "application/json",
@@ -7017,14 +7108,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
     </main>
 </body>
 </html>"##,
-        reverse_proxy,
-        static_site,
-        webdav,
-        streams,
-        ftp,
-        health,
-        error_pages,
-        maintenance,
+        reverse_proxy, static_site, webdav, streams, ftp, health, error_pages, maintenance,
     )
 }
 

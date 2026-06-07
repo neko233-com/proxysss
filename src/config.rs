@@ -821,27 +821,21 @@ impl GatewayConfig {
                 && !self.load_balance.active_health.tcp_enabled
             {
                 errors.push(
-                    "load_balance.active_health requires http_enabled or tcp_enabled"
-                        .to_string(),
+                    "load_balance.active_health requires http_enabled or tcp_enabled".to_string(),
                 );
             }
             if self.load_balance.active_health.interval_secs == 0 {
                 errors.push(
-                    "load_balance.active_health.interval_secs must be greater than 0"
-                        .to_string(),
+                    "load_balance.active_health.interval_secs must be greater than 0".to_string(),
                 );
             }
             if self.load_balance.active_health.timeout_ms < 100 {
-                errors.push(
-                    "load_balance.active_health.timeout_ms must be >= 100".to_string(),
-                );
+                errors.push("load_balance.active_health.timeout_ms must be >= 100".to_string());
             }
             if self.load_balance.active_health.http_enabled
                 && !self.load_balance.active_health.path.starts_with('/')
             {
-                errors.push(
-                    "load_balance.active_health.path must start with /".to_string(),
-                );
+                errors.push("load_balance.active_health.path must start with /".to_string());
             }
             if self.load_balance.active_health.http_enabled
                 && self.load_balance.active_health.expected_statuses.is_empty()
@@ -863,11 +857,15 @@ impl GatewayConfig {
                 );
             }
             if self.load_balance.active_health.jitter_percent > 100 {
-                errors.push(
-                    "load_balance.active_health.jitter_percent must be <= 100".to_string(),
-                );
+                errors.push("load_balance.active_health.jitter_percent must be <= 100".to_string());
             }
-            for (index, webhook) in self.load_balance.active_health.alert_webhooks.iter().enumerate() {
+            for (index, webhook) in self
+                .load_balance
+                .active_health
+                .alert_webhooks
+                .iter()
+                .enumerate()
+            {
                 if !looks_like_url(webhook) {
                     errors.push(format!(
                         "load_balance.active_health.alert_webhooks.{index} must be an http/https URL"
@@ -2351,7 +2349,9 @@ fn normalize_active_health_override(config: &mut ActiveHealthOverrideConfig) {
     if let Some(path) = &mut config.path {
         *path = path.trim().to_string();
     }
-    config.alert_webhooks.retain(|value| !value.trim().is_empty());
+    config
+        .alert_webhooks
+        .retain(|value| !value.trim().is_empty());
 }
 
 fn default_reload_interval_ms() -> u64 {
@@ -2558,7 +2558,9 @@ fn validate_active_health_override(
     }
     for (index, webhook) in config.alert_webhooks.iter().enumerate() {
         if !looks_like_url(webhook) {
-            errors.push(format!("{prefix}.alert_webhooks.{index} must be an http/https URL"));
+            errors.push(format!(
+                "{prefix}.alert_webhooks.{index} must be an http/https URL"
+            ));
         }
     }
 }
