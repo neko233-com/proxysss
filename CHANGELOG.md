@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.7 - 2026-06-07
+
+- Further reduced packaging overhead by trimming deploy/release bundle contents to the binary, README, key offline docs, and install scripts instead of copying the full templates/scripts trees.
+- Switched the Linux ARM64 release build from the x64 cross-toolchain + `apt-get` path to a native ARM GitHub runner to remove cross-toolchain setup overhead while preserving the same final asset.
+- Unified Rust cache keys across workflows and targets so release/deploy/CI builds can reuse cached dependencies and target artifacts more effectively across version bumps.
+
 ## v0.3.6 - 2026-06-07
 
 - Fixed the release/cold-build dependency lock by downgrading the locked `getrandom` crate from `0.3.5` to `0.3.4`, restoring reproducible builds on clean GitHub Actions runners.
