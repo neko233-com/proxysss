@@ -57,11 +57,14 @@ impl AdminAuthGuard {
         let now = Instant::now();
         let window = Duration::from_secs(config.window_secs.max(1));
         let lockout = Duration::from_secs(config.lockout_secs.max(1));
-        let mut entry = self.failures.entry(key.to_string()).or_insert(AdminAuthFailureState {
-            count: 0,
-            window_start: now,
-            locked_until: None,
-        });
+        let mut entry = self
+            .failures
+            .entry(key.to_string())
+            .or_insert(AdminAuthFailureState {
+                count: 0,
+                window_start: now,
+                locked_until: None,
+            });
         if now.duration_since(entry.window_start) >= window {
             entry.window_start = now;
             entry.count = 0;
@@ -157,7 +160,10 @@ pub fn validate_upstream_target(upstream: &str, security: &SecurityConfig) -> Re
     Ok(())
 }
 
-pub fn validate_domain_route_mutation(route: &DomainRouteConfig, security: &SecurityConfig) -> Result<()> {
+pub fn validate_domain_route_mutation(
+    route: &DomainRouteConfig,
+    security: &SecurityConfig,
+) -> Result<()> {
     if !security.validate_admin_mutations {
         return Ok(());
     }
@@ -286,7 +292,9 @@ fn reject_ssrf_host(host: &str, security: &SecurityConfig) -> Result<()> {
         .iter()
         .any(|item| item.eq_ignore_ascii_case(&normalized))
     {
-        return Err(anyhow!("upstream host {host} is blocked by security policy"));
+        return Err(anyhow!(
+            "upstream host {host} is blocked by security policy"
+        ));
     }
     if let Ok(ip) = normalized.parse::<IpAddr>() {
         reject_ssrf_ip(ip, security)?;
@@ -348,18 +356,17 @@ fn ip_matches_cidr(ip: IpAddr, cidr: &str) -> bool {
             let ip_bits = u128::from_be_bytes(ip.octets());
             let network_bits = u128::from_be_bytes(network.octets());
             let shift = 128 - prefix;
-            let mask = if shift == 128 {
-                0
-            } else {
-                u128::MAX << shift
-            };
+            let mask = if shift == 128 { 0 } else { u128::MAX << shift };
             (ip_bits & mask) == (network_bits & mask)
         }
         _ => false,
     }
 }
 
-pub fn apply_kubernetes_routes(config: &mut KubernetesConfig, domain_routes: &mut Vec<DomainRouteConfig>) {
+pub fn apply_kubernetes_routes(
+    config: &mut KubernetesConfig,
+    domain_routes: &mut Vec<DomainRouteConfig>,
+) {
     if !config.enabled {
         return;
     }
@@ -469,7 +476,9 @@ mod tests {
             block_ssrf_targets: true,
             ..SecurityConfig::default()
         };
-        assert!(validate_upstream_target("http://169.254.169.254/latest/meta-data", &security).is_err());
+        assert!(
+            validate_upstream_target("http://169.254.169.254/latest/meta-data", &security).is_err()
+        );
         assert!(validate_upstream_target("http://127.0.0.1:8080", &security).is_err());
         assert!(validate_upstream_target("http://api.internal.example:8080", &security).is_ok());
     }
@@ -523,6 +532,8 @@ mod tests {
         };
         apply_kubernetes_routes(&mut k8s, &mut routes);
         assert_eq!(routes.len(), 1);
-        assert!(routes[0].upstream.contains("api-svc.prod.svc.cluster.local:8080"));
+        assert!(routes[0]
+            .upstream
+            .contains("api-svc.prod.svc.cluster.local:8080"));
     }
 }

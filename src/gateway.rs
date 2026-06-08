@@ -806,9 +806,7 @@ impl Gateway {
                 }
             };
 
-            if let Err(error) =
-                validate_domain_route_mutation(&route, &state.config.security)
-            {
+            if let Err(error) = validate_domain_route_mutation(&route, &state.config.security) {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": error.to_string()}),
@@ -934,9 +932,7 @@ impl Gateway {
                 }
             };
 
-            if let Err(error) =
-                validate_tcp_listener_mutation(&listener, &state.config.security)
-            {
+            if let Err(error) = validate_tcp_listener_mutation(&listener, &state.config.security) {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": error.to_string()}),
@@ -997,9 +993,7 @@ impl Gateway {
                 }
             };
 
-            if let Err(error) =
-                validate_udp_listener_mutation(&listener, &state.config.security)
-            {
+            if let Err(error) = validate_udp_listener_mutation(&listener, &state.config.security) {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": error.to_string()}),
@@ -1477,9 +1471,9 @@ impl Gateway {
         security::atomic_write(&self.config_path, &updated)?;
         if let Err(error) = self.reload_from_disk().await {
             let _ = security::atomic_write(&self.config_path, &original);
-            return Err(error.context(
-                "delete was written but reload failed; original file was restored",
-            ));
+            return Err(
+                error.context("delete was written but reload failed; original file was restored")
+            );
         }
         Ok(())
     }
@@ -1513,9 +1507,9 @@ impl Gateway {
         security::atomic_write(&self.config_path, &updated)?;
         if let Err(error) = self.reload_from_disk().await {
             let _ = security::atomic_write(&self.config_path, &original);
-            return Err(error.context(
-                "delete was written but reload failed; original file was restored",
-            ));
+            return Err(
+                error.context("delete was written but reload failed; original file was restored")
+            );
         }
         Ok(())
     }
@@ -1549,9 +1543,8 @@ impl Gateway {
         security::atomic_write(&self.config_path, &updated)?;
         if let Err(error) = self.reload_from_disk().await {
             let _ = security::atomic_write(&self.config_path, &original);
-            return Err(error.context(
-                "tls update was written but reload failed; original file was restored",
-            ));
+            return Err(error
+                .context("tls update was written but reload failed; original file was restored"));
         }
         Ok(domains)
     }
@@ -3203,11 +3196,9 @@ impl Gateway {
                 selected_key.as_deref(),
                 candidates,
             ),
-            LoadBalanceAlgorithm::Weighted => self.select_weighted_plan(
-                &scope_base,
-                candidates,
-                &route.upstream_weights,
-            ),
+            LoadBalanceAlgorithm::Weighted => {
+                self.select_weighted_plan(&scope_base, candidates, &route.upstream_weights)
+            }
         }
     }
 
@@ -6198,7 +6189,10 @@ fn render_config_with_deleted_reverse_proxy_route(original: &str, name: &str) ->
     serde_yaml::to_string(&value).context("failed to render updated YAML config")
 }
 
-fn render_config_with_auto_https(original: &str, payload: &AutoHttpsUpsertRequest) -> Result<String> {
+fn render_config_with_auto_https(
+    original: &str,
+    payload: &AutoHttpsUpsertRequest,
+) -> Result<String> {
     let mut value: serde_yaml::Value =
         serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
     let root = value
@@ -6206,7 +6200,10 @@ fn render_config_with_auto_https(original: &str, payload: &AutoHttpsUpsertReques
         .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
     let http_key = serde_yaml::Value::String("http".to_string());
     if !root.contains_key(&http_key) {
-        root.insert(http_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+        root.insert(
+            http_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
     }
     let http = root
         .get_mut(&http_key)
@@ -6214,7 +6211,10 @@ fn render_config_with_auto_https(original: &str, payload: &AutoHttpsUpsertReques
         .ok_or_else(|| anyhow!("http must be a mapping"))?;
     let tls_key = serde_yaml::Value::String("tls".to_string());
     if !http.contains_key(&tls_key) {
-        http.insert(tls_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+        http.insert(
+            tls_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
     }
     let tls = http
         .get_mut(&tls_key)
@@ -6266,7 +6266,10 @@ fn render_config_with_wildcard_tls(
         .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
     let http_key = serde_yaml::Value::String("http".to_string());
     if !root.contains_key(&http_key) {
-        root.insert(http_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+        root.insert(
+            http_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
     }
     let http = root
         .get_mut(&http_key)
@@ -6274,7 +6277,10 @@ fn render_config_with_wildcard_tls(
         .ok_or_else(|| anyhow!("http must be a mapping"))?;
     let tls_key = serde_yaml::Value::String("tls".to_string());
     if !http.contains_key(&tls_key) {
-        http.insert(tls_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+        http.insert(
+            tls_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
     }
     let tls = http
         .get_mut(&tls_key)
@@ -10217,10 +10223,7 @@ mod tests {
         let key = "remote:127.0.0.1".to_string();
         assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
         assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
-        assert!(
-            apply_http_rate_limit_to_store(&store, &config, key)
-                .is_some()
-        );
+        assert!(apply_http_rate_limit_to_store(&store, &config, key).is_some());
     }
 
     #[test]
