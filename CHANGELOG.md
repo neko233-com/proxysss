@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.13 - 2026-06-09
+
+- Added Prometheus text exposition on `monitoring.path` (default `/metrics`) with `monitoring.format: prometheus|json`.
+- Added weighted load balancing via `load_balance.algorithm: weighted` and per-route `upstream_weights`.
+- Added token-bucket HTTP rate limiting through `services.rate_limit.http.algorithm: token_bucket`.
+- Documented configuration, architecture, and demo workflows in `docs/CONFIGURATION.md`, `docs/ARCHITECTURE.md`, and `examples/demo/README.md`.
+- Expanded capability matrix coverage for Prometheus metrics, weighted balancing, and gRPC-over-HTTP/2 proxying.
+
 ## v0.3.12 - 2026-06-07
 
 - Added non-default `http.tls.mode: acme_dns_external` for wildcard certificate issuance and renewal through external `acme.sh` DNS-01 providers, with DNS credentials redacted from config display paths.

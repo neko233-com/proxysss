@@ -101,9 +101,10 @@ proxysss config nginx-parity --format yaml
 
 ## Known nginx Parity Gaps (track honestly)
 
-- Response compression (gzip/brotli)
-- Proxy cache zones
-- Native FTP passive/active channel awareness (currently TCP passthrough)
-- Multi-cert SNI certificate selection
+- FTP is no longer raw TCP passthrough: control-channel proxying plus passive/active data-channel rewriting exists. Remaining gap: richer FTP policy controls and command-aware observability.
+- Compression supports configurable zstd/brotli/gzip response handling through `services.response_policy` and route-level overrides. Remaining gap: extend response policy into cache zones and protocol-specific tuning surfaces.
+- Proxy cache zones exist with shared zones, optional disk-backed entries, and PURGE invalidation. Remaining gap: add background revalidation and more advanced cache key/variant controls.
+- Rate limiting supports fixed-window and token-bucket shared-zone request limiting plus concurrent connection caps. Remaining gap: add stream-layer shared rate-limit policies and leaky-bucket shaping.
+- Wildcard DNS-01 certificates are supported through the explicit external `acme.sh` path. Remaining gap: native DNS provider integrations remain external by design.
 
 These are tracked in `proxysss config nginx-parity` and should move toward `supported` with tests, not disappear from the matrix.

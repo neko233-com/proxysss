@@ -336,6 +336,18 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "admin API and the 7777 dashboard can take individual upstreams offline or restore them without changing config",
     ),
     (
+        "prometheus metrics",
+        "monitoring.path (default /metrics) exposes Prometheus text or JSON counters via monitoring.format",
+    ),
+    (
+        "weighted load balancing",
+        "load_balance.algorithm=weighted with per-upstream upstream_weights on HTTP and stream routes",
+    ),
+    (
+        "grpc over http/2",
+        "HTTP/2 reverse proxy transparently forwards gRPC (application/grpc) when upstreams speak h2",
+    ),
+    (
         "tcp tuning assistant",
         "proxysss tune tcp launches an interactive Linux-oriented sysctl tuning flow based on workload and hardware",
     ),
@@ -472,8 +484,8 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "rate limiting",
         status: ParityStatus::Partial,
-        evidence: "services.rate_limit.http plus route-level overrides provide fixed-window shared-zone request limiting and concurrent connection caps",
-        next_gap: "add leaky-bucket/token-bucket shaping and stream-layer shared policies",
+        evidence: "services.rate_limit.http plus route-level overrides provide fixed-window or token-bucket shared-zone request limiting and concurrent connection caps",
+        next_gap: "add stream-layer shared rate-limit policies and leaky-bucket shaping",
     },
     NginxParityItem {
         capability: "forwarding header semantics",
@@ -2118,6 +2130,8 @@ mod tests {
             "auto https",
             "active health checks",
             "manual upstream drain",
+            "prometheus metrics",
+            "weighted load balancing",
             "ip allow/deny blacklist",
             "admin api/console",
             "cluster automation api",
@@ -2155,6 +2169,7 @@ mod tests {
                 hosts: vec!["api.example.com".to_string()],
                 upstream: "http://127.0.0.1:8080".to_string(),
                 upstreams: vec!["http://127.0.0.1:8080".to_string()],
+                upstream_weights: std::collections::BTreeMap::new(),
                 strip_prefix: true,
                 set_headers: std::collections::BTreeMap::new(),
                 strip_headers: Vec::new(),
@@ -2187,12 +2202,14 @@ mod tests {
             bind: "0.0.0.0:7000".to_string(),
             upstream: "127.0.0.1:9000".to_string(),
             upstreams: vec!["127.0.0.1:9001".to_string()],
+            upstream_weights: std::collections::BTreeMap::new(),
         });
         config.udp.listeners.push(crate::config::UdpListenerConfig {
             name: "realtime".to_string(),
             bind: "0.0.0.0:7001".to_string(),
             upstream: String::new(),
             upstreams: vec!["127.0.0.1:9100".to_string()],
+            upstream_weights: std::collections::BTreeMap::new(),
         });
 
         let topology = render_route_topology(&config);
@@ -2280,6 +2297,42 @@ mod tests {
         assert!(NGINX_PARITY_MATRIX
             .iter()
             .any(|item| item.status == ParityStatus::Partial));
+    }
+
+    #[test]
+    fn agents_nginx_gap_docs_match_current_partial_items() {
+        let agents = include_str!("../AGENTS.md");
+
+        for stale_gap in [
+            "- Response compression (gzip/brotli)\n",
+            "- Proxy cache zones\n",
+            "- Native FTP passive/active channel awareness (currently TCP passthrough)\n",
+            "- Multi-cert SNI certificate selection\n",
+        ] {
+            assert!(
+                !agents.contains(stale_gap),
+                "AGENTS.md still contains stale nginx parity gap: {stale_gap}"
+            );
+        }
+
+        for item in NGINX_PARITY_MATRIX
+            .iter()
+            .filter(|item| item.status == ParityStatus::Partial)
+        {
+            assert!(
+                agents.contains(item.next_gap),
+                "AGENTS.md should mention current nginx parity gap for {}: {}",
+                item.capability,
+                item.next_gap
+            );
+        }
+
+        let tls = NGINX_PARITY_MATRIX
+            .iter()
+            .find(|item| item.capability == "TLS certificates")
+            .expect("TLS certificate parity item");
+        assert_eq!(tls.status, ParityStatus::Supported);
+        assert!(tls.evidence.contains("multi-cert SNI"));
     }
 
     #[test]

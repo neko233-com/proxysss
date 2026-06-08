@@ -59,10 +59,10 @@ use zstd::stream::encode_all as zstd_encode_all;
 use crate::config::{
     AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig, AdminConfig,
     CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
-    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, RateLimitKey,
-    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
-    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
-    WebDavConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
+    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
+    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig,
+    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -131,6 +131,8 @@ struct UpstreamRuntimeState {
 struct RateLimitBucket {
     window_start: Instant,
     count: u32,
+    tokens: f64,
+    last_refill: Instant,
 }
 
 #[derive(Clone)]
@@ -1574,6 +1576,7 @@ impl Gateway {
                         RouteDecision {
                             upstream: state.config.services.ftp.upstream.clone(),
                             upstreams: Vec::new(),
+                            upstream_weights: BTreeMap::new(),
                             affinity_key: player_id.clone(),
                             rewrite_path: None,
                             set_headers: BTreeMap::new(),
@@ -2085,11 +2088,19 @@ impl Gateway {
         }
 
         if monitoring_path_matches(&state.config.monitoring, uri.path()) {
-            return Ok(json_gateway_response(
-                StatusCode::OK,
-                self.stats.snapshot_json(),
-                "proxysss://metrics",
-            ));
+            return Ok(match state.config.monitoring.format {
+                MonitoringFormat::Json => json_gateway_response(
+                    StatusCode::OK,
+                    self.stats.snapshot_json(),
+                    "proxysss://metrics",
+                ),
+                MonitoringFormat::Prometheus => GatewayHttpResponse::bytes(
+                    StatusCode::OK,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    Bytes::from(self.stats.snapshot_prometheus()),
+                    "proxysss://metrics",
+                ),
+            });
         }
 
         if let Some(response) =
@@ -2772,7 +2783,63 @@ impl Gateway {
                 selected_key.as_deref(),
                 candidates,
             ),
+            LoadBalanceAlgorithm::Weighted => self.select_weighted_plan(
+                &scope_base,
+                candidates,
+                &route.upstream_weights,
+            ),
         }
+    }
+
+    fn select_weighted_plan(
+        &self,
+        scope_base: &str,
+        candidates: Vec<String>,
+        weights: &BTreeMap<String, u32>,
+    ) -> Vec<String> {
+        if candidates.len() <= 1 {
+            return candidates;
+        }
+
+        let weighted = candidates
+            .iter()
+            .map(|candidate| {
+                let weight = weights.get(candidate).copied().unwrap_or(1).max(1);
+                (candidate.clone(), weight)
+            })
+            .collect::<Vec<_>>();
+        let total: u32 = weighted.iter().map(|(_, weight)| weight).sum();
+        if total == 0 {
+            return candidates;
+        }
+
+        let counter = {
+            let mut entry = self
+                .round_robin_state
+                .entry(format!("weighted:{scope_base}"))
+                .or_insert(0);
+            let current = *entry;
+            *entry = entry.wrapping_add(1);
+            current
+        };
+
+        let mut pick = (counter as u32) % total;
+        let mut primary_idx = 0usize;
+        for (index, (_, weight)) in weighted.iter().enumerate() {
+            if pick < *weight {
+                primary_idx = index;
+                break;
+            }
+            pick -= weight;
+        }
+
+        let mut plan = vec![weighted[primary_idx].0.clone()];
+        for (index, (candidate, _)) in weighted.iter().enumerate() {
+            if index != primary_idx {
+                plan.push(candidate.clone());
+            }
+        }
+        plan
     }
 
     fn select_rendezvous_plan(
@@ -3138,6 +3205,7 @@ fn route_names_for_runtime_scope(
                 if normalize_candidates(&RouteDecision {
                     upstream: route.upstream.clone(),
                     upstreams: route.upstreams.clone(),
+                    upstream_weights: route.upstream_weights.clone(),
                     affinity_key: None,
                     rewrite_path: None,
                     set_headers: BTreeMap::new(),
@@ -3155,6 +3223,7 @@ fn route_names_for_runtime_scope(
                 if normalize_candidates(&RouteDecision {
                     upstream: route.upstream.clone(),
                     upstreams: route.upstreams.clone(),
+                    upstream_weights: route.upstream_weights.clone(),
                     affinity_key: None,
                     rewrite_path: None,
                     set_headers: BTreeMap::new(),
@@ -3217,6 +3286,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
             for upstream in normalize_candidates(&RouteDecision {
                 upstream: route.upstream.clone(),
                 upstreams: route.upstreams.clone(),
+                upstream_weights: route.upstream_weights.clone(),
                 affinity_key: None,
                 rewrite_path: None,
                 set_headers: BTreeMap::new(),
@@ -3242,6 +3312,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
             for upstream in normalize_candidates(&RouteDecision {
                 upstream: route.upstream.clone(),
                 upstreams: route.upstreams.clone(),
+                upstream_weights: route.upstream_weights.clone(),
                 affinity_key: None,
                 rewrite_path: None,
                 set_headers: BTreeMap::new(),
@@ -3269,6 +3340,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
             for upstream in normalize_candidates(&RouteDecision {
                 upstream: listener.upstream.clone(),
                 upstreams: listener.upstreams.clone(),
+                upstream_weights: listener.upstream_weights.clone(),
                 affinity_key: None,
                 rewrite_path: None,
                 set_headers: BTreeMap::new(),
@@ -3695,6 +3767,76 @@ impl GatewayStats {
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
         })
     }
+
+    fn snapshot_prometheus(&self) -> String {
+        let metrics = [
+            (
+                "proxysss_http_requests_total",
+                "Total HTTP requests handled by the gateway",
+                self.http_requests.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_http_errors_total",
+                "Total HTTP error responses emitted by the gateway",
+                self.http_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_tcp_sessions_total",
+                "Total TCP stream sessions accepted",
+                self.tcp_sessions_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_udp_packets_total",
+                "Total UDP datagrams proxied",
+                self.udp_packets_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_udp_bytes_total",
+                "Total UDP payload bytes proxied",
+                self.udp_bytes_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_reload_success_total",
+                "Successful configuration reload operations",
+                self.reload_success_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_reload_failure_total",
+                "Failed configuration reload operations",
+                self.reload_failure_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_admin_requests_total",
+                "Admin API requests served",
+                self.admin_requests_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_admin_auth_fail_total",
+                "Admin API authentication failures",
+                self.admin_auth_fail_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_script_fail_total",
+                "Embedded script execution failures",
+                self.script_fail_total.load(Ordering::Relaxed),
+            ),
+        ];
+
+        let mut lines = Vec::new();
+        for (name, help, value) in metrics {
+            lines.push(format!("# HELP {name} {help}"));
+            lines.push(format!("# TYPE {name} counter"));
+            lines.push(format!("{name} {value}"));
+        }
+        lines.push("# HELP proxysss_tcp_sessions_active Active TCP stream sessions".to_string());
+        lines.push("# TYPE proxysss_tcp_sessions_active gauge".to_string());
+        lines.push(format!(
+            "proxysss_tcp_sessions_active {}",
+            self.tcp_sessions_active.load(Ordering::Relaxed)
+        ));
+        lines.push(String::new());
+        lines.join("\n")
+    }
 }
 
 fn decorate_error_response(
@@ -4019,6 +4161,7 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
             bind: config.services.ftp.bind.clone(),
             upstream: config.services.ftp.upstream.clone(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
         }));
     }
 
@@ -5892,25 +6035,47 @@ fn apply_http_rate_limit_to_store(
     let mut bucket = store.entry(key).or_insert(RateLimitBucket {
         window_start: now,
         count: 0,
+        tokens: limit as f64,
+        last_refill: now,
     });
 
-    if now.duration_since(bucket.window_start) >= window {
-        bucket.window_start = now;
-        bucket.count = 0;
-    }
+    match config.algorithm {
+        RateLimitAlgorithm::FixedWindow => {
+            if now.duration_since(bucket.window_start) >= window {
+                bucket.window_start = now;
+                bucket.count = 0;
+            }
 
-    bucket.count = bucket.count.saturating_add(1);
-    if bucket.count <= limit {
-        return None;
-    }
+            bucket.count = bucket.count.saturating_add(1);
+            if bucket.count <= limit {
+                return None;
+            }
 
-    Some(
-        window
-            .saturating_sub(now.duration_since(bucket.window_start))
-            .as_secs()
-            .max(1)
-            .to_string(),
-    )
+            Some(
+                window
+                    .saturating_sub(now.duration_since(bucket.window_start))
+                    .as_secs()
+                    .max(1)
+                    .to_string(),
+            )
+        }
+        RateLimitAlgorithm::TokenBucket => {
+            let elapsed = now.duration_since(bucket.last_refill);
+            let refill_per_ms = config.requests as f64 / window.as_millis().max(1) as f64;
+            let refill = elapsed.as_millis() as f64 * refill_per_ms;
+            bucket.tokens = (bucket.tokens + refill).min(limit as f64);
+            bucket.last_refill = now;
+
+            if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                return None;
+            }
+
+            let deficit = 1.0 - bucket.tokens;
+            let wait_ms = (deficit / refill_per_ms).ceil() as u64;
+            Some(wait_ms.max(1).to_string())
+        }
+    }
 }
 
 fn builtin_http_route(path: &str) -> Option<RouteDecision> {
@@ -5923,6 +6088,7 @@ fn builtin_http_route(path: &str) -> Option<RouteDecision> {
             return Some(RouteDecision {
                 upstream: format!("proxysss://static/{}", path.trim_start_matches("/static/")),
                 upstreams: Vec::new(),
+                upstream_weights: BTreeMap::new(),
                 affinity_key: None,
                 rewrite_path: None,
                 set_headers: BTreeMap::new(),
@@ -5937,6 +6103,7 @@ fn builtin_http_route(path: &str) -> Option<RouteDecision> {
     Some(RouteDecision {
         upstream: upstream.to_string(),
         upstreams: Vec::new(),
+        upstream_weights: BTreeMap::new(),
         affinity_key: None,
         rewrite_path: None,
         set_headers: BTreeMap::new(),
@@ -6003,6 +6170,7 @@ fn configured_stream_listener_route(
     Some(RouteDecision {
         upstream: selected,
         upstreams: normalized_upstreams,
+        upstream_weights: BTreeMap::new(),
         affinity_key,
         rewrite_path: None,
         set_headers: BTreeMap::new(),
@@ -6209,6 +6377,7 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
     RouteDecision {
         upstream: route.upstream.clone(),
         upstreams: route.upstreams.clone(),
+        upstream_weights: route.upstream_weights.clone(),
         affinity_key: None,
         rewrite_path,
         set_headers: route.set_headers.clone(),
@@ -6228,6 +6397,7 @@ fn domain_route_config(
         decision: RouteDecision {
             upstream: route.upstream.clone(),
             upstreams: route.upstreams.clone(),
+            upstream_weights: route.upstream_weights.clone(),
             affinity_key: None,
             rewrite_path: route.strip_prefix.then(|| {
                 let prefix = normalize_route_prefix(&route.path_prefix);
@@ -8868,6 +9038,7 @@ mod tests {
                 path_prefix: "/".to_string(),
                 upstream: "http://127.0.0.1:9000".to_string(),
                 upstreams: vec!["http://127.0.0.1:9001".to_string()],
+                upstream_weights: BTreeMap::new(),
                 strip_prefix: false,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
@@ -8895,6 +9066,7 @@ mod tests {
                 path_prefix: "/api".to_string(),
                 upstream: "http://127.0.0.1:9000".to_string(),
                 upstreams: Vec::new(),
+                upstream_weights: BTreeMap::new(),
                 strip_prefix: true,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
@@ -8923,6 +9095,7 @@ mod tests {
                 hosts: vec!["api.example.com".to_string()],
                 upstream: "http://127.0.0.1:9000".to_string(),
                 upstreams: vec!["http://127.0.0.1:9001".to_string()],
+                upstream_weights: BTreeMap::new(),
                 strip_prefix: true,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
@@ -8948,6 +9121,7 @@ mod tests {
                 bind: "0.0.0.0:7001".to_string(),
                 upstream: "127.0.0.1:9100".to_string(),
                 upstreams: vec!["127.0.0.1:9101".to_string()],
+                upstream_weights: BTreeMap::new(),
             },
         )
         .expect("render updated config");
@@ -8965,6 +9139,7 @@ mod tests {
                 bind: "0.0.0.0:8001".to_string(),
                 upstream: String::new(),
                 upstreams: vec!["127.0.0.1:9300".to_string()],
+            upstream_weights: BTreeMap::new(),
             },
         )
         .expect("render updated config");
@@ -8982,6 +9157,7 @@ mod tests {
                 "".to_string(),
                 "127.0.0.1:7002".to_string(),
             ],
+            upstream_weights: BTreeMap::new(),
             affinity_key: None,
             rewrite_path: None,
             set_headers: BTreeMap::new(),
@@ -9002,6 +9178,7 @@ mod tests {
         let route = RouteDecision {
             upstream: "wss://chat.example.com/socket".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             affinity_key: None,
             rewrite_path: None,
             set_headers: BTreeMap::new(),
@@ -9037,6 +9214,7 @@ mod tests {
             hosts: vec!["*.example.com".to_string()],
             upstream: "http://127.0.0.1:8080".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             strip_prefix: true,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -9067,6 +9245,7 @@ mod tests {
                     hosts: Vec::new(),
                     upstream: "http://127.0.0.1:8080".to_string(),
                     upstreams: Vec::new(),
+                    upstream_weights: BTreeMap::new(),
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
@@ -9081,6 +9260,7 @@ mod tests {
                     hosts: Vec::new(),
                     upstream: "http://127.0.0.1:9090".to_string(),
                     upstreams: Vec::new(),
+                    upstream_weights: BTreeMap::new(),
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
@@ -9107,6 +9287,7 @@ mod tests {
             path_prefix: "/".to_string(),
             upstream: "http://127.0.0.1:9000".to_string(),
             upstreams: vec!["http://127.0.0.1:9001".to_string()],
+            upstream_weights: BTreeMap::new(),
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -9145,6 +9326,7 @@ mod tests {
             path_prefix: "/".to_string(),
             upstream: "http://127.0.0.1:9000".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -9160,6 +9342,7 @@ mod tests {
             path_prefix: "/".to_string(),
             upstream: "http://127.0.0.1:9000".to_string(),
             upstreams: vec!["http://127.0.0.1:9001".to_string()],
+            upstream_weights: BTreeMap::new(),
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -9257,6 +9440,7 @@ mod tests {
         let config = HttpRateLimitConfig {
             enabled: true,
             zone: "default".to_string(),
+            algorithm: RateLimitAlgorithm::default(),
             key: RateLimitKey::Header("x-api-key".to_string()),
             requests: 1,
             window_ms: 1000,
@@ -9277,6 +9461,7 @@ mod tests {
         let route = RouteDecision {
             upstream: "http://127.0.0.1:8080".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             affinity_key: None,
             rewrite_path: None,
             set_headers: BTreeMap::new(),
@@ -9336,10 +9521,82 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_prometheus_emits_counter_lines() {
+        let stats = GatewayStats::default();
+        stats.http_requests.store(42, Ordering::Relaxed);
+        let body = stats.snapshot_prometheus();
+        assert!(body.contains("proxysss_http_requests_total 42"));
+        assert!(body.contains("# TYPE proxysss_http_requests_total counter"));
+    }
+
+    #[test]
+    fn weighted_plan_prefers_heavier_upstream() {
+        let gateway = Gateway {
+            config_path: PathBuf::from("proxysss.yaml"),
+            bootstrap_config: GatewayConfig::default(),
+            dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
+                config: GatewayConfig::default(),
+                http_client: reqwest::Client::new(),
+                script: None,
+            }))),
+            stats: Arc::new(GatewayStats::default()),
+            sticky_affinity: Arc::new(DashMap::new()),
+            round_robin_state: Arc::new(DashMap::new()),
+            upstream_runtime: Arc::new(DashMap::new()),
+            http_rate_limits: Arc::new(DashMap::new()),
+            http_connection_limits: Arc::new(DashMap::new()),
+            http_cache: Arc::new(DashMap::new()),
+            acme_http_challenges: Arc::new(DashMap::new()),
+            acme_tls_alpn_certs: Arc::new(DashMap::new()),
+        };
+        let mut weights = BTreeMap::new();
+        weights.insert("http://127.0.0.1:9000".to_string(), 1);
+        weights.insert("http://127.0.0.1:9001".to_string(), 9);
+        let plan = gateway.select_weighted_plan(
+            "http:test",
+            vec![
+                "http://127.0.0.1:9000".to_string(),
+                "http://127.0.0.1:9001".to_string(),
+            ],
+            &weights,
+        );
+        assert_eq!(plan.len(), 2);
+        let heavy_first = plan
+            .iter()
+            .filter(|item| **item == "http://127.0.0.1:9001")
+            .count();
+        assert!(heavy_first >= 1);
+    }
+
+    #[test]
+    fn token_bucket_rate_limit_allows_burst_then_blocks() {
+        let config = HttpRateLimitConfig {
+            enabled: true,
+            zone: "default".to_string(),
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            key: RateLimitKey::RemoteAddr,
+            requests: 1,
+            window_ms: 60_000,
+            burst: 1,
+            max_connections: 0,
+            status: 429,
+        };
+        let store = DashMap::new();
+        let key = "remote:127.0.0.1".to_string();
+        assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
+        assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
+        assert!(
+            apply_http_rate_limit_to_store(&store, &config, key)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn http_rate_limit_blocks_after_limit() {
         let config = HttpRateLimitConfig {
             enabled: true,
             zone: "default".to_string(),
+            algorithm: RateLimitAlgorithm::default(),
             key: RateLimitKey::RemoteAddr,
             requests: 1,
             window_ms: 60_000,
@@ -9735,12 +9992,14 @@ mod tests {
             bind: "0.0.0.0:7000".to_string(),
             upstream: "127.0.0.1:9000".to_string(),
             upstreams: vec!["127.0.0.1:9001".to_string()],
+            upstream_weights: BTreeMap::new(),
         });
         config.udp.listeners.push(UdpListenerConfig {
             name: "game-udp".to_string(),
             bind: "0.0.0.0:7001".to_string(),
             upstream: String::new(),
             upstreams: vec!["127.0.0.1:9100".to_string(), "127.0.0.1:9101".to_string()],
+            upstream_weights: BTreeMap::new(),
         });
 
         let tcp = configured_tcp_listener_route(&config, "game-tcp", Some("pid-1".to_string()))

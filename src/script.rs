@@ -73,6 +73,8 @@ pub struct RouteDecision {
     #[serde(default)]
     pub upstreams: Vec<String>,
     #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
+    #[serde(default)]
     pub affinity_key: Option<String>,
     #[serde(default)]
     pub rewrite_path: Option<String>,
@@ -115,6 +117,8 @@ struct PartialRoute {
     upstream: Option<String>,
     #[serde(default)]
     upstreams: Option<Vec<String>>,
+    #[serde(default)]
+    upstream_weights: Option<BTreeMap<String, u32>>,
     #[serde(default)]
     affinity_key: Option<String>,
     #[serde(default)]
@@ -974,6 +978,9 @@ fn merge_route(current: &mut Option<PartialRoute>, next: PartialRoute) {
             if next.upstreams.is_some() {
                 cur.upstreams = next.upstreams;
             }
+            if next.upstream_weights.is_some() {
+                cur.upstream_weights = next.upstream_weights;
+            }
             if next.affinity_key.is_some() {
                 cur.affinity_key = next.affinity_key;
             }
@@ -1025,6 +1032,7 @@ fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
     Ok(RouteDecision {
         upstream,
         upstreams,
+        upstream_weights: partial.upstream_weights.unwrap_or_default(),
         affinity_key: partial.affinity_key,
         rewrite_path: partial.rewrite_path,
         set_headers: partial.set_headers.unwrap_or_default(),
@@ -1041,6 +1049,9 @@ fn partial_to_json(partial: &PartialRoute) -> JsonValue {
     }
     if let Some(value) = &partial.upstreams {
         map.insert("upstreams".into(), json!(value));
+    }
+    if let Some(value) = &partial.upstream_weights {
+        map.insert("upstream_weights".into(), json!(value));
     }
     if let Some(value) = &partial.affinity_key {
         map.insert("affinity_key".into(), json!(value));

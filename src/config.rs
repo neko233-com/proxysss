@@ -256,6 +256,8 @@ pub struct TcpListenerConfig {
     pub upstream: String,
     #[serde(default)]
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -272,6 +274,8 @@ pub struct UdpListenerConfig {
     pub upstream: String,
     #[serde(default)]
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +331,7 @@ pub enum LoadBalanceAlgorithm {
     RoundRobin,
     LeastConnections,
     SourceHash,
+    Weighted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,12 +455,22 @@ pub struct AdminConfig {
     pub enable_write_ops: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitoringFormat {
+    #[default]
+    Prometheus,
+    Json,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_monitoring_path")]
     pub path: String,
+    #[serde(default)]
+    pub format: MonitoringFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -528,12 +543,22 @@ pub struct HttpAccessControlConfig {
     pub status: u16,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitAlgorithm {
+    #[default]
+    FixedWindow,
+    TokenBucket,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRateLimitConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_rate_limit_zone")]
     pub zone: String,
+    #[serde(default)]
+    pub algorithm: RateLimitAlgorithm,
     #[serde(default)]
     pub key: RateLimitKey,
     #[serde(default = "default_rate_limit_requests")]
@@ -582,6 +607,8 @@ pub struct ReverseProxyRouteConfig {
     #[serde(default)]
     pub upstreams: Vec<String>,
     #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
+    #[serde(default)]
     pub strip_prefix: bool,
     #[serde(default, alias = "add_headers")]
     pub set_headers: BTreeMap<String, String>,
@@ -607,6 +634,8 @@ pub struct DomainRouteConfig {
     pub upstream: String,
     #[serde(default)]
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
     #[serde(default)]
     pub strip_prefix: bool,
     #[serde(default, alias = "add_headers")]
@@ -1854,6 +1883,7 @@ impl Default for MonitoringConfig {
         Self {
             enabled: default_true(),
             path: default_monitoring_path(),
+            format: MonitoringFormat::default(),
         }
     }
 }
@@ -1907,6 +1937,7 @@ impl Default for ReverseProxyRouteConfig {
             hosts: Vec::new(),
             upstream: "http://127.0.0.1:8080".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -1926,6 +1957,7 @@ impl Default for DomainRouteConfig {
             path_prefix: default_route_path_prefix(),
             upstream: "http://127.0.0.1:8080".to_string(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
@@ -1999,6 +2031,7 @@ impl Default for HttpRateLimitConfig {
         Self {
             enabled: false,
             zone: default_rate_limit_zone(),
+            algorithm: RateLimitAlgorithm::default(),
             key: RateLimitKey::default(),
             requests: default_rate_limit_requests(),
             window_ms: default_rate_limit_window_ms(),
@@ -3005,6 +3038,7 @@ mod tests {
                 hosts: Vec::new(),
                 upstream: String::new(),
                 upstreams: Vec::new(),
+                upstream_weights: BTreeMap::new(),
                 strip_prefix: false,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
@@ -3053,6 +3087,7 @@ mod tests {
             bind: "0.0.0.0:7000".to_string(),
             upstream: String::new(),
             upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
         });
 
         let error = config

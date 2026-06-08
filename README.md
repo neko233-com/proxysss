@@ -1,8 +1,25 @@
 # proxysss
 
+## Installation
+
+**Linux and macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
+```
+
+**Windows PowerShell:**
+```powershell
+irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1 | iex
+```
+
+**Upgrade to a specific version:**
+```bash
+proxysss update --version v0.3.13
+```
+
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v0.3.12
+Current version: v0.3.13
 
 ## Why proxysss
 
@@ -22,7 +39,9 @@ Current version: v0.3.12
 - FTP control-channel proxying with passive and active data-channel rewriting
 - WebDAV and static file serving
 - Managed ACME with HTTP-01 and TLS-ALPN-01, plus explicit acme.sh DNS-01 for wildcard certificates
-- Shared cache zones, compression, access control, rate limiting, retries, and active health checks
+- Shared cache zones, compression, access control, fixed-window and token-bucket rate limiting, retries, and active health checks
+- Prometheus metrics on `/metrics`, weighted load balancing, round-robin, least-connections, source-hash, and rendezvous affinity
+- gRPC-over-HTTP/2, WebSocket, sticky sessions, passive quarantine (circuit breaker), and upstream failover retries
 
 ## Configuration model
 
@@ -286,26 +305,6 @@ If you use auto-loaded plugins, sidecar metadata is YAML-only as well.
 - `plugins/<name>.plugin.yaml`
 - `plugins/<name>.plugin.yml`
 
-## Installation
-
-Linux and macOS:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1 | iex
-```
-
-Upgrade to a specific version:
-
-```bash
-proxysss update --version v0.3.12
-```
-
 ## Operational defaults
 
 - Admin bind: `127.0.0.1:7777`
@@ -315,8 +314,24 @@ proxysss update --version v0.3.12
 
 Change the default admin credentials before production use.
 
+## Monitoring
+
+Prometheus-compatible counters are exposed on the public HTTP listener:
+
+```yaml
+monitoring:
+  enabled: true
+  path: /metrics
+  format: prometheus   # set to json for the previous JSON payload
+```
+
+Scrape `http://<host>/metrics` or inspect JSON stats from the admin API at `GET /v1/stats`.
+
 ## Related docs
 
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — configuration tutorial
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime architecture
+- [examples/demo/README.md](examples/demo/README.md) — demo commands
 - `ts-how-to-use.md`
 - `nginx-to-proxysss.md`
 - `proxysss-script.d.ts`
