@@ -14,12 +14,12 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 **Upgrade to a specific version:**
 ```bash
-proxysss update --version v0.3.13
+proxysss update --version v0.3.14
 ```
 
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v0.3.13
+Current version: v0.3.14
 
 ## Why proxysss
 
@@ -27,8 +27,8 @@ Current version: v0.3.13
 - Explicit config path support: use `-config`, `--config`, or `-c` to point at a different YAML path.
 - YAML-only gateway config: JSON config files are intentionally unsupported.
 - Domain-first reverse proxying: `services.domain_routes` is the primary grouping unit for multi-domain HTTP services.
-- Built-in control plane: admin API and dashboard on `127.0.0.1:7777` by default.
-- Cluster automation API: token-authenticated HTTP calls can register or update domain routes, reverse proxy routes, and TCP/UDP listeners and persist them back to the main YAML file.
+- Agent-native control plane: password or bearer-token admin API on `127.0.0.1:7777` with secure defaults (`enable_write_ops: false` until explicitly enabled).
+- Cluster automation API: upsert/delete routes, provision managed ACME or acme.sh wildcard TLS, and persist atomically to the single YAML file.
 - Hot reload: the main YAML config, the main script, and auto-loaded plugins participate in reload fingerprinting.
 - Optional scripting: TypeScript plugins are for custom business logic, not for ordinary gateway setup.
 
@@ -331,6 +331,8 @@ Scrape `http://<host>/metrics` or inspect JSON stats from the admin API at `GET 
 
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — configuration tutorial
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime architecture
+- [docs/SECURITY.md](docs/SECURITY.md) — security defaults and hardening
+- [docs/AGENT-API.md](docs/AGENT-API.md) — password/token agent automation API
 - [examples/demo/README.md](examples/demo/README.md) — demo commands
 - `ts-how-to-use.md`
 - `nginx-to-proxysss.md`

@@ -58,14 +58,20 @@ use zstd::stream::encode_all as zstd_encode_all;
 
 use crate::config::{
     AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig, AdminConfig,
-    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
-    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
-    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    CompressionAlgorithm, DomainRouteConfig, DomainTlsConfig, DomainTlsMode, GatewayConfig,
+    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
+    MonitoringFormat, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
+    ResponseCompressionConfig, ReverseProxyRouteConfig, SecurityConfig, StaticSiteConfig,
+    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
+    WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
+use crate::security::{
+    self, admin_loopback_only_allows, validate_domain_route_mutation,
+    validate_reverse_proxy_route_mutation, validate_tcp_listener_mutation,
+    validate_udp_listener_mutation, AdminAuthGuard,
+};
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -81,6 +87,7 @@ pub struct Gateway {
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
     acme_tls_alpn_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    admin_auth_guard: AdminAuthGuard,
 }
 
 struct DynamicState {
@@ -367,6 +374,7 @@ impl Gateway {
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
             acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            admin_auth_guard: AdminAuthGuard::default(),
         });
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         Ok(gateway)
@@ -643,6 +651,16 @@ impl Gateway {
         }
 
         let state = self.current_state().await;
+
+        if state.config.admin.loopback_only
+            && !admin_loopback_only_allows(remote_addr, &state.config.admin.bind)
+        {
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                "admin API is restricted to loopback clients",
+            ));
+        }
+
         if method == Method::GET && (path == "/" || path == "/index.html") {
             return Ok(html_response(
                 StatusCode::OK,
@@ -650,12 +668,27 @@ impl Gateway {
             ));
         }
 
+        let auth_key = AdminAuthGuard::key_for(remote_addr);
+        if self
+            .admin_auth_guard
+            .is_locked(&auth_key, &state.config.admin.auth_rate_limit)
+        {
+            return Ok(text_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "admin authentication temporarily locked",
+            ));
+        }
+
         if !is_authorized(request.headers().get(AUTHORIZATION), &state.config.admin) {
             self.stats
                 .admin_auth_fail_total
                 .fetch_add(1, Ordering::Relaxed);
+            self.admin_auth_guard
+                .record_failure(&auth_key, &state.config.admin.auth_rate_limit);
             return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized"));
         }
+
+        self.admin_auth_guard.clear_failures(&auth_key);
 
         if method == Method::GET && path == "/v1/stats" {
             return Ok(json_response(StatusCode::OK, self.stats.snapshot_json()));
@@ -773,6 +806,15 @@ impl Gateway {
                 }
             };
 
+            if let Err(error) =
+                validate_domain_route_mutation(&route, &state.config.security)
+            {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+
             match self
                 .persist_domain_route_and_reload(&state.config, route)
                 .await
@@ -827,6 +869,15 @@ impl Gateway {
                     ));
                 }
             };
+
+            if let Err(error) =
+                validate_reverse_proxy_route_mutation(&route, &state.config.security)
+            {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
 
             match self
                 .persist_reverse_proxy_route_and_reload(&state.config, route)
@@ -883,6 +934,15 @@ impl Gateway {
                 }
             };
 
+            if let Err(error) =
+                validate_tcp_listener_mutation(&listener, &state.config.security)
+            {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+
             match self
                 .persist_tcp_listener_and_reload(&state.config, listener)
                 .await
@@ -937,6 +997,15 @@ impl Gateway {
                 }
             };
 
+            if let Err(error) =
+                validate_udp_listener_mutation(&listener, &state.config.security)
+            {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+
             match self
                 .persist_udp_listener_and_reload(&state.config, listener)
                 .await
@@ -952,6 +1021,194 @@ impl Gateway {
                             "upstream": result.listener.upstream,
                             "upstreams": result.listener.upstreams,
                         }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/domain-routes/delete" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid delete payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&payload.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_domain_route_delete_and_reload(&state.config, &payload.name)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "name": payload.name}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/reverse-proxy-routes/delete" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid delete payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&payload.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_reverse_proxy_route_delete_and_reload(&state.config, &payload.name)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "name": payload.name}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tls/auto-https/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<AutoHttpsUpsertRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid tls payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_auto_https_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(domains) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_managed"}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tls/wildcard-dns/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<WildcardTlsUpsertRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid wildcard tls payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_wildcard_tls_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(domains) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_dns_external"}),
                     ));
                 }
                 Err(error) => {
@@ -1180,17 +1437,160 @@ impl Gateway {
             .with_context(|| format!("failed to read {}", self.config_path.display()))?;
         let updated = render_config_with_upserted_domain_route(&original, &route)?;
 
-        fs::write(&self.config_path, &updated)
+        security::atomic_write(&self.config_path, &updated)
             .with_context(|| format!("failed to write {}", self.config_path.display()))?;
 
         if let Err(error) = self.reload_from_disk().await {
-            let _ = fs::write(&self.config_path, &original);
+            let _ = security::atomic_write(&self.config_path, &original);
             return Err(error.context(
                 "updated config was written but reload failed; original file was restored",
             ));
         }
 
         Ok(DomainRouteUpsertResult { action, route })
+    }
+
+    async fn persist_domain_route_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        name: &str,
+    ) -> Result<()> {
+        let mut candidate = current_config.clone();
+        let removed = candidate
+            .services
+            .domain_routes
+            .iter()
+            .any(|route| route.name == name);
+        if !removed {
+            return Err(anyhow!("domain route {name} not found"));
+        }
+        candidate
+            .services
+            .domain_routes
+            .retain(|route| route.name != name);
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_domain_route(&original, name)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "delete was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persist_reverse_proxy_route_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        name: &str,
+    ) -> Result<()> {
+        let mut candidate = current_config.clone();
+        if !candidate
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .any(|route| route.name == name)
+        {
+            return Err(anyhow!("reverse proxy route {name} not found"));
+        }
+        candidate
+            .services
+            .reverse_proxy
+            .routes
+            .retain(|route| route.name != name);
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_reverse_proxy_route(&original, name)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "delete was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persist_auto_https_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: AutoHttpsUpsertRequest,
+    ) -> Result<Vec<String>> {
+        if payload.domains.is_empty() {
+            return Err(anyhow!("domains cannot be empty"));
+        }
+        if payload.email.trim().is_empty() {
+            return Err(anyhow!("email is required for managed ACME"));
+        }
+        security::validate_domains(&payload.domains)?;
+
+        let domains = payload.domains.clone();
+        let mut candidate = current_config.clone();
+        candidate.http.tls.auto_https.enabled = true;
+        candidate.http.tls.auto_https.domains = domains.clone();
+        candidate.http.tls.auto_https.email = payload.email.clone();
+        candidate.http.tls.auto_https.production = payload.production;
+        candidate.http.tls.mode = TlsMode::AcmeManaged;
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_auto_https(&original, &payload)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "tls update was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(domains)
+    }
+
+    async fn persist_wildcard_tls_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: WildcardTlsUpsertRequest,
+    ) -> Result<Vec<String>> {
+        security::validate_domains(&payload.domains)?;
+        if payload.email.trim().is_empty() {
+            return Err(anyhow!("email is required for wildcard ACME"));
+        }
+        if payload.dns_provider.trim().is_empty() {
+            return Err(anyhow!("dns_provider is required for acme.sh DNS-01"));
+        }
+
+        let domains = payload.domains.clone();
+        let mut candidate = current_config.clone();
+        candidate.http.tls.mode = TlsMode::AcmeDnsExternal;
+        candidate.http.tls.acme.email = payload.email.clone();
+        candidate.http.tls.acme.domains = domains.clone();
+        candidate.http.tls.acme.dns.provider = payload.dns_provider.clone();
+        candidate.http.tls.acme.dns.credentials = payload.credentials.clone();
+        candidate.http.tls.generate_self_signed_if_missing = false;
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_wildcard_tls(&original, &payload)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "wildcard tls update was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(domains)
     }
 
     async fn persist_reverse_proxy_route_and_reload(
@@ -1209,11 +1609,11 @@ impl Gateway {
             .with_context(|| format!("failed to read {}", self.config_path.display()))?;
         let updated = render_config_with_upserted_reverse_proxy_route(&original, &route)?;
 
-        fs::write(&self.config_path, &updated)
+        security::atomic_write(&self.config_path, &updated)
             .with_context(|| format!("failed to write {}", self.config_path.display()))?;
 
         if let Err(error) = self.reload_from_disk().await {
-            let _ = fs::write(&self.config_path, &original);
+            let _ = security::atomic_write(&self.config_path, &original);
             return Err(error.context(
                 "updated config was written but reload failed; original file was restored",
             ));
@@ -1235,11 +1635,11 @@ impl Gateway {
             .with_context(|| format!("failed to read {}", self.config_path.display()))?;
         let updated = render_config_with_upserted_tcp_listener(&original, &listener)?;
 
-        fs::write(&self.config_path, &updated)
+        security::atomic_write(&self.config_path, &updated)
             .with_context(|| format!("failed to write {}", self.config_path.display()))?;
 
         if let Err(error) = self.reload_from_disk().await {
-            let _ = fs::write(&self.config_path, &original);
+            let _ = security::atomic_write(&self.config_path, &original);
             return Err(error.context(
                 "updated config was written but reload failed; original file was restored",
             ));
@@ -1261,11 +1661,11 @@ impl Gateway {
             .with_context(|| format!("failed to read {}", self.config_path.display()))?;
         let updated = render_config_with_upserted_udp_listener(&original, &listener)?;
 
-        fs::write(&self.config_path, &updated)
+        security::atomic_write(&self.config_path, &updated)
             .with_context(|| format!("failed to write {}", self.config_path.display()))?;
 
         if let Err(error) = self.reload_from_disk().await {
-            let _ = fs::write(&self.config_path, &original);
+            let _ = security::atomic_write(&self.config_path, &original);
             return Err(error.context(
                 "updated config was written but reload failed; original file was restored",
             ));
@@ -2047,6 +2447,26 @@ impl Gateway {
         on_upgrade: Option<OnUpgrade>,
     ) -> Result<GatewayHttpResponse> {
         let state = self.current_state().await;
+
+        if !security::request_uri_is_safe(&uri) {
+            return Ok(GatewayHttpResponse::bytes(
+                StatusCode::BAD_REQUEST,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"invalid request path"),
+                "proxysss://security",
+            ));
+        }
+
+        if let Some(status) =
+            security::reject_ambiguous_http1_request(&headers, &state.config.security)
+        {
+            return Ok(GatewayHttpResponse::bytes(
+                status,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"ambiguous http/1 request"),
+                "proxysss://security",
+            ));
+        }
 
         let host = headers
             .get(HOST)
@@ -5499,6 +5919,28 @@ struct PluginUnloadRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct NamedDeleteRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoHttpsUpsertRequest {
+    domains: Vec<String>,
+    email: String,
+    #[serde(default)]
+    production: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WildcardTlsUpsertRequest {
+    domains: Vec<String>,
+    email: String,
+    dns_provider: String,
+    #[serde(default)]
+    credentials: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpstreamToggleRequest {
     key: String,
     #[serde(default)]
@@ -5710,6 +6152,195 @@ fn render_config_with_upserted_reverse_proxy_route(
         routes.push(route_value);
     }
 
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_domain_route(original: &str, name: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let routes = value
+        .get_mut("services")
+        .and_then(|item| item.get_mut("domain_routes"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("services.domain_routes must be a sequence"))?;
+    let before = routes.len();
+    routes.retain(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value != name)
+            .unwrap_or(true)
+    });
+    if routes.len() == before {
+        return Err(anyhow!("domain route {name} not found"));
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_reverse_proxy_route(original: &str, name: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let routes = value
+        .get_mut("services")
+        .and_then(|item| item.get_mut("reverse_proxy"))
+        .and_then(|item| item.get_mut("routes"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("services.reverse_proxy.routes must be a sequence"))?;
+    let before = routes.len();
+    routes.retain(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value != name)
+            .unwrap_or(true)
+    });
+    if routes.len() == before {
+        return Err(anyhow!("reverse proxy route {name} not found"));
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_auto_https(original: &str, payload: &AutoHttpsUpsertRequest) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+    let http_key = serde_yaml::Value::String("http".to_string());
+    if !root.contains_key(&http_key) {
+        root.insert(http_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+    }
+    let http = root
+        .get_mut(&http_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http must be a mapping"))?;
+    let tls_key = serde_yaml::Value::String("tls".to_string());
+    if !http.contains_key(&tls_key) {
+        http.insert(tls_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+    }
+    let tls = http
+        .get_mut(&tls_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http.tls must be a mapping"))?;
+    tls.insert(
+        serde_yaml::Value::String("mode".to_string()),
+        serde_yaml::Value::String("acme_managed".to_string()),
+    );
+    let auto_https = serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("enabled".to_string()),
+            serde_yaml::Value::Bool(true),
+        ),
+        (
+            serde_yaml::Value::String("domains".to_string()),
+            serde_yaml::Value::Sequence(
+                payload
+                    .domains
+                    .iter()
+                    .map(|domain| serde_yaml::Value::String(domain.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            serde_yaml::Value::String("email".to_string()),
+            serde_yaml::Value::String(payload.email.clone()),
+        ),
+        (
+            serde_yaml::Value::String("production".to_string()),
+            serde_yaml::Value::Bool(payload.production),
+        ),
+    ]);
+    tls.insert(
+        serde_yaml::Value::String("auto_https".to_string()),
+        serde_yaml::Value::Mapping(auto_https),
+    );
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_wildcard_tls(
+    original: &str,
+    payload: &WildcardTlsUpsertRequest,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+    let http_key = serde_yaml::Value::String("http".to_string());
+    if !root.contains_key(&http_key) {
+        root.insert(http_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+    }
+    let http = root
+        .get_mut(&http_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http must be a mapping"))?;
+    let tls_key = serde_yaml::Value::String("tls".to_string());
+    if !http.contains_key(&tls_key) {
+        http.insert(tls_key.clone(), serde_yaml::Value::Mapping(Default::default()));
+    }
+    let tls = http
+        .get_mut(&tls_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http.tls must be a mapping"))?;
+    tls.insert(
+        serde_yaml::Value::String("mode".to_string()),
+        serde_yaml::Value::String("acme_dns_external".to_string()),
+    );
+    tls.insert(
+        serde_yaml::Value::String("generate_self_signed_if_missing".to_string()),
+        serde_yaml::Value::Bool(false),
+    );
+    let credentials = serde_yaml::Mapping::from_iter(
+        payload
+            .credentials
+            .iter()
+            .map(|(key, value)| {
+                (
+                    serde_yaml::Value::String(key.clone()),
+                    serde_yaml::Value::String(value.clone()),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let acme = serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("client".to_string()),
+            serde_yaml::Value::String("acme.sh".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("email".to_string()),
+            serde_yaml::Value::String(payload.email.clone()),
+        ),
+        (
+            serde_yaml::Value::String("domains".to_string()),
+            serde_yaml::Value::Sequence(
+                payload
+                    .domains
+                    .iter()
+                    .map(|domain| serde_yaml::Value::String(domain.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            serde_yaml::Value::String("directory_production".to_string()),
+            serde_yaml::Value::Bool(true),
+        ),
+        (
+            serde_yaml::Value::String("dns".to_string()),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+                (
+                    serde_yaml::Value::String("provider".to_string()),
+                    serde_yaml::Value::String(payload.dns_provider.clone()),
+                ),
+                (
+                    serde_yaml::Value::String("credentials".to_string()),
+                    serde_yaml::Value::Mapping(credentials),
+                ),
+            ])),
+        ),
+    ]);
+    tls.insert(
+        serde_yaml::Value::String("acme".to_string()),
+        serde_yaml::Value::Mapping(acme),
+    );
     serde_yaml::to_string(&value).context("failed to render updated YAML config")
 }
 
@@ -9548,6 +10179,7 @@ mod tests {
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
             acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            admin_auth_guard: AdminAuthGuard::default(),
         };
         let mut weights = BTreeMap::new();
         weights.insert("http://127.0.0.1:9000".to_string(), 1);

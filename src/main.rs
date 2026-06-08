@@ -4,6 +4,7 @@ mod demo;
 mod gateway;
 mod install;
 mod script;
+mod security;
 mod ts_transpile;
 
 use std::ffi::OsString;
@@ -346,6 +347,18 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     (
         "grpc over http/2",
         "HTTP/2 reverse proxy transparently forwards gRPC (application/grpc) when upstreams speak h2",
+    ),
+    (
+        "agent automation api",
+        "password/bearer admin API upserts and deletes routes, provisions ACME and acme.sh wildcard TLS, atomically persists YAML",
+    ),
+    (
+        "security hardening",
+        "security.* SSRF checks, HTTP/1 smuggling rejection, admin auth rate limiting, loopback-only admin, atomic config writes",
+    ),
+    (
+        "kubernetes ingress mode",
+        "kubernetes.enabled expands in-cluster service DNS mappings into domain routes",
     ),
     (
         "tcp tuning assistant",

@@ -8,7 +8,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 
 - Default public HTTP port is `80` (nginx parity).
 - Default public `/` route is a polished `Welcome to proxysss` page.
-- Default admin console/API port is `7777`.
+- Default admin console/API port is `7777` on loopback with `enable_write_ops=false` and `expose_config=false` until explicitly enabled for automation.
 - Default HTTPS/HTTP2/HTTP3 port is `443`.
 - Default FTP control port is `21` when `services.ftp.enabled=true`.
 - Configuration must be more human-friendly than nginx while still covering nginx-level gateway duties.

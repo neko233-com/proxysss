@@ -43,6 +43,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub monitoring: MonitoringConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
+    pub kubernetes: KubernetesConfig,
+    #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub services: ServicesConfig,
@@ -435,6 +439,18 @@ pub struct StreamAffinityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAuthRateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_admin_auth_max_failures")]
+    pub max_failures: u32,
+    #[serde(default = "default_admin_auth_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_admin_auth_lockout_secs")]
+    pub lockout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -449,10 +465,54 @@ pub struct AdminConfig {
         skip_serializing_if = "skip_default_admin_bearer_token"
     )]
     pub bearer_token: String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub expose_config: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enable_write_ops: bool,
+    #[serde(default = "default_true")]
+    pub loopback_only: bool,
+    #[serde(default)]
+    pub auth_rate_limit: AdminAuthRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_true")]
+    pub validate_admin_mutations: bool,
+    #[serde(default = "default_true")]
+    pub block_ssrf_targets: bool,
+    #[serde(default = "default_true")]
+    pub reject_ambiguous_http1: bool,
+    #[serde(default = "default_blocked_upstream_hosts")]
+    pub blocked_upstream_hosts: Vec<String>,
+    #[serde(default = "default_blocked_upstream_cidrs")]
+    pub blocked_upstream_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KubernetesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_k8s_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_k8s_cluster_domain")]
+    pub cluster_domain: String,
+    #[serde(default)]
+    pub mappings: Vec<KubernetesServiceMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KubernetesServiceMapping {
+    pub name: String,
+    pub service: String,
+    #[serde(default = "default_k8s_service_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default = "default_route_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default)]
+    pub strip_prefix: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1482,6 +1542,18 @@ impl GatewayConfig {
             );
         }
 
+        if self.admin.enabled && self.admin.enable_write_ops && !self.admin.loopback_only {
+            warnings.push(
+                "admin.enable_write_ops is true while admin.loopback_only is false; keep the admin API on loopback for production".to_string(),
+            );
+        }
+
+        if self.admin.enabled && self.admin.enable_write_ops && self.admin.expose_config {
+            warnings.push(
+                "admin.expose_config is enabled with write operations; disable config export on untrusted networks".to_string(),
+            );
+        }
+
         warnings
     }
 
@@ -1542,6 +1614,10 @@ impl GatewayConfig {
 
         normalize_vec_lowercase(&mut self.affinity.http.header_keys);
         normalize_vec_lowercase(&mut self.logging.redact_headers);
+        crate::security::apply_kubernetes_routes(
+            &mut self.kubernetes,
+            &mut self.services.domain_routes,
+        );
     }
 
     fn normalize_domain_tls(&mut self, root_dir: &Path) {
@@ -1655,6 +1731,8 @@ impl Default for GatewayConfig {
             affinity: AffinityConfig::default(),
             admin: AdminConfig::default(),
             monitoring: MonitoringConfig::default(),
+            security: SecurityConfig::default(),
+            kubernetes: KubernetesConfig::default(),
             runtime: RuntimeConfig::default(),
             services: ServicesConfig::default(),
             root_dir: PathBuf::from("."),
@@ -1864,6 +1942,17 @@ impl Default for StreamAffinityConfig {
     }
 }
 
+impl Default for AdminAuthRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_failures: default_admin_auth_max_failures(),
+            window_secs: default_admin_auth_window_secs(),
+            lockout_secs: default_admin_auth_lockout_secs(),
+        }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -1872,8 +1961,33 @@ impl Default for AdminConfig {
             username: default_admin_username(),
             password: default_admin_password(),
             bearer_token: default_admin_bearer_token(),
-            expose_config: default_true(),
-            enable_write_ops: default_true(),
+            expose_config: false,
+            enable_write_ops: false,
+            loopback_only: default_true(),
+            auth_rate_limit: AdminAuthRateLimitConfig::default(),
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            validate_admin_mutations: default_true(),
+            block_ssrf_targets: default_true(),
+            reject_ambiguous_http1: default_true(),
+            blocked_upstream_hosts: default_blocked_upstream_hosts(),
+            blocked_upstream_cidrs: default_blocked_upstream_cidrs(),
+        }
+    }
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: default_k8s_namespace(),
+            cluster_domain: default_k8s_cluster_domain(),
+            mappings: Vec::new(),
         }
     }
 }
@@ -2334,6 +2448,41 @@ fn default_stream_peek_timeout_ms() -> u64 {
 
 fn default_admin_bind() -> String {
     "127.0.0.1:7777".to_string()
+}
+
+fn default_admin_auth_max_failures() -> u32 {
+    8
+}
+
+fn default_admin_auth_window_secs() -> u64 {
+    300
+}
+
+fn default_admin_auth_lockout_secs() -> u64 {
+    900
+}
+
+fn default_blocked_upstream_hosts() -> Vec<String> {
+    vec![
+        "metadata.google.internal".to_string(),
+        "169.254.169.254".to_string(),
+    ]
+}
+
+fn default_blocked_upstream_cidrs() -> Vec<String> {
+    vec!["169.254.169.254/32".to_string()]
+}
+
+fn default_k8s_namespace() -> String {
+    "default".to_string()
+}
+
+fn default_k8s_cluster_domain() -> String {
+    "cluster.local".to_string()
+}
+
+fn default_k8s_service_port() -> u16 {
+    80
 }
 
 fn default_monitoring_path() -> String {

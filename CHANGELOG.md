@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.14 - 2026-06-09
+
+- Hardened admin defaults: `enable_write_ops` and `expose_config` now default to `false`, with `loopback_only` and auth rate limiting enabled by default.
+- Added `security.*` controls for admin mutation validation, SSRF blocking on agent-supplied upstreams, and HTTP/1 smuggling rejection.
+- Added agent delete endpoints: `POST /v1/domain-routes/delete` and `POST /v1/reverse-proxy-routes/delete`.
+- Added TLS automation endpoints: `POST /v1/tls/auto-https/upsert` and `POST /v1/tls/wildcard-dns/upsert` (acme.sh DNS-01 wildcard path).
+- Added optional `kubernetes.enabled` service-to-upstream DNS mappings for in-cluster ingress-style routing.
+- Switched admin config persistence to atomic temp-file writes with rollback on failed reload.
+- Documented security and agent workflows in `docs/SECURITY.md` and `docs/AGENT-API.md`.
+
 ## v0.3.13 - 2026-06-09
 
 - Added Prometheus text exposition on `monitoring.path` (default `/metrics`) with `monitoring.format: prometheus|json`.

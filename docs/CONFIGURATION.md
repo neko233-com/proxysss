@@ -136,18 +136,55 @@ monitoring:
 
 Prometheus scrapers should hit `http://<public-host>/metrics`. JSON format remains available for legacy dashboards.
 
+## Security
+
+```yaml
+security:
+  validate_admin_mutations: true
+  block_ssrf_targets: true
+  reject_ambiguous_http1: true
+  blocked_upstream_hosts: [metadata.google.internal, 169.254.169.254]
+```
+
+See [SECURITY.md](./SECURITY.md) for the full hardening guide.
+
 ## Admin console
 
 ```yaml
 admin:
   enabled: true
   bind: 127.0.0.1:7777
-  username: root
-  password: root
+  username: ops
+  password: change-me
   bearer_token: cluster-automation-token
-  enable_write_ops: true
-  expose_config: true
+  enable_write_ops: true   # default false — enable for agent automation
+  expose_config: false
+  loopback_only: true
+  auth_rate_limit:
+    enabled: true
+    max_failures: 8
+    window_secs: 300
+    lockout_secs: 900
 ```
+
+Agent automation examples: [AGENT-API.md](./AGENT-API.md).
+
+## Kubernetes ingress-style mode
+
+```yaml
+kubernetes:
+  enabled: true
+  namespace: prod
+  cluster_domain: cluster.local
+  mappings:
+    - name: api
+      service: api-svc
+      port: 8080
+      domains: [api.example.com]
+      path_prefix: /
+```
+
+When enabled, mappings are expanded into `services.domain_routes` on each load/reload.
 
 Open `http://127.0.0.1:7777/` for the dashboard. Automation APIs live under `/v1/*`.
 
