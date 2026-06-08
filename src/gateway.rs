@@ -58,12 +58,11 @@ use zstd::stream::encode_all as zstd_encode_all;
 
 use crate::config::{
     AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig, AdminConfig,
-    CompressionAlgorithm, DomainRouteConfig, DomainTlsConfig, DomainTlsMode, GatewayConfig,
-    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
-    MonitoringFormat, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
-    ResponseCompressionConfig, ReverseProxyRouteConfig, SecurityConfig, StaticSiteConfig,
-    StreamAffinityConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
-    WebDavConfig,
+    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
+    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
+    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig,
+    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -3037,7 +3036,7 @@ impl Gateway {
             .filter_map(|(name, value)| {
                 Some((
                     HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
+                    security::sanitize_header_value(&value).ok()?,
                 ))
             })
             .collect::<Vec<_>>();
