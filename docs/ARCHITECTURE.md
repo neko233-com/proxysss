@@ -58,6 +58,10 @@ One YAML file is intentional: agents and humans can reason about the entire edge
 - `plugins.auto_load_dir`: prioritized plugin modules with optional `<name>.plugin.yaml` sidecars.
 - Admin automation for dynamic route/listener upserts.
 
+## Interactive visualization
+
+Open [architecture.html](./architecture.html) in a browser for an animated, topic-based walkthrough of listeners, policy chains, extension hooks, and reload boundaries.
+
 ## Related docs
 
 - [CONFIGURATION.md](./CONFIGURATION.md) — field-by-field tutorial

@@ -61,8 +61,8 @@ use crate::config::{
     CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
     HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
     RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig,
+    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -82,6 +82,7 @@ pub struct Gateway {
     round_robin_state: Arc<DashMap<String, u64>>,
     upstream_runtime: Arc<DashMap<String, UpstreamRuntimeState>>,
     http_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
+    stream_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
     http_connection_limits: Arc<DashMap<String, u32>>,
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
@@ -144,6 +145,7 @@ struct RateLimitBucket {
 #[derive(Clone)]
 struct CachedHttpEntry {
     expires_at_unix_ms: u64,
+    stale_until_unix_ms: u64,
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
@@ -153,10 +155,17 @@ struct CachedHttpEntry {
 #[derive(Serialize, Deserialize)]
 struct DiskCachedHttpEntry {
     expires_at_unix_ms: u64,
+    #[serde(default)]
+    stale_until_unix_ms: u64,
     status: u16,
     headers: Vec<(String, String)>,
     body_base64: String,
     upstream: String,
+}
+
+enum CacheLookup {
+    Fresh(GatewayHttpResponse),
+    Stale(GatewayHttpResponse),
 }
 
 #[derive(Clone)]
@@ -369,6 +378,7 @@ impl Gateway {
             round_robin_state: Arc::new(DashMap::new()),
             upstream_runtime: Arc::new(DashMap::new()),
             http_rate_limits: Arc::new(DashMap::new()),
+            stream_rate_limits: Arc::new(DashMap::new()),
             http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
@@ -1914,6 +1924,22 @@ impl Gateway {
                 listener.accept().await.context("tcp accept failed")?;
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
+            let stream_rate_limit = self
+                .current_state()
+                .await
+                .config
+                .services
+                .rate_limit
+                .stream
+                .clone();
+            if !apply_stream_rate_limit(&self.stream_rate_limits, &stream_rate_limit, remote_addr) {
+                tracing::info!(
+                    %remote_addr,
+                    listener = %listener_name,
+                    "tcp connection rejected by stream rate limit"
+                );
+                continue;
+            }
             self.stats
                 .tcp_sessions_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -2122,6 +2148,28 @@ impl Gateway {
                     if read == 0 {
                         break;
                     }
+                    let command_line = String::from_utf8_lossy(&client_line).into_owned();
+                    if let Some(verb) = parse_ftp_command_verb(&command_line) {
+                        if config.log_commands {
+                            tracing::info!(
+                                %remote_addr,
+                                command = %verb,
+                                "ftp control command"
+                            );
+                        }
+                        if !ftp_command_allowed(config, &verb) {
+                            tracing::warn!(
+                                %remote_addr,
+                                command = %verb,
+                                "ftp command denied by policy"
+                            );
+                            client_write
+                                .write_all(b"502 Command not allowed by gateway policy.\r\n")
+                                .await
+                                .context("failed writing ftp policy rejection")?;
+                            continue;
+                        }
+                    }
                     let outbound_line = rewrite_ftp_active_command(
                         &client_line,
                         config,
@@ -2130,7 +2178,7 @@ impl Gateway {
                         remote_addr,
                     )
                     .await?
-                    .unwrap_or_else(|| String::from_utf8_lossy(&client_line).into_owned());
+                    .unwrap_or(command_line);
                     server_write
                         .write_all(outbound_line.as_bytes())
                         .await
@@ -2654,10 +2702,38 @@ impl Gateway {
 
         let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
         if let Some(cache_key) = cache_key.as_deref() {
-            if let Some(response) =
-                self.load_cached_http_response(&state.config, &route.cache, cache_key)
-            {
-                return finalize_http_response(&headers, &route.compression, response);
+            match self.lookup_cached_http_response(&state.config, &route.cache, cache_key) {
+                Some(CacheLookup::Fresh(response)) => {
+                    return finalize_http_response(&headers, &route.compression, response);
+                }
+                Some(CacheLookup::Stale(response)) => {
+                    let gateway = self.clone();
+                    let route_for_refresh = route.clone();
+                    let cache_key_owned = cache_key.to_string();
+                    let host_owned = host.to_string();
+                    let uri_owned = uri.clone();
+                    let headers_owned = headers.clone();
+                    let remote = remote_addr;
+                    let scheme_owned = scheme.to_string();
+                    tokio::spawn(async move {
+                        if let Err(error) = gateway
+                            .revalidate_cached_http_response(
+                                &route_for_refresh,
+                                &cache_key_owned,
+                                &host_owned,
+                                &uri_owned,
+                                &headers_owned,
+                                remote,
+                                &scheme_owned,
+                            )
+                            .await
+                        {
+                            tracing::debug!(?error, key = %cache_key_owned, "cache background revalidation failed");
+                        }
+                    });
+                    return finalize_http_response(&headers, &route.compression, response);
+                }
+                None => {}
             }
         }
 
@@ -2852,32 +2928,26 @@ impl Gateway {
         self.dynamic.read().await.clone()
     }
 
-    fn load_cached_http_response(
+    fn lookup_cached_http_response(
         &self,
         config: &GatewayConfig,
         cache: &ResponseCacheConfig,
         key: &str,
-    ) -> Option<GatewayHttpResponse> {
+    ) -> Option<CacheLookup> {
         let storage_key = cache_storage_key(cache, key);
         let now = current_unix_millis();
 
-        if let Some(entry) = self.http_cache.get(&storage_key) {
-            if entry.expires_at_unix_ms <= now {
-                drop(entry);
-                self.http_cache.remove(&storage_key);
-                self.remove_disk_cached_http_response(config, cache, &storage_key);
-            } else {
-                return Some(GatewayHttpResponse {
-                    status: entry.status,
-                    headers: entry.headers.clone(),
-                    body: entry.body.clone(),
-                    upstream: entry.upstream.clone(),
-                });
-            }
-        }
+        let entry = if let Some(entry) = self.http_cache.get(&storage_key) {
+            entry.clone()
+        } else {
+            let entry = self.load_disk_cached_http_response(config, cache, &storage_key)?;
+            self.http_cache.insert(storage_key.clone(), entry.clone());
+            entry
+        };
 
-        let entry = self.load_disk_cached_http_response(config, cache, &storage_key)?;
-        if entry.expires_at_unix_ms <= now {
+        if entry.stale_until_unix_ms > 0 && now >= entry.stale_until_unix_ms {
+            drop(entry);
+            self.http_cache.remove(&storage_key);
             self.remove_disk_cached_http_response(config, cache, &storage_key);
             return None;
         }
@@ -2888,8 +2958,18 @@ impl Gateway {
             body: entry.body.clone(),
             upstream: entry.upstream.clone(),
         };
-        self.http_cache.insert(storage_key, entry);
-        Some(response)
+
+        if now < entry.expires_at_unix_ms {
+            return Some(CacheLookup::Fresh(response));
+        }
+
+        if cache.stale_while_revalidate_secs > 0 {
+            return Some(CacheLookup::Stale(response));
+        }
+
+        self.http_cache.remove(&storage_key);
+        self.remove_disk_cached_http_response(config, cache, &storage_key);
+        None
     }
 
     fn store_cached_http_response(
@@ -2912,9 +2992,20 @@ impl Gateway {
         }
 
         let storage_key = cache_storage_key(cache_config, key);
+        let now = current_unix_millis();
+        let fresh_until = now.saturating_add(cache_config.ttl_secs.saturating_mul(1000));
+        let stale_until = if cache_config.stale_while_revalidate_secs > 0 {
+            fresh_until.saturating_add(
+                cache_config
+                    .stale_while_revalidate_secs
+                    .saturating_mul(1000),
+            )
+        } else {
+            fresh_until
+        };
         let entry = CachedHttpEntry {
-            expires_at_unix_ms: current_unix_millis()
-                .saturating_add(cache_config.ttl_secs.saturating_mul(1000)),
+            expires_at_unix_ms: fresh_until,
+            stale_until_unix_ms: stale_until,
             status: response.status,
             headers: response.headers.clone(),
             body: response.body.clone(),
@@ -2923,6 +3014,60 @@ impl Gateway {
         self.http_cache.insert(storage_key.clone(), entry.clone());
         self.persist_disk_cached_http_response(gateway_config, cache_config, &storage_key, &entry);
         self.evict_cache_zone_if_needed(gateway_config, cache_config);
+    }
+
+    async fn revalidate_cached_http_response(
+        &self,
+        route: &HttpRouteConfig,
+        cache_key: &str,
+        host: &str,
+        uri: &Uri,
+        headers: &HeaderMap,
+        remote_addr: SocketAddr,
+        scheme: &str,
+    ) -> Result<()> {
+        let state = self.current_state().await;
+        let upstream_plan = self.select_upstream_plan(
+            &state.config,
+            &route.decision,
+            "http",
+            route.runtime_scope.as_deref(),
+            route.decision.affinity_key.as_deref(),
+            Some(&remote_addr.to_string()),
+        );
+        let upstream = upstream_plan
+            .first()
+            .cloned()
+            .unwrap_or_else(|| route.decision.upstream.clone());
+        let upstream_url = build_upstream_url(&upstream, &route.decision, uri)?;
+        let upstream_headers =
+            build_upstream_headers(headers, &route.decision, host, remote_addr, scheme)?;
+        let response = state
+            .http_client
+            .get(upstream_url)
+            .headers(upstream_headers)
+            .send()
+            .await
+            .context("cache revalidation upstream request failed")?;
+        let status = response.status();
+        let response_headers = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| !is_hop_header(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let response_body = response
+            .bytes()
+            .await
+            .context("cache revalidation body read failed")?;
+        let cached = GatewayHttpResponse {
+            status,
+            headers: response_headers,
+            body: response_body,
+            upstream,
+        };
+        self.store_cached_http_response(&state.config, cache_key, &route.cache, &cached);
+        Ok(())
     }
 
     fn purge_http_cache(
@@ -2988,7 +3133,7 @@ impl Gateway {
             .http_cache
             .iter()
             .filter(|entry| {
-                entry.key().starts_with(&prefix) && entry.value().expires_at_unix_ms <= now
+                entry.key().starts_with(&prefix) && entry.value().stale_until_unix_ms <= now
             })
             .map(|entry| entry.key().clone())
             .collect::<Vec<_>>();
@@ -3041,8 +3186,15 @@ impl Gateway {
             })
             .collect::<Vec<_>>();
 
+        let stale_until = if disk.stale_until_unix_ms > 0 {
+            disk.stale_until_unix_ms
+        } else {
+            disk.expires_at_unix_ms
+        };
+
         Some(CachedHttpEntry {
             expires_at_unix_ms: disk.expires_at_unix_ms,
+            stale_until_unix_ms: stale_until,
             status,
             headers,
             body: Bytes::from(body),
@@ -3067,6 +3219,7 @@ impl Gateway {
         }
         let disk = DiskCachedHttpEntry {
             expires_at_unix_ms: entry.expires_at_unix_ms,
+            stale_until_unix_ms: entry.stale_until_unix_ms,
             status: entry.status.as_u16(),
             headers: entry
                 .headers
@@ -5302,14 +5455,27 @@ fn cache_lookup_key(
         return None;
     }
 
-    Some(format!(
-        "{}:{}:{}",
-        method.as_str(),
+    let mut parts = vec![
+        method.as_str().to_string(),
         host.to_ascii_lowercase(),
         uri.path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/")
-    ))
+            .to_string(),
+    ];
+    for header_name in &config.vary_headers {
+        let value = headers
+            .get(header_name.as_str())
+            .and_then(|item| item.to_str().ok())
+            .unwrap_or("");
+        parts.push(format!("{header_name}={value}"));
+    }
+    let key = parts.join(":");
+    if config.key_prefix.is_empty() {
+        Some(key)
+    } else {
+        Some(format!("{}:{}", config.key_prefix, key))
+    }
 }
 
 fn cache_storage_key(config: &ResponseCacheConfig, key: &str) -> String {
@@ -5372,6 +5538,12 @@ async fn rewrite_ftp_passive_reply(
                 "425 Can't open passive data connection.\r\n".to_string(),
             ));
         };
+        tracing::info!(
+            %remote_addr,
+            %upstream_addr,
+            channel = "passive",
+            "ftp data channel bridge starting"
+        );
         spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
 
         let IpAddr::V4(public_v4) = public_ip else {
@@ -5400,6 +5572,12 @@ async fn rewrite_ftp_passive_reply(
             ));
         };
         let upstream_addr = SocketAddr::new(upstream_control_ip, upstream_port);
+        tracing::info!(
+            %remote_addr,
+            %upstream_addr,
+            channel = "passive-epsv",
+            "ftp data channel bridge starting"
+        );
         spawn_ftp_passive_bridge(listener, upstream_addr, remote_addr);
         return Ok(Some(format!(
             "229 Entering Extended Passive Mode (|||{}|)\r\n",
@@ -5426,6 +5604,12 @@ async fn rewrite_ftp_active_command(
         else {
             return Err(anyhow!("ftp active listener pool exhausted"));
         };
+        tracing::info!(
+            %remote_addr,
+            %target_addr,
+            channel = "active-port",
+            "ftp data channel bridge starting"
+        );
         spawn_ftp_active_bridge(listener, target_addr, remote_addr);
 
         let IpAddr::V4(ip) = public_ip else {
@@ -5449,6 +5633,12 @@ async fn rewrite_ftp_active_command(
         else {
             return Err(anyhow!("ftp active listener pool exhausted"));
         };
+        tracing::info!(
+            %remote_addr,
+            %target_addr,
+            channel = "active-eprt",
+            "ftp data channel bridge starting"
+        );
         spawn_ftp_active_bridge(listener, target_addr, remote_addr);
 
         let advertised_addr = match (af, public_ip) {
@@ -5471,6 +5661,28 @@ async fn rewrite_ftp_active_command(
     }
 
     Ok(None)
+}
+
+fn parse_ftp_command_verb(line: &str) -> Option<String> {
+    line.trim()
+        .split_whitespace()
+        .next()
+        .map(|verb| verb.to_ascii_uppercase())
+}
+
+fn ftp_command_allowed(config: &crate::config::FtpConfig, verb: &str) -> bool {
+    if !config.command_allow.is_empty()
+        && !config
+            .command_allow
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(verb))
+    {
+        return false;
+    }
+    !config
+        .command_deny
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(verb))
 }
 
 fn parse_ftp_pasv_addr(reply: &str) -> Option<SocketAddr> {
@@ -5582,8 +5794,13 @@ fn spawn_ftp_passive_bridge(
         }
         .await;
 
-        if let Err(error) = result {
-            tracing::warn!(?error, %remote_addr, %upstream_addr, "ftp passive bridge failed");
+        match result {
+            Ok(()) => {
+                tracing::info!(%remote_addr, %upstream_addr, channel = "passive", "ftp data channel bridge closed")
+            }
+            Err(error) => {
+                tracing::warn!(?error, %remote_addr, %upstream_addr, channel = "passive", "ftp passive bridge failed")
+            }
         }
     });
 }
@@ -5609,8 +5826,13 @@ fn spawn_ftp_active_bridge(
         }
         .await;
 
-        if let Err(error) = result {
-            tracing::warn!(?error, %remote_addr, %client_target, "ftp active bridge failed");
+        match result {
+            Ok(()) => {
+                tracing::info!(%remote_addr, %client_target, channel = "active", "ftp data channel bridge closed")
+            }
+            Err(error) => {
+                tracing::warn!(?error, %remote_addr, %client_target, channel = "active", "ftp active bridge failed")
+            }
         }
     });
 }
@@ -6668,10 +6890,15 @@ fn apply_http_rate_limit_to_store(
     let window = Duration::from_millis(config.window_ms.max(100));
     let limit = config.requests.saturating_add(config.burst).max(1);
 
+    let initial_tokens = match config.algorithm {
+        RateLimitAlgorithm::TokenBucket => limit as f64,
+        RateLimitAlgorithm::LeakyBucket => 0.0,
+        RateLimitAlgorithm::FixedWindow => limit as f64,
+    };
     let mut bucket = store.entry(key).or_insert(RateLimitBucket {
         window_start: now,
         count: 0,
-        tokens: limit as f64,
+        tokens: initial_tokens,
         last_refill: now,
     });
 
@@ -6711,7 +6938,49 @@ fn apply_http_rate_limit_to_store(
             let wait_ms = (deficit / refill_per_ms).ceil() as u64;
             Some(wait_ms.max(1).to_string())
         }
+        RateLimitAlgorithm::LeakyBucket => {
+            let leak_per_ms = config.requests as f64 / window.as_millis().max(1) as f64;
+            let elapsed = now.duration_since(bucket.last_refill);
+            bucket.tokens = (bucket.tokens - elapsed.as_millis() as f64 * leak_per_ms).max(0.0);
+            bucket.last_refill = now;
+
+            if bucket.tokens + 1.0 <= limit as f64 {
+                bucket.tokens += 1.0;
+                return None;
+            }
+
+            let overflow = bucket.tokens + 1.0 - limit as f64;
+            let wait_ms = (overflow / leak_per_ms).ceil() as u64;
+            Some(wait_ms.max(1).to_string())
+        }
     }
+}
+
+fn stream_rate_limit_key(config: &StreamRateLimitConfig, remote_addr: SocketAddr) -> String {
+    format!("{}:remote:{}", config.zone, remote_addr.ip())
+}
+
+fn apply_stream_rate_limit(
+    store: &DashMap<String, RateLimitBucket>,
+    config: &StreamRateLimitConfig,
+    remote_addr: SocketAddr,
+) -> bool {
+    if !config.enabled {
+        return true;
+    }
+    let key = stream_rate_limit_key(config, remote_addr);
+    let limit_config = HttpRateLimitConfig {
+        enabled: true,
+        zone: config.zone.clone(),
+        algorithm: config.algorithm,
+        key: RateLimitKey::RemoteAddr,
+        requests: config.connections,
+        window_ms: config.window_ms,
+        burst: config.burst,
+        max_connections: 0,
+        status: 429,
+    };
+    apply_http_rate_limit_to_store(store, &limit_config, key).is_none()
 }
 
 fn builtin_http_route(path: &str) -> Option<RouteDecision> {
@@ -8389,7 +8658,7 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
     html.replace("__VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
-fn render_docs_html(_config: &GatewayConfig) -> String {
+pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
     let reverse_proxy = docs_template_reverse_proxy();
     let static_site = docs_template_static_site();
     let webdav = docs_template_webdav();
@@ -8539,7 +8808,7 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                         <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
                         <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
                         <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
-                        <tr><td>FTP</td><td><span class="pill warn">partial</span></td><td>control channel proxy, passive and active data channel rewriting, still evolving richer command-aware policy</td></tr>
+                        <tr><td>FTP</td><td><span class="pill warn">partial</span></td><td>control channel proxy, passive/active data rewriting, command allow/deny policy, structured command/data lifecycle logs</td></tr>
                     </tbody>
                 </table>
             </section>
@@ -8549,9 +8818,9 @@ fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Still Honest About What Remains</h2>
                 <div class="list">
                     <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
-                    <div><strong>Advanced cache semantics:</strong> background revalidation and richer cache key variants remain future work.</div>
-                    <div><strong>Advanced rate shaping:</strong> token-bucket/leaky-bucket shaping is still beyond the current fixed-window controls.</div>
-                    <div><strong>FTP deep policy:</strong> native command-aware policy and observability can still go deeper.</div>
+                    <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
+                    <div><strong>Auto HTTPS boundary:</strong> wildcard DNS-01 stays on the explicit <code>acme_dns_external</code> + <code>acme.sh</code> path; built-in managed ACME covers HTTP-01/TLS-ALPN-01 only.</div>
+                    <div><strong>FTP deep policy:</strong> transfer-level hooks and richer per-user policy remain future work.</div>
                 </div>
             </section>
         </section>
@@ -8587,7 +8856,7 @@ fn docs_template_streams() -> &'static str {
 }
 
 fn docs_template_ftp() -> &'static str {
-    "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n"
+    "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n    log_commands: true\n    command_deny: [SITE, STAT]\n"
 }
 
 fn docs_template_acme_dns() -> &'static str {
@@ -9940,6 +10209,7 @@ mod tests {
                 statuses: vec![200],
                 max_body_bytes: 4096,
                 allow_purge: true,
+                ..Default::default()
             },
             rate_limit: HttpRateLimitConfig::default(),
             active_health: ActiveHealthOverrideConfig::default(),
@@ -10180,6 +10450,7 @@ mod tests {
             round_robin_state: Arc::new(DashMap::new()),
             upstream_runtime: Arc::new(DashMap::new()),
             http_rate_limits: Arc::new(DashMap::new()),
+            stream_rate_limits: Arc::new(DashMap::new()),
             http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
@@ -10657,5 +10928,75 @@ mod tests {
         assert!(!monitoring_path_matches(&config, "/metrics"));
         config.enabled = false;
         assert!(!monitoring_path_matches(&config, "/internal-metrics"));
+    }
+
+    #[test]
+    fn ftp_command_policy_honors_allow_and_deny_lists() {
+        let mut config = crate::config::FtpConfig::default();
+        config.command_deny = vec!["DELE".to_string()];
+        assert!(!ftp_command_allowed(&config, "DELE"));
+        assert!(ftp_command_allowed(&config, "LIST"));
+
+        config.command_allow = vec!["USER".to_string(), "PASS".to_string()];
+        assert!(ftp_command_allowed(&config, "USER"));
+        assert!(!ftp_command_allowed(&config, "LIST"));
+    }
+
+    #[test]
+    fn cache_lookup_key_includes_vary_headers_and_prefix() {
+        let mut cache = ResponseCacheConfig {
+            enabled: true,
+            vary_headers: vec!["Accept-Encoding".to_string()],
+            key_prefix: "api".to_string(),
+            ..Default::default()
+        };
+        let uri: Uri = "/v1/items".parse().expect("uri");
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let key = cache_lookup_key(&cache, &Method::GET, "example.com", &uri, &headers)
+            .expect("cache key");
+        assert!(key.starts_with("api:"));
+        assert!(key.contains("Accept-Encoding=gzip"));
+
+        cache.vary_headers.clear();
+        let plain = cache_lookup_key(&cache, &Method::GET, "example.com", &uri, &headers)
+            .expect("cache key");
+        assert!(plain.starts_with("api:GET:example.com:/v1/items"));
+    }
+
+    #[test]
+    fn leaky_bucket_rate_limit_blocks_sustained_overflow() {
+        let config = HttpRateLimitConfig {
+            enabled: true,
+            zone: "default".to_string(),
+            algorithm: RateLimitAlgorithm::LeakyBucket,
+            key: RateLimitKey::RemoteAddr,
+            requests: 2,
+            window_ms: 1_000,
+            burst: 0,
+            max_connections: 0,
+            status: 429,
+        };
+        let store = DashMap::new();
+        let key = "remote:127.0.0.1".to_string();
+        assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
+        assert!(apply_http_rate_limit_to_store(&store, &config, key.clone()).is_none());
+        assert!(apply_http_rate_limit_to_store(&store, &config, key).is_some());
+    }
+
+    #[test]
+    fn stream_rate_limit_uses_shared_zone_store() {
+        let config = StreamRateLimitConfig {
+            enabled: true,
+            zone: "stream".to_string(),
+            algorithm: RateLimitAlgorithm::FixedWindow,
+            connections: 1,
+            window_ms: 60_000,
+            burst: 0,
+        };
+        let store = DashMap::new();
+        let addr = "127.0.0.1:4000".parse().expect("socket");
+        assert!(apply_stream_rate_limit(&store, &config, addr));
+        assert!(!apply_stream_rate_limit(&store, &config, addr));
     }
 }

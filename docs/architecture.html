@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>proxysss Architecture</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a2f;
+      --panel-2: #18233d;
+      --text: #e8eefc;
+      --muted: #9fb0d0;
+      --accent: #5eead4;
+      --accent-2: #60a5fa;
+      --warn: #fbbf24;
+      --good: #34d399;
+      --border: rgba(255,255,255,.08);
+      --shadow: 0 20px 60px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 60%),
+                  radial-gradient(900px 500px at 100% 0%, #134e4a 0%, transparent 55%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: 100vh;
+    }
+    aside {
+      border-right: 1px solid var(--border);
+      background: rgba(10,14,28,.75);
+      backdrop-filter: blur(12px);
+      padding: 1.25rem .75rem;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+    }
+    .brand {
+      padding: .5rem .75rem 1.25rem;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: .02em;
+    }
+    .brand p {
+      margin: .35rem 0 0;
+      color: var(--muted);
+      font-size: .85rem;
+      line-height: 1.4;
+    }
+    nav { display: flex; flex-direction: column; gap: .35rem; }
+    .topic-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      padding: .65rem .85rem;
+      border-radius: .65rem;
+      cursor: pointer;
+      font: inherit;
+      transition: .2s ease;
+    }
+    .topic-btn:hover {
+      color: var(--text);
+      background: rgba(255,255,255,.04);
+    }
+    .topic-btn.active {
+      color: var(--text);
+      border-color: rgba(94,234,212,.35);
+      background: linear-gradient(135deg, rgba(94,234,212,.12), rgba(96,165,250,.08));
+      box-shadow: inset 0 0 0 1px rgba(94,234,212,.08);
+    }
+    main {
+      padding: 2rem clamp(1rem, 3vw, 3rem) 4rem;
+      max-width: 1100px;
+    }
+    .panel {
+      display: none;
+      animation: fadeSlide .45s ease;
+    }
+    .panel.active { display: block; }
+    @keyframes fadeSlide {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .eyebrow {
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: .14em;
+      font-size: .72rem;
+      font-weight: 700;
+    }
+    h2 {
+      margin: .35rem 0 1rem;
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+    }
+    p, li { color: var(--muted); line-height: 1.65; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin: 1.25rem 0;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 1rem 1.1rem;
+      box-shadow: var(--shadow);
+      transform: translateY(8px);
+      opacity: 0;
+      animation: cardIn .6s ease forwards;
+    }
+    .card:nth-child(2) { animation-delay: .08s; }
+    .card:nth-child(3) { animation-delay: .16s; }
+    @keyframes cardIn {
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .card strong { color: var(--text); display: block; margin-bottom: .35rem; }
+    .flow {
+      margin: 1.5rem 0;
+      padding: 1rem;
+      border-radius: 1rem;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      overflow-x: auto;
+    }
+    .flow svg { width: 100%; min-width: 520px; height: auto; }
+    .pulse {
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: .55; }
+      50% { opacity: 1; }
+    }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .85rem;
+    }
+    pre {
+      background: #0a0f1c;
+      border: 1px solid var(--border);
+      border-radius: .75rem;
+      padding: 1rem;
+      overflow: auto;
+      color: #d6e4ff;
+    }
+    .pill {
+      display: inline-block;
+      padding: .15rem .55rem;
+      border-radius: 999px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+    .pill.good { background: rgba(52,211,153,.15); color: var(--good); }
+    .pill.warn { background: rgba(251,191,36,.15); color: var(--warn); }
+    .list { display: grid; gap: .75rem; margin-top: 1rem; }
+    .list div {
+      padding: .85rem 1rem;
+      border-radius: .75rem;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+    }
+    .list strong { color: var(--text); }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      aside {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      nav {
+        flex-direction: row;
+        flex-wrap: wrap;
+      }
+      .topic-btn { flex: 1 1 auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <div class="brand">
+        <h1>proxysss</h1>
+        <p>Interactive architecture map — one Rust binary, nginx-class edge duties.</p>
+      </div>
+      <nav id="topics">
+        <button class="topic-btn active" data-topic="overview">Overview</button>
+        <button class="topic-btn" data-topic="reverse-proxy">Reverse Proxy &amp; LB</button>
+        <button class="topic-btn" data-topic="tls">TLS / Auto HTTPS</button>
+        <button class="topic-btn" data-topic="websocket-grpc">WebSocket &amp; gRPC</button>
+        <button class="topic-btn" data-topic="rate-limit">Rate Limiting</button>
+        <button class="topic-btn" data-topic="cache">Cache &amp; Compression</button>
+        <button class="topic-btn" data-topic="ftp">FTP</button>
+        <button class="topic-btn" data-topic="admin">Admin / Agent API</button>
+        <button class="topic-btn" data-topic="security">Security</button>
+        <button class="topic-btn" data-topic="kubernetes">Kubernetes Mode</button>
+        <button class="topic-btn" data-topic="scripts">TypeScript Plugins</button>
+        <button class="topic-btn" data-topic="reload">Hot Reload</button>
+      </nav>
+    </aside>
+
+    <main>
+      <section class="panel active" id="overview">
+        <div class="eyebrow">Big Picture</div>
+        <h2>Single-binary edge gateway</h2>
+        <p>proxysss terminates protocols, matches routes, enforces policy, proxies to upstream pools, and exposes observability — optional TypeScript plugins extend business logic without sitting on every hot-path byte.</p>
+        <div class="cards">
+          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, TCP/UDP streams, FTP, WebDAV, static files, cache, compression, rate limits.</p></article>
+          <article class="card"><strong>Config</strong><p>One YAML file (<code>proxysss.yaml</code>) is the source of truth with hot reload fingerprinting.</p></article>
+          <article class="card"><strong>Extensions</strong><p>Embedded QuickJS + in-process TypeScript strip — no Node/Deno/tsc sidecar.</p></article>
+        </div>
+        <div class="flow">
+          <svg viewBox="0 0 720 180" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <defs>
+              <linearGradient id="g" x1="0" x2="1"><stop offset="0%" stop-color="#5eead4"/><stop offset="100%" stop-color="#60a5fa"/></linearGradient>
+            </defs>
+            <rect x="10" y="60" width="110" height="60" rx="12" fill="#18233d" stroke="#ffffff22"/>
+            <text x="65" y="95" fill="#e8eefc" text-anchor="middle" font-size="14">Clients</text>
+            <rect class="pulse" x="150" y="40" width="140" height="100" rx="14" fill="url(#g)" opacity=".25" stroke="#5eead4"/>
+            <text x="220" y="88" fill="#e8eefc" text-anchor="middle" font-size="15" font-weight="600">proxysss</text>
+            <text x="220" y="108" fill="#9fb0d0" text-anchor="middle" font-size="11">gateway core</text>
+            <rect x="330" y="50" width="120" height="80" rx="12" fill="#18233d" stroke="#ffffff22"/>
+            <text x="390" y="88" fill="#e8eefc" text-anchor="middle" font-size="13">Upstreams</text>
+            <rect x="490" y="50" width="110" height="80" rx="12" fill="#18233d" stroke="#ffffff22"/>
+            <text x="545" y="88" fill="#e8eefc" text-anchor="middle" font-size="13">Admin API</text>
+            <rect x="630" y="65" width="70" height="50" rx="10" fill="#18233d" stroke="#ffffff22"/>
+            <text x="665" y="95" fill="#9fb0d0" text-anchor="middle" font-size="11">YAML</text>
+            <path d="M120 90 H150" stroke="#5eead4" stroke-width="2" marker-end="url(#arrow)"/>
+            <path d="M290 90 H330" stroke="#60a5fa" stroke-width="2"/>
+            <path d="M450 90 H490" stroke="#60a5fa" stroke-width="2"/>
+            <path d="M600 90 H630" stroke="#fbbf24" stroke-width="2" stroke-dasharray="5 4"/>
+          </svg>
+        </div>
+      </section>
+
+      <section class="panel" id="reverse-proxy">
+        <div class="eyebrow">HTTP Path</div>
+        <h2>Reverse proxy &amp; load balancing</h2>
+        <p>Requests hit plain/TLS/H3 listeners, pass access control and rate limits, then match static sites, WebDAV, domain routes, reverse-proxy routes, or script hooks.</p>
+        <div class="list">
+          <div><strong>Domain-first routing:</strong> <code>services.domain_routes</code> groups host/path upstream pools with per-route compression, cache, and rate limits.</div>
+          <div><strong>Algorithms:</strong> rendezvous (default), round-robin, least-connections, source-hash, weighted — with sticky affinity and active health probes.</div>
+          <div><strong>Resilience:</strong> retry policy, passive quarantine, manual upstream drain via admin API, forwarding headers (X-Forwarded-*, Forwarded).</div>
+        </div>
+        <pre>services:
+  domain_routes:
+    - name: api
+      domains: [api.example.com]
+      upstream: http://127.0.0.1:8080
+      upstreams: [http://127.0.0.1:8081]
+      upstream_weights:
+        http://127.0.0.1:8080: 1
+        http://127.0.0.1:8081: 3</pre>
+      </section>
+
+      <section class="panel" id="tls">
+        <div class="eyebrow">Certificates</div>
+        <h2>TLS &amp; automatic HTTPS</h2>
+        <p>Default public TLS listens on <code>0.0.0.0:443</code>. Managed ACME uses built-in HTTP-01 and TLS-ALPN-01 without external tooling.</p>
+        <div class="list">
+          <div><strong>Built-in path:</strong> <code>http.tls.auto_https</code> / <code>acme_managed</code> — ordinary hostname certificates.</div>
+          <div><strong>Wildcard boundary:</strong> <span class="pill warn">external</span> Use <code>http.tls.mode: acme_dns_external</code> with <code>acme.sh</code> DNS-01 for <code>*.example.com</code>. Native DNS APIs are not embedded.</div>
+          <div><strong>SNI:</strong> Multi-cert selection via <code>http.tls.certificates</code> and per-domain manual SSL on routes.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="websocket-grpc">
+        <div class="eyebrow">Long-lived HTTP</div>
+        <h2>WebSocket &amp; gRPC-over-H2</h2>
+        <p>WebSocket upgrades tunnel bidirectionally after a successful <code>101 Switching Protocols</code> handshake to compatible upstreams.</p>
+        <div class="list">
+          <div><strong>WebSocket:</strong> Route to <code>ws://</code> or <code>wss://</code> upstreams; hop-by-hop headers are stripped appropriately.</div>
+          <div><strong>gRPC:</strong> <span class="pill good">transparent</span> HTTP/2 reverse proxy forwards <code>application/grpc</code> payloads when upstreams speak HTTP/2 — no special directive required.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="rate-limit">
+        <div class="eyebrow">Shaping</div>
+        <h2>Rate limiting</h2>
+        <p>Shared-zone policies protect HTTP routes and TCP stream listeners using the same algorithm implementations.</p>
+        <div class="cards">
+          <article class="card"><strong>HTTP</strong><p><code>services.rate_limit.http</code> — fixed window, token bucket, or leaky bucket; optional connection caps per zone key.</p></article>
+          <article class="card"><strong>Streams</strong><p><code>services.rate_limit.stream</code> — limits new TCP connections per client IP in a shared zone.</p></article>
+          <article class="card"><strong>Keys</strong><p>Scope by remote IP, Host header, or arbitrary header value for API-key style quotas.</p></article>
+        </div>
+      </section>
+
+      <section class="panel" id="cache">
+        <div class="eyebrow">Response policy</div>
+        <h2>Cache &amp; compression</h2>
+        <p>Global defaults in <code>services.response_policy</code>; routes override compression and cache. Zones can be memory-backed with optional disk files.</p>
+        <div class="list">
+          <div><strong>Cache keys:</strong> <code>key_prefix</code> and <code>vary_headers</code> (e.g. <code>Accept-Encoding</code>) build variant-aware keys.</div>
+          <div><strong>Stale-while-revalidate:</strong> Serve slightly stale entries immediately while background refresh updates the zone.</div>
+          <div><strong>PURGE:</strong> Active invalidation when <code>allow_purge: true</code>.</div>
+          <div><strong>Compression:</strong> Negotiates zstd, brotli, or gzip based on <code>Accept-Encoding</code>, content-type allowlist, and minimum body size.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="ftp">
+        <div class="eyebrow">Control + data</div>
+        <h2>FTP gateway</h2>
+        <p>When <code>services.ftp.native_control=true</code>, proxysss terminates the control channel and rewrites passive (PASV/EPSV) and active (PORT/EPRT) data connections through a local port pool.</p>
+        <div class="list">
+          <div><strong>Policy:</strong> <code>command_allow</code> / <code>command_deny</code> filter verbs before forwarding to upstream.</div>
+          <div><strong>Observability:</strong> Structured logs for control commands and data-channel bridge open/close events.</div>
+          <div><strong>Public IP:</strong> <code>public_ip</code> advertises the correct address in rewritten PASV replies.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="admin">
+        <div class="eyebrow">Control plane</div>
+        <h2>Admin &amp; agent API</h2>
+        <p>Loopback dashboard on <code>127.0.0.1:7777</code> exposes health, stats, upstream drain, plugin load/unload, and automation endpoints.</p>
+        <div class="list">
+          <div><strong>Read-only defaults:</strong> <code>enable_write_ops=false</code> until operators enable cluster automation.</div>
+          <div><strong>Upserts:</strong> Bearer-token <code>POST /v1/domain-routes/upsert</code> (and TCP/UDP/listener siblings) persist into YAML and reload in-process.</div>
+          <div><strong>Inspection CLI:</strong> <code>proxysss config explain</code>, <code>capabilities</code>, <code>nginx-parity</code>, <code>reload-plan</code>.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="security">
+        <div class="eyebrow">Hardening</div>
+        <h2>Security model</h2>
+        <div class="list">
+          <div><strong>SSRF guards:</strong> Blocked upstream host lists and mutation validation.</div>
+          <div><strong>HTTP/1 smuggling:</strong> Ambiguous requests rejected when enabled.</div>
+          <div><strong>Admin auth:</strong> Rate-limited failed logins with lockout windows.</div>
+          <div><strong>Secrets:</strong> Redacted in <code>proxysss config show</code>; atomic YAML writes on automation.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="kubernetes">
+        <div class="eyebrow">In-cluster</div>
+        <h2>Kubernetes ingress-style mode</h2>
+        <p>When <code>kubernetes.enabled=true</code>, service DNS mappings expand into <code>services.domain_routes</code> on each load/reload — useful for in-cluster edge registration without hand-editing every pod hostname.</p>
+        <pre>kubernetes:
+  enabled: true
+  namespace: prod
+  cluster_domain: cluster.local
+  mappings:
+    - name: api
+      service: api-svc
+      port: 8080
+      domains: [api.example.com]</pre>
+      </section>
+
+      <section class="panel" id="scripts">
+        <div class="eyebrow">Extensions</div>
+        <h2>Embedded TypeScript runtime</h2>
+        <p>Scripts run inside the binary via QuickJS with in-process TypeScript stripping (SWC). Hooks like <code>access</code>, <code>routeHttp</code>, and plugin modules are optional — the default gateway path avoids script calls on hot paths.</p>
+        <div class="list">
+          <div><strong>Main script:</strong> <code>gateway.ts</code> exported default plugin object.</div>
+          <div><strong>Auto plugins:</strong> <code>plugins/*.ts</code> with optional <code>&lt;name&gt;.plugin.yaml</code> sidecars.</div>
+          <div><strong>Not supported:</strong> Node/Deno/tsc, npm module graphs, or external runtimes.</div>
+        </div>
+      </section>
+
+      <section class="panel" id="reload">
+        <div class="eyebrow">Operations</div>
+        <h2>Hot reload boundaries</h2>
+        <div class="list">
+          <div><strong>Hot:</strong> Routes, policies, scripts, plugins, most <code>services.*</code> values, upstream health overrides.</div>
+          <div><strong>Restart:</strong> Listener binds, TLS mode, admin bind, FTP enable/bind, logging sink paths/format.</div>
+          <div><strong>Inspect:</strong> <code>proxysss config reload-plan</code> lists what changes need a process restart vs in-process reload.</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const buttons = document.querySelectorAll('.topic-btn');
+    const panels = document.querySelectorAll('.panel');
+    function show(topic) {
+      buttons.forEach(btn => btn.classList.toggle('active', btn.dataset.topic === topic));
+      panels.forEach(panel => {
+        const active = panel.id === topic;
+        panel.classList.toggle('active', active);
+        if (active) {
+          panel.style.animation = 'none';
+          panel.offsetHeight;
+          panel.style.animation = '';
+        }
+      });
+      history.replaceState(null, '', '#' + topic);
+    }
+    buttons.forEach(btn => btn.addEventListener('click', () => show(btn.dataset.topic)));
+    const initial = location.hash.replace('#', '') || 'overview';
+    if (document.getElementById(initial)) show(initial);
+  </script>
+</body>
+</html>

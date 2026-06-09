@@ -22,7 +22,8 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Logging must expose access logs (`logs/access.log`), error logs (`logs/error.log`), and level control for `debug`, `info`, `warn`, and `error`; default to `info`, with `debug` reserved for internal diagnostics.
 - Official demo plugins ship with `proxysss init`: `structured-log` (log hook demo), `traffic-stats` (traffic/error counters), and `player-affinity` (affinity routing demo).
 - Automated tests should protect nginx-parity defaults and capability declarations whenever related code changes.
-- `AGENTS.md`、内建 `docs.html` / `/docs` 页面、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`proxysss-script.d.ts` 必须随能力和脚本 API 一起维护，不允许文档长期落后于实现。
+- `AGENTS.md`、内建 `docs.html` / `/docs` 页面、`docs/architecture.html`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`proxysss-script.d.ts` 必须随能力和脚本 API 一起维护，不允许文档长期落后于实现。
+- **Agents MUST update `docs/architecture.html`** whenever proxysss architecture or request/data-path behavior changes (new listeners, policy chains, reload boundaries, extension hooks, etc.).
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance must be treated as a core product requirement: aim for nginx-class throughput/latency and leave room to exceed nginx where proxysss can use Rust, async IO, and script isolation effectively.
 - Architecture should favor extensibility without putting hot-path traffic behind unnecessary dynamic dispatch, allocation, serialization, or script calls.
@@ -95,16 +96,16 @@ proxysss config nginx-parity --format yaml
 - Any new user-facing command should be useful for both humans and autonomous agents.
 - Keep install paths and startup instructions scriptable so an agent can bootstrap proxysss without manual discovery.
 - Prefer CLI inspection surfaces for agent workflows.
-- 任何涉及脚本 API、内建文档、nginx 对照配置、模板、错误页、运维入口的变更，都必须同步更新 `AGENTS.md`、内建 `docs.html`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`proxysss-script.d.ts`、README/模板/测试中的对应内容。
+- 任何涉及脚本 API、内建文档、nginx 对照配置、模板、错误页、运维入口的变更，都必须同步更新 `AGENTS.md`、内建 `docs.html`、`docs/architecture.html`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`proxysss-script.d.ts`、README/模板/测试中的对应内容。
 - For hot-path code, measure or reason about throughput, allocation pressure, backpressure, and lock contention before adding abstractions.
 - Do not keep legacy code merely because it already exists; if a simpler high-performance design better serves nginx replacement, migrate decisively and cover it with tests.
 
 ## Known nginx Parity Gaps (track honestly)
 
-- FTP is no longer raw TCP passthrough: control-channel proxying plus passive/active data-channel rewriting exists. Remaining gap: richer FTP policy controls and command-aware observability.
-- Compression supports configurable zstd/brotli/gzip response handling through `services.response_policy` and route-level overrides. Remaining gap: extend response policy into cache zones and protocol-specific tuning surfaces.
-- Proxy cache zones exist with shared zones, optional disk-backed entries, and PURGE invalidation. Remaining gap: add background revalidation and more advanced cache key/variant controls.
-- Rate limiting supports fixed-window and token-bucket shared-zone request limiting plus concurrent connection caps. Remaining gap: add stream-layer shared rate-limit policies and leaky-bucket shaping.
-- Wildcard DNS-01 certificates are supported through the explicit external `acme.sh` path. Remaining gap: native DNS provider integrations remain external by design.
+- FTP: control-channel proxying, passive/active data rewriting, `command_allow`/`command_deny`, and structured command/data lifecycle logs. Remaining gap: transfer-level hooks and richer per-user FTP policy.
+- Compression: supported via `services.response_policy` and route overrides (zstd/brotli/gzip).
+- Proxy cache: supported with shared/disk zones, PURGE, `vary_headers`/`key_prefix`, and `stale_while_revalidate_secs` background refresh.
+- Rate limiting: supported with fixed-window, token-bucket, or leaky-bucket HTTP policies, stream shared zones, and HTTP connection caps.
+- Wildcard DNS-01 certificates stay on the explicit non-default `http.tls.mode: acme_dns_external` + `acme.sh` path. Built-in managed ACME covers HTTP-01/TLS-ALPN-01 only; native DNS provider integrations remain external by design.
 
 These are tracked in `proxysss config nginx-parity` and should move toward `supported` with tests, not disappear from the matrix.

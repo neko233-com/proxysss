@@ -583,6 +583,24 @@ pub struct ServicesConfig {
 pub struct RateLimitConfig {
     #[serde(default)]
     pub http: HttpRateLimitConfig,
+    #[serde(default)]
+    pub stream: StreamRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamRateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rate_limit_zone")]
+    pub zone: String,
+    #[serde(default)]
+    pub algorithm: RateLimitAlgorithm,
+    #[serde(default = "default_rate_limit_requests")]
+    pub connections: u32,
+    #[serde(default = "default_rate_limit_window_ms")]
+    pub window_ms: u64,
+    #[serde(default)]
+    pub burst: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -609,6 +627,7 @@ pub enum RateLimitAlgorithm {
     #[default]
     FixedWindow,
     TokenBucket,
+    LeakyBucket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,8 +760,14 @@ pub struct ResponseCacheConfig {
     pub enabled: bool,
     #[serde(default = "default_cache_zone")]
     pub zone: String,
+    #[serde(default)]
+    pub key_prefix: String,
+    #[serde(default)]
+    pub vary_headers: Vec<String>,
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
+    #[serde(default)]
+    pub stale_while_revalidate_secs: u64,
     #[serde(default = "default_cache_statuses")]
     pub statuses: Vec<u16>,
     #[serde(default = "default_cache_max_body_bytes")]
@@ -827,6 +852,12 @@ pub struct FtpConfig {
     pub passive_port_end: u16,
     #[serde(default = "default_true")]
     pub passive_hint: bool,
+    #[serde(default)]
+    pub command_allow: Vec<String>,
+    #[serde(default)]
+    pub command_deny: Vec<String>,
+    #[serde(default = "default_true")]
+    pub log_commands: bool,
 }
 
 impl GatewayConfig {
@@ -1011,6 +1042,14 @@ impl GatewayConfig {
             validate_http_rate_limit_config(
                 &self.services.rate_limit.http,
                 "services.rate_limit.http",
+                &mut errors,
+            );
+        }
+
+        if self.services.rate_limit.stream.enabled {
+            validate_stream_rate_limit_config(
+                &self.services.rate_limit.stream,
+                "services.rate_limit.stream",
                 &mut errors,
             );
         }
@@ -2100,10 +2139,26 @@ impl Default for ResponseCacheConfig {
         Self {
             enabled: false,
             zone: default_cache_zone(),
+            key_prefix: String::new(),
+            vary_headers: Vec::new(),
             ttl_secs: default_cache_ttl_secs(),
+            stale_while_revalidate_secs: 0,
             statuses: default_cache_statuses(),
             max_body_bytes: default_cache_max_body_bytes(),
             allow_purge: default_true(),
+        }
+    }
+}
+
+impl Default for StreamRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            zone: default_rate_limit_zone(),
+            algorithm: RateLimitAlgorithm::default(),
+            connections: default_rate_limit_requests(),
+            window_ms: default_rate_limit_window_ms(),
+            burst: 0,
         }
     }
 }
@@ -2178,6 +2233,9 @@ impl Default for FtpConfig {
             passive_port_start: default_ftp_passive_port_start(),
             passive_port_end: default_ftp_passive_port_end(),
             passive_hint: default_true(),
+            command_allow: Vec::new(),
+            command_deny: Vec::new(),
+            log_commands: default_true(),
         }
     }
 }
@@ -2722,6 +2780,25 @@ fn validate_http_rate_limit_config(
         if name.trim().is_empty() {
             errors.push(format!("{prefix}.key header name cannot be empty"));
         }
+    }
+}
+
+fn validate_stream_rate_limit_config(
+    config: &StreamRateLimitConfig,
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
+    if !config.enabled {
+        return;
+    }
+    if config.zone.trim().is_empty() {
+        errors.push(format!("{prefix}.zone cannot be empty"));
+    }
+    if config.connections == 0 {
+        errors.push(format!("{prefix}.connections must be greater than 0"));
+    }
+    if config.window_ms < 100 {
+        errors.push(format!("{prefix}.window_ms must be >= 100"));
     }
 }
 

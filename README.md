@@ -39,7 +39,7 @@ Current version: v0.3.14
 - FTP control-channel proxying with passive and active data-channel rewriting
 - WebDAV and static file serving
 - Managed ACME with HTTP-01 and TLS-ALPN-01, plus explicit acme.sh DNS-01 for wildcard certificates
-- Shared cache zones, compression, access control, fixed-window and token-bucket rate limiting, retries, and active health checks
+- Shared cache zones with stale-while-revalidate, compression, access control, fixed-window/token-bucket/leaky-bucket HTTP and stream rate limiting, retries, and active health checks
 - Prometheus metrics on `/metrics`, weighted load balancing, round-robin, least-connections, source-hash, and rendezvous affinity
 - gRPC-over-HTTP/2, WebSocket, sticky sessions, passive quarantine (circuit breaker), and upstream failover retries
 

@@ -326,7 +326,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "http cache",
-        "services.response_policy/routes support shared cache zones, optional disk-backed entries, and PURGE for active invalidation",
+        "services.response_policy/routes support shared cache zones, disk-backed entries, PURGE, vary_headers/key_prefix, and stale-while-revalidate background refresh",
     ),
     (
         "active health checks",
@@ -442,8 +442,8 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "FTP",
         status: ParityStatus::Partial,
-        evidence: "services.ftp proxies the control channel and rewrites both passive and active data channels through a configurable local port pool",
-        next_gap: "richer FTP policy controls and command-aware observability",
+        evidence: "services.ftp proxies the control channel, rewrites passive/active data channels, supports command_allow/command_deny policy, and logs control/data channel lifecycle events",
+        next_gap: "transfer-level hooks and richer per-user FTP policy",
     },
     NginxParityItem {
         capability: "TLS certificates",
@@ -472,9 +472,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "compression",
-        status: ParityStatus::Partial,
-        evidence: "services.response_policy plus route-level overrides provide configurable zstd/brotli/gzip response compression",
-        next_gap: "extend response policy into cache zones and protocol-specific tuning surfaces",
+        status: ParityStatus::Supported,
+        evidence: "services.response_policy plus route-level overrides provide configurable zstd/brotli/gzip response compression with content-type and min-length guards",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "IP allow/deny / blacklist",
@@ -484,9 +484,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "cache/proxy cache",
-        status: ParityStatus::Partial,
-        evidence: "services.response_policy/routes provide shared cache zones, disk-backed cache files, and PURGE-based invalidation",
-        next_gap: "add background revalidation and more advanced cache key/variant controls",
+        status: ParityStatus::Supported,
+        evidence: "services.response_policy/routes provide shared cache zones, disk-backed entries, PURGE invalidation, vary_headers/key_prefix variants, and stale-while-revalidate background refresh",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "active health checks",
@@ -496,9 +496,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "rate limiting",
-        status: ParityStatus::Partial,
-        evidence: "services.rate_limit.http plus route-level overrides provide fixed-window or token-bucket shared-zone request limiting and concurrent connection caps",
-        next_gap: "add stream-layer shared rate-limit policies and leaky-bucket shaping",
+        status: ParityStatus::Supported,
+        evidence: "services.rate_limit.http and services.rate_limit.stream provide fixed-window, token-bucket, or leaky-bucket shared-zone policies plus HTTP concurrent connection caps",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "forwarding header semantics",
@@ -2346,6 +2346,62 @@ mod tests {
             .expect("TLS certificate parity item");
         assert_eq!(tls.status, ParityStatus::Supported);
         assert!(tls.evidence.contains("multi-cert SNI"));
+    }
+
+    #[test]
+    fn readme_and_agents_do_not_contradict_supported_capabilities() {
+        let readme = include_str!("../README.md");
+        let agents = include_str!("../AGENTS.md");
+
+        for capability in ["compression", "cache/proxy cache", "rate limiting"] {
+            let item = NGINX_PARITY_MATRIX
+                .iter()
+                .find(|item| item.capability == capability)
+                .unwrap_or_else(|| panic!("missing parity item {capability}"));
+            assert_eq!(
+                item.status,
+                ParityStatus::Supported,
+                "{capability} should be supported in nginx parity matrix"
+            );
+        }
+
+        assert!(readme.contains("token-bucket"));
+        assert!(readme.contains("gRPC-over-HTTP/2"));
+        assert!(readme.contains("acme.sh DNS-01"));
+        assert!(agents.contains("docs/architecture.html"));
+        assert!(agents.contains("acme_dns_external"));
+    }
+
+    #[test]
+    fn init_templates_describe_embedded_runtime_not_node() {
+        let gateway_script = include_str!("../templates/gateway.ts");
+        let ts_guide = include_str!("../ts-how-to-use.md");
+        assert!(gateway_script.contains("embedded") || gateway_script.contains("QuickJS"));
+        assert!(ts_guide.contains("QuickJS"));
+        assert!(!gateway_script.contains("npm install"));
+        assert!(!ts_guide.contains("npm install"));
+    }
+
+    #[test]
+    fn builtin_docs_gap_section_matches_partial_parity_items() {
+        let docs = crate::gateway::render_docs_html(&GatewayConfig::default());
+        for item in NGINX_PARITY_MATRIX
+            .iter()
+            .filter(|item| item.status == ParityStatus::Partial)
+        {
+            if item.capability == "self-contained auto ssl" {
+                assert!(
+                    docs.contains("acme_dns_external") || docs.contains("acme.sh"),
+                    "built-in docs should document wildcard ACME boundary"
+                );
+            }
+            if item.capability == "FTP" {
+                assert!(
+                    docs.contains("FTP") && docs.contains("partial"),
+                    "built-in docs should keep FTP partial status honest"
+                );
+            }
+        }
     }
 
     #[test]

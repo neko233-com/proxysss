@@ -39,15 +39,18 @@ services:
       strip_prefix: true
       compression:
         enabled: true
-      cache:
-        enabled: true
-        ttl_secs: 30
       rate_limit:
         enabled: true
-        algorithm: token_bucket
+        algorithm: token_bucket   # fixed_window, token_bucket, or leaky_bucket
         requests: 120
         window_ms: 60000
         burst: 30
+      cache:
+        enabled: true
+        ttl_secs: 30
+        stale_while_revalidate_secs: 15
+        vary_headers: [Accept-Encoding]
+        key_prefix: api
       active_health:
         path: /healthz
 ```
@@ -113,17 +116,29 @@ services:
   rate_limit:
     http:
       enabled: true
-      algorithm: fixed_window   # or token_bucket
+      algorithm: fixed_window   # fixed_window, token_bucket, or leaky_bucket
       zone: public
       requests: 100
       window_ms: 60000
       burst: 20
       max_connections: 200
+    stream:
+      enabled: true
+      zone: edge-tcp
+      algorithm: leaky_bucket
+      connections: 60
+      window_ms: 60000
+      burst: 10
 ```
 
 ## Caching and compression
 
-Global defaults live in `services.response_policy`; routes can override `compression` and `cache`. Use `services.cache_zones` for shared zones and optional disk backing. Send `PURGE` to invalidate entries when `allow_purge: true`.
+Global defaults live in `services.response_policy`; routes can override `compression` and `cache`. Use `services.cache_zones` for shared zones and optional disk backing. Send `PURGE` to invalidate entries when `allow_purge: true`. Cache keys support `key_prefix` and `vary_headers`; `stale_while_revalidate_secs` serves stale responses while refreshing upstream in the background.
+
+## TLS and wildcard certificates
+
+- Default automatic HTTPS uses built-in managed ACME with HTTP-01 and TLS-ALPN-01 (`http.tls.auto_https` or `http.tls.mode: acme_managed`).
+- Wildcard certificates require the **non-default** external path: `http.tls.mode: acme_dns_external` with `acme.sh` DNS-01 (`http.tls.acme.dns.provider` + credentials). Native DNS provider integrations are not built into the binary.
 
 ## Monitoring
 

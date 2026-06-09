@@ -97,6 +97,8 @@ curl -X POST http://127.0.0.1:7777/v1/tls/auto-https/upsert \
 
 ### Wildcard certificate via acme.sh DNS-01
 
+Wildcard certificates are **not** issued by built-in managed ACME. Use this non-default path only when DNS-01 is required (`*.example.com`).
+
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/tls/wildcard-dns/upsert \
   -u ops:change-me \
