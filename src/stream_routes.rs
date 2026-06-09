@@ -155,7 +155,7 @@ mod tests {
     fn build_tls_client_hello_with_sni(hostname: &str) -> Vec<u8> {
         let host = hostname.as_bytes();
         let sni_list_len = (3 + host.len()) as u16;
-        let sni_ext_len = (2 + sni_list_len) as u16;
+        let sni_ext_len = 2 + sni_list_len;
         let mut sni_ext = Vec::new();
         sni_ext.extend_from_slice(&0u16.to_be_bytes());
         sni_ext.extend_from_slice(&sni_ext_len.to_be_bytes());
