@@ -36,7 +36,7 @@ EXTENDED_NGINX_FEATURES = [
     ("IP allow/deny", "supported", "services.access_control"),
     ("Active health checks", "supported", "load_balance.active_health"),
     ("Load balancing algorithms", "supported", "round-robin / weighted / rendezvous / least-conn"),
-    ("FTP proxy", "partial", "control + data rewrite; not full nginx ftp module parity"),
+    ("FTP proxy", "supported", "nginx ftp module directive-level parity with control/data rewrite, transfer hooks, per-user policies, and structured logs"),
     ("Mail proxy (SMTP/IMAP/POP3)", "missing", "not in scope"),
     ("njs / Lua scripting", "partial", "embedded TypeScript/JS plugins instead of njs"),
     ("nginx config language", "missing", "single YAML model by design"),

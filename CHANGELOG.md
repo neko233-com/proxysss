@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.2 - 2026-06-09
+
+- Stabilized benchmark automation by comparing proxysss directly against nginx, removing Caddy download/runtime dependencies, fixing Linux JSON row capture, and writing Windows benchmark JSON without a UTF-8 BOM.
+
 ## v1.1.1 - 2026-06-09
 
 - Hardened deep/e2e verification startup by waiting for the spawned gateway listener to accept TCP connections before requests are sent, matching the Linux CI timing model.

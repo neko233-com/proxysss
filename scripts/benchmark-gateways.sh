@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare static-file throughput: proxysss vs nginx vs caddy.
+# Compare static-file throughput: proxysss vs nginx.
 # All downloads and run artifacts stay under .benchmark/ (gitignored).
 set -euo pipefail
 
@@ -9,7 +9,6 @@ cd "$ROOT"
 CONCURRENCY="${CONCURRENCY:-512}"
 DURATION_SECS="${DURATION_SECS:-30}"
 NGINX_VERSION="${NGINX_VERSION:-1.31.0}"
-CADDY_VERSION="${CADDY_VERSION:-2.11.3}"
 QUICK="${QUICK:-0}"
 
 if [[ "$QUICK" == "1" ]]; then
@@ -32,7 +31,6 @@ stop_bench_processes() {
     done < "$PID_FILE"
   fi
   pkill -f "$RUN_DIR/nginx.conf" 2>/dev/null || true
-  pkill -f "caddy file-server --listen 127.0.0.1:18082" 2>/dev/null || true
 }
 
 if [[ ! -x "$PROXY_BIN" ]]; then
@@ -64,19 +62,8 @@ if [[ ! -x "$NGINX_BIN" ]]; then
   rm -rf "$BUILD_DIR"
 fi
 
-CADDY_TARBALL="$VENDOR_DIR/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
-CADDY_BIN="$VENDOR_DIR/caddy"
-if [[ ! -x "$CADDY_BIN" ]]; then
-  echo "==> downloading caddy $CADDY_VERSION"
-  if [[ ! -f "$CADDY_TARBALL" ]]; then
-    curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" -o "$CADDY_TARBALL"
-  fi
-  tar -xzf "$CADDY_TARBALL" -C "$VENDOR_DIR" caddy
-  chmod +x "$CADDY_BIN"
-fi
-
 cat >"$WWW_DIR/index.html" <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><title>gateway bench</title></head><body><h1>gateway benchmark</h1><p>same static payload for proxysss nginx caddy.</p></body></html>
+<!doctype html><html><head><meta charset="utf-8"><title>gateway bench</title></head><body><h1>gateway benchmark</h1><p>same static payload for proxysss and nginx.</p></body></html>
 HTML
 
 PROXY_DIR="$RUN_DIR/proxysss"
@@ -139,11 +126,11 @@ wait_http() {
 
 run_bench() {
   local name="$1" url="$2"
-  echo ""
-  echo "=== $name c$CONCURRENCY d${DURATION_SECS}s ==="
+  echo "" >&2
+  echo "=== $name c$CONCURRENCY d${DURATION_SECS}s ===" >&2
   local output
   output="$("$PROXY_BIN" bench http --url "$url" --concurrency "$CONCURRENCY" --duration-secs "$DURATION_SECS" 2>&1)"
-  echo "$output"
+  echo "$output" >&2
   python3 - "$name" "$url" "$CONCURRENCY" "$DURATION_SECS" "$output" <<'PY'
 import json, re, sys
 name, url, concurrency, duration, output = sys.argv[1:6]
@@ -185,13 +172,10 @@ trap 'stop_bench_processes' EXIT
 echo $! >"$PID_FILE"
 "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$RUN_DIR/nginx.conf" >/dev/null 2>&1 &
 echo $! >>"$PID_FILE"
-"$CADDY_BIN" file-server --listen 127.0.0.1:18082 --root "$WWW_DIR" >/dev/null 2>&1 &
-echo $! >>"$PID_FILE"
 
 TARGETS=(
   "proxysss|http://127.0.0.1:18083/bench/index.html"
   "nginx|http://127.0.0.1:18081/bench/index.html"
-  "caddy|http://127.0.0.1:18082/index.html"
 )
 
 for target in "${TARGETS[@]}"; do

@@ -2,7 +2,6 @@ param(
     [int]$Concurrency = 512,
     [int]$DurationSecs = 30,
     [string]$NginxVersion = "1.31.0",
-    [string]$CaddyVersion = "2.11.3",
     [switch]$Quick,
     [switch]$SkipGate
 )
@@ -24,7 +23,7 @@ function Stop-BenchProcesses {
             }
         }
     }
-    Get-Process nginx,caddy -ErrorAction SilentlyContinue |
+    Get-Process nginx -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
@@ -105,22 +104,7 @@ if (-not (Test-Path $NginxExe)) {
     Expand-Archive -Path $NginxZip -DestinationPath $Vendor -Force
 }
 
-$CaddyZip = Join-Path $Vendor "caddy_$CaddyVersion`_windows_amd64.zip"
-$CaddyExe = Join-Path $Vendor "caddy.exe"
-if (-not (Test-Path $CaddyZip)) {
-    Write-Host "==> downloading caddy $CaddyVersion to $Vendor"
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh) {
-        gh release download "v$CaddyVersion" -R caddyserver/caddy -p "caddy_$CaddyVersion`_windows_amd64.zip" -D $Vendor
-    } else {
-        Invoke-WebRequest -Uri "https://github.com/caddyserver/caddy/releases/download/v$CaddyVersion/caddy_$CaddyVersion`_windows_amd64.zip" -OutFile $CaddyZip
-    }
-}
-if (-not (Test-Path $CaddyExe)) {
-    Expand-Archive -Path $CaddyZip -DestinationPath $Vendor -Force
-}
-
-"<!doctype html><html><head><meta charset=`"utf-8`"><title>gateway bench</title></head><body><h1>gateway benchmark</h1><p>same static payload for proxysss nginx caddy.</p></body></html>" |
+"<!doctype html><html><head><meta charset=`"utf-8`"><title>gateway bench</title></head><body><h1>gateway benchmark</h1><p>same static payload for proxysss and nginx.</p></body></html>" |
     Set-Content -Path (Join-Path $Www "index.html") -Encoding ascii
 
 & $ReleaseProxysss init --dir (Join-Path $RunDir "proxysss") --overwrite | Out-Null
@@ -176,15 +160,13 @@ $NginxConfig | Set-Content -Path $NginxConfigPath -Encoding ascii
 
 $Proxy = Start-Process -FilePath $ReleaseProxysss -ArgumentList @("-config", $ProxyConfigPath) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
 $Nginx = Start-Process -FilePath $NginxExe -ArgumentList @("-p", $NginxDir, "-c", $NginxConfigPath) -WorkingDirectory $NginxDir -WindowStyle Hidden -PassThru
-$Caddy = Start-Process -FilePath $CaddyExe -ArgumentList @("file-server", "--listen", "127.0.0.1:18082", "--root", $Www) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
-@($Proxy.Id, $Nginx.Id, $Caddy.Id) | Set-Content -Path $PidFile -Encoding ascii
+@($Proxy.Id, $Nginx.Id) | Set-Content -Path $PidFile -Encoding ascii
 
 $Results = @()
 try {
     $Targets = @(
         @{ Name = "proxysss"; Url = "http://127.0.0.1:18083/bench/index.html" },
-        @{ Name = "nginx"; Url = "http://127.0.0.1:18081/bench/index.html" },
-        @{ Name = "caddy"; Url = "http://127.0.0.1:18082/index.html" }
+        @{ Name = "nginx"; Url = "http://127.0.0.1:18081/bench/index.html" }
     )
 
     foreach ($Target in $Targets) {
@@ -203,7 +185,8 @@ try {
     Stop-BenchProcesses -PidFile $PidFile
 }
 
-$Results | ConvertTo-Json -Depth 4 | Set-Content -Path $ResultsFile -Encoding utf8
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($ResultsFile, ($Results | ConvertTo-Json -Depth 4), $utf8NoBom)
 
 Write-Host ""
 Write-Host "=== throughput summary (ops/sec) ===" -ForegroundColor Green

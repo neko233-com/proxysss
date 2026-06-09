@@ -3,7 +3,6 @@ name: benchmark
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   NGINX_VERSION: "1.31.0"
-  CADDY_VERSION: "2.11.3"
 
 on:
   workflow_dispatch:
@@ -36,7 +35,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .benchmark/vendors
-          key: benchmark-vendors-linux-${{ env.NGINX_VERSION }}-${{ env.CADDY_VERSION }}-v1
+          key: benchmark-vendors-linux-${{ env.NGINX_VERSION }}-v2
 
       - name: Install build deps for nginx
         run: |
@@ -81,7 +80,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .benchmark/vendors
-          key: benchmark-vendors-windows-${{ env.NGINX_VERSION }}-${{ env.CADDY_VERSION }}-v1
+          key: benchmark-vendors-windows-${{ env.NGINX_VERSION }}-v2
 
       - name: Build proxysss release
         run: cargo build --locked --release
