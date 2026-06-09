@@ -1,0 +1,23 @@
+# Wildcard TLS via acme.sh DNS-01 (non-default path).
+# Merge into your single proxysss.yaml — do NOT use runtime include files.
+#
+# Built-in managed ACME covers HTTP-01 and TLS-ALPN-01 only.
+# Wildcard certificates (*.example.com) require this explicit mode + acme.sh.
+
+http:
+  tls:
+    mode: acme_dns_external
+    cert_path: certs/proxysss-cert.pem
+    key_path: certs/proxysss-key.pem
+    generate_self_signed_if_missing: false
+    server_name: example.com
+    acme:
+      client: acme.sh
+      email: admin@example.com
+      domains: [example.com, "*.example.com"]
+      directory_production: true
+      renew_interval_hours: 12
+      dns:
+        provider: dns_cf
+        credentials:
+          CF_Token: your-cloudflare-api-token

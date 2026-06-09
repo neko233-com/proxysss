@@ -1,0 +1,5 @@
+{
+  "min_proxysss_vs_nginx_ops_ratio": 0.65,
+  "max_error_count": 0,
+  "notes": "CI fails when proxysss ops/sec falls below 65% of nginx on the same static payload, or when any gateway reports bench errors."
+}

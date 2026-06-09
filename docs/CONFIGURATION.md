@@ -20,6 +20,31 @@ logging:       # access/error logs and levels
 runtime:       # hot reload and maintenance state
 ```
 
+## AI reverse proxy
+
+`services.ai_proxy` is the native surface for New API, sub2api, and OpenAI-compatible upstreams. It runs before generic domain/reverse-proxy routes, supports host/path matching, path rewrite, provider headers, and header strip/set behavior.
+
+```yaml
+services:
+  ai_proxy:
+    enabled: true
+    header_prefix: proxysss-
+    routes:
+      - name: new-api
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+      - name: sub2api
+        provider: sub2api
+        match_host: sub2api.example.com
+        path_prefix: /
+        upstream: http://127.0.0.1:3001
+        rewrite_base_path: /v1
+        strip_headers: [x-debug-token]
+```
+
 ## HTTP reverse proxy
 
 ### Domain-first routes (recommended)

@@ -1,5 +1,9 @@
 target/
 dist/
 certs/
+.ssh/
 .DS_Store
 Thumbs.db
+
+# Gateway benchmark + deep verify reports (vendor downloads, run artifacts, HTML/MD output)
+.benchmark/

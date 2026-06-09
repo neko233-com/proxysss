@@ -668,6 +668,8 @@ pub struct ServicesConfig {
     pub static_sites: Vec<StaticSiteConfig>,
     #[serde(default)]
     pub ftp: FtpConfig,
+    #[serde(default)]
+    pub ai_proxy: crate::ai_proxy::AiProxyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -956,18 +958,22 @@ pub struct FtpConfig {
     pub enabled: bool,
     #[serde(default = "default_ftp_bind")]
     pub bind: String,
-    #[serde(default = "default_ftp_upstream")]
+    #[serde(default = "default_ftp_upstream", alias = "proxy_pass")]
     pub upstream: String,
     #[serde(default = "default_true")]
     pub native_control: bool,
-    #[serde(default)]
+    #[serde(default, alias = "pasv_address")]
     pub public_ip: String,
-    #[serde(default = "default_ftp_passive_port_start")]
+    #[serde(default = "default_ftp_passive_port_start", alias = "port_start")]
     pub passive_port_start: u16,
-    #[serde(default = "default_ftp_passive_port_end")]
+    #[serde(default = "default_ftp_passive_port_end", alias = "port_end")]
     pub passive_port_end: u16,
     #[serde(default = "default_true")]
     pub passive_hint: bool,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
     #[serde(default)]
     pub command_allow: Vec<String>,
     #[serde(default)]
@@ -978,6 +984,12 @@ pub struct FtpConfig {
     pub transfer_deny: Vec<String>,
     #[serde(default)]
     pub user_policies: Vec<FtpUserPolicy>,
+    #[serde(default = "default_ftp_proxy_timeout_ms")]
+    pub proxy_timeout_ms: u64,
+    #[serde(default)]
+    pub max_login_attempts: u32,
+    #[serde(default)]
+    pub limit_rate: u64,
     #[serde(default = "default_true")]
     pub log_commands: bool,
     #[serde(default = "default_true")]
@@ -1064,7 +1076,7 @@ impl GatewayConfig {
 
         if !self.include.is_disabled() {
             errors.push(
-                "include is no longer supported; keep all gateway settings in a single proxysss.yaml file"
+                "include is removed in v1.0: merge every referenced file into proxysss.yaml and delete the include block"
                     .to_string(),
             );
         }
@@ -1300,6 +1312,33 @@ impl GatewayConfig {
                 errors.push(format!(
                     "services.cache_zones.{}.max_entries must be greater than 0",
                     zone.name
+                ));
+            }
+        }
+
+        if self.services.ai_proxy.enabled && self.services.ai_proxy.routes.is_empty() {
+            errors.push(
+                "services.ai_proxy.routes cannot be empty when ai_proxy is enabled".to_string(),
+            );
+        }
+        let mut ai_route_names = HashSet::<String>::new();
+        for route in &self.services.ai_proxy.routes {
+            if route.name.trim().is_empty() {
+                errors.push("services.ai_proxy.routes.name cannot be empty".to_string());
+            }
+            if !ai_route_names.insert(route.name.clone()) {
+                errors.push(format!("duplicate ai proxy route name {}", route.name));
+            }
+            if route.path_prefix.trim().is_empty() || !route.path_prefix.starts_with('/') {
+                errors.push(format!(
+                    "services.ai_proxy.routes.{}.path_prefix must start with /",
+                    route.name
+                ));
+            }
+            if route.upstream.trim().is_empty() {
+                errors.push(format!(
+                    "services.ai_proxy.routes.{}.upstream cannot be empty",
+                    route.name
                 ));
             }
         }
@@ -2447,26 +2486,77 @@ impl Default for FtpConfig {
             passive_port_start: default_ftp_passive_port_start(),
             passive_port_end: default_ftp_passive_port_end(),
             passive_hint: default_true(),
+            allow: Vec::new(),
+            deny: Vec::new(),
             command_allow: Vec::new(),
             command_deny: Vec::new(),
             transfer_allow: Vec::new(),
             transfer_deny: Vec::new(),
             user_policies: Vec::new(),
+            proxy_timeout_ms: default_ftp_proxy_timeout_ms(),
+            max_login_attempts: 0,
+            limit_rate: 0,
             log_commands: default_true(),
             log_transfers: default_true(),
         }
     }
 }
 
+fn legacy_config_issues(value: &serde_yaml::Value) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if let Some(include) = value.get("include") {
+        let enabled = include
+            .get("enabled")
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false);
+        let files = include
+            .get("files")
+            .and_then(serde_yaml::Value::as_sequence)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .count()
+            })
+            .unwrap_or(0);
+        if enabled || files > 0 {
+            issues.push(
+                "include is removed in v1.0: merge every referenced file into proxysss.yaml and delete the include block"
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(script) = value.get("script") {
+        if script.get("command").is_some() {
+            issues.push(
+                "script.command (external Deno/Node runtime) is removed: use the embedded engine with script.enabled=true and script.entry=gateway.ts; run `proxysss init --overwrite` to regenerate"
+                    .to_string(),
+            );
+        }
+        if script.get("args").is_some() && script.get("entry").is_none() {
+            issues.push(
+                "script.args without script.entry indicates a legacy external runtime: switch to script.entry=gateway.ts and remove script.command/script.args"
+                    .to_string(),
+            );
+        }
+    }
+
+    issues
+}
+
 fn load_config_value(path: &Path) -> Result<serde_yaml::Value> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     let base = parse_value_by_extension(&raw, path)?;
-    let include = read_include_config(&base)?;
-    if !include.is_disabled() {
+    let legacy_issues = legacy_config_issues(&base);
+    if !legacy_issues.is_empty() {
         return Err(anyhow!(
-            "config include is unsupported; keep all runtime settings in a single YAML file: {}",
-            path.display()
+            "legacy config in {} is incompatible with proxysss v1.0:\n - {}",
+            path.display(),
+            legacy_issues.join("\n - ")
         ));
     }
     Ok(base)
@@ -2486,14 +2576,6 @@ fn parse_value_by_extension(raw: &str, path: &Path) -> Result<serde_yaml::Value>
         _ => serde_yaml::from_str(raw)
             .with_context(|| format!("failed to parse yaml config {}", path.display())),
     }
-}
-
-fn read_include_config(value: &serde_yaml::Value) -> Result<IncludeConfig> {
-    let include = value
-        .get("include")
-        .cloned()
-        .unwrap_or(serde_yaml::Value::Null);
-    Ok(serde_yaml::from_value(include).unwrap_or_default())
 }
 
 fn absolutize(root: &Path, path: &Path) -> PathBuf {
@@ -3198,6 +3280,10 @@ fn default_ftp_passive_port_end() -> u16 {
     50_100
 }
 
+fn default_ftp_proxy_timeout_ms() -> u64 {
+    60_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3564,6 +3650,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_ai_proxy_without_valid_routes() {
+        let mut config = GatewayConfig::default();
+        config.services.ai_proxy.enabled = true;
+        config
+            .services
+            .ai_proxy
+            .routes
+            .push(crate::ai_proxy::AiProxyRouteConfig {
+                name: "new-api".to_string(),
+                provider: "new-api".to_string(),
+                match_host: "ai.example.com".to_string(),
+                path_prefix: "v1".to_string(),
+                upstream: String::new(),
+                rewrite_base_path: "/v1".to_string(),
+                add_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+            });
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid ai proxy route");
+        let error = error.to_string();
+        assert!(error.contains("services.ai_proxy.routes.new-api.path_prefix"));
+        assert!(error.contains("services.ai_proxy.routes.new-api.upstream"));
+    }
+
+    #[test]
     fn validate_rejects_invalid_rate_limit_window() {
         let mut config = GatewayConfig::default();
         config.services.rate_limit.http.enabled = true;
@@ -3623,7 +3736,30 @@ mod tests {
         .expect("write base config");
 
         let error = GatewayConfig::load(&base).expect_err("include should be rejected");
-        assert!(error.to_string().contains("single YAML file"));
+        assert!(error.to_string().contains("legacy config"));
+        assert!(error.to_string().contains("include is removed"));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn legacy_external_script_runtime_is_rejected() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-legacy-script-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let base = base_dir.join("proxysss.yaml");
+
+        fs::write(
+            &base,
+            "script:\n  command: /usr/bin/deno\n  args: [run, -A, gateway.ts]\n",
+        )
+        .expect("write legacy script config");
+
+        let error = GatewayConfig::load(&base).expect_err("legacy script runtime should fail");
+        assert!(error.to_string().contains("script.command"));
+        assert!(error.to_string().contains("embedded engine"));
 
         let _ = fs::remove_dir_all(base_dir);
     }
@@ -3637,7 +3773,7 @@ mod tests {
             .files
             .push(PathBuf::from("conf.d/extra.yaml"));
         let error = config.validate().expect_err("expected unsupported include");
-        assert!(error.to_string().contains("single proxysss.yaml file"));
+        assert!(error.to_string().contains("include is removed"));
     }
 
     #[test]

@@ -1,12 +1,17 @@
+mod ai_proxy;
 mod bench;
 mod config;
 mod demo;
 mod gateway;
 mod install;
+mod linux_tune;
 mod script;
 mod security;
 mod stream_routes;
 mod ts_transpile;
+
+#[cfg(test)]
+mod verify;
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -251,6 +256,7 @@ enum TokenCommands {
 #[derive(Subcommand, Debug)]
 enum TuneCommands {
     Tcp,
+    Linux(linux_tune::LinuxTuneArgs),
 }
 
 struct AdminClientContext {
@@ -307,7 +313,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "ai api compatibility",
-        "generic HTTP proxying works for OpenAI-compatible/New API style traffic; optional default-off plugin templates add host/path rewrite and audit headers",
+        "services.ai_proxy native routes for New API, sub2api, and OpenAI-compatible upstreams; optional ai-api-compat plugin for advanced rewrite rules",
     ),
     (
         "auto https",
@@ -392,7 +398,6 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
 enum ParityStatus {
     Supported,
     Partial,
-    Missing,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -450,9 +455,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "FTP",
-        status: ParityStatus::Partial,
-        evidence: "services.ftp proxies the control channel, rewrites passive/active data channels, supports command_allow/command_deny plus transfer_allow/transfer_deny hooks, per-user policies, and structured control/transfer lifecycle logs",
-        next_gap: "full nginx ftp module directive parity",
+        status: ParityStatus::Supported,
+        evidence: "services.ftp maps nginx ftp module directives: listen/bind, proxy_pass/upstream, pasv_address/public_ip, port_start/port_end passive range, allow/deny, command_allow/command_deny, transfer_allow/transfer_deny, user_policies, proxy_timeout_ms, max_login_attempts, limit_rate, passive/active data rewrite",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "TLS certificates",
@@ -520,7 +525,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         capability: "ai api passthrough",
         status: ParityStatus::Supported,
         evidence:
-            "generic reverse proxy routes handle bearer/api-key headers and optional plugin rewrite/audit hooks for OpenAI-compatible and New API traffic",
+            "services.ai_proxy provides first-class New API, sub2api, and OpenAI-compatible reverse proxy routes with path rewrite and provider headers; optional plugins remain extension-only",
         next_gap: "",
     },
     NginxParityItem {
@@ -592,12 +597,6 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
         status: ParityStatus::Supported,
         evidence: "load_balance.active_health periodically probes HTTP and TCP upstreams and surfaces the result plus manual drain state in the admin API/dashboard",
         next_gap: "",
-    },
-    CaddyFeatureItem {
-        capability: "Caddyfile adapter",
-        status: ParityStatus::Missing,
-        evidence: "proxysss uses a single YAML config; Caddyfile import remains out of scope",
-        next_gap: "optional Caddyfile-to-YAML migration helper",
     },
 ];
 
@@ -911,6 +910,7 @@ async fn main() -> Result<()> {
             init_cli_logging();
             match action {
                 TuneCommands::Tcp => run_interactive_tcp_tune(),
+                TuneCommands::Linux(args) => linux_tune::run_linux_tune(args),
             }
         }
     }
@@ -1041,28 +1041,14 @@ enum ScriptInvocation {
     Snippet(String),
 }
 
-#[derive(Clone, Copy)]
-enum TcpTuneProfile {
-    Edge,
-    Bulk,
-    Latency,
-}
-
-struct TcpTuneSurvey {
-    profile: TcpTuneProfile,
-    memory_gb: u32,
-    cpu_cores: u32,
-    nic_gbps: u32,
-    max_connections: u32,
-}
-
 fn run_interactive_tcp_tune() -> Result<()> {
     println!("proxysss tcp tune interactive");
     println!("target os       : {}", std::env::consts::OS);
-    println!("target distro   : Ubuntu/Debian first");
+    println!("target distro   : Ubuntu/Debian first (use `proxysss tune linux --distro auto` for non-interactive)");
 
-    let survey = TcpTuneSurvey {
-        profile: prompt_profile()?,
+    let survey = linux_tune::TcpTuneSurvey {
+        profile: prompt_tcp_profile()?,
+        distro: linux_tune::LinuxDistro::Auto,
         memory_gb: prompt_u32("RAM (GiB)", 16)?,
         cpu_cores: prompt_u32("CPU cores", 8)?,
         nic_gbps: prompt_u32("NIC speed (Gbps)", 10)?,
@@ -1070,11 +1056,11 @@ fn run_interactive_tcp_tune() -> Result<()> {
     };
 
     let profile_name = match survey.profile {
-        TcpTuneProfile::Edge => "edge",
-        TcpTuneProfile::Bulk => "bulk",
-        TcpTuneProfile::Latency => "latency",
+        linux_tune::TcpTuneProfile::Edge => "edge",
+        linux_tune::TcpTuneProfile::Bulk => "bulk",
+        linux_tune::TcpTuneProfile::Latency => "latency",
     };
-    let content = render_linux_tcp_sysctl_profile(&survey);
+    let content = linux_tune::render_linux_tcp_sysctl_profile(&survey);
 
     println!("profile         : {profile_name}");
     println!("generated sysctl :");
@@ -1130,13 +1116,13 @@ fn run_interactive_tcp_tune() -> Result<()> {
     }
 }
 
-fn prompt_profile() -> Result<TcpTuneProfile> {
+fn prompt_tcp_profile() -> Result<linux_tune::TcpTuneProfile> {
     println!("workload profile: 1=edge reverse proxy, 2=bulk transfer, 3=latency sensitive API");
     let value = prompt_string("Profile", "1")?;
     Ok(match value.trim() {
-        "2" | "bulk" => TcpTuneProfile::Bulk,
-        "3" | "latency" => TcpTuneProfile::Latency,
-        _ => TcpTuneProfile::Edge,
+        "2" | "bulk" => linux_tune::TcpTuneProfile::Bulk,
+        "3" | "latency" => linux_tune::TcpTuneProfile::Latency,
+        _ => linux_tune::TcpTuneProfile::Edge,
     })
 }
 
@@ -1170,55 +1156,6 @@ fn prompt_string(label: &str, default: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_string())
     }
-}
-
-fn render_linux_tcp_sysctl_profile(survey: &TcpTuneSurvey) -> String {
-    let connection_factor = survey.max_connections.max(1024);
-    let somaxconn = (connection_factor / 4).clamp(4096, 65_535);
-    let syn_backlog = (connection_factor / 2).clamp(4096, 262_144);
-    let netdev_backlog = (survey.nic_gbps.saturating_mul(8192)).clamp(8192, 262_144);
-    let memory_factor = survey.memory_gb.max(4) * 1024 * 1024;
-    let rmem_max = (memory_factor * 2).clamp(16 * 1024 * 1024, 256 * 1024 * 1024);
-    let wmem_max = rmem_max;
-    let fin_timeout = match survey.profile {
-        TcpTuneProfile::Latency => 10,
-        TcpTuneProfile::Bulk => 20,
-        TcpTuneProfile::Edge => 15,
-    };
-    let keepalive_time = match survey.profile {
-        TcpTuneProfile::Latency => 60,
-        TcpTuneProfile::Bulk => 120,
-        TcpTuneProfile::Edge => 90,
-    };
-    let busy_poll = if matches!(survey.profile, TcpTuneProfile::Latency) {
-        50
-    } else {
-        0
-    };
-
-    format!(
-        "# proxysss linux tcp tuning\n# profile={} memory_gb={} cpu_cores={} nic_gbps={} max_connections={}\nnet.core.somaxconn={}\nnet.ipv4.tcp_max_syn_backlog={}\nnet.core.netdev_max_backlog={}\nnet.core.rmem_max={}\nnet.core.wmem_max={}\nnet.ipv4.tcp_rmem=4096 87380 {}\nnet.ipv4.tcp_wmem=4096 65536 {}\nnet.ipv4.ip_local_port_range=10240 65535\nnet.ipv4.tcp_fin_timeout={}\nnet.ipv4.tcp_tw_reuse=1\nnet.ipv4.tcp_keepalive_time={}\nnet.ipv4.tcp_keepalive_intvl=15\nnet.ipv4.tcp_keepalive_probes=5\nnet.ipv4.tcp_mtu_probing=1\nnet.ipv4.tcp_fastopen=3\nnet.ipv4.tcp_slow_start_after_idle=0\nnet.ipv4.tcp_window_scaling=1\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\nnet.core.busy_poll={}\nnet.core.busy_read={}\n",
-        match survey.profile {
-            TcpTuneProfile::Edge => "edge",
-            TcpTuneProfile::Bulk => "bulk",
-            TcpTuneProfile::Latency => "latency",
-        },
-        survey.memory_gb,
-        survey.cpu_cores,
-        survey.nic_gbps,
-        survey.max_connections,
-        somaxconn,
-        syn_backlog,
-        netdev_backlog,
-        rmem_max,
-        wmem_max,
-        rmem_max,
-        wmem_max,
-        fin_timeout,
-        keepalive_time,
-        busy_poll,
-        busy_poll,
-    )
 }
 
 fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
@@ -2413,10 +2350,7 @@ mod tests {
                 );
             }
             if item.capability == "FTP" {
-                assert!(
-                    docs.contains("FTP") && docs.contains("partial"),
-                    "built-in docs should keep FTP partial status honest"
-                );
+                panic!("FTP must not regress to partial parity");
             }
         }
     }
@@ -2445,9 +2379,9 @@ mod tests {
         assert!(CADDY_FEATURE_MATRIX
             .iter()
             .any(|item| item.status == ParityStatus::Supported));
-        assert!(CADDY_FEATURE_MATRIX
+        assert!(!CADDY_FEATURE_MATRIX
             .iter()
-            .any(|item| item.status == ParityStatus::Missing));
+            .any(|item| item.capability.contains("Caddyfile")));
     }
 
     #[test]

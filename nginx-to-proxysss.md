@@ -380,6 +380,8 @@ udp:
 
 ## 12. FTP
 
+nginx ftp module 常见指令在 proxysss 中落到 `services.ftp`：`listen`/`bind`、`proxy_pass`/`upstream`、`pasv_address`/`public_ip`、`port_start`/`port_end`、全局与按用户的命令/传输策略、超时、登录和速率控制。
+
 ```yaml
 services:
   ftp:
@@ -387,8 +389,20 @@ services:
     bind: 0.0.0.0:21
     upstream: 127.0.0.1:2121
     native_control: true
+    public_ip: 203.0.113.10
     passive_port_start: 50000
     passive_port_end: 50100
+    proxy_timeout_ms: 66000
+    max_login_attempts: 5
+    limit_rate: 0
+    allow: [198.51.100.0/24]
+    deny: [203.0.113.9]
+    command_deny: [SITE, STAT]
+    transfer_allow: [RETR, STOR]
+    user_policies:
+      - user: readonly
+        transfer_allow: [RETR]
+        transfer_deny: [STOR, DELE]
 ```
 
 ## 13. 错误页 / 404

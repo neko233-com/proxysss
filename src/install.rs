@@ -87,6 +87,16 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
         DEFAULT_PLUGIN_AI_API_COMPAT,
         overwrite,
     )?;
+    write_if_needed(
+        &plugin_dir.join("ai-api-compat.plugin.yaml"),
+        DEFAULT_PLUGIN_AI_API_YAML,
+        overwrite,
+    )?;
+    write_if_needed(
+        &base_dir.join("wildcard-acme.example.yaml"),
+        DEFAULT_WILDCARD_ACME_EXAMPLE,
+        overwrite,
+    )?;
 
     ensure_cert_pair(
         &cert_dir.join("proxysss-cert.pem"),
@@ -796,6 +806,9 @@ const DEFAULT_PLUGIN_TRAFFIC_STATS: &str = include_str!("../templates/plugins/tr
 const DEFAULT_PLUGIN_STRUCTURED_LOG: &str = include_str!("../templates/plugins/structured-log.ts");
 const DEFAULT_PLUGIN_GEO_HEADERS: &str = include_str!("../templates/plugins/geo-headers.ts");
 const DEFAULT_PLUGIN_AI_API_COMPAT: &str = include_str!("../templates/plugins/ai-api-compat.ts");
+const DEFAULT_PLUGIN_AI_API_YAML: &str =
+    include_str!("../templates/plugins/ai-api-compat.plugin.yaml");
+const DEFAULT_WILDCARD_ACME_EXAMPLE: &str = include_str!("../templates/wildcard-acme.example.yaml");
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.1.0 - 2026-06-09
+
+- Reworked the built-in welcome page into a standalone `templates/welcome.html` asset with polished responsive styling and CSS motion, while keeping runtime rendering embedded in the single binary.
+- Added first-class AI reverse proxy configuration for New API, sub2api, and OpenAI-compatible route shapes, including validation and docs/templates.
+- Completed declared FTP nginx module parity coverage for command/transfer policies, per-user policies, passive/active data rewrite, timeouts, login limits, and structured logs.
+- Fixed nginx migration routing parity: configured YAML routes and TypeScript gateway scripts now run before the fallback welcome page, upstream `Host` preserves the external host, and `/` path prefixes match child paths.
+- Hardened static migration behavior by allowing `proxysss://static/...` to serve config-root symlinks safely and by covering root static-site child files with tests.
+- Kept wildcard certificate guidance on the explicit non-default `http.tls.mode: acme_dns_external` + `acme.sh` DNS-01 path.
+
 ## v1.0.0 - 2026-06-09
 
 - **1.0 stable release** — agent-native high-performance gateway with single-YAML config, admin API, and full cross-platform release artifacts.

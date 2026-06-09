@@ -216,7 +216,7 @@
         <h2>Single-binary edge gateway</h2>
         <p>proxysss terminates protocols, matches routes, enforces policy, proxies to upstream pools, and exposes observability — optional TypeScript plugins extend business logic without sitting on every hot-path byte.</p>
         <div class="cards">
-          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, TCP/UDP streams, FTP, WebDAV, static files, cache, compression, rate limits.</p></article>
+          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, TCP/UDP streams, FTP, WebDAV, static files, AI reverse proxy, cache, compression, rate limits.</p></article>
           <article class="card"><strong>Config</strong><p>One YAML file (<code>proxysss.yaml</code>) is the source of truth with hot reload fingerprinting.</p></article>
           <article class="card"><strong>Extensions</strong><p>Embedded QuickJS + in-process TypeScript strip — no Node/Deno/tsc sidecar.</p></article>
         </div>
@@ -247,9 +247,10 @@
       <section class="panel" id="reverse-proxy">
         <div class="eyebrow">HTTP Path</div>
         <h2>Reverse proxy &amp; load balancing</h2>
-        <p>Requests hit plain/TLS/H3 listeners, pass access control and rate limits, then match static sites, WebDAV, domain routes, reverse-proxy routes, or script hooks.</p>
+        <p>Requests hit plain/TLS/H3 listeners, pass access control and rate limits, then match static sites, WebDAV, native AI proxy routes, domain routes, reverse-proxy routes, or script hooks.</p>
         <div class="list">
           <div><strong>Domain-first routing:</strong> <code>services.domain_routes</code> groups host/path upstream pools with per-route compression, cache, and rate limits.</div>
+          <div><strong>AI API routes:</strong> <code>services.ai_proxy</code> handles New API, sub2api, and OpenAI-compatible upstreams with path rewrite and provider metadata before generic HTTP routes.</div>
           <div><strong>Algorithms:</strong> rendezvous (default), round-robin, least-connections, source-hash, weighted — with sticky affinity and active health probes.</div>
           <div><strong>Resilience:</strong> retry policy, passive quarantine, manual upstream drain via admin API, forwarding headers (X-Forwarded-*, Forwarded).</div>
         </div>
@@ -313,11 +314,11 @@
       <section class="panel" id="ftp">
         <div class="eyebrow">Control + data</div>
         <h2>FTP gateway</h2>
-        <p>When <code>services.ftp.native_control=true</code>, proxysss terminates the control channel and rewrites passive (PASV/EPSV) and active (PORT/EPRT) data connections through a local port pool.</p>
+        <p>When <code>services.ftp.native_control=true</code>, proxysss provides nginx ftp module directive-level parity: control-channel proxying, passive (PASV/EPSV) and active (PORT/EPRT) data rewriting, policy hooks, and structured lifecycle logs.</p>
         <div class="list">
           <div><strong>Policy:</strong> <code>command_allow</code> / <code>command_deny</code> plus <code>transfer_allow</code> / <code>transfer_deny</code> and per-user <code>user_policies</code>.</div>
           <div><strong>Observability:</strong> Structured logs for control commands, transfer hooks, and data-channel bridge lifecycle.</div>
-          <div><strong>Public IP:</strong> <code>public_ip</code> advertises the correct address in rewritten PASV replies.</div>
+          <div><strong>Directive mapping:</strong> <code>bind</code>, <code>proxy_pass</code>/<code>upstream</code>, <code>pasv_address</code>/<code>public_ip</code>, passive port range, timeout, login, and rate knobs map into <code>services.ftp</code>.</div>
         </div>
       </section>
 

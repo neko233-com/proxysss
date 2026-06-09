@@ -36,8 +36,9 @@ Current version: v1.0.0
 
 - HTTP/1.1, HTTPS, HTTP/2, HTTP/3, and WebSocket
 - TCP and UDP stream proxying
-- FTP control-channel proxying with passive and active data-channel rewriting
+- FTP nginx module directive-level parity with control-channel proxying, passive and active data-channel rewriting, allow/deny policy, command/transfer hooks, and per-user policies
 - WebDAV and static file serving
+- First-class AI reverse proxy routes for New API, sub2api, and OpenAI-compatible upstreams through `services.ai_proxy`
 - Managed ACME with HTTP-01 and TLS-ALPN-01, plus explicit acme.sh DNS-01 for wildcard certificates
 - Shared cache zones with stale-while-revalidate, compression, access control, fixed-window/token-bucket/leaky-bucket HTTP and stream rate limiting, retries, and active health checks
 - Prometheus metrics on `/metrics`, weighted load balancing, round-robin, least-connections, source-hash, and rendezvous affinity
@@ -149,6 +150,30 @@ services:
         path: /healthz
         failure_threshold: 2
         success_threshold: 2
+```
+
+## Example: AI API reverse proxy
+
+Use `services.ai_proxy` for New API, sub2api, and OpenAI-compatible upstreams when the gateway should own path rewrites and provider metadata without custom business code.
+
+```yaml
+services:
+  ai_proxy:
+    enabled: true
+    header_prefix: proxysss-
+    routes:
+      - name: new-api
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+      - name: sub2api
+        provider: sub2api
+        match_host: sub2api.example.com
+        path_prefix: /
+        upstream: http://127.0.0.1:3001
+        rewrite_base_path: /v1
 ```
 
 In that example:

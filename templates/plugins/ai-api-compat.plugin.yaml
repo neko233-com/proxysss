@@ -1,0 +1,29 @@
+enabled: true
+priority: 220
+config:
+  header_prefix: proxysss-
+  rules:
+    - name: new-api
+      provider: new-api
+      match_host: ai.local
+      path_prefix: /v1
+      rewrite_base_path: /v1
+      upstream: http://127.0.0.1:3000
+      add_headers:
+        proxysss-ai-profile: new-api
+    - name: sub2api
+      provider: sub2api
+      match_host: sub2ai.local
+      path_prefix: /
+      rewrite_base_path: /v1
+      upstream: http://127.0.0.1:3001
+      add_headers:
+        proxysss-ai-profile: sub2api
+    - name: openai-chat
+      provider: openai-compatible
+      match_host: ai.local
+      path_prefix: /v1/chat/completions
+      rewrite_base_path: /v1/chat/completions
+      upstream: https://api.openai.com
+      add_headers:
+        proxysss-ai-profile: openai-chat

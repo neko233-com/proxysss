@@ -1,6 +1,6 @@
 [package]
 name = "proxysss"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "General-purpose Rust gateway built to replace nginx with HTTP, HTTPS, HTTP/2, HTTP/3, TCP, UDP, FTP, WebDAV, and script hooks"
@@ -45,3 +45,7 @@ zstd = "0.13"
 rquickjs = "0.12.0"
 swc_ts_fast_strip = "52.0.0"
 swc_common = { version = "23.0.1", features = ["tty-emitter"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.26"

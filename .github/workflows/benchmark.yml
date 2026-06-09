@@ -1,0 +1,105 @@
+name: benchmark
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NGINX_VERSION: "1.31.0"
+  CADDY_VERSION: "2.11.3"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/benchmark-*.ps1"
+      - "scripts/benchmark-*.sh"
+      - "scripts/benchmark-baseline.json"
+      - ".github/workflows/benchmark.yml"
+
+jobs:
+  throughput-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-bench-ubuntu
+
+      - uses: actions/cache@v4
+        with:
+          path: .benchmark/vendors
+          key: benchmark-vendors-linux-${{ env.NGINX_VERSION }}-${{ env.CADDY_VERSION }}-v1
+
+      - name: Install build deps for nginx
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre3-dev zlib1g-dev libssl-dev python3
+
+      - name: Build proxysss release
+        run: cargo build --locked --release
+
+      - name: Install Python report deps
+        run: pip install pyyaml
+
+      - name: Gateway throughput benchmark
+        env:
+          QUICK: "1"
+        run: |
+          chmod +x scripts/benchmark-gateways.sh scripts/benchmark-gate-check.sh
+          bash scripts/benchmark-gateways.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-results-linux
+          path: |
+            .benchmark/runs/latest/results.json
+            .benchmark/runs/latest/report.md
+            .benchmark/runs/latest/report.html
+            .benchmark/runs/latest/nginx-compare.md
+            .benchmark/runs/latest/nginx-compare.html
+          if-no-files-found: error
+
+  throughput-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-bench-windows
+
+      - uses: actions/cache@v4
+        with:
+          path: .benchmark/vendors
+          key: benchmark-vendors-windows-${{ env.NGINX_VERSION }}-${{ env.CADDY_VERSION }}-v1
+
+      - name: Build proxysss release
+        run: cargo build --locked --release
+
+      - name: Install Python report deps
+        run: pip install pyyaml
+
+      - name: Gateway throughput benchmark
+        shell: pwsh
+        run: ./scripts/benchmark-gateways.ps1 -Quick
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-results-windows
+          path: |
+            .benchmark/runs/latest/results.json
+            .benchmark/runs/latest/report.md
+            .benchmark/runs/latest/report.html
+            .benchmark/runs/latest/nginx-compare.md
+            .benchmark/runs/latest/nginx-compare.html
+          if-no-files-found: error

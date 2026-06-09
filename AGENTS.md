@@ -18,6 +18,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Wildcard ACME certificates are a non-default external path: use `http.tls.mode: acme_dns_external` with `acme.sh`, `http.tls.acme.dns.provider`, and redacted `http.tls.acme.dns.credentials`; ordinary automatic HTTPS remains built-in HTTP-01/TLS-ALPN-01.
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
+- New API, sub2api, and OpenAI-compatible AI reverse proxy routes are first-class `services.ai_proxy` gateway behavior and must stay supported in code, docs, examples, tests, and generated config surfaces.
 - The main YAML config, the main extension script, and auto-loaded plugin scripts must participate in hot reload.
 - Logging must expose access logs (`logs/access.log`), error logs (`logs/error.log`), and level control for `debug`, `info`, `warn`, and `error`; default to `info`, with `debug` reserved for internal diagnostics.
 - Official demo plugins ship with `proxysss init`: `structured-log` (log hook demo), `traffic-stats` (traffic/error counters), and `player-affinity` (affinity routing demo).
@@ -46,6 +47,10 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 | Install / update proxysss | `skills/proxysss-install/SKILL.md` | Bootstrap gateway, verify ports 80 and 7777 |
 | Monitor GitHub Actions | `skills/gh-cli/SKILL.md` | Inspect CI/release runs, logs, reruns, release assets |
 | Edit workflow YAML | `.github/skills/github-actions/SKILL.md` | Fix or extend `.github/workflows/*` locally |
+
+## Local Agent Runtime Files
+
+- `.ssh/` is a local-only operator workspace for test server connection records, migration notes, temporary SSH keys, known hosts, and deployment artifacts. It must stay ignored by git and must not be committed.
 
 ### Mandatory agent rules
 
@@ -102,7 +107,7 @@ proxysss config nginx-parity --format yaml
 
 ## Known nginx Parity Gaps (track honestly)
 
-- FTP: control-channel proxying, passive/active data rewriting, `command_allow`/`command_deny`, `transfer_allow`/`transfer_deny`, per-user `user_policies`, and structured control/transfer lifecycle logs. Remaining gap: full nginx ftp module directive parity.
+- FTP: nginx ftp module directive-level parity is supported through control-channel proxying, passive/active data rewriting, `allow`/`deny`, `command_allow`/`command_deny`, `transfer_allow`/`transfer_deny`, per-user `user_policies`, timeouts, passive port ranges, public passive address rewriting, rate/login knobs, and structured control/transfer lifecycle logs.
 - Compression: supported via `services.response_policy` and route overrides (zstd/brotli/gzip).
 - Proxy cache: Cloudflare-style behaviors (`bypass`, `respect_origin`, `override`, `no_cache`), edge/browser TTL, `CDN-Cache-Control`, `stale_while_revalidate_secs`, `stale_if_error_secs`, PURGE, `vary_headers`, and `key_prefix`.
 - Domain stream proxy: `tcp.stream_routes` for Redis/MySQL/PostgreSQL/MongoDB-style TLS SNI routing with optional per-route access control.

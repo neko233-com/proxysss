@@ -2537,6 +2537,22 @@ impl Gateway {
         config: &crate::config::FtpConfig,
         remote_addr: SocketAddr,
     ) -> Result<()> {
+        let ftp_acl = crate::config::HttpAccessControlConfig {
+            enabled: !config.allow.is_empty() || !config.deny.is_empty(),
+            allow: config.allow.clone(),
+            deny: config.deny.clone(),
+            status: 421,
+        };
+        if crate::security::ip_access_is_denied(&ftp_acl, remote_addr.ip()).is_some() {
+            let (client_read, mut client_write) = inbound.into_split();
+            let _ = client_read;
+            client_write
+                .write_all(b"421 Access denied by gateway policy.\r\n")
+                .await
+                .ok();
+            return Ok(());
+        }
+
         let upstream = TcpStream::connect(&config.upstream)
             .await
             .with_context(|| format!("failed to connect ftp upstream {}", config.upstream))?;
@@ -3090,23 +3106,6 @@ impl Gateway {
             );
         }
 
-        if let Some(route) = builtin_http_route(uri.path()) {
-            let _rate_limit_lease = match self.apply_http_rate_limit(
-                &state.config.services.rate_limit.http,
-                &host,
-                &headers,
-                remote_addr,
-            ) {
-                Ok(lease) => lease,
-                Err(response) => return Ok(response),
-            };
-            return finalize_http_response(
-                &headers,
-                &state.config.services.response_policy.compression,
-                dispatch_internal_http(&state.config, &route),
-            );
-        }
-
         let route = if let Some(route) = configured_http_route(&state.config, &host, &uri) {
             route
         } else if let Some(script) = &state.script {
@@ -3130,6 +3129,14 @@ impl Gateway {
                     .inspect_err(|_| {
                         self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
                     })?,
+                compression: state.config.services.response_policy.compression.clone(),
+                cache: state.config.services.response_policy.cache.clone(),
+                rate_limit: state.config.services.rate_limit.http.clone(),
+            }
+        } else if let Some(route) = builtin_http_route(uri.path()) {
+            HttpRouteConfig {
+                runtime_scope: Some("builtin".to_string()),
+                decision: route,
                 compression: state.config.services.response_policy.compression.clone(),
                 cache: state.config.services.response_policy.cache.clone(),
                 rate_limit: state.config.services.rate_limit.http.clone(),
@@ -5825,6 +5832,10 @@ fn build_upstream_headers(
         headers.insert(name, value);
     }
 
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(host).context("invalid host header")?,
+    );
     apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
 
     Ok(headers)
@@ -7854,8 +7865,40 @@ pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, Str
 }
 
 fn configured_http_route(config: &GatewayConfig, host: &str, uri: &Uri) -> Option<HttpRouteConfig> {
-    configured_domain_route(config, host, uri)
+    configured_ai_proxy_route(config, host, uri)
+        .or_else(|| configured_domain_route(config, host, uri))
         .or_else(|| configured_reverse_proxy_route(config, host, uri))
+}
+
+fn configured_ai_proxy_route(
+    config: &GatewayConfig,
+    host: &str,
+    uri: &Uri,
+) -> Option<HttpRouteConfig> {
+    if !config.services.ai_proxy.enabled {
+        return None;
+    }
+    let route = config
+        .services
+        .ai_proxy
+        .routes
+        .iter()
+        .filter(|route| crate::ai_proxy::route_matches(route, host, uri.path()))
+        .max_by_key(|route| route.path_prefix.len())?;
+    Some(HttpRouteConfig {
+        runtime_scope: Some(format!("ai:{}", route.name)),
+        decision: crate::ai_proxy::build_route_decision(
+            route,
+            uri,
+            &config.services.ai_proxy.header_prefix,
+        ),
+        compression: config.services.response_policy.compression.clone(),
+        cache: ResponseCacheConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        rate_limit: config.services.rate_limit.http.clone(),
+    })
 }
 
 fn configured_domain_route(
@@ -7914,6 +7957,9 @@ fn reverse_proxy_route_matches(route: &ReverseProxyRouteConfig, host: &str, path
 
 fn reverse_proxy_path_matches(prefix: &str, path: &str) -> bool {
     let prefix = normalize_route_prefix(prefix);
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
@@ -8673,6 +8719,9 @@ async fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
 
 fn webdav_path_matches(prefix: &str, path: &str) -> bool {
     let prefix = normalize_webdav_prefix(prefix);
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
@@ -8853,22 +8902,35 @@ fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> Gate
 fn resolve_static_file(root_dir: &Path, relative: &str) -> Result<PathBuf> {
     let decoded = percent_decode_path(relative)?;
     let relative_path = PathBuf::from(decoded.trim_start_matches('/'));
-    if relative_path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
+    let mut components = relative_path.components();
+    let Some(first) = components.next() else {
+        return Err(anyhow!("static path cannot be empty"));
+    };
+    if !matches!(first, std::path::Component::Normal(_))
+        || components
+            .clone()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
-        return Err(anyhow!("static path cannot contain parent directory"));
+        return Err(anyhow!(
+            "static path cannot contain parent directory or absolute prefixes"
+        ));
     }
 
     let root = root_dir
         .canonicalize()
         .unwrap_or_else(|_| root_dir.to_path_buf());
-    let candidate = root.join(relative_path);
+    let base = root.join(first.as_os_str());
+    let canonical_base = base
+        .canonicalize()
+        .with_context(|| format!("failed to resolve static base {}", base.display()))?;
+    let candidate = components.fold(canonical_base.clone(), |path, component| {
+        path.join(component.as_os_str())
+    });
     let canonical = candidate
         .canonicalize()
         .with_context(|| format!("failed to resolve static path {}", candidate.display()))?;
-    if !canonical.starts_with(&root) {
-        return Err(anyhow!("static path escaped config root"));
+    if !canonical.starts_with(&canonical_base) {
+        return Err(anyhow!("static path escaped static base"));
     }
     Ok(canonical)
 }
@@ -8894,489 +8956,11 @@ fn guess_content_type(path: &Path) -> &'static str {
 }
 
 fn render_welcome_html(_config: &GatewayConfig) -> String {
-    let html = r#"<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>proxysss</title>
-    <style>
-        :root {
-            --bg: #07111a;
-            --bg-soft: #0c1823;
-            --panel: rgba(10, 22, 33, 0.92);
-            --panel-strong: rgba(12, 28, 43, 0.96);
-            --line: rgba(139, 202, 255, 0.16);
-            --text: #f2f7fb;
-            --muted: #9ab0c2;
-            --cyan: #56d7ff;
-            --mint: #77f3bf;
-            --gold: #f3d27c;
-            --rose: #ff8f8f;
-        }
-        * { box-sizing: border-box; }
-        html, body {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-        }
-        body {
-            margin: 0;
-            font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
-            color: var(--text);
-            background:
-                radial-gradient(circle at 14% 12%, rgba(86, 215, 255, 0.14), transparent 28%),
-                radial-gradient(circle at 82% 18%, rgba(119, 243, 191, 0.10), transparent 26%),
-                linear-gradient(160deg, var(--bg), var(--bg-soft) 48%, #09131d 100%);
-        }
-        body::before,
-        body::after {
-            content: "";
-            position: fixed;
-            inset: auto;
-            pointer-events: none;
-            border-radius: 999px;
-            filter: blur(18px);
-            opacity: 0.5;
-        }
-        body::before {
-            width: 210px;
-            height: 210px;
-            top: 9%;
-            right: 9%;
-            background: rgba(86, 215, 255, 0.15);
-        }
-        body::after {
-            width: 180px;
-            height: 180px;
-            bottom: 7%;
-            left: 6%;
-            background: rgba(119, 243, 191, 0.11);
-        }
-        .page {
-            position: relative;
-            z-index: 1;
-            width: min(1200px, calc(100vw - 40px));
-            height: min(760px, calc(100vh - 40px));
-            margin: 20px auto;
-            padding: 24px;
-            display: grid;
-            grid-template-columns: minmax(320px, 1.15fr) minmax(320px, 0.95fr);
-            gap: 18px;
-        }
-        .hero,
-        .panel {
-            border: 1px solid var(--line);
-            border-radius: 28px;
-            background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)) , var(--panel);
-            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
-            backdrop-filter: blur(16px);
-        }
-        .hero {
-            padding: 28px;
-            display: grid;
-            grid-template-rows: auto auto 1fr auto;
-            min-height: 0;
-        }
-        .topbar {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 14px;
-        }
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }
-        .logo {
-            width: 76px;
-            height: 76px;
-            border-radius: 24px;
-            position: relative;
-            overflow: hidden;
-            background: linear-gradient(145deg, rgba(86, 215, 255, 0.95), rgba(119, 243, 191, 0.88));
-            box-shadow: 0 18px 44px rgba(86, 215, 255, 0.22);
-        }
-        .logo::before,
-        .logo::after {
-            content: "";
-            position: absolute;
-            inset: 0;
-        }
-        .logo::before {
-            background: linear-gradient(180deg, rgba(255,255,255,0.24), transparent 46%);
-        }
-        .logo::after {
-            width: 38px;
-            height: 38px;
-            inset: 19px auto auto 19px;
-            border-radius: 14px 14px 14px 4px;
-            border: 7px solid #04111a;
-            border-right-width: 10px;
-            transform: skewY(-8deg);
-        }
-        .brand-mark {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        .eyebrow {
-            font-size: 11px;
-            letter-spacing: 0.22em;
-            text-transform: uppercase;
-            color: var(--mint);
-        }
-        .brand-title {
-            font-size: 26px;
-            line-height: 1;
-            font-weight: 800;
-        }
-        .version {
-            color: var(--muted);
-            font-size: 13px;
-        }
-        .docs-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 10px;
-            text-decoration: none;
-            padding: 12px 16px;
-            border-radius: 999px;
-            color: #04111a;
-            font-weight: 800;
-            background: linear-gradient(135deg, var(--cyan), var(--mint));
-            white-space: nowrap;
-        }
-        .hero-main {
-            display: grid;
-            align-content: center;
-            gap: 16px;
-            min-height: 0;
-        }
-        .hero-main h1 {
-            margin: 0;
-            font-size: clamp(42px, 6vw, 78px);
-            line-height: 0.92;
-            letter-spacing: -0.05em;
-        }
-        .hero-main p {
-            margin: 0;
-            max-width: 560px;
-            color: var(--muted);
-            font-size: clamp(15px, 2vw, 18px);
-            line-height: 1.6;
-        }
-        .protocols {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 10px;
-        }
-        .protocol {
-            min-width: 0;
-            border-radius: 18px;
-            padding: 12px 12px 10px;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-        }
-        .protocol strong {
-            display: block;
-            font-size: 13px;
-            line-height: 1.2;
-        }
-        .protocol span {
-            display: block;
-            margin-top: 4px;
-            font-size: 11px;
-            color: var(--muted);
-            line-height: 1.3;
-        }
-        .notes {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-        .note {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 10px 12px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            font-size: 12px;
-            color: var(--muted);
-        }
-        .note i {
-            width: 7px;
-            height: 7px;
-            border-radius: 999px;
-            background: var(--mint);
-            display: inline-block;
-        }
-        .side {
-            display: grid;
-            gap: 18px;
-            min-height: 0;
-        }
-        .panel {
-            padding: 20px 20px 18px;
-            min-height: 0;
-        }
-        .panel h2,
-        .panel h3,
-        .panel p {
-            margin: 0;
-        }
-        .panel-head {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            gap: 12px;
-            margin-bottom: 14px;
-        }
-        .panel-head h2 {
-            font-size: 20px;
-        }
-        .panel-head span {
-            font-size: 12px;
-            color: var(--muted);
-        }
-        .bench-grid {
-            display: grid;
-            gap: 12px;
-        }
-        .bench-card {
-            border-radius: 20px;
-            padding: 14px 14px 12px;
-            background: rgba(255,255,255,0.035);
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-        .bench-card.proxysss {
-            background: linear-gradient(135deg, rgba(86, 215, 255, 0.10), rgba(119, 243, 191, 0.08));
-            border-color: rgba(86, 215, 255, 0.20);
-        }
-        .bench-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            gap: 12px;
-            margin-bottom: 10px;
-        }
-        .bench-top strong {
-            font-size: 16px;
-        }
-        .bench-top span {
-            font-size: 12px;
-            color: var(--muted);
-        }
-        .metric-row {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 10px;
-        }
-        .metric {
-            min-width: 0;
-        }
-        .metric em {
-            display: block;
-            font-style: normal;
-            color: var(--muted);
-            font-size: 11px;
-            margin-bottom: 4px;
-        }
-        .metric strong {
-            display: block;
-            font-size: 15px;
-            line-height: 1.15;
-        }
-        .bench-note {
-            margin-top: 12px;
-            color: var(--muted);
-            font-size: 12px;
-            line-height: 1.45;
-        }
-        .bench-source {
-            margin-top: 12px;
-            color: var(--gold);
-            font-size: 11px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-        @media (max-width: 980px) {
-            .page {
-                width: min(100vw - 24px, 920px);
-                height: min(100vh - 24px, 900px);
-                margin: 12px auto;
-                grid-template-columns: 1fr;
-            }
-            .hero {
-                grid-template-rows: auto auto auto auto;
-            }
-        }
-        @media (max-width: 640px) {
-            .page {
-                width: calc(100vw - 16px);
-                height: calc(100vh - 16px);
-                margin: 8px auto;
-                padding: 10px;
-                gap: 10px;
-            }
-            .hero,
-            .panel {
-                border-radius: 22px;
-            }
-            .hero {
-                padding: 18px;
-                gap: 14px;
-            }
-            .panel {
-                padding: 16px;
-            }
-            .topbar {
-                align-items: flex-start;
-                flex-direction: column;
-            }
-            .logo {
-                width: 62px;
-                height: 62px;
-                border-radius: 20px;
-            }
-            .logo::after {
-                width: 31px;
-                height: 31px;
-                inset: 15px auto auto 15px;
-                border-width: 6px;
-                border-right-width: 8px;
-            }
-            .brand-title {
-                font-size: 22px;
-            }
-            .hero-main h1 {
-                font-size: 34px;
-            }
-            .hero-main p {
-                font-size: 14px;
-            }
-            .protocols,
-            .metric-row {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }
-            .protocol {
-                padding: 10px;
-            }
-            .bench-card {
-                padding: 12px;
-            }
-            .bench-top {
-                margin-bottom: 8px;
-            }
-            .bench-top strong {
-                font-size: 15px;
-            }
-            .metric strong {
-                font-size: 14px;
-            }
-        }
-    </style>
-</head>
-<body>
-    <main class="page">
-        <section class="hero">
-            <div class="topbar">
-                <div class="brand">
-                    <div class="logo" aria-hidden="true"></div>
-                    <div class="brand-mark">
-                        <div class="eyebrow">General Gateway</div>
-                        <div class="brand-title">proxysss</div>
-                        <div class="version">v__VERSION__</div>
-                    </div>
-                </div>
-                <a class="docs-btn" href="/docs.html">Docs</a>
-            </div>
-            <div class="hero-main">
-                <h1>proxysss</h1>
-                <p>通用网关与反向代理。YAML 负责主配置面，TypeScript 作为可选扩展脚本层。</p>
-            </div>
-            <div class="protocols" aria-label="supported protocols">
-                <div class="protocol"><strong>HTTP/1.1</strong><span>Reverse proxy and static delivery</span></div>
-                <div class="protocol"><strong>HTTP/2</strong><span>TLS termination and upstream proxying</span></div>
-                <div class="protocol"><strong>HTTP/3</strong><span>QUIC listener on the public edge</span></div>
-                <div class="protocol"><strong>WebSocket</strong><span>ws and wss upgrade tunneling</span></div>
-                <div class="protocol"><strong>TCP</strong><span>Declarative stream listener routing</span></div>
-                <div class="protocol"><strong>UDP</strong><span>YAML upstream and upstream pool support</span></div>
-                <div class="protocol"><strong>FTP</strong><span>Control-channel proxy with passive data-channel bridging</span></div>
-                <div class="protocol"><strong>WebDAV</strong><span>Built-in file methods in Rust hot path</span></div>
-            </div>
-            <div class="notes">
-                <div class="note"><i></i><span>Default public ports: 80 / 443</span></div>
-                <div class="note"><i></i><span>Config-first runtime model</span></div>
-                <div class="note"><i></i><span>Bundled script engine delivery</span></div>
-            </div>
-        </section>
-        <section class="side">
-            <article class="panel">
-                <div class="panel-head">
-                    <h2>Supported Protocols</h2>
-                    <span>Edge and stream</span>
-                </div>
-                <div class="protocols">
-                    <div class="protocol"><strong>HTTPS</strong><span>Self-signed, manual, or auto HTTPS</span></div>
-                    <div class="protocol"><strong>WSS</strong><span>Secure upgrade with upstream tunneling</span></div>
-                    <div class="protocol"><strong>TLS</strong><span>Gateway termination and certificate control</span></div>
-                    <div class="protocol"><strong>Static</strong><span>Built-in site serving and autoindex</span></div>
-                </div>
-            </article>
-            <article class="panel">
-                <div class="panel-head">
-                    <h2>Operational Snapshot</h2>
-                    <span>Single-binary edge gateway</span>
-                </div>
-                <div class="bench-grid">
-                    <section class="bench-card proxysss">
-                        <div class="bench-top">
-                            <strong>Single YAML config</strong>
-                            <span>Default file: proxysss.yaml</span>
-                        </div>
-                        <div class="metric-row">
-                            <div class="metric"><em>ports</em><strong>80 / 443 / 7777</strong></div>
-                            <div class="metric"><em>config path flags</em><strong>-config / --config / -c</strong></div>
-                        </div>
-                    </section>
-                    <section class="bench-card">
-                        <div class="bench-top">
-                            <strong>Domain service groups</strong>
-                            <span>One YAML, many domains</span>
-                        </div>
-                        <div class="metric-row">
-                            <div class="metric"><em>grouping</em><strong>services.domain_routes</strong></div>
-                            <div class="metric"><em>pooling</em><strong>per-domain upstream pools</strong></div>
-                        </div>
-                    </section>
-                    <section class="bench-card">
-                        <div class="bench-top">
-                            <strong>Reload surface</strong>
-                            <span>Main config plus scripts</span>
-                        </div>
-                        <div class="metric-row">
-                            <div class="metric"><em>hot reload</em><strong>config + scripts + plugins</strong></div>
-                            <div class="metric"><em>format</em><strong>YAML only</strong></div>
-                        </div>
-                    </section>
-                </div>
-                <p class="bench-note">proxysss is documented as a standalone gateway surface. Public docs emphasize direct capabilities and operational shape instead of positioning around another product's configuration model.</p>
-                <div class="bench-source">Built-in gateway overview</div>
-            </article>
-        </section>
-    </main>
-</body>
-</html>"#;
-
-    html.replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+    include_str!("../templates/welcome.html").replace("__VERSION__", env!("CARGO_PKG_VERSION"))
 }
-
 pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
     let reverse_proxy = docs_template_reverse_proxy();
+    let ai_proxy = docs_template_ai_proxy();
     let static_site = docs_template_static_site();
     let webdav = docs_template_webdav();
     let streams = docs_template_streams();
@@ -9495,6 +9079,8 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Configuration Templates</h2>
                 <h3>HTTP Reverse Proxy</h3>
                 <pre>{}</pre>
+                <h3>AI API Reverse Proxy</h3>
+                <pre>{}</pre>
                 <h3>Static Site</h3>
                 <pre>{}</pre>
                 <h3>WebDAV</h3>
@@ -9521,11 +9107,12 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                     <thead><tr><th>Surface</th><th>Status</th><th>Notes</th></tr></thead>
                     <tbody>
                         <tr><td>HTTP reverse proxy</td><td><span class="pill good">supported</span></td><td>host/path matching, upstream pools, strip prefix, header set/strip, retry, health, maintenance drain</td></tr>
+                        <tr><td>AI API reverse proxy</td><td><span class="pill good">supported</span></td><td>native New API, sub2api, and OpenAI-compatible routes through services.ai_proxy</td></tr>
                         <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME, acme.sh DNS-01 wildcard certificates, WebSocket, automatic redirect for managed domains</td></tr>
                         <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
                         <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
                         <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
-                        <tr><td>FTP</td><td><span class="pill warn">partial</span></td><td>control channel proxy, passive/active data rewriting, command allow/deny policy, structured command/data lifecycle logs</td></tr>
+                        <tr><td>FTP</td><td><span class="pill good">supported</span></td><td>nginx ftp module directive parity: bind/proxy_pass, passive range, pasv_address, allow/deny, command and transfer policies, per-user rules, lifecycle logs</td></tr>
                     </tbody>
                 </table>
             </section>
@@ -9535,9 +9122,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Still Honest About What Remains</h2>
                 <div class="list">
                     <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
-                    <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
                     <div><strong>Auto HTTPS boundary:</strong> wildcard DNS-01 stays on the explicit <code>acme_dns_external</code> + <code>acme.sh</code> path; built-in managed ACME covers HTTP-01/TLS-ALPN-01 only.</div>
-                    <div><strong>FTP policy:</strong> transfer_allow/transfer_deny hooks, per-user user_policies, and structured transfer logging.</div>
                 </div>
             </section>
         </section>
@@ -9545,6 +9130,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
 </body>
 </html>"##,
         reverse_proxy,
+        ai_proxy,
         static_site,
         webdav,
         streams,
@@ -9560,6 +9146,10 @@ fn docs_template_reverse_proxy() -> &'static str {
     "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  access_control:\n    http:\n      enabled: true\n      blacklist: [203.0.113.10, 198.51.100.0/24]\n  domain_routes:\n    - name: example-site\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n    - name: neko233-store\n      domains: [neko233.store]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9001\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 120\n        window_ms: 60000\n        burst: 30\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
 }
 
+fn docs_template_ai_proxy() -> &'static str {
+    "services:\n  ai_proxy:\n    enabled: true\n    header_prefix: proxysss-\n    routes:\n      - name: new-api\n        provider: new-api\n        match_host: ai.example.com\n        path_prefix: /v1\n        upstream: http://127.0.0.1:3000\n        rewrite_base_path: /v1\n      - name: sub2api\n        provider: sub2api\n        match_host: sub2api.example.com\n        path_prefix: /\n        upstream: http://127.0.0.1:3001\n        rewrite_base_path: /v1\n"
+}
+
 fn docs_template_static_site() -> &'static str {
     "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
 }
@@ -9573,7 +9163,7 @@ fn docs_template_streams() -> &'static str {
 }
 
 fn docs_template_ftp() -> &'static str {
-    "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n    log_commands: true\n    command_deny: [SITE, STAT]\n"
+    "services:\n  ftp:\n    enabled: true\n    bind: 0.0.0.0:21\n    upstream: 127.0.0.1:2121\n    native_control: true\n    public_ip: 203.0.113.10\n    passive_port_start: 50000\n    passive_port_end: 50100\n    log_commands: true\n    log_transfers: true\n    allow: [198.51.100.0/24]\n    deny: [203.0.113.9]\n    command_deny: [SITE, STAT]\n    transfer_allow: [RETR, STOR]\n    user_policies:\n      - user: readonly\n        transfer_allow: [RETR]\n        transfer_deny: [STOR, DELE]\n"
 }
 
 fn docs_template_acme_dns() -> &'static str {
@@ -10402,7 +9992,12 @@ fn build_websocket_upstream_headers(
         headers.insert(name, value);
     }
 
-    headers.insert(HOST, HeaderValue::from_str(upstream_host)?);
+    let host = if original_host.trim().is_empty() {
+        upstream_host
+    } else {
+        original_host
+    };
+    headers.insert(HOST, HeaderValue::from_str(host)?);
     apply_forwarding_headers(&mut headers, original_host, remote_addr, scheme)?;
 
     Ok(headers)
@@ -11428,6 +11023,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_site_root_prefix_serves_child_files() {
+        let root = std::env::temp_dir().join(format!(
+            "proxysss-static-root-prefix-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create static root");
+        tokio::fs::write(root.join("test.txt"), b"hello")
+            .await
+            .expect("write file");
+
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/".to_string(),
+            root: root.clone(),
+            index_files: vec!["index.html".to_string()],
+            autoindex: true,
+        };
+        let uri: Uri = "/test.txt".parse().expect("valid uri");
+        let response = dispatch_static_site(&site, &Method::GET, &uri)
+            .await
+            .expect("static response");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"hello"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn static_site_autoindex_lists_directory() {
         let root =
             std::env::temp_dir().join(format!("proxysss-static-autoindex-test-{}", Uuid::new_v4()));
@@ -11534,10 +11160,11 @@ mod tests {
     fn welcome_page_stays_brand_focused() {
         let config = GatewayConfig::default();
         let html = render_welcome_html(&config);
-        assert!(html.contains("<h1>proxysss</h1>"));
-        assert!(html.contains("Supported Protocols"));
-        assert!(html.contains("Operational Snapshot"));
-        assert!(html.contains("Single YAML config"));
+        assert!(html.contains("Welcome to proxysss"));
+        assert!(html.contains("<h1>Gateway ready.</h1>"));
+        assert!(html.contains("animation:"));
+        assert!(html.contains("@keyframes"));
+        assert!(!html.contains("<script"));
         assert!(html.contains("/docs.html"));
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));
