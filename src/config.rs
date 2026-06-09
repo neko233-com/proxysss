@@ -150,11 +150,28 @@ pub struct HttpErrorPageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnDemandTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional glob patterns (e.g. `*.example.com`) that may receive first-hit certificates.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default = "default_on_demand_max_certs")]
+    pub max_active_certs: usize,
+    #[serde(default = "default_on_demand_rate_per_hour")]
+    pub max_issues_per_hour: u32,
+    #[serde(default)]
+    pub ask_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
     #[serde(default)]
     pub auto_https: AutoHttpsConfig,
+    #[serde(default)]
+    pub on_demand: OnDemandTlsConfig,
     #[serde(default)]
     pub certificates: Vec<TlsCertificateConfig>,
     #[serde(default = "default_cert_path")]
@@ -250,6 +267,51 @@ pub enum AcmeChallengeType {
 pub struct TcpConfig {
     #[serde(default = "default_tcp_listeners")]
     pub listeners: Vec<TcpListenerConfig>,
+    #[serde(default)]
+    pub stream_routes: Vec<StreamRouteConfig>,
+}
+
+/// Domain-aware TCP/TLS stream proxy routes (Redis, MySQL, PostgreSQL, MongoDB, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamRouteConfig {
+    pub name: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    pub listen: String,
+    pub upstream: String,
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub upstream_weights: BTreeMap<String, u32>,
+    /// Observability hint: redis, mysql, postgres, mongodb, etc.
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub tls_mode: StreamTlsMode,
+    #[serde(default)]
+    pub access_control: StreamAccessControlConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTlsMode {
+    /// Peek TLS ClientHello for SNI when present; otherwise use the route upstream.
+    #[default]
+    Auto,
+    /// Always relay TLS without termination (ssl_preread style routing).
+    Passthrough,
+    /// Terminate TLS on the gateway edge (uses http.tls material for the matched domain).
+    Terminate,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamAccessControlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, alias = "allowlist", alias = "whitelist")]
+    pub allow: Vec<String>,
+    #[serde(default, alias = "denylist", alias = "blacklist", alias = "blocklist")]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +538,28 @@ pub struct AdminConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdosProtectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ddos_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_ddos_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_ddos_ban_secs")]
+    pub ban_secs: u64,
+    #[serde(default)]
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicBlacklistConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dynamic_blacklist_path")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default = "default_true")]
     pub validate_admin_mutations: bool,
@@ -487,6 +571,13 @@ pub struct SecurityConfig {
     pub blocked_upstream_hosts: Vec<String>,
     #[serde(default = "default_blocked_upstream_cidrs")]
     pub blocked_upstream_cidrs: Vec<String>,
+    #[serde(default)]
+    pub ddos: DdosProtectionConfig,
+    /// MAC deny list (Linux L2 only; ignored on Windows/macOS).
+    #[serde(default)]
+    pub mac_deny: Vec<String>,
+    #[serde(default)]
+    pub dynamic_blacklist: DynamicBlacklistConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -607,6 +698,8 @@ pub struct StreamRateLimitConfig {
 pub struct AccessControlConfig {
     #[serde(default)]
     pub http: HttpAccessControlConfig,
+    #[serde(default)]
+    pub stream: StreamAccessControlConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,10 +847,26 @@ pub enum CompressionAlgorithm {
     Gzip,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheBehavior {
+    /// Honor origin Cache-Control for storage; use configured edge TTL when storing.
+    #[default]
+    RespectOrigin,
+    /// Skip cache lookup and storage entirely.
+    Bypass,
+    /// Always fetch upstream; may still emit no-cache response headers.
+    NoCache,
+    /// Force edge TTL from config; ignore origin max-age for storage decisions.
+    Override,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCacheConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub behavior: CacheBehavior,
     #[serde(default = "default_cache_zone")]
     pub zone: String,
     #[serde(default)]
@@ -766,8 +875,15 @@ pub struct ResponseCacheConfig {
     pub vary_headers: Vec<String>,
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
+    /// Browser/client max-age override (0 = pass through origin Cache-Control).
+    #[serde(default)]
+    pub browser_ttl_secs: u64,
     #[serde(default)]
     pub stale_while_revalidate_secs: u64,
+    #[serde(default)]
+    pub stale_if_error_secs: u64,
+    #[serde(default)]
+    pub emit_cdn_cache_control: bool,
     #[serde(default = "default_cache_statuses")]
     pub statuses: Vec<u16>,
     #[serde(default = "default_cache_max_body_bytes")]
@@ -856,8 +972,29 @@ pub struct FtpConfig {
     pub command_allow: Vec<String>,
     #[serde(default)]
     pub command_deny: Vec<String>,
+    #[serde(default)]
+    pub transfer_allow: Vec<String>,
+    #[serde(default)]
+    pub transfer_deny: Vec<String>,
+    #[serde(default)]
+    pub user_policies: Vec<FtpUserPolicy>,
     #[serde(default = "default_true")]
     pub log_commands: bool,
+    #[serde(default = "default_true")]
+    pub log_transfers: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtpUserPolicy {
+    pub user: String,
+    #[serde(default)]
+    pub command_allow: Vec<String>,
+    #[serde(default)]
+    pub command_deny: Vec<String>,
+    #[serde(default)]
+    pub transfer_allow: Vec<String>,
+    #[serde(default)]
+    pub transfer_deny: Vec<String>,
 }
 
 impl GatewayConfig {
@@ -1349,6 +1486,42 @@ impl GatewayConfig {
             errors.push("affinity.stream.peek_timeout_ms must be greater than 0".to_string());
         }
 
+        let mut stream_route_names = HashSet::<String>::new();
+        for route in &self.tcp.stream_routes {
+            if route.name.trim().is_empty() {
+                errors.push("tcp.stream_routes[].name cannot be empty".to_string());
+            }
+            if !stream_route_names.insert(route.name.clone()) {
+                errors.push(format!("duplicate tcp.stream_routes name {}", route.name));
+            }
+            if route.listen.trim().is_empty() {
+                errors.push(format!(
+                    "tcp.stream_routes.{}.listen cannot be empty",
+                    route.name
+                ));
+            }
+            if route.upstream.trim().is_empty() {
+                errors.push(format!(
+                    "tcp.stream_routes.{}.upstream cannot be empty",
+                    route.name
+                ));
+            }
+            validate_bind_required(
+                &format!("tcp.stream_routes.{}.listen", route.name),
+                &normalize_stream_listen(&route.listen),
+                &mut errors,
+            );
+        }
+
+        if self.http.tls.on_demand.enabled && self.http.tls.mode != TlsMode::AcmeManaged {
+            errors
+                .push("http.tls.on_demand.enabled requires http.tls.mode=acme_managed".to_string());
+        }
+
+        if self.security.ddos.enabled && self.security.ddos.max_connections == 0 {
+            errors.push("security.ddos.max_connections must be greater than 0".to_string());
+        }
+
         let mut tcp_names = HashSet::<String>::new();
         let mut tcp_binds = HashSet::<String>::new();
         for listener in &self.tcp.listeners {
@@ -1830,11 +2003,24 @@ impl Default for HttpErrorPageConfig {
     }
 }
 
+impl Default for OnDemandTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow: Vec::new(),
+            max_active_certs: default_on_demand_max_certs(),
+            max_issues_per_hour: default_on_demand_rate_per_hour(),
+            ask_url: String::new(),
+        }
+    }
+}
+
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             mode: TlsMode::default(),
             auto_https: AutoHttpsConfig::default(),
+            on_demand: OnDemandTlsConfig::default(),
             certificates: Vec::new(),
             cert_path: default_cert_path(),
             key_path: default_key_path(),
@@ -2016,6 +2202,9 @@ impl Default for SecurityConfig {
             reject_ambiguous_http1: default_true(),
             blocked_upstream_hosts: default_blocked_upstream_hosts(),
             blocked_upstream_cidrs: default_blocked_upstream_cidrs(),
+            ddos: DdosProtectionConfig::default(),
+            mac_deny: Vec::new(),
+            dynamic_blacklist: DynamicBlacklistConfig::default(),
         }
     }
 }
@@ -2138,14 +2327,39 @@ impl Default for ResponseCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            behavior: CacheBehavior::default(),
             zone: default_cache_zone(),
             key_prefix: String::new(),
             vary_headers: Vec::new(),
             ttl_secs: default_cache_ttl_secs(),
+            browser_ttl_secs: 0,
             stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
+            emit_cdn_cache_control: false,
             statuses: default_cache_statuses(),
             max_body_bytes: default_cache_max_body_bytes(),
             allow_purge: default_true(),
+        }
+    }
+}
+
+impl Default for DdosProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: default_ddos_max_connections(),
+            window_secs: default_ddos_window_secs(),
+            ban_secs: default_ddos_ban_secs(),
+            burst: 0,
+        }
+    }
+}
+
+impl Default for DynamicBlacklistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_dynamic_blacklist_path(),
         }
     }
 }
@@ -2235,7 +2449,11 @@ impl Default for FtpConfig {
             passive_hint: default_true(),
             command_allow: Vec::new(),
             command_deny: Vec::new(),
+            transfer_allow: Vec::new(),
+            transfer_deny: Vec::new(),
+            user_policies: Vec::new(),
             log_commands: default_true(),
+            log_transfers: default_true(),
         }
     }
 }
@@ -2422,6 +2640,30 @@ fn default_acme_cache_dir() -> PathBuf {
 
 fn default_acme_renew_hours() -> u64 {
     12
+}
+
+fn default_on_demand_max_certs() -> usize {
+    100
+}
+
+fn default_on_demand_rate_per_hour() -> u32 {
+    30
+}
+
+fn default_ddos_max_connections() -> u32 {
+    50
+}
+
+fn default_ddos_window_secs() -> u64 {
+    10
+}
+
+fn default_ddos_ban_secs() -> u64 {
+    300
+}
+
+fn default_dynamic_blacklist_path() -> PathBuf {
+    PathBuf::from("runtime/dynamic-blacklist.json")
 }
 
 fn default_tcp_listeners() -> Vec<TcpListenerConfig> {
@@ -2664,6 +2906,47 @@ fn default_compression_types() -> Vec<String> {
         "application/xml".to_string(),
         "image/svg+xml".to_string(),
     ]
+}
+
+/// Normalize `6379` → `0.0.0.0:6379` for stream route listen values.
+pub fn normalize_stream_listen(listen: &str) -> String {
+    let trimmed = listen.trim();
+    if trimmed.contains(':') {
+        trimmed.to_string()
+    } else if let Ok(port) = trimmed.parse::<u16>() {
+        format!("0.0.0.0:{port}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Glob-style domain match (`*.example.com`, exact hostnames).
+pub fn domain_matches_pattern(domain: &str, pattern: &str) -> bool {
+    let domain = domain.trim().to_ascii_lowercase();
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == domain {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return domain.ends_with(suffix) && domain.len() > suffix.len();
+    }
+    false
+}
+
+pub fn on_demand_domain_allowed(config: &OnDemandTlsConfig, domain: &str) -> bool {
+    if !config.enabled {
+        return false;
+    }
+    if config.allow.is_empty() {
+        return false;
+    }
+    config
+        .allow
+        .iter()
+        .any(|pattern| domain_matches_pattern(domain, pattern))
 }
 
 fn default_cache_ttl_secs() -> u64 {
@@ -3435,5 +3718,28 @@ mod tests {
             .validate()
             .expect_err("expected invalid monitoring path");
         assert!(error.to_string().contains("monitoring.path"));
+    }
+
+    #[test]
+    fn on_demand_tls_requires_acme_managed_mode() {
+        let mut config = GatewayConfig::default();
+        config.http.tls.on_demand.enabled = true;
+        let error = config
+            .validate()
+            .expect_err("expected on-demand tls validation error");
+        assert!(error
+            .to_string()
+            .contains("http.tls.on_demand.enabled requires http.tls.mode=acme_managed"));
+    }
+
+    #[test]
+    fn domain_pattern_matching_supports_wildcards() {
+        assert!(domain_matches_pattern("api.example.com", "*.example.com"));
+        assert!(!domain_matches_pattern("example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn normalize_stream_listen_expands_port_only_values() {
+        assert_eq!(normalize_stream_listen("6379"), "0.0.0.0:6379");
     }
 }

@@ -57,9 +57,41 @@ Ambiguous HTTP/1 requests with both `Content-Length` and `Transfer-Encoding` are
 
 Failed basic/bearer auth attempts per client IP are counted. After `max_failures` inside `window_secs`, the client receives `429` until `lockout_secs` elapses.
 
+### IP allow/deny and stream access control
+
+HTTP clients are filtered by `services.access_control.http` (aliases: `whitelist`/`blacklist`). TCP/stream listeners honor `services.access_control.stream` globally and per `tcp.stream_routes[].access_control`.
+
+### DDoS mitigation
+
+```yaml
+security:
+  ddos:
+    enabled: true
+    max_connections: 50
+    window_secs: 10
+    ban_secs: 300
+    burst: 20
+  dynamic_blacklist:
+    enabled: true
+    path: runtime/dynamic-blacklist.json
+```
+
+When a client exceeds `max_connections + burst` inside `window_secs`, proxysss temporarily bans the IP for `ban_secs`. Metrics: `proxysss_blocked_requests_total`, `proxysss_ddos_bans_total`.
+
+Agent API (requires `admin.enable_write_ops`):
+
+- `GET /v1/security/blacklist`
+- `POST /v1/security/blacklist/add` — body `{"ip":"203.0.113.5","ban_secs":3600}`
+- `POST /v1/security/blacklist/remove` — body `{"ip":"203.0.113.5"}`
+
+### MAC deny list
+
+`security.mac_deny` is documented for Linux L2 deployments. MAC-based blocking is **not enforced on Windows** (no reliable L2 hook in userspace).
+
 ### TLS
 
 - Use `http.tls.mode: acme_managed` for public sites (HTTP-01 / TLS-ALPN-01).
+- Use `http.tls.on_demand` for first-hit managed ACME with `allow` glob patterns and optional `ask_url` gate.
 - Use `http.tls.mode: acme_dns_external` with `acme.sh` for wildcard certificates.
 - Avoid `self_signed` on the public internet.
 

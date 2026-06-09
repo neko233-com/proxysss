@@ -9,8 +9,9 @@ use http::{HeaderValue, StatusCode, Uri};
 use url::Url;
 
 use crate::config::{
-    AdminAuthRateLimitConfig, DomainRouteConfig, KubernetesConfig, ReverseProxyRouteConfig,
-    SecurityConfig, TcpListenerConfig, UdpListenerConfig,
+    AdminAuthRateLimitConfig, DdosProtectionConfig, DomainRouteConfig, DynamicBlacklistConfig,
+    HttpAccessControlConfig, KubernetesConfig, ReverseProxyRouteConfig, SecurityConfig,
+    StreamAccessControlConfig, TcpListenerConfig, UdpListenerConfig,
 };
 
 #[derive(Clone)]
@@ -363,6 +364,223 @@ fn ip_matches_cidr(ip: IpAddr, cidr: &str) -> bool {
     }
 }
 
+#[derive(Clone)]
+struct DdosWindowState {
+    count: u32,
+    window_start: Instant,
+    banned_until: Option<Instant>,
+}
+
+#[derive(Clone, Default)]
+pub struct DdosGuard {
+    windows: std::sync::Arc<DashMap<String, DdosWindowState>>,
+}
+
+impl DdosGuard {
+    pub fn check_and_record(&self, ip: IpAddr, config: &DdosProtectionConfig) -> Option<u64> {
+        if !config.enabled {
+            return None;
+        }
+        let key = ip.to_string();
+        let now = Instant::now();
+        let window = Duration::from_secs(config.window_secs.max(1));
+        let ban = Duration::from_secs(config.ban_secs.max(1));
+        let limit = config.max_connections.saturating_add(config.burst);
+
+        let mut entry = self.windows.entry(key).or_insert(DdosWindowState {
+            count: 0,
+            window_start: now,
+            banned_until: None,
+        });
+
+        if entry.banned_until.is_some_and(|until| until > now) {
+            return Some(
+                entry
+                    .banned_until
+                    .unwrap()
+                    .duration_since(now)
+                    .as_secs()
+                    .max(1),
+            );
+        }
+
+        if now.duration_since(entry.window_start) >= window {
+            entry.window_start = now;
+            entry.count = 0;
+            entry.banned_until = None;
+        }
+
+        entry.count = entry.count.saturating_add(1);
+        if entry.count > limit {
+            entry.banned_until = Some(now + ban);
+            return Some(ban.as_secs().max(1));
+        }
+
+        None
+    }
+
+    pub fn ban_ip(&self, ip: IpAddr, ban_secs: u64) {
+        let now = Instant::now();
+        let ban = Duration::from_secs(ban_secs.max(1));
+        self.windows.insert(
+            ip.to_string(),
+            DdosWindowState {
+                count: 0,
+                window_start: now,
+                banned_until: Some(now + ban),
+            },
+        );
+    }
+
+    pub fn unban_ip(&self, ip: IpAddr) {
+        self.windows.remove(&ip.to_string());
+    }
+
+}
+
+#[derive(Clone, Default)]
+pub struct DynamicBlacklist {
+    entries: std::sync::Arc<DashMap<String, Instant>>,
+}
+
+impl DynamicBlacklist {
+    pub fn load_from_disk(config: &DynamicBlacklistConfig) -> Self {
+        let blacklist = Self::default();
+        if !config.enabled {
+            return blacklist;
+        }
+        if let Ok(bytes) = std::fs::read(&config.path) {
+            if let Ok(items) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                let ban = Duration::from_secs(3600);
+                let until = Instant::now() + ban;
+                for item in items {
+                    blacklist.entries.insert(item, until);
+                }
+            }
+        }
+        blacklist
+    }
+
+    pub fn persist(&self, config: &DynamicBlacklistConfig) -> Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+        if let Some(parent) = config.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let now = Instant::now();
+        let active = self
+            .entries
+            .iter()
+            .filter(|entry| entry.value() > &now)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &config.path,
+            serde_json::to_vec_pretty(&active).context("failed to serialize blacklist")?,
+        )
+        .with_context(|| format!("failed to write {}", config.path.display()))?;
+        Ok(())
+    }
+
+    pub fn add(&self, ip: IpAddr, ban_secs: u64) {
+        let until = Instant::now() + Duration::from_secs(ban_secs.max(1));
+        self.entries.insert(ip.to_string(), until);
+    }
+
+    pub fn remove(&self, ip: IpAddr) {
+        self.entries.remove(&ip.to_string());
+    }
+
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
+        let Some(until) = self.entries.get(&ip.to_string()) else {
+            return false;
+        };
+        if *until <= Instant::now() {
+            drop(until);
+            self.entries.remove(&ip.to_string());
+            return false;
+        }
+        true
+    }
+
+    pub fn list_active(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(|entry| *entry.value() > now)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+}
+
+pub fn ip_access_is_denied(config: &HttpAccessControlConfig, ip: IpAddr) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+    access_list_denies(ip, &config.allow, &config.deny)
+}
+
+pub fn stream_access_is_denied(config: &StreamAccessControlConfig, ip: IpAddr) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+    access_list_denies(ip, &config.allow, &config.deny)
+}
+
+fn access_list_denies(ip: IpAddr, allow: &[String], deny: &[String]) -> Option<String> {
+    if !allow.is_empty() && !allow.iter().any(|entry| ip_matches_rule(ip, entry)) {
+        return Some(ip.to_string());
+    }
+    if deny.iter().any(|entry| ip_matches_rule(ip, entry)) {
+        return Some(ip.to_string());
+    }
+    None
+}
+
+pub fn ip_matches_rule(ip: IpAddr, rule: &str) -> bool {
+    let Some((base, prefix)) = parse_ip_rule(rule) else {
+        return false;
+    };
+    match (ip, base) {
+        (IpAddr::V4(ip), IpAddr::V4(base)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            let ip_bits = u32::from_be_bytes(ip.octets());
+            let base_bits = u32::from_be_bytes(base.octets());
+            (ip_bits & mask) == (base_bits & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(base)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u128::from(prefix))
+            };
+            let ip_bits = u128::from_be_bytes(ip.octets());
+            let base_bits = u128::from_be_bytes(base.octets());
+            (ip_bits & mask) == (base_bits & mask)
+        }
+        _ => false,
+    }
+}
+
+fn parse_ip_rule(rule: &str) -> Option<(IpAddr, u8)> {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((network, prefix)) = trimmed.split_once('/') {
+        let base = network.parse::<IpAddr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        return Some((base, prefix));
+    }
+    trimmed.parse::<IpAddr>().ok().map(|ip| (ip, 128))
+}
+
 pub fn apply_kubernetes_routes(
     config: &mut KubernetesConfig,
     domain_routes: &mut Vec<DomainRouteConfig>,
@@ -512,6 +730,34 @@ mod tests {
             reject_ambiguous_http1_request(&headers, &security),
             Some(StatusCode::BAD_REQUEST)
         );
+    }
+
+    #[test]
+    fn ddos_guard_bans_after_threshold() {
+        let guard = DdosGuard::default();
+        let config = DdosProtectionConfig {
+            enabled: true,
+            max_connections: 2,
+            window_secs: 60,
+            ban_secs: 120,
+            burst: 0,
+        };
+        let ip = "203.0.113.5".parse().expect("ip");
+        assert!(guard.check_and_record(ip, &config).is_none());
+        assert!(guard.check_and_record(ip, &config).is_none());
+        assert!(guard.check_and_record(ip, &config).is_some());
+        assert!(guard.check_and_record(ip, &config).is_some());
+    }
+
+    #[test]
+    fn stream_access_control_honors_cidr_deny() {
+        let config = StreamAccessControlConfig {
+            enabled: true,
+            allow: Vec::new(),
+            deny: vec!["203.0.113.0/24".to_string()],
+        };
+        assert!(stream_access_is_denied(&config, "203.0.113.10".parse().expect("ip")).is_some());
+        assert!(stream_access_is_denied(&config, "198.51.100.1".parse().expect("ip")).is_none());
     }
 
     #[test]

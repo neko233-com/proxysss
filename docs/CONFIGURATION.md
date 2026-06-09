@@ -133,11 +133,72 @@ services:
 
 ## Caching and compression
 
-Global defaults live in `services.response_policy`; routes can override `compression` and `cache`. Use `services.cache_zones` for shared zones and optional disk backing. Send `PURGE` to invalidate entries when `allow_purge: true`. Cache keys support `key_prefix` and `vary_headers`; `stale_while_revalidate_secs` serves stale responses while refreshing upstream in the background.
+Global defaults live in `services.response_policy`; routes can override `compression` and `cache`. Use `services.cache_zones` for shared zones and optional disk backing.
 
-## TLS and wildcard certificates
+Cache modes (Cloudflare-style):
+
+| `behavior` | Effect |
+| --- | --- |
+| `respect_origin` | Default. Honor origin `Cache-Control` for storage; use `ttl_secs` when origin has no max-age. |
+| `override` | Force edge TTL from `ttl_secs`; ignore origin max-age for storage. |
+| `bypass` | Skip cache lookup and storage. |
+| `no_cache` | Always fetch upstream; emit `no-cache` when configured. |
+
+```yaml
+services:
+  response_policy:
+    cache:
+      enabled: true
+      behavior: override
+      ttl_secs: 3600          # edge TTL
+      browser_ttl_secs: 300   # 0 = pass through origin Cache-Control
+      stale_while_revalidate_secs: 60
+      stale_if_error_secs: 86400
+      emit_cdn_cache_control: true
+      vary_headers: [Accept-Encoding]
+```
+
+Send `PURGE` to invalidate entries when `allow_purge: true`. Responses include `X-Cache: HIT|MISS|STALE` when caching is active.
+
+## Domain stream proxy (Redis, MySQL, etc.)
+
+Route TCP/TLS workloads by SNI hostname (nginx `ssl_preread` / HAProxy style):
+
+```yaml
+tcp:
+  stream_routes:
+    - name: redis-prod
+      domains: [redis.example.com]
+      listen: 6379
+      upstream: redis.internal:6379
+      protocol: redis
+    - name: mysql-prod
+      domains: [db.example.com]
+      listen: 3306
+      upstream: mysql.internal:3306
+      protocol: mysql
+      tls_mode: passthrough
+```
+
+`listen` accepts `0.0.0.0:6379` or shorthand `6379`. `protocol` is an observability hint. Per-route `access_control` supports allow/deny IP lists.
+
+## TLS, on-demand certificates, and wildcards
 
 - Default automatic HTTPS uses built-in managed ACME with HTTP-01 and TLS-ALPN-01 (`http.tls.auto_https` or `http.tls.mode: acme_managed`).
+- On-demand TLS (Caddy-style first-hit issuance):
+
+```yaml
+http:
+  tls:
+    mode: acme_managed
+    on_demand:
+      enabled: true
+      allow: ['*.customers.example.com']
+      max_active_certs: 100
+      max_issues_per_hour: 30
+      ask_url: http://127.0.0.1:8080/allow-tls?domain={domain}
+```
+
 - Wildcard certificates require the **non-default** external path: `http.tls.mode: acme_dns_external` with `acme.sh` DNS-01 (`http.tls.acme.dns.provider` + credentials). Native DNS provider integrations are not built into the binary.
 
 ## Monitoring

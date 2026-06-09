@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.15 - 2026-06-09
+
+- Added Cloudflare-style HTTP cache policies: `behavior` (`bypass`, `respect_origin`, `override`, `no_cache`), edge/browser TTL, `CDN-Cache-Control`, `stale_if_error_secs`, and `X-Cache` status headers.
+- Added domain stream proxy via `tcp.stream_routes` with TLS SNI routing for Redis/MySQL/PostgreSQL-style workloads and `POST /v1/stream-routes/upsert`.
+- Added on-demand TLS (`http.tls.on_demand`) with managed ACME first-hit issuance, allow globs, optional `ask_url`, and rate limits.
+- Added DDoS mitigation (`security.ddos`), dynamic IP blacklist admin API (`/v1/security/blacklist/*`), and `services.access_control.stream`.
+- Extended FTP with transfer-level hooks (`transfer_allow`/`transfer_deny`), per-user `user_policies`, and structured transfer logging.
+- Documented new surfaces in `docs/CONFIGURATION.md`, `docs/SECURITY.md`, `docs/AGENT-API.md`, and `docs/architecture.html`.
+
 ## v0.3.14 - 2026-06-09
 
 - Hardened admin defaults: `enable_write_ops` and `expose_config` now default to `false`, with `loopback_only` and auth rate limiting enabled by default.

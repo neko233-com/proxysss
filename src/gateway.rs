@@ -57,20 +57,23 @@ use uuid::Uuid;
 use zstd::stream::encode_all as zstd_encode_all;
 
 use crate::config::{
-    AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig, AdminConfig,
-    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, GatewayConfig, HttpAccessControlConfig,
-    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
-    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig,
-    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
+    AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
+    FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig,
+    LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey,
+    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
+    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
+    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
 use crate::security::{
-    self, admin_loopback_only_allows, validate_domain_route_mutation,
-    validate_reverse_proxy_route_mutation, validate_tcp_listener_mutation,
-    validate_udp_listener_mutation, AdminAuthGuard,
+    self, admin_loopback_only_allows, ip_access_is_denied, stream_access_is_denied,
+    validate_domain_route_mutation, validate_reverse_proxy_route_mutation,
+    validate_tcp_listener_mutation, validate_udp_listener_mutation, AdminAuthGuard, DdosGuard,
+    DynamicBlacklist,
 };
+use crate::stream_routes::{parse_tls_client_hello_sni, StreamRouteTable};
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -87,6 +90,12 @@ pub struct Gateway {
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
     acme_tls_alpn_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
+    on_demand_issue_counts: Arc<DashMap<String, u32>>,
+    ddos_guard: DdosGuard,
+    dynamic_blacklist: DynamicBlacklist,
+    ftp_session_users: Arc<DashMap<SocketAddr, String>>,
     admin_auth_guard: AdminAuthGuard,
 }
 
@@ -174,6 +183,7 @@ struct DiskCachedHttpEntry {
 enum CacheLookup {
     Fresh(GatewayHttpResponse),
     Stale(GatewayHttpResponse),
+    StaleIfError(GatewayHttpResponse),
 }
 
 #[derive(Clone)]
@@ -202,6 +212,9 @@ struct SniResolver {
     default: Arc<CertifiedKey>,
     by_name: BTreeMap<String, Arc<CertifiedKey>>,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand: OnDemandTlsConfig,
+    on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 #[derive(Default)]
@@ -217,6 +230,8 @@ struct GatewayStats {
     admin_requests_total: AtomicU64,
     admin_auth_fail_total: AtomicU64,
     script_fail_total: AtomicU64,
+    blocked_requests_total: AtomicU64,
+    ddos_bans_total: AtomicU64,
 }
 
 struct UpstreamLease {
@@ -326,6 +341,13 @@ impl ResolvesServerCert for SniResolver {
         if let Some(certified) = self.by_name.get(&server_name) {
             return Some(certified.clone());
         }
+        if let Some(certified) = self.on_demand_certs.get(&server_name) {
+            return Some(certified.clone());
+        }
+
+        if on_demand_domain_allowed(&self.on_demand, &server_name) {
+            let _ = self.on_demand_trigger.send(server_name.clone());
+        }
 
         let labels = server_name.split('.').collect::<Vec<_>>();
         for index in 1..labels.len() {
@@ -376,6 +398,9 @@ impl Gateway {
         prepare_tls_material(&config)?;
 
         let dynamic = Arc::new(build_dynamic_state(config.clone()).await?);
+        let (on_demand_trigger, on_demand_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dynamic_blacklist =
+            DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist);
 
         let gateway = Arc::new(Self {
             config_path,
@@ -391,8 +416,15 @@ impl Gateway {
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
             acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            on_demand_certs: Arc::new(DashMap::new()),
+            on_demand_trigger,
+            on_demand_issue_counts: Arc::new(DashMap::new()),
+            ddos_guard: DdosGuard::default(),
+            dynamic_blacklist,
+            ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
         });
+        gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         Ok(gateway)
     }
@@ -422,6 +454,11 @@ impl Gateway {
 
         let gateway = self.clone();
         tasks.spawn(async move { gateway.run_active_health_loop().await });
+
+        if self.bootstrap_config.http.tls.on_demand.enabled {
+            let gateway = self.clone();
+            tasks.spawn(async move { gateway.run_on_demand_tls_cleanup_loop().await });
+        }
 
         while let Some(result) = tasks.join_next().await {
             result??;
@@ -545,6 +582,138 @@ impl Gateway {
             let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
             tokio::time::sleep(renew_every).await;
         }
+    }
+
+    fn spawn_on_demand_tls_worker(
+        self: &Arc<Self>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            while let Some(domain) = rx.recv().await {
+                if gateway.on_demand_certs.contains_key(&domain) {
+                    continue;
+                }
+                let state = gateway.current_state().await;
+                let on_demand = state.config.http.tls.on_demand.clone();
+                if gateway.on_demand_certs.len() >= on_demand.max_active_certs {
+                    tracing::warn!(%domain, "on-demand tls cert pool full");
+                    continue;
+                }
+                let hour_key = format!(
+                    "{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        / 3600
+                );
+                let mut issued = gateway.on_demand_issue_counts.entry(hour_key).or_insert(0);
+                if *issued >= on_demand.max_issues_per_hour {
+                    tracing::warn!(%domain, "on-demand tls hourly rate limit reached");
+                    continue;
+                }
+                *issued = issued.saturating_add(1);
+                drop(issued);
+
+                if !on_demand.ask_url.trim().is_empty() {
+                    let ask_url = on_demand.ask_url.replace("{domain}", &domain);
+                    let client = state.http_client.clone();
+                    match client.get(&ask_url).send().await {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => {
+                            tracing::info!(%domain, status = %response.status(), "on-demand tls ask denied");
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, %domain, "on-demand tls ask request failed");
+                            continue;
+                        }
+                    }
+                }
+
+                let tls = state.config.http.tls.clone();
+                match issue_on_demand_managed_certificate(
+                    &tls,
+                    &domain,
+                    &gateway.acme_http_challenges,
+                    &gateway.acme_tls_alpn_certs,
+                    &gateway.on_demand_certs,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!(%domain, "on-demand tls certificate issued"),
+                    Err(error) => tracing::warn!(?error, %domain, "on-demand tls issuance failed"),
+                }
+            }
+        });
+    }
+
+    async fn run_on_demand_tls_cleanup_loop(self: Arc<Self>) -> Result<()> {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            let max = self
+                .current_state()
+                .await
+                .config
+                .http
+                .tls
+                .on_demand
+                .max_active_certs;
+            if self.on_demand_certs.len() > max {
+                let overflow = self.on_demand_certs.len().saturating_sub(max);
+                for key in self
+                    .on_demand_certs
+                    .iter()
+                    .take(overflow)
+                    .map(|entry| entry.key().clone())
+                    .collect::<Vec<_>>()
+                {
+                    self.on_demand_certs.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn is_stream_connection_blocked(
+        &self,
+        config: &GatewayConfig,
+        remote_addr: SocketAddr,
+    ) -> bool {
+        if self.dynamic_blacklist.is_blocked(remote_addr.ip()) {
+            return true;
+        }
+        if self
+            .ddos_guard
+            .check_and_record(remote_addr.ip(), &config.security.ddos)
+            .is_some()
+        {
+            self.stats.ddos_bans_total.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .blocked_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.dynamic_blacklist
+                .add(remote_addr.ip(), config.security.ddos.ban_secs.max(1));
+            return true;
+        }
+        stream_access_is_denied(&config.services.access_control.stream, remote_addr.ip()).is_some()
+    }
+
+    fn is_http_connection_blocked(&self, config: &GatewayConfig, remote_addr: SocketAddr) -> bool {
+        if self.dynamic_blacklist.is_blocked(remote_addr.ip()) {
+            return true;
+        }
+        if self
+            .ddos_guard
+            .check_and_record(remote_addr.ip(), &config.security.ddos)
+            .is_some()
+        {
+            self.stats.ddos_bans_total.fetch_add(1, Ordering::Relaxed);
+            self.dynamic_blacklist
+                .add(remote_addr.ip(), config.security.ddos.ban_secs.max(1));
+            return true;
+        }
+        false
     }
 
     async fn run_listener_supervisor(self: Arc<Self>) -> Result<()> {
@@ -1041,6 +1210,167 @@ impl Gateway {
                     ));
                 }
             }
+        }
+
+        if method == Method::POST && path == "/v1/stream-routes/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let route = match serde_json::from_slice::<StreamRouteConfig>(&body) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid stream route payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&route.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_stream_route_and_reload(&state.config, route)
+                .await
+            {
+                Ok(result) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": result.action,
+                            "name": result.route.name,
+                            "domains": result.route.domains,
+                            "listen": result.route.listen,
+                            "upstream": result.route.upstream,
+                            "protocol": result.route.protocol,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::GET && path == "/v1/security/blacklist" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": self.dynamic_blacklist.list_active(),
+                }),
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/security/blacklist/add" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<BlacklistMutationRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid blacklist payload: {error}")}),
+                    ));
+                }
+            };
+            let ip = match payload.ip.parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid ip: {error}")}),
+                    ));
+                }
+            };
+            let ban_secs = payload
+                .ban_secs
+                .unwrap_or(state.config.security.ddos.ban_secs.max(1));
+            self.dynamic_blacklist.add(ip, ban_secs);
+            self.ddos_guard.ban_ip(ip, ban_secs);
+            let _ = self
+                .dynamic_blacklist
+                .persist(&state.config.security.dynamic_blacklist);
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "ip": ip.to_string(), "ban_secs": ban_secs}),
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/security/blacklist/remove" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = match request.body_mut().collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            };
+            let payload = match serde_json::from_slice::<BlacklistMutationRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid blacklist payload: {error}")}),
+                    ));
+                }
+            };
+            let ip = match payload.ip.parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid ip: {error}")}),
+                    ));
+                }
+            };
+            self.dynamic_blacklist.remove(ip);
+            self.ddos_guard.unban_ip(ip);
+            let _ = self
+                .dynamic_blacklist
+                .persist(&state.config.security.dynamic_blacklist);
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "ip": ip.to_string()}),
+            ));
         }
 
         if method == Method::POST && path == "/v1/domain-routes/delete" {
@@ -1684,6 +2014,32 @@ impl Gateway {
         Ok(UdpListenerUpsertResult { action, listener })
     }
 
+    async fn persist_stream_route_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        route: StreamRouteConfig,
+    ) -> Result<StreamRouteUpsertResult> {
+        let mut candidate = current_config.clone();
+        let action = upsert_stream_route_config(&mut candidate.tcp.stream_routes, route.clone());
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_stream_route(&original, &route)?;
+
+        security::atomic_write(&self.config_path, &updated)
+            .with_context(|| format!("failed to write {}", self.config_path.display()))?;
+
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "updated config was written but reload failed; original file was restored",
+            ));
+        }
+
+        Ok(StreamRouteUpsertResult { action, route })
+    }
+
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.plain_bind address")?;
         let listener = TcpListener::bind(bind_addr)
@@ -1726,6 +2082,8 @@ impl Gateway {
         let tls_acceptor = TlsAcceptor::from(Arc::new(build_rustls_server_config(
             &state.config,
             self.acme_tls_alpn_certs.clone(),
+            self.on_demand_certs.clone(),
+            self.on_demand_trigger.clone(),
             vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
         )?));
         let listener = TcpListener::bind(bind_addr)
@@ -1777,6 +2135,8 @@ impl Gateway {
             QuicServerConfig::try_from(build_rustls_server_config(
                 &state.config,
                 self.acme_tls_alpn_certs.clone(),
+                self.on_demand_certs.clone(),
+                self.on_demand_trigger.clone(),
                 vec![b"h3".to_vec()],
             )?)?,
         ));
@@ -1932,6 +2292,8 @@ impl Gateway {
                 listener.accept().await.context("tcp accept failed")?;
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
+            let listener_bind = listener_config.bind.clone();
+            let listener_default_upstream = listener_config.upstream.clone();
             let stream_rate_limit = self
                 .current_state()
                 .await
@@ -1946,6 +2308,17 @@ impl Gateway {
                     listener = %listener_name,
                     "tcp connection rejected by stream rate limit"
                 );
+                self.stats
+                    .blocked_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let block_config = self.current_state().await.config.clone();
+            if self.is_stream_connection_blocked(&block_config, remote_addr) {
+                tracing::info!(%remote_addr, listener = %listener_name, "tcp connection blocked by security policy");
+                self.stats
+                    .blocked_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             self.stats
@@ -1998,7 +2371,50 @@ impl Gateway {
                         Some(first_packet_preview(&first_payload))
                     };
 
-                    let route = if listener_name == "ftp" && state.config.services.ftp.enabled {
+                    let route = if listener_name.starts_with("stream|") {
+                        let stream_table =
+                            StreamRouteTable::from_config(&state.config.tcp.stream_routes);
+                        let sni = parse_tls_client_hello_sni(&first_payload);
+                        let resolved = stream_table
+                            .resolve_upstream(
+                                &listener_bind,
+                                sni.as_deref(),
+                                &listener_default_upstream,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "no stream route matched for listener {} (sni={:?})",
+                                    listener_name,
+                                    sni
+                                )
+                            })?;
+                        if let Some(denied) = stream_access_is_denied(
+                            &resolved.route.access_control,
+                            remote_addr.ip(),
+                        ) {
+                            return Err(anyhow!("stream access denied for {denied}"));
+                        }
+                        if !resolved.protocol.is_empty() {
+                            tracing::info!(
+                                protocol = %resolved.protocol,
+                                route = %resolved.route.name,
+                                sni = ?sni,
+                                %remote_addr,
+                                "domain stream route selected"
+                            );
+                        }
+                        RouteDecision {
+                            upstream: resolved.upstream.to_string(),
+                            upstreams: resolved.route.upstreams.clone(),
+                            upstream_weights: resolved.route.upstream_weights.clone(),
+                            affinity_key: player_id.clone(),
+                            rewrite_path: None,
+                            set_headers: BTreeMap::new(),
+                            strip_headers: Vec::new(),
+                            status: None,
+                            content_type: None,
+                        }
+                    } else if listener_name == "ftp" && state.config.services.ftp.enabled {
                         RouteDecision {
                             upstream: state.config.services.ftp.upstream.clone(),
                             upstreams: Vec::new(),
@@ -2145,6 +2561,7 @@ impl Gateway {
         let (server_read, mut server_write) = upstream.into_split();
         let mut client_reader = TokioBufReader::new(client_read);
         let mut server_reader = TokioBufReader::new(server_read);
+        let session_users = self.ftp_session_users.clone();
 
         loop {
             let mut client_line = Vec::new();
@@ -2158,17 +2575,28 @@ impl Gateway {
                     }
                     let command_line = String::from_utf8_lossy(&client_line).into_owned();
                     if let Some(verb) = parse_ftp_command_verb(&command_line) {
+                        if verb == "USER" {
+                            if let Some(user) = command_line.split_whitespace().nth(1) {
+                                session_users.insert(remote_addr, user.to_string());
+                            }
+                        }
+                        let active_user = session_users
+                            .get(&remote_addr)
+                            .map(|entry| entry.clone())
+                            .unwrap_or_default();
                         if config.log_commands {
                             tracing::info!(
                                 %remote_addr,
                                 command = %verb,
+                                user = %active_user,
                                 "ftp control command"
                             );
                         }
-                        if !ftp_command_allowed(config, &verb) {
+                        if !ftp_command_allowed_for_user(config, &verb, &active_user) {
                             tracing::warn!(
                                 %remote_addr,
                                 command = %verb,
+                                user = %active_user,
                                 "ftp command denied by policy"
                             );
                             client_write
@@ -2176,6 +2604,29 @@ impl Gateway {
                                 .await
                                 .context("failed writing ftp policy rejection")?;
                             continue;
+                        }
+                        if ftp_transfer_verb(&verb)
+                            && !ftp_transfer_allowed_for_user(config, &verb, &active_user)
+                        {
+                            tracing::warn!(
+                                %remote_addr,
+                                command = %verb,
+                                user = %active_user,
+                                "ftp transfer denied by policy"
+                            );
+                            client_write
+                                .write_all(b"550 Transfer not allowed by gateway policy.\r\n")
+                                .await
+                                .context("failed writing ftp transfer rejection")?;
+                            continue;
+                        }
+                        if ftp_transfer_verb(&verb) && config.log_transfers {
+                            tracing::info!(
+                                %remote_addr,
+                                command = %verb,
+                                user = %active_user,
+                                "ftp transfer hook"
+                            );
                         }
                     }
                     let outbound_line = rewrite_ftp_active_command(
@@ -2222,6 +2673,7 @@ impl Gateway {
             }
         }
 
+        session_users.remove(&remote_addr);
         Ok(())
     }
 
@@ -2571,9 +3023,24 @@ impl Gateway {
             });
         }
 
+        if self.is_http_connection_blocked(&state.config, remote_addr) {
+            self.stats
+                .blocked_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(GatewayHttpResponse::bytes(
+                StatusCode::TOO_MANY_REQUESTS,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"connection blocked by security policy"),
+                "proxysss://security",
+            ));
+        }
+
         if let Some(response) =
             self.apply_http_access_control(&state.config.services.access_control.http, remote_addr)
         {
+            self.stats
+                .blocked_requests_total
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(response);
         }
 
@@ -2711,10 +3178,11 @@ impl Gateway {
         let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
         if let Some(cache_key) = cache_key.as_deref() {
             match self.lookup_cached_http_response(&state.config, &route.cache, cache_key) {
-                Some(CacheLookup::Fresh(response)) => {
+                Some(CacheLookup::Fresh(mut response)) => {
+                    let _ = apply_cache_response_headers(&route.cache, &mut response, "HIT");
                     return finalize_http_response(&headers, &route.compression, response);
                 }
-                Some(CacheLookup::Stale(response)) => {
+                Some(CacheLookup::Stale(mut response)) => {
                     let gateway = self.clone();
                     let route_for_refresh = route.clone();
                     let cache_key_owned = cache_key.to_string();
@@ -2742,6 +3210,11 @@ impl Gateway {
                             tracing::debug!(?error, key = %cache_key_owned, "cache background revalidation failed");
                         }
                     });
+                    let _ = apply_cache_response_headers(&route.cache, &mut response, "STALE");
+                    return finalize_http_response(&headers, &route.compression, response);
+                }
+                Some(CacheLookup::StaleIfError(mut response)) => {
+                    let _ = apply_cache_response_headers(&route.cache, &mut response, "STALE");
                     return finalize_http_response(&headers, &route.compression, response);
                 }
                 None => {}
@@ -2844,7 +3317,21 @@ impl Gateway {
             if let Some(cache_key) = cache_key.as_deref() {
                 self.store_cached_http_response(&state.config, cache_key, &route.cache, &response);
             }
+            let mut response = response;
+            if cache_key.is_some() && route.cache.enabled {
+                let _ = apply_cache_response_headers(&route.cache, &mut response, "MISS");
+            }
             return finalize_http_response(&headers, &route.compression, response);
+        }
+
+        if let Some(cache_key) = cache_key.as_deref() {
+            if let Some(
+                CacheLookup::StaleIfError(mut response) | CacheLookup::Stale(mut response),
+            ) = self.lookup_cached_http_response(&state.config, &route.cache, cache_key)
+            {
+                let _ = apply_cache_response_headers(&route.cache, &mut response, "STALE");
+                return finalize_http_response(&headers, &route.compression, response);
+            }
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("upstream request failed after retries")))
@@ -2978,6 +3465,10 @@ impl Gateway {
             return Some(CacheLookup::Stale(response));
         }
 
+        if cache.stale_if_error_secs > 0 && now < entry.stale_until_unix_ms {
+            return Some(CacheLookup::StaleIfError(response));
+        }
+
         self.http_cache.remove(&storage_key);
         self.remove_disk_cached_http_response(config, cache, &storage_key);
         None
@@ -2991,21 +3482,25 @@ impl Gateway {
         response: &GatewayHttpResponse,
     ) {
         if !cache_config.enabled
+            || cache_config.behavior == CacheBehavior::Bypass
+            || cache_config.behavior == CacheBehavior::NoCache
             || response.body.len() > cache_config.max_body_bytes
             || !cache_config
                 .statuses
                 .iter()
                 .any(|status| *status == response.status.as_u16())
             || response.headers.iter().any(|(name, _)| name == SET_COOKIE)
-            || cache_control_prevents_storage(&response.headers)
+            || (cache_config.behavior == CacheBehavior::RespectOrigin
+                && cache_control_prevents_storage(&response.headers))
         {
             return;
         }
 
         let storage_key = cache_storage_key(cache_config, key);
         let now = current_unix_millis();
-        let fresh_until = now.saturating_add(cache_config.ttl_secs.saturating_mul(1000));
-        let stale_until = if cache_config.stale_while_revalidate_secs > 0 {
+        let edge_ttl_secs = effective_edge_ttl_secs(cache_config, &response.headers);
+        let fresh_until = now.saturating_add(edge_ttl_secs.saturating_mul(1000));
+        let mut stale_until = if cache_config.stale_while_revalidate_secs > 0 {
             fresh_until.saturating_add(
                 cache_config
                     .stale_while_revalidate_secs
@@ -3014,6 +3509,10 @@ impl Gateway {
         } else {
             fresh_until
         };
+        if cache_config.stale_if_error_secs > 0 {
+            stale_until =
+                stale_until.saturating_add(cache_config.stale_if_error_secs.saturating_mul(1000));
+        }
         let entry = CachedHttpEntry {
             expires_at_unix_ms: fresh_until,
             stale_until_unix_ms: stale_until,
@@ -4340,6 +4839,8 @@ impl GatewayStats {
             "admin_requests_total": self.admin_requests_total.load(Ordering::Relaxed),
             "admin_auth_fail_total": self.admin_auth_fail_total.load(Ordering::Relaxed),
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
+            "blocked_requests_total": self.blocked_requests_total.load(Ordering::Relaxed),
+            "ddos_bans_total": self.ddos_bans_total.load(Ordering::Relaxed),
         })
     }
 
@@ -4394,6 +4895,16 @@ impl GatewayStats {
                 "proxysss_script_fail_total",
                 "Embedded script execution failures",
                 self.script_fail_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_blocked_requests_total",
+                "Requests or connections blocked by security policy",
+                self.blocked_requests_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_ddos_bans_total",
+                "Connections temporarily banned by DDoS mitigation",
+                self.ddos_bans_total.load(Ordering::Relaxed),
             ),
         ];
 
@@ -4740,6 +5251,22 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
         }));
     }
 
+    let stream_table = StreamRouteTable::from_config(&config.tcp.stream_routes);
+    for bind in stream_table.by_bind.keys() {
+        let routes = stream_table.routes_for_bind(bind).unwrap_or(&[]);
+        let default_upstream = routes
+            .first()
+            .map(|route| route.upstream.clone())
+            .unwrap_or_default();
+        specs.push(ListenerSpec::Tcp(TcpListenerConfig {
+            name: format!("stream|{bind}"),
+            bind: bind.to_string(),
+            upstream: default_upstream,
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+        }));
+    }
+
     specs
 }
 
@@ -4862,11 +5389,18 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
 fn build_rustls_server_config(
     config: &GatewayConfig,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<rustls::ServerConfig> {
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(build_tls_resolver(config, acme_tls_alpn_by_name)?);
+        .with_cert_resolver(build_tls_resolver(
+            config,
+            acme_tls_alpn_by_name,
+            on_demand_certs,
+            on_demand_trigger,
+        )?);
     server_config.alpn_protocols = alpn_protocols;
     Ok(server_config)
 }
@@ -4874,6 +5408,8 @@ fn build_rustls_server_config(
 fn build_tls_resolver(
     config: &GatewayConfig,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<Arc<dyn ResolvesServerCert>> {
     let default = Arc::new(build_certified_key(
         &config.http.tls.cert_path,
@@ -4893,6 +5429,9 @@ fn build_tls_resolver(
         default,
         by_name,
         acme_tls_alpn_by_name,
+        on_demand_certs,
+        on_demand: config.http.tls.on_demand.clone(),
+        on_demand_trigger,
     }))
 }
 
@@ -5105,6 +5644,35 @@ async fn issue_managed_acme_certificate(
     }
 
     result
+}
+
+async fn issue_on_demand_managed_certificate(
+    tls: &crate::config::TlsConfig,
+    domain: &str,
+    challenges: &DashMap<String, String>,
+    tls_alpn_certs: &DashMap<String, Arc<CertifiedKey>>,
+    on_demand_certs: &DashMap<String, Arc<CertifiedKey>>,
+) -> Result<()> {
+    if on_demand_certs.contains_key(domain) {
+        return Ok(());
+    }
+    let mut tls = tls.clone();
+    tls.acme.domains = vec![domain.to_string()];
+    let cache_dir = tls.acme.cache_dir.join("on-demand");
+    fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create on-demand cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+    let cert_path = cache_dir.join(format!("{domain}.crt.pem"));
+    let key_path = cache_dir.join(format!("{domain}.key.pem"));
+    tls.cert_path = cert_path;
+    tls.key_path = key_path;
+    issue_managed_acme_certificate(&tls, challenges, tls_alpn_certs).await?;
+    let certified = Arc::new(build_certified_key(&tls.cert_path, &tls.key_path)?);
+    on_demand_certs.insert(domain.to_ascii_lowercase(), certified);
+    Ok(())
 }
 
 fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<()> {
@@ -5460,6 +6028,8 @@ fn cache_lookup_key(
     headers: &HeaderMap,
 ) -> Option<String> {
     if !config.enabled
+        || config.behavior == CacheBehavior::Bypass
+        || config.behavior == CacheBehavior::NoCache
         || *method != Method::GET
         || headers.contains_key(AUTHORIZATION)
         || headers.contains_key(COOKIE)
@@ -5681,6 +6251,83 @@ fn parse_ftp_command_verb(line: &str) -> Option<String> {
         .map(|verb| verb.to_ascii_uppercase())
 }
 
+fn ftp_transfer_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "RETR" | "STOR" | "STOU" | "APPE" | "LIST" | "NLST" | "MLSD" | "MLST"
+    )
+}
+
+fn ftp_user_policy<'a>(
+    config: &'a crate::config::FtpConfig,
+    user: &str,
+) -> Option<&'a FtpUserPolicy> {
+    if user.is_empty() {
+        return None;
+    }
+    config
+        .user_policies
+        .iter()
+        .find(|policy| policy.user.eq_ignore_ascii_case(user))
+}
+
+fn ftp_command_allowed_for_user(config: &crate::config::FtpConfig, verb: &str, user: &str) -> bool {
+    if let Some(policy) = ftp_user_policy(config, user) {
+        if !policy.command_allow.is_empty()
+            && !policy
+                .command_allow
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(verb))
+        {
+            return false;
+        }
+        if policy
+            .command_deny
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(verb))
+        {
+            return false;
+        }
+    }
+    ftp_command_allowed(config, verb)
+}
+
+fn ftp_transfer_allowed_for_user(
+    config: &crate::config::FtpConfig,
+    verb: &str,
+    user: &str,
+) -> bool {
+    if let Some(policy) = ftp_user_policy(config, user) {
+        if !policy.transfer_allow.is_empty()
+            && !policy
+                .transfer_allow
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(verb))
+        {
+            return false;
+        }
+        if policy
+            .transfer_deny
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(verb))
+        {
+            return false;
+        }
+    }
+    if !config.transfer_allow.is_empty()
+        && !config
+            .transfer_allow
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(verb))
+    {
+        return false;
+    }
+    !config
+        .transfer_deny
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(verb))
+}
+
 fn ftp_command_allowed(config: &crate::config::FtpConfig, verb: &str) -> bool {
     if !config.command_allow.is_empty()
         && !config
@@ -5846,6 +6493,66 @@ fn spawn_ftp_active_bridge(
             }
         }
     });
+}
+
+fn effective_edge_ttl_secs(
+    cache: &ResponseCacheConfig,
+    headers: &[(HeaderName, HeaderValue)],
+) -> u64 {
+    if cache.behavior == CacheBehavior::Override {
+        return cache.ttl_secs.max(1);
+    }
+    parse_cache_control_max_age(headers)
+        .unwrap_or(cache.ttl_secs)
+        .max(1)
+}
+
+fn parse_cache_control_max_age(headers: &[(HeaderName, HeaderValue)]) -> Option<u64> {
+    let value = headers
+        .iter()
+        .find(|(name, _)| name == CACHE_CONTROL)
+        .and_then(|(_, value)| value.to_str().ok())?;
+    for part in value.split(',') {
+        let part = part.trim().to_ascii_lowercase();
+        if let Some(max_age) = part.strip_prefix("max-age=") {
+            return max_age.parse().ok();
+        }
+        if part == "no-store" || part == "no-cache" || part == "private" {
+            return Some(0);
+        }
+    }
+    None
+}
+
+fn apply_cache_response_headers(
+    cache: &ResponseCacheConfig,
+    response: &mut GatewayHttpResponse,
+    status: &str,
+) -> Result<()> {
+    append_or_insert_header(
+        &mut response.headers,
+        HeaderName::from_static("x-cache"),
+        status,
+    )?;
+    if cache.emit_cdn_cache_control {
+        let edge_ttl = cache.ttl_secs.max(1);
+        append_or_insert_header(
+            &mut response.headers,
+            HeaderName::from_static("cdn-cache-control"),
+            &format!("max-age={edge_ttl}"),
+        )?;
+    }
+    if cache.browser_ttl_secs > 0 {
+        response.headers.retain(|(name, _)| name != CACHE_CONTROL);
+        append_or_insert_header(
+            &mut response.headers,
+            CACHE_CONTROL,
+            &format!("public, max-age={}", cache.browser_ttl_secs),
+        )?;
+    } else if cache.behavior == CacheBehavior::NoCache {
+        append_or_insert_header(&mut response.headers, CACHE_CONTROL, "no-cache")?;
+    }
+    Ok(())
 }
 
 fn cache_control_prevents_storage(headers: &[(HeaderName, HeaderValue)]) -> bool {
@@ -6190,6 +6897,18 @@ struct UdpListenerUpsertResult {
     listener: UdpListenerConfig,
 }
 
+struct StreamRouteUpsertResult {
+    action: &'static str,
+    route: StreamRouteConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlacklistMutationRequest {
+    ip: String,
+    #[serde(default)]
+    ban_secs: Option<u64>,
+}
+
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -6267,6 +6986,19 @@ fn upsert_udp_listener_config(
         "updated"
     } else {
         listeners.push(listener);
+        "created"
+    }
+}
+
+fn upsert_stream_route_config(
+    routes: &mut Vec<StreamRouteConfig>,
+    route: StreamRouteConfig,
+) -> &'static str {
+    if let Some(existing) = routes.iter_mut().find(|item| item.name == route.name) {
+        *existing = route;
+        "updated"
+    } else {
+        routes.push(route);
         "created"
     }
 }
@@ -6684,6 +7416,53 @@ fn render_config_with_upserted_udp_listener(
     serde_yaml::to_string(&value).context("failed to render updated YAML config")
 }
 
+fn render_config_with_upserted_stream_route(
+    original: &str,
+    route: &StreamRouteConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+
+    let tcp_key = serde_yaml::Value::String("tcp".to_string());
+    if !root.contains_key(&tcp_key) {
+        root.insert(
+            tcp_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let tcp = root
+        .get_mut(&tcp_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("tcp must be a mapping"))?;
+
+    let routes_key = serde_yaml::Value::String("stream_routes".to_string());
+    if !tcp.contains_key(&routes_key) {
+        tcp.insert(routes_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let routes = tcp
+        .get_mut(&routes_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("tcp.stream_routes must be a sequence"))?;
+
+    let route_value = serde_yaml::to_value(route).context("failed to serialize stream route")?;
+    if let Some(existing) = routes.iter_mut().find(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value == route.name)
+            .unwrap_or(false)
+    }) {
+        *existing = route_value;
+    } else {
+        routes.push(route_value);
+    }
+
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
 fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -6781,80 +7560,7 @@ fn websocket_upstream_requested(route: &RouteDecision) -> bool {
 }
 
 fn http_access_is_denied(config: &HttpAccessControlConfig, ip: IpAddr) -> Option<String> {
-    if !config.enabled {
-        return None;
-    }
-
-    if !config.allow.is_empty()
-        && !config
-            .allow
-            .iter()
-            .any(|entry| ip_matches_rule(ip, entry).unwrap_or(false))
-    {
-        return Some(ip.to_string());
-    }
-
-    if config
-        .deny
-        .iter()
-        .any(|entry| ip_matches_rule(ip, entry).unwrap_or(false))
-    {
-        return Some(ip.to_string());
-    }
-
-    None
-}
-
-fn ip_matches_rule(ip: IpAddr, rule: &str) -> Option<bool> {
-    let (base, prefix) = parse_ip_rule(rule)?;
-    match (ip, base) {
-        (IpAddr::V4(ip), IpAddr::V4(base)) => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - u32::from(prefix))
-            };
-            let ip = u32::from_be_bytes(ip.octets());
-            let base = u32::from_be_bytes(base.octets());
-            Some((ip & mask) == (base & mask))
-        }
-        (IpAddr::V6(ip), IpAddr::V6(base)) => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - u32::from(prefix))
-            };
-            let ip = u128::from_be_bytes(ip.octets());
-            let base = u128::from_be_bytes(base.octets());
-            Some((ip & mask) == (base & mask))
-        }
-        _ => Some(false),
-    }
-}
-
-fn parse_ip_rule(rule: &str) -> Option<(IpAddr, u8)> {
-    let rule = rule.trim();
-    let (ip, prefix) = match rule.split_once('/') {
-        Some((addr, prefix)) => {
-            let ip = addr.trim().parse::<IpAddr>().ok()?;
-            let prefix = prefix.trim().parse::<u8>().ok()?;
-            (ip, prefix)
-        }
-        None => {
-            let ip = rule.parse::<IpAddr>().ok()?;
-            let prefix = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            (ip, prefix)
-        }
-    };
-
-    match ip {
-        IpAddr::V4(_) if prefix <= 32 => Some((ip, prefix)),
-        IpAddr::V6(_) if prefix <= 128 => Some((ip, prefix)),
-        _ => None,
-    }
+    ip_access_is_denied(config, ip)
 }
 
 fn http_rate_limit_key(
@@ -8831,7 +9537,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                     <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
                     <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
                     <div><strong>Auto HTTPS boundary:</strong> wildcard DNS-01 stays on the explicit <code>acme_dns_external</code> + <code>acme.sh</code> path; built-in managed ACME covers HTTP-01/TLS-ALPN-01 only.</div>
-                    <div><strong>FTP deep policy:</strong> transfer-level hooks and richer per-user policy remain future work.</div>
+                    <div><strong>FTP policy:</strong> transfer_allow/transfer_deny hooks, per-user user_policies, and structured transfer logging.</div>
                 </div>
             </section>
         </section>
@@ -10466,6 +11172,12 @@ mod tests {
             http_cache: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
             acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            on_demand_certs: Arc::new(DashMap::new()),
+            on_demand_trigger: tokio::sync::mpsc::unbounded_channel().0,
+            on_demand_issue_counts: Arc::new(DashMap::new()),
+            ddos_guard: DdosGuard::default(),
+            dynamic_blacklist: DynamicBlacklist::default(),
+            ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
         };
         let mut weights = BTreeMap::new();
@@ -10939,6 +11651,40 @@ mod tests {
         assert!(!monitoring_path_matches(&config, "/metrics"));
         config.enabled = false;
         assert!(!monitoring_path_matches(&config, "/internal-metrics"));
+    }
+
+    #[test]
+    fn cache_lookup_key_skips_bypass_behavior() {
+        let cache = ResponseCacheConfig {
+            enabled: true,
+            behavior: CacheBehavior::Bypass,
+            ..Default::default()
+        };
+        let uri: Uri = "/".parse().expect("uri");
+        let headers = HeaderMap::new();
+        assert!(cache_lookup_key(&cache, &Method::GET, "example.com", &uri, &headers).is_none());
+    }
+
+    #[test]
+    fn effective_edge_ttl_override_ignores_origin_max_age() {
+        let cache = ResponseCacheConfig {
+            enabled: true,
+            behavior: CacheBehavior::Override,
+            ttl_secs: 3600,
+            ..Default::default()
+        };
+        let headers = vec![(CACHE_CONTROL, HeaderValue::from_static("max-age=60"))];
+        assert_eq!(effective_edge_ttl_secs(&cache, &headers), 3600);
+    }
+
+    #[test]
+    fn ftp_transfer_policy_honors_deny_list() {
+        let config = crate::config::FtpConfig {
+            transfer_deny: vec!["STOR".to_string()],
+            ..Default::default()
+        };
+        assert!(!ftp_transfer_allowed_for_user(&config, "STOR", "alice"));
+        assert!(ftp_transfer_allowed_for_user(&config, "RETR", "alice"));
     }
 
     #[test]

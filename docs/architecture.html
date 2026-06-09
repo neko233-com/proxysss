@@ -271,6 +271,7 @@
         <div class="list">
           <div><strong>Built-in path:</strong> <code>http.tls.auto_https</code> / <code>acme_managed</code> — ordinary hostname certificates.</div>
           <div><strong>Wildcard boundary:</strong> <span class="pill warn">external</span> Use <code>http.tls.mode: acme_dns_external</code> with <code>acme.sh</code> DNS-01 for <code>*.example.com</code>. Native DNS APIs are not embedded.</div>
+          <div><strong>On-demand TLS:</strong> <code>http.tls.on_demand</code> issues managed ACME certs on first SNI hit when <code>allow</code> patterns match (optional <code>ask_url</code> gate).</div>
           <div><strong>SNI:</strong> Multi-cert selection via <code>http.tls.certificates</code> and per-domain manual SSL on routes.</div>
         </div>
       </section>
@@ -301,8 +302,9 @@
         <h2>Cache &amp; compression</h2>
         <p>Global defaults in <code>services.response_policy</code>; routes override compression and cache. Zones can be memory-backed with optional disk files.</p>
         <div class="list">
+          <div><strong>Behaviors:</strong> <code>bypass</code>, <code>respect_origin</code>, <code>override</code>, <code>no_cache</code> with edge/browser TTL and optional <code>CDN-Cache-Control</code>.</div>
           <div><strong>Cache keys:</strong> <code>key_prefix</code> and <code>vary_headers</code> (e.g. <code>Accept-Encoding</code>) build variant-aware keys.</div>
-          <div><strong>Stale-while-revalidate:</strong> Serve slightly stale entries immediately while background refresh updates the zone.</div>
+          <div><strong>Stale policies:</strong> <code>stale_while_revalidate_secs</code> background refresh; <code>stale_if_error_secs</code> serves stale on upstream failure.</div>
           <div><strong>PURGE:</strong> Active invalidation when <code>allow_purge: true</code>.</div>
           <div><strong>Compression:</strong> Negotiates zstd, brotli, or gzip based on <code>Accept-Encoding</code>, content-type allowlist, and minimum body size.</div>
         </div>
@@ -313,8 +315,8 @@
         <h2>FTP gateway</h2>
         <p>When <code>services.ftp.native_control=true</code>, proxysss terminates the control channel and rewrites passive (PASV/EPSV) and active (PORT/EPRT) data connections through a local port pool.</p>
         <div class="list">
-          <div><strong>Policy:</strong> <code>command_allow</code> / <code>command_deny</code> filter verbs before forwarding to upstream.</div>
-          <div><strong>Observability:</strong> Structured logs for control commands and data-channel bridge open/close events.</div>
+          <div><strong>Policy:</strong> <code>command_allow</code> / <code>command_deny</code> plus <code>transfer_allow</code> / <code>transfer_deny</code> and per-user <code>user_policies</code>.</div>
+          <div><strong>Observability:</strong> Structured logs for control commands, transfer hooks, and data-channel bridge lifecycle.</div>
           <div><strong>Public IP:</strong> <code>public_ip</code> advertises the correct address in rewritten PASV replies.</div>
         </div>
       </section>

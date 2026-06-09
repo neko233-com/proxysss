@@ -115,6 +115,39 @@ curl -X POST http://127.0.0.1:7777/v1/tls/wildcard-dns/upsert \
 
 `dns_provider` is the `acme.sh --dns` provider name. Credentials are persisted into YAML and redacted from `proxysss config show`.
 
+## Domain stream routes (Redis, MySQL, etc.)
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/stream-routes/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "redis-prod",
+    "domains": ["redis.example.com"],
+    "listen": "6379",
+    "upstream": "redis.internal:6379",
+    "protocol": "redis"
+  }'
+```
+
+Routes are persisted under `tcp.stream_routes` in the main YAML file and hot-reloaded.
+
+## Dynamic IP blacklist
+
+```bash
+curl http://127.0.0.1:7777/v1/security/blacklist -u ops:change-me
+
+curl -X POST http://127.0.0.1:7777/v1/security/blacklist/add \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"203.0.113.5","ban_secs":3600}'
+
+curl -X POST http://127.0.0.1:7777/v1/security/blacklist/remove \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"203.0.113.5"}'
+```
+
 ## Stream listeners
 
 ```bash

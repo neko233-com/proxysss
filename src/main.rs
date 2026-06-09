@@ -5,6 +5,7 @@ mod gateway;
 mod install;
 mod script;
 mod security;
+mod stream_routes;
 mod ts_transpile;
 
 use std::ffi::OsString;
@@ -326,7 +327,15 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "http cache",
-        "services.response_policy/routes support shared cache zones, disk-backed entries, PURGE, vary_headers/key_prefix, and stale-while-revalidate background refresh",
+        "services.response_policy/routes support Cloudflare-style cache modes, edge/browser TTL, CDN-Cache-Control, stale-while-revalidate, stale-if-error, PURGE, vary_headers, and key_prefix",
+    ),
+    (
+        "domain stream proxy",
+        "tcp.stream_routes route Redis/MySQL/PostgreSQL/MongoDB and similar protocols by TLS SNI with optional per-route access control",
+    ),
+    (
+        "ddos protection",
+        "security.ddos sliding-window connection limits with temporary bans, dynamic IP blacklist admin API, and stream/http access control lists",
     ),
     (
         "active health checks",
@@ -442,8 +451,8 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "FTP",
         status: ParityStatus::Partial,
-        evidence: "services.ftp proxies the control channel, rewrites passive/active data channels, supports command_allow/command_deny policy, and logs control/data channel lifecycle events",
-        next_gap: "transfer-level hooks and richer per-user FTP policy",
+        evidence: "services.ftp proxies the control channel, rewrites passive/active data channels, supports command_allow/command_deny plus transfer_allow/transfer_deny hooks, per-user policies, and structured control/transfer lifecycle logs",
+        next_gap: "full nginx ftp module directive parity",
     },
     NginxParityItem {
         capability: "TLS certificates",
@@ -485,7 +494,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "cache/proxy cache",
         status: ParityStatus::Supported,
-        evidence: "services.response_policy/routes provide shared cache zones, disk-backed entries, PURGE invalidation, vary_headers/key_prefix variants, and stale-while-revalidate background refresh",
+        evidence: "services.response_policy/routes provide Cloudflare-style cache behaviors (bypass/respect_origin/override), edge and browser TTL controls, CDN-Cache-Control, stale-while-revalidate, stale-if-error, PURGE, vary_headers, and key_prefix",
         next_gap: "",
     },
     NginxParityItem {
@@ -574,15 +583,21 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     },
     CaddyFeatureItem {
         capability: "on-demand TLS",
-        status: ParityStatus::Missing,
-        evidence: "certificate issuance currently uses configured domain sets rather than first-hit on-demand policy",
-        next_gap: "add policy-gated on-demand issuance and storage controls",
+        status: ParityStatus::Supported,
+        evidence: "http.tls.on_demand issues managed ACME certificates on first SNI hit when allow patterns match, with optional ask_url gate, hourly rate limits, and in-memory cert pool",
+        next_gap: "",
     },
     CaddyFeatureItem {
         capability: "active upstream health checks",
         status: ParityStatus::Supported,
         evidence: "load_balance.active_health periodically probes HTTP and TCP upstreams and surfaces the result plus manual drain state in the admin API/dashboard",
         next_gap: "",
+    },
+    CaddyFeatureItem {
+        capability: "Caddyfile adapter",
+        status: ParityStatus::Missing,
+        evidence: "proxysss uses a single YAML config; Caddyfile import remains out of scope",
+        next_gap: "optional Caddyfile-to-YAML migration helper",
     },
 ];
 
@@ -2146,6 +2161,8 @@ mod tests {
             "prometheus metrics",
             "weighted load balancing",
             "ip allow/deny blacklist",
+            "domain stream proxy",
+            "ddos protection",
             "admin api/console",
             "cluster automation api",
             "agent install skill",

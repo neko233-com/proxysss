@@ -102,9 +102,12 @@ proxysss config nginx-parity --format yaml
 
 ## Known nginx Parity Gaps (track honestly)
 
-- FTP: control-channel proxying, passive/active data rewriting, `command_allow`/`command_deny`, and structured command/data lifecycle logs. Remaining gap: transfer-level hooks and richer per-user FTP policy.
+- FTP: control-channel proxying, passive/active data rewriting, `command_allow`/`command_deny`, `transfer_allow`/`transfer_deny`, per-user `user_policies`, and structured control/transfer lifecycle logs. Remaining gap: full nginx ftp module directive parity.
 - Compression: supported via `services.response_policy` and route overrides (zstd/brotli/gzip).
-- Proxy cache: supported with shared/disk zones, PURGE, `vary_headers`/`key_prefix`, and `stale_while_revalidate_secs` background refresh.
+- Proxy cache: Cloudflare-style behaviors (`bypass`, `respect_origin`, `override`, `no_cache`), edge/browser TTL, `CDN-Cache-Control`, `stale_while_revalidate_secs`, `stale_if_error_secs`, PURGE, `vary_headers`, and `key_prefix`.
+- Domain stream proxy: `tcp.stream_routes` for Redis/MySQL/PostgreSQL/MongoDB-style TLS SNI routing with optional per-route access control.
+- On-demand TLS: `http.tls.on_demand` with managed ACME first-hit issuance, `allow` glob patterns, optional `ask_url`, and rate limits.
+- DDoS mitigation: `security.ddos` sliding-window bans, dynamic blacklist admin API (`/v1/security/blacklist/*`), and `services.access_control.stream`.
 - Rate limiting: supported with fixed-window, token-bucket, or leaky-bucket HTTP policies, stream shared zones, and HTTP connection caps.
 - Wildcard DNS-01 certificates stay on the explicit non-default `http.tls.mode: acme_dns_external` + `acme.sh` path. Built-in managed ACME covers HTTP-01/TLS-ALPN-01 only; native DNS provider integrations remain external by design.
 
