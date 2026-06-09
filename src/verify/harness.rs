@@ -14,7 +14,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_tungstenite::accept_async;
 
 use crate::config::GatewayConfig;
@@ -53,6 +53,28 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("endpoint not ready: {url}")
+}
+
+pub async fn wait_tcp_ready(addr: &str) -> Result<()> {
+    let probe_addr = loopback_probe_addr(addr);
+    for _ in 0..100 {
+        if let Ok(stream) = TcpStream::connect(&probe_addr).await {
+            drop(stream);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("tcp endpoint not ready: {addr}")
+}
+
+fn loopback_probe_addr(addr: &str) -> String {
+    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+        return format!("127.0.0.1:{port}");
+    }
+    if let Some(port) = addr.strip_prefix("[::]:") {
+        return format!("[::1]:{port}");
+    }
+    addr.to_string()
 }
 
 pub fn base_gateway_yaml(gateway_port: u16) -> String {
@@ -217,6 +239,7 @@ pub async fn spawn_gateway(
 ) -> Result<(Arc<Gateway>, tokio::task::JoinHandle<()>)> {
     let _guard = gateway_test_guard().await;
     let config = GatewayConfig::load(&config_path)?;
+    let plain_bind = config.http.plain_bind.clone();
     let gateway = Gateway::from_config(config_path, config).await?;
     let runner = {
         let gateway = gateway.clone();
@@ -224,6 +247,12 @@ pub async fn spawn_gateway(
             let _ = gateway.run().await;
         })
     };
+    if !plain_bind.trim().is_empty() {
+        wait_tcp_ready(&plain_bind).await?;
+    }
+    if runner.is_finished() {
+        anyhow::bail!("gateway task exited before it became usable");
+    }
     Ok((gateway, runner))
 }
 

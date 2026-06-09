@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.1 - 2026-06-09
+
+- Hardened deep/e2e verification startup by waiting for the spawned gateway listener to accept TCP connections before requests are sent, matching the Linux CI timing model.
+
 ## v1.1.0 - 2026-06-09
 
 - Reworked the built-in welcome page into a standalone `templates/welcome.html` asset with polished responsive styling and CSS motion, while keeping runtime rendering embedded in the single binary.
