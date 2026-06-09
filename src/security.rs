@@ -435,7 +435,6 @@ impl DdosGuard {
     pub fn unban_ip(&self, ip: IpAddr) {
         self.windows.remove(&ip.to_string());
     }
-
 }
 
 #[derive(Clone, Default)]
