@@ -152,6 +152,14 @@ struct CachedHttpEntry {
     upstream: String,
 }
 
+struct HttpCacheRevalidateRequest<'a> {
+    host: &'a str,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+    remote_addr: SocketAddr,
+    scheme: &'a str,
+}
+
 #[derive(Serialize, Deserialize)]
 struct DiskCachedHttpEntry {
     expires_at_unix_ms: u64,
@@ -2716,15 +2724,18 @@ impl Gateway {
                     let remote = remote_addr;
                     let scheme_owned = scheme.to_string();
                     tokio::spawn(async move {
+                        let revalidate_request = HttpCacheRevalidateRequest {
+                            host: &host_owned,
+                            uri: &uri_owned,
+                            headers: &headers_owned,
+                            remote_addr: remote,
+                            scheme: &scheme_owned,
+                        };
                         if let Err(error) = gateway
                             .revalidate_cached_http_response(
                                 &route_for_refresh,
                                 &cache_key_owned,
-                                &host_owned,
-                                &uri_owned,
-                                &headers_owned,
-                                remote,
-                                &scheme_owned,
+                                &revalidate_request,
                             )
                             .await
                         {
@@ -3020,11 +3031,7 @@ impl Gateway {
         &self,
         route: &HttpRouteConfig,
         cache_key: &str,
-        host: &str,
-        uri: &Uri,
-        headers: &HeaderMap,
-        remote_addr: SocketAddr,
-        scheme: &str,
+        request: &HttpCacheRevalidateRequest<'_>,
     ) -> Result<()> {
         let state = self.current_state().await;
         let upstream_plan = self.select_upstream_plan(
@@ -3033,15 +3040,20 @@ impl Gateway {
             "http",
             route.runtime_scope.as_deref(),
             route.decision.affinity_key.as_deref(),
-            Some(&remote_addr.to_string()),
+            Some(&request.remote_addr.to_string()),
         );
         let upstream = upstream_plan
             .first()
             .cloned()
             .unwrap_or_else(|| route.decision.upstream.clone());
-        let upstream_url = build_upstream_url(&upstream, &route.decision, uri)?;
-        let upstream_headers =
-            build_upstream_headers(headers, &route.decision, host, remote_addr, scheme)?;
+        let upstream_url = build_upstream_url(&upstream, &route.decision, request.uri)?;
+        let upstream_headers = build_upstream_headers(
+            request.headers,
+            &route.decision,
+            request.host,
+            request.remote_addr,
+            request.scheme,
+        )?;
         let response = state
             .http_client
             .get(upstream_url)
@@ -5664,8 +5676,7 @@ async fn rewrite_ftp_active_command(
 }
 
 fn parse_ftp_command_verb(line: &str) -> Option<String> {
-    line.trim()
-        .split_whitespace()
+    line.split_whitespace()
         .next()
         .map(|verb| verb.to_ascii_uppercase())
 }
@@ -10932,12 +10943,18 @@ mod tests {
 
     #[test]
     fn ftp_command_policy_honors_allow_and_deny_lists() {
-        let mut config = crate::config::FtpConfig::default();
-        config.command_deny = vec!["DELE".to_string()];
+        let config = crate::config::FtpConfig {
+            command_deny: vec!["DELE".to_string()],
+            ..Default::default()
+        };
         assert!(!ftp_command_allowed(&config, "DELE"));
         assert!(ftp_command_allowed(&config, "LIST"));
 
-        config.command_allow = vec!["USER".to_string(), "PASS".to_string()];
+        let config = crate::config::FtpConfig {
+            command_allow: vec!["USER".to_string(), "PASS".to_string()],
+            command_deny: vec!["DELE".to_string()],
+            ..Default::default()
+        };
         assert!(ftp_command_allowed(&config, "USER"));
         assert!(!ftp_command_allowed(&config, "LIST"));
     }
