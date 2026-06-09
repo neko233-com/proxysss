@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "proxysss"
-version = "0.3.15"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",

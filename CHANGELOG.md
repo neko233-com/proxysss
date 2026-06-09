@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.0 - 2026-06-09
+
+- **1.0 stable release** — agent-native high-performance gateway with single-YAML config, admin API, and full cross-platform release artifacts.
+- Cloudflare-style HTTP cache policies, domain stream SNI routing (Redis/MySQL/PostgreSQL), on-demand TLS, DDoS mitigation, and dynamic IP blacklist.
+- Security hardening: SSRF blocking, HTTP smuggling rejection, admin auth rate limits, atomic config writes.
+- Interactive architecture guide at `docs/architecture.html`; parity drift tests keep README, AGENTS.md, and capability matrix aligned.
+- Release workflow fix: version bumps now ship with a synced `Cargo.lock` so `cargo build --locked` succeeds on all CI/release runners.
+
 ## v0.3.15 - 2026-06-09
 
 - Added Cloudflare-style HTTP cache policies: `behavior` (`bypass`, `respect_origin`, `override`, `no_cache`), edge/browser TTL, `CDN-Cache-Control`, `stale_if_error_secs`, and `X-Cache` status headers.
