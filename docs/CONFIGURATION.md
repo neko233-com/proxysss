@@ -224,7 +224,7 @@ http:
       ask_url: http://127.0.0.1:8080/allow-tls?domain={domain}
 ```
 
-- Wildcard certificates require the **non-default** external path: `http.tls.mode: acme_dns_external` with `acme.sh` DNS-01 (`http.tls.acme.dns.provider` + credentials). Native DNS provider integrations are not built into the binary.
+- Wildcard certificates use built-in managed DNS-01: `http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01` + `http.tls.acme.dns.provider` (`cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`, or `manual` without API keys). Configure from the admin console at `http://127.0.0.1:7777/` or YAML/API. Legacy `acme_dns_external` + `acme.sh` remains for non-built-in providers only.
 
 ## Monitoring
 
@@ -261,12 +261,18 @@ admin:
   enable_write_ops: true   # default false — enable for agent automation
   expose_config: false
   loopback_only: true
+  https:
+    enabled: false         # set true after initial TLS bootstrap
+    path_prefix: /_proxysss/admin
+    hosts: []              # optional Host allowlist for HTTPS admin API
   auth_rate_limit:
     enabled: true
     max_failures: 8
     window_secs: 300
     lockout_secs: 900
 ```
+
+Bootstrap ACME/TLS on loopback (`http://127.0.0.1:7777/v1/tls/*`). After certificate material exists, enable `admin.https` and drive the same `/v1/*` endpoints over HTTPS at `path_prefix` (Bearer token recommended). Plain HTTP to the public admin path is rejected; HTTPS writes require existing cert/key files.
 
 Agent automation examples: [AGENT-API.md](./AGENT-API.md).
 

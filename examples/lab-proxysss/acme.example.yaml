@@ -1,43 +1,47 @@
-# Copy these keys into %APPDATA%\proxysss\proxysss.yaml when you have a public domain.
+# Copy these keys into proxysss.yaml when you have a public domain.
+# Fully embedded ACME — no acme.sh, certbot, or external CLI required.
 
 http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   h3_bind: 0.0.0.0:443
   tls:
-    mode: acme_external
+    auto_https:
+      enabled: true
+      email: ops@example.com
+      domains:
+        - gateway.example.com
+      production: false
+    mode: acme_managed
     cert_path: certs/proxysss-cert.pem
     key_path: certs/proxysss-key.pem
     generate_self_signed_if_missing: false
     server_name: gateway.example.com
     acme:
-      client: acme.sh
       email: ops@example.com
       domains:
         - gateway.example.com
-      cache_dir: certs/acme-cache
       challenge: http01
       directory_production: false
       renew_interval_hours: 12
 
-# Wildcard certificates are intentionally non-default. Install acme.sh first, then
-# use the DNS provider name and environment variables documented by acme.sh:
-# https://github.com/acmesh-official/acme.sh/wiki/dnsapi
+# Wildcard (*.example.com) — built-in DNS-01 (configure via admin console or YAML):
 #
 # http:
 #   tls:
-#     mode: acme_dns_external
+#     mode: acme_managed
 #     cert_path: certs/proxysss-cert.pem
 #     key_path: certs/proxysss-key.pem
 #     generate_self_signed_if_missing: false
-#     server_name: example.com
 #     acme:
-#       client: acme.sh
 #       email: ops@example.com
+#       challenge: dns01
 #       domains: [example.com, "*.example.com"]
-#       directory_production: false
-#       renew_interval_hours: 12
+#       directory_production: true
 #       dns:
-#         provider: dns_cf
+#         provider: cloudflare
 #         credentials:
-#           CF_Token: your-cloudflare-api-token
+#           api_token: your-cloudflare-api-token
+#
+# No API key path:
+#         provider: manual

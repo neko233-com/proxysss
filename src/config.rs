@@ -514,6 +514,18 @@ pub struct AdminAuthRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminHttpsConfig {
+    /// Expose the full admin API on the main gateway HTTPS listener at `path_prefix`.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_admin_https_path_prefix")]
+    pub path_prefix: String,
+    /// When empty, any Host on the TLS listener may reach the HTTPS admin API.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -534,6 +546,8 @@ pub struct AdminConfig {
     pub enable_write_ops: bool,
     #[serde(default = "default_true")]
     pub loopback_only: bool,
+    #[serde(default)]
+    pub https: AdminHttpsConfig,
     #[serde(default)]
     pub auth_rate_limit: AdminAuthRateLimitConfig,
 }
@@ -1563,6 +1577,22 @@ impl GatewayConfig {
                         .to_string(),
                 );
             }
+            if self.admin.https.enabled {
+                let prefix = normalize_admin_https_path_prefix(&self.admin.https.path_prefix);
+                if prefix == "/" {
+                    errors.push("admin.https.path_prefix cannot be /".to_string());
+                }
+                if !prefix.starts_with('/') {
+                    errors.push("admin.https.path_prefix must start with /".to_string());
+                }
+                for reserved in ["/docs", "/healthz", "/metrics", "/filecloud"] {
+                    if prefix == reserved || prefix.starts_with(&format!("{reserved}/")) {
+                        errors.push(format!(
+                            "admin.https.path_prefix cannot overlap reserved path {reserved}"
+                        ));
+                    }
+                }
+            }
         }
 
         if self.monitoring.enabled && !self.monitoring.path.starts_with('/') {
@@ -1864,6 +1894,12 @@ impl GatewayConfig {
             );
         }
 
+        if self.admin.https.enabled && self.admin.enable_write_ops {
+            warnings.push(
+                "admin.https is enabled with write operations; bootstrap TLS/ACME on loopback first, then drive automation over HTTPS".to_string(),
+            );
+        }
+
         warnings
     }
 
@@ -1878,6 +1914,9 @@ impl GatewayConfig {
         self.normalize_domain_tls(&root_dir);
         self.apply_auto_https();
         self.normalize_acme_dns_config();
+        self.admin.https.path_prefix =
+            normalize_admin_https_path_prefix(&self.admin.https.path_prefix);
+        normalize_vec_lowercase(&mut self.admin.https.hosts);
 
         if self.logging.filter.trim().is_empty() {
             self.logging.filter = default_filter_for_level(self.logging.level);
@@ -2336,6 +2375,16 @@ impl Default for AdminAuthRateLimitConfig {
     }
 }
 
+impl Default for AdminHttpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_admin_https_path_prefix(),
+            hosts: Vec::new(),
+        }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -2347,6 +2396,7 @@ impl Default for AdminConfig {
             expose_config: false,
             enable_write_ops: false,
             loopback_only: default_true(),
+            https: AdminHttpsConfig::default(),
             auth_rate_limit: AdminAuthRateLimitConfig::default(),
         }
     }
@@ -2969,6 +3019,23 @@ fn default_stream_peek_timeout_ms() -> u64 {
 
 fn default_admin_bind() -> String {
     "127.0.0.1:7777".to_string()
+}
+
+fn default_admin_https_path_prefix() -> String {
+    "/_proxysss/admin".to_string()
+}
+
+pub fn normalize_admin_https_path_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return default_admin_https_path_prefix();
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    with_slash.trim_end_matches('/').to_string()
 }
 
 fn default_admin_auth_max_failures() -> u32 {

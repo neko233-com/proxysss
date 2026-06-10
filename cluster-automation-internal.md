@@ -4,16 +4,34 @@ This document is for operators and agents that need to take over cluster routing
 
 ## Scope
 
-These endpoints are intended for internal automation only.
+### Loopback bootstrap (first TLS / ACME)
 
-- `POST /v1/domain-routes/upsert`
-- `POST /v1/reverse-proxy-routes/upsert`
-- `POST /v1/tcp-listeners/upsert`
-- `POST /v1/udp-listeners/upsert`
+Use `http://127.0.0.1:7777/v1/*` while `admin.loopback_only: true`:
 
-All of them:
+- TLS / ACME: `/v1/tls/auto-https/upsert`, `/v1/tls/wildcard-dns/upsert`, `/v1/tls/on-demand/upsert`, `/v1/tls/issue-now`
+- SNI certs: `/v1/tls/sni-certificates/*`
 
-- authenticate with `Authorization: Bearer <token>`
+### HTTPS automation (after cert material exists)
+
+Enable `admin.https.enabled` and call the same endpoints on the main gateway TLS listener:
+
+`https://<host>/_proxysss/admin/v1/*`
+
+Plain HTTP to the public admin path is rejected. HTTPS writes require existing cert/key material.
+
+### Core route/listener endpoints
+
+- `POST /v1/domain-routes/upsert` · `POST /v1/domain-routes/delete`
+- `POST /v1/reverse-proxy-routes/upsert` · `POST /v1/reverse-proxy-routes/delete`
+- `POST /v1/tcp-listeners/upsert` · `POST /v1/tcp-listeners/delete`
+- `POST /v1/udp-listeners/upsert` · `POST /v1/udp-listeners/delete`
+- `POST /v1/stream-routes/upsert` · `POST /v1/stream-routes/delete`
+- `GET/POST /v1/security/blacklist/*`
+- `POST /v1/filecloud/upsert` · `GET /v1/filecloud/summary`
+
+All mutation endpoints:
+
+- authenticate with `Authorization: Bearer <token>` (or Basic auth)
 - write back into the main `proxysss.yaml`
 - trigger in-process reload on success
 - restore the original YAML if reload fails
@@ -33,6 +51,11 @@ admin:
   bind: 127.0.0.1:7777
   bearer_token: replace-with-a-cluster-secret
   enable_write_ops: true
+  loopback_only: true
+  https:
+    enabled: true          # after initial TLS bootstrap
+    path_prefix: /_proxysss/admin
+    hosts: []              # optional Host allowlist
 ```
 
 ## Domain route upsert
@@ -53,9 +76,16 @@ curl -X POST http://127.0.0.1:7777/v1/domain-routes/upsert \
   }'
 ```
 
-## Reverse proxy route upsert
+Delete:
 
-Use this for host/path matcher-driven HTTP routing when the domain-first model is not enough.
+```bash
+curl -X POST http://127.0.0.1:7777/v1/domain-routes/delete \
+  -H "Authorization: Bearer replace-with-a-cluster-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "api-edge"}'
+```
+
+## Reverse proxy route upsert
 
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/reverse-proxy-routes/upsert \
@@ -70,7 +100,36 @@ curl -X POST http://127.0.0.1:7777/v1/reverse-proxy-routes/upsert \
   }'
 ```
 
-## TCP listener upsert
+## Wildcard TLS (built-in DNS-01)
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/tls/wildcard-dns/upsert \
+  -H "Authorization: Bearer replace-with-a-cluster-secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domains": ["example.com", "*.example.com"],
+    "email": "admin@example.com",
+    "dns_provider": "cloudflare",
+    "credentials": {"api_token": "..."}
+  }'
+```
+
+Use `dns_provider: manual` when no cloud API key is available.
+
+## SNI manual certificate upsert
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/tls/sni-certificates/upsert \
+  -H "Authorization: Bearer replace-with-a-cluster-secret" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domains": ["legacy.example.com"],
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }'
+```
+
+## TCP / UDP listener upsert
 
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/upsert \
@@ -79,12 +138,9 @@ curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/upsert \
   -d '{
     "name": "game-tcp",
     "bind": "0.0.0.0:7000",
-    "upstream": "10.0.0.17:7000",
-    "upstreams": ["10.0.0.18:7000"]
+    "upstream": "10.0.0.17:7000"
   }'
 ```
-
-## UDP listener upsert
 
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/udp-listeners/upsert \
@@ -93,7 +149,7 @@ curl -X POST http://127.0.0.1:7777/v1/udp-listeners/upsert \
   -d '{
     "name": "game-udp",
     "bind": "0.0.0.0:7001",
-    "upstreams": ["10.0.0.17:7001", "10.0.0.18:7001"]
+    "upstream": "10.0.0.17:7001"
   }'
 ```
 
@@ -101,22 +157,22 @@ curl -X POST http://127.0.0.1:7777/v1/udp-listeners/upsert \
 
 Recommended pattern for agents:
 
-1. Discover node/service health outside the gateway.
-2. Upsert the desired route or listener by name.
-3. Re-run the same upsert when backends or pools change.
-4. Keep `name` stable so updates replace instead of append.
+1. Bootstrap TLS/ACME on loopback admin.
+2. Enable `admin.https` and switch automation traffic to HTTPS.
+3. Discover node/service health outside the gateway.
+4. Upsert the desired route, listener, or certificate by stable name/domain.
 5. Treat `proxysss.yaml` as the persisted source of truth after each successful call.
 
 ## Protocol mapping
 
 - HTTP/HTTPS/HTTP2/HTTP3/WebSocket/WSS: `domain-routes` or `reverse-proxy-routes`
-- TCP: `tcp-listeners`
-- UDP: `udp-listeners`
-- FTP: still managed through the YAML service block
-- Static sites and WebDAV: still managed through the YAML service blocks
+- TCP: `tcp-listeners` · UDP: `udp-listeners` · TLS SNI stream: `stream-routes`
+- FTP / static sites / WebDAV / FileCloud: YAML or dedicated admin endpoints (`/v1/filecloud/*`)
 
-## Current gap notes
+## Remaining gaps
 
-- Wildcard certificate automation through DNS provider APIs is not implemented in this document's API surface yet.
-- Route deletion and listener deletion endpoints are not implemented yet.
-- Bulk transaction/compare-and-swap semantics are not implemented yet.
+- Bulk transaction / compare-and-swap semantics for multi-resource updates
+- Admin HTTP API for static sites, WebDAV, FTP, and AI proxy route blocks (YAML-only today)
+- Bearer token rotation via HTTP (`proxysss token set` CLI only)
+
+See [docs/AGENT-API.md](docs/AGENT-API.md) for the full endpoint catalog.

@@ -271,7 +271,7 @@
         <p>Default public TLS listens on <code>0.0.0.0:443</code>. Managed ACME uses built-in HTTP-01 and TLS-ALPN-01 without external tooling.</p>
         <div class="list">
           <div><strong>Built-in path:</strong> <code>http.tls.auto_https</code> / <code>acme_managed</code> — ordinary hostname certificates.</div>
-          <div><strong>Wildcard boundary:</strong> <span class="pill warn">external</span> Use <code>http.tls.mode: acme_dns_external</code> with <code>acme.sh</code> DNS-01 for <code>*.example.com</code>. Native DNS APIs are not embedded.</div>
+          <div><strong>Wildcard boundary:</strong> <span class="pill ok">built-in</span> Use <code>http.tls.mode: acme_managed</code> + <code>http.tls.acme.challenge: dns01</code> with embedded providers (<code>cloudflare</code>, <code>aliyun_cn</code>, <code>aliyun_intl</code>, <code>tencent</code>, <code>volcengine</code>, <code>aws</code>, <code>azure</code>, <code>google</code>, or <code>manual</code>). No acme.sh/certbot required. Legacy <code>acme_dns_external</code> remains for non-built-in providers only.</div>
           <div><strong>On-demand TLS:</strong> <code>http.tls.on_demand</code> issues managed ACME certs on first SNI hit when <code>allow</code> patterns match (optional <code>ask_url</code> gate).</div>
           <div><strong>SNI:</strong> Multi-cert selection via <code>http.tls.certificates</code> and per-domain manual SSL on routes.</div>
         </div>

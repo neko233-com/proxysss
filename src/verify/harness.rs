@@ -21,6 +21,13 @@ use crate::config::GatewayConfig;
 use crate::gateway::Gateway;
 
 static GATEWAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static RUSTLS_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
+
+pub fn ensure_rustls_crypto_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub async fn gateway_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_TEST_LOCK.lock().await
@@ -237,9 +244,11 @@ pub fn write_config(root: &Path, yaml: &str) -> Result<PathBuf> {
 pub async fn spawn_gateway(
     config_path: PathBuf,
 ) -> Result<(Arc<Gateway>, tokio::task::JoinHandle<()>)> {
+    ensure_rustls_crypto_provider();
     let _guard = gateway_test_guard().await;
     let config = GatewayConfig::load(&config_path)?;
     let plain_bind = config.http.plain_bind.clone();
+    let tls_bind = config.http.tls_bind.clone();
     let gateway = Gateway::from_config(config_path, config).await?;
     let runner = {
         let gateway = gateway.clone();
@@ -249,6 +258,8 @@ pub async fn spawn_gateway(
     };
     if !plain_bind.trim().is_empty() {
         wait_tcp_ready(&plain_bind).await?;
+    } else if !tls_bind.trim().is_empty() {
+        wait_tcp_ready(&tls_bind).await?;
     }
     if runner.is_finished() {
         anyhow::bail!("gateway task exited before it became usable");

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.1 - 2026-06-10
+
+- Added **HTTPS admin API** (`admin.https`): expose the full `/v1/*` automation surface on the main TLS listener at `admin.https.path_prefix` (default `/_proxysss/admin`); bootstrap TLS/ACME on loopback first, then drive agents over HTTPS with Bearer auth.
+- Added **SNI certificate admin API** (`GET/POST /v1/tls/sni-certificates/*`) with PEM upload or path-based upsert, plus TLS panel UI.
+- Added **Security** admin view for dynamic IP blacklist (`/v1/security/blacklist/*`).
+- Expanded admin route forms (extra upstreams, strip_prefix) and documented full JSON fields for agents in `docs/AGENT-API.md`.
+- Updated `cluster-automation-internal.md` and `AGENTS.md` for current automation scope.
+- Added integration tests for HTTPS admin API and SNI certificate upsert.
+- Fixed TLS handshake rejection when clients connect by IP without SNI (falls back to the default certificate).
+
 ## v1.2.0 - 2026-06-10
 
 - Added **FileCloud** (`services.filecloud`): proxysss-exclusive shared directory UI with single-password auth, file tree with sizes, drag upload/move, search, delete/rename/mkdir, and CDN-friendly `/dl/*` downloads; all operations are confined to `services.filecloud.root`. Existing nginx-style `services.webdav` is unchanged.

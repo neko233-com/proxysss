@@ -136,4 +136,4 @@ return {
 
 - nginx 对照与常见反代案例见 `nginx-to-proxysss.md`
 - 运行时/内建文档页见 `http://localhost/docs.html` 或 `http://localhost/docs`
-- 泛域名证书不走脚本 API；使用非默认 `http.tls.mode: acme_dns_external`，由外部 `acme.sh` 按 DNS-01 provider 和 credentials 申请/续签，provider 变量名参考 <https://github.com/acmesh-official/acme.sh/wiki/dnsapi>
+- 泛域名证书使用内建 managed DNS-01：`http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01` + `http.tls.acme.dns.provider`（`cloudflare` / `aliyun_cn` / `aliyun_intl` / `tencent` / `volcengine` / `aws` / `azure` / `google`）。无云 token 时用 `auto_https`（HTTP-01/TLS-ALPN-01），均不依赖 acme.sh

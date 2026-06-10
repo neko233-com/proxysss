@@ -80,7 +80,46 @@ curl -X POST http://127.0.0.1:7777/v1/reverse-proxy-routes/delete \
   -d '{"name": "internal-api"}'
 ```
 
+### Full JSON fields (agents)
+
+The admin console forms cover common fields only. Agents should POST the full `DomainRouteConfig` / `ReverseProxyRouteConfig` JSON accepted by the Rust config schema, including:
+
+**Domain route** (`POST /v1/domain-routes/upsert`): `name`, `domains`, `path_prefix`, `upstream`, `upstreams`, `upstream_weights`, `strip_prefix`, `set_headers`, `strip_headers`, `compression`, `cache`, `rate_limit`, `active_health`, `ssl` (`mode`: `inherit|disabled|auto|manual`, `cert_path`, `key_path`, `email`).
+
+**Reverse proxy route** (`POST /v1/reverse-proxy-routes/upsert`): `name`, `hosts`, `path_prefix`, `upstream`, `upstreams`, `upstream_weights`, `strip_prefix`, `set_headers`, `strip_headers`, `compression`, `cache`, `rate_limit`.
+
+Inspect defaults with `proxysss config explain` and mirror shapes from generated `proxysss.yaml` templates.
+
 ## TLS / ACME
+
+Agent workflow:
+
+1. **Bootstrap** (first certificate): use loopback admin `http://127.0.0.1:7777/v1/tls/*` while `admin.loopback_only: true`.
+2. **Automation** (after cert material exists): enable `admin.https.enabled` and call the same `/v1/*` endpoints over **HTTPS** on the main gateway listener.
+
+```yaml
+admin:
+  enable_write_ops: true
+  bearer_token: long-random-cluster-token
+  https:
+    enabled: true
+    path_prefix: /_proxysss/admin
+    hosts: ["ops.example.com"]   # optional; empty = any TLS host
+```
+
+```bash
+# Inspect TLS + HTTPS admin base path
+curl https://ops.example.com/_proxysss/admin/v1/tls/summary \
+  -H "Authorization: Bearer long-random-cluster-token"
+
+# After TLS is ready: upsert routes / ACME / FileCloud over HTTPS
+curl -X POST https://ops.example.com/_proxysss/admin/v1/domain-routes/upsert \
+  -H "Authorization: Bearer long-random-cluster-token" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"api","domains":["api.example.com"],"upstream":"http://127.0.0.1:8080","path_prefix":"/"}'
+```
+
+Plain HTTP to `admin.https.path_prefix` is rejected. HTTPS write operations require existing certificate/key material (`GET /v1/tls/summary` → `https_api.tls_ready: true`).
 
 ### Managed HTTPS (HTTP-01 / TLS-ALPN-01)
 
@@ -95,25 +134,132 @@ curl -X POST http://127.0.0.1:7777/v1/tls/auto-https/upsert \
   }'
 ```
 
-### Wildcard certificate via acme.sh DNS-01
+### Wildcard certificate via built-in DNS-01 (no external ACME client)
 
-Wildcard certificates are **not** issued by built-in managed ACME. Use this non-default path only when DNS-01 is required (`*.example.com`).
+Built-in managed ACME supports wildcard certificates through embedded DNS-01 providers. Configure from the admin console (`http://127.0.0.1:7777/` → **TLS / ACME**) or via API:
 
 ```bash
+curl http://127.0.0.1:7777/v1/tls/summary -u ops:change-me
+curl http://127.0.0.1:7777/v1/tls/dns-providers -u ops:change-me
+
 curl -X POST http://127.0.0.1:7777/v1/tls/wildcard-dns/upsert \
   -u ops:change-me \
   -H "Content-Type: application/json" \
   -d '{
     "domains": ["example.com", "*.example.com"],
     "email": "admin@example.com",
-    "dns_provider": "dns_cf",
+    "dns_provider": "cloudflare",
     "credentials": {
-      "CF_Token": "your-cloudflare-api-token"
+      "api_token": "your-cloudflare-api-token"
     }
   }'
 ```
 
-`dns_provider` is the `acme.sh --dns` provider name. Credentials are persisted into YAML and redacted from `proxysss config show`.
+Built-in providers: `cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`, `manual`.
+
+- `manual` needs **no API key** — proxysss prints the TXT record and polls public DNS until propagation completes.
+- Legacy `acme_dns_external` + `acme.sh` remains only for providers not implemented natively.
+
+Credentials are persisted into YAML and redacted from `proxysss config show`.
+
+### On-demand TLS (first-hit issuance)
+
+Requires `http.tls.mode: acme_managed`. Configure allow globs from the admin console or API:
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/tls/on-demand/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "allow": ["*.example.com", "edge.example.com"]
+  }'
+```
+
+Trigger immediate managed certificate issuance (uses current auto-HTTPS / ACME domain list):
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/tls/issue-now \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### SNI manual certificates (`http.tls.certificates`)
+
+List, upsert PEM inline, or reference existing cert/key files on disk:
+
+```bash
+curl http://127.0.0.1:7777/v1/tls/sni-certificates -u ops:change-me
+
+curl -X POST http://127.0.0.1:7777/v1/tls/sni-certificates/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domains": ["api.example.com", "*.internal.example.com"],
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }'
+
+curl -X POST http://127.0.0.1:7777/v1/tls/sni-certificates/delete \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "api.example.com"}'
+```
+
+Path-based upsert (files must already exist):
+
+```bash
+curl -X POST http://127.0.0.1:7777/v1/tls/sni-certificates/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domains": ["legacy.example.com"],
+    "cert_path": "./certs/legacy.crt",
+    "key_path": "./certs/legacy.key"
+  }'
+```
+
+### Domain routes (admin UI + API)
+
+```bash
+curl http://127.0.0.1:7777/v1/domain-routes -u ops:change-me
+```
+
+Use the **Domain Routes** tab in the admin console or `POST /v1/domain-routes/upsert` (requires `admin.enable_write_ops=true`).
+
+### List path-based reverse proxy routes
+
+```bash
+curl http://127.0.0.1:7777/v1/reverse-proxy-routes -u ops:change-me
+```
+
+## FileCloud (proxysss-exclusive shared folder)
+
+Not nginx WebDAV — password-protected UI with CRUD, drag upload, search, and CDN-friendly `/dl/*` downloads confined to `services.filecloud.root`.
+
+```bash
+curl http://127.0.0.1:7777/v1/filecloud/summary -u ops:change-me
+
+curl -X POST http://127.0.0.1:7777/v1/filecloud/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "path_prefix": "/filecloud",
+    "root": "./filecloud-data",
+    "password": "change-me",
+    "title": "Shared Files",
+    "allow_upload": true,
+    "allow_delete": true,
+    "allow_mkdir": true,
+    "allow_move": true,
+    "max_upload_bytes": 536870912,
+    "cdn_cache_secs": 86400
+  }'
+```
+
+Omit `password` or send an empty string to keep the existing password. Password is redacted from `GET /v1/config`.
 
 ## Domain stream routes (Redis, MySQL, etc.)
 
@@ -131,6 +277,15 @@ curl -X POST http://127.0.0.1:7777/v1/stream-routes/upsert \
 ```
 
 Routes are persisted under `tcp.stream_routes` in the main YAML file and hot-reloaded.
+
+```bash
+curl http://127.0.0.1:7777/v1/stream-routes -u ops:change-me
+
+curl -X POST http://127.0.0.1:7777/v1/stream-routes/delete \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"name": "redis-prod"}'
+```
 
 ## Dynamic IP blacklist
 
@@ -151,6 +306,9 @@ curl -X POST http://127.0.0.1:7777/v1/security/blacklist/remove \
 ## Stream listeners
 
 ```bash
+curl http://127.0.0.1:7777/v1/tcp-listeners -u ops:change-me
+curl http://127.0.0.1:7777/v1/udp-listeners -u ops:change-me
+
 curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/upsert \
   -u ops:change-me \
   -H "Content-Type: application/json" \
@@ -160,6 +318,25 @@ curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/upsert \
     "upstream": "127.0.0.1:9000",
     "upstreams": ["127.0.0.1:9001"]
   }'
+
+curl -X POST http://127.0.0.1:7777/v1/udp-listeners/upsert \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "voice",
+    "bind": "0.0.0.0:7001",
+    "upstream": "127.0.0.1:9001"
+  }'
+
+curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/delete \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"name": "game"}'
+
+curl -X POST http://127.0.0.1:7777/v1/udp-listeners/delete \
+  -u ops:change-me \
+  -H "Content-Type: application/json" \
+  -d '{"name": "voice"}'
 ```
 
 ## Kubernetes ingress-style mappings (config-gated)

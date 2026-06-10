@@ -13,6 +13,7 @@ pub mod util;
 pub mod volcengine;
 
 pub use factory::{
-    is_builtin_dns_provider, list_builtin_dns_provider_ids, normalize_provider_id, DnsProvider,
+    dns_providers_json, is_builtin_dns_provider, list_builtin_dns_provider_ids,
+    normalize_provider_id, DnsProvider,
 };
 pub use util::acme_challenge_fqdn;

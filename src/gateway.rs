@@ -60,11 +60,12 @@ use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
     on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
     AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
-    FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig,
-    LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey,
-    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig, StaticSiteConfig,
-    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig,
+    HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig,
+    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
+    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig,
+    StreamRouteConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
+    WebDavConfig,
 };
 use crate::install;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
@@ -325,7 +326,10 @@ impl ServerCertVerifier for InsecureUpstreamVerifier {
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let server_name = client_hello.server_name()?.to_ascii_lowercase();
+        let Some(server_name) = client_hello.server_name() else {
+            return Some(self.default.clone());
+        };
+        let server_name = server_name.to_ascii_lowercase();
         let is_acme_tls_alpn = client_hello
             .alpn()
             .map(|protocols| {
@@ -819,7 +823,11 @@ impl Gateway {
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let gateway = gateway.clone();
-                    async move { gateway.handle_admin_request(request, remote_addr).await }
+                    async move {
+                        gateway
+                            .handle_admin_request(request, remote_addr, AdminTransport::Loopback)
+                            .await
+                    }
                 });
 
                 let result = AutoBuilder::new(TokioExecutor::new())
@@ -837,13 +845,40 @@ impl Gateway {
         self: Arc<Self>,
         mut request: Request<Incoming>,
         remote_addr: SocketAddr,
+        transport: AdminTransport,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+        let headers = request.headers().clone();
+        let body = if method == Method::GET || method == Method::HEAD {
+            Bytes::new()
+        } else {
+            match request.body_mut().collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
+                    ));
+                }
+            }
+        };
+        self.serve_admin_api(method, path, headers, body, remote_addr, transport)
+            .await
+    }
+
+    async fn serve_admin_api(
+        &self,
+        method: Method,
+        path: String,
+        headers: HeaderMap,
+        body: Bytes,
+        remote_addr: SocketAddr,
+        transport: AdminTransport,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         self.stats
             .admin_requests_total
             .fetch_add(1, Ordering::Relaxed);
-
-        let method = request.method().clone();
-        let path = request.uri().path().to_string();
 
         if path == "/healthz" {
             return Ok(json_response(
@@ -854,13 +889,9 @@ impl Gateway {
 
         let state = self.current_state().await;
 
-        if state.config.admin.loopback_only
-            && !admin_loopback_only_allows(remote_addr, &state.config.admin.bind)
+        if let Some(response) = check_admin_transport_access(&state.config, &transport, remote_addr)
         {
-            return Ok(text_response(
-                StatusCode::FORBIDDEN,
-                "admin API is restricted to loopback clients",
-            ));
+            return Ok(response);
         }
 
         if method == Method::GET && (path == "/" || path == "/index.html") {
@@ -881,7 +912,7 @@ impl Gateway {
             ));
         }
 
-        if !is_authorized(request.headers().get(AUTHORIZATION), &state.config.admin) {
+        if !is_authorized(headers.get(AUTHORIZATION), &state.config.admin) {
             self.stats
                 .admin_auth_fail_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -891,6 +922,12 @@ impl Gateway {
         }
 
         self.admin_auth_guard.clear_failures(&auth_key);
+
+        if admin_request_is_write(&method, &path) {
+            if let Some(response) = check_admin_mutation_access(&state.config, &transport) {
+                return Ok(response);
+            }
+        }
 
         if method == Method::GET && path == "/v1/stats" {
             return Ok(json_response(StatusCode::OK, self.stats.snapshot_json()));
@@ -910,15 +947,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<UpstreamToggleRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -942,15 +971,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<UpstreamToggleRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -980,6 +1001,84 @@ impl Gateway {
             ));
         }
 
+        if method == Method::GET && path == "/v1/tls/summary" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "tls": tls_admin_summary(&state.config)}),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/tls/dns-providers" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "providers": crate::acme::dns_providers_json(),
+                    "zero_external_deps": true,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/domain-routes" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.services.domain_routes,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/reverse-proxy-routes" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.services.reverse_proxy.routes,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/tcp-listeners" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.tcp.listeners,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/udp-listeners" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.udp.listeners,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/stream-routes" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.tcp.stream_routes,
+                }),
+            ));
+        }
+
+        if method == Method::GET && path == "/v1/filecloud/summary" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "filecloud": filecloud_admin_summary(&state.config),
+                }),
+            ));
+        }
+
         if method == Method::POST && path == "/v1/domain-routes/upsert" {
             if !state.config.admin.enable_write_ops {
                 return Ok(text_response(
@@ -988,15 +1087,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let route = match serde_json::from_slice::<DomainRouteConfig>(&body) {
                 Ok(route) => route,
@@ -1050,15 +1141,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let route = match serde_json::from_slice::<ReverseProxyRouteConfig>(&body) {
                 Ok(route) => route,
@@ -1114,15 +1197,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let listener = match serde_json::from_slice::<TcpListenerConfig>(&body) {
                 Ok(listener) => listener,
@@ -1175,15 +1250,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let listener = match serde_json::from_slice::<UdpListenerConfig>(&body) {
                 Ok(listener) => listener,
@@ -1235,15 +1302,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let route = match serde_json::from_slice::<StreamRouteConfig>(&body) {
                 Ok(route) => route,
                 Err(error) => {
@@ -1303,15 +1362,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<BlacklistMutationRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1351,15 +1402,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<BlacklistMutationRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1396,15 +1439,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1446,15 +1481,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1496,15 +1523,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<AutoHttpsUpsertRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1540,15 +1559,7 @@ impl Gateway {
                     "write operations disabled",
                 ));
             }
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
             let payload = match serde_json::from_slice::<WildcardTlsUpsertRequest>(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -1566,6 +1577,311 @@ impl Gateway {
                     return Ok(json_response(
                         StatusCode::OK,
                         serde_json::json!({"ok": true, "domains": domains, "mode": "acme_managed", "challenge": "dns01"}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tls/on-demand/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<OnDemandTlsUpsertRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid on-demand tls payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_on_demand_tls_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(summary) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "on_demand": summary}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tls/issue-now" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            match self.trigger_managed_tls_issue().await {
+                Ok(summary) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "issued": summary}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::GET && path == "/v1/tls/sni-certificates" {
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "items": state.config.http.tls.certificates.iter().map(|cert| {
+                        serde_json::json!({
+                            "domains": cert.domains,
+                            "cert_path": cert.cert_path.display().to_string(),
+                            "key_path": cert.key_path.display().to_string(),
+                            "cert_exists": cert.cert_path.exists(),
+                            "key_exists": cert.key_path.exists(),
+                        })
+                    }).collect::<Vec<_>>(),
+                }),
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/tls/sni-certificates/upsert" {
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<SniCertificateUpsertRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid sni certificate payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_sni_certificate_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(cert) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "action": cert.action,
+                            "domains": cert.certificate.domains,
+                            "cert_path": cert.certificate.cert_path.display().to_string(),
+                            "key_path": cert.certificate.key_path.display().to_string(),
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tls/sni-certificates/delete" {
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<SniCertificateDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid sni certificate delete payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_sni_certificate_delete_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/filecloud/upsert" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<FileCloudUpsertRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid filecloud payload: {error}")}),
+                    ));
+                }
+            };
+            match self
+                .persist_filecloud_and_reload(&state.config, payload)
+                .await
+            {
+                Ok(summary) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "filecloud": summary}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/tcp-listeners/delete" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid delete payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&payload.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_tcp_listener_delete_and_reload(&state.config, &payload.name)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "name": payload.name}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/udp-listeners/delete" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid delete payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&payload.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_udp_listener_delete_and_reload(&state.config, &payload.name)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "name": payload.name}),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                }
+            }
+        }
+
+        if method == Method::POST && path == "/v1/stream-routes/delete" {
+            if !state.config.admin.enable_write_ops {
+                return Ok(text_response(
+                    StatusCode::FORBIDDEN,
+                    "write operations disabled",
+                ));
+            }
+            let body = body.clone();
+            let payload = match serde_json::from_slice::<NamedDeleteRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid delete payload: {error}")}),
+                    ));
+                }
+            };
+            if let Err(error) = security::validate_route_name(&payload.name) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": error.to_string()}),
+                ));
+            }
+            match self
+                .persist_stream_route_delete_and_reload(&state.config, &payload.name)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        serde_json::json!({"ok": true, "name": payload.name}),
                     ));
                 }
                 Err(error) => {
@@ -1628,15 +1944,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let spec = match serde_json::from_slice::<ScriptPluginSpec>(&body) {
                 Ok(spec) => spec,
@@ -1685,15 +1993,7 @@ impl Gateway {
                 ));
             }
 
-            let body = match request.body_mut().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
-            };
+            let body = body.clone();
 
             let unload = match serde_json::from_slice::<PluginUnloadRequest>(&body) {
                 Ok(data) => data,
@@ -1931,6 +2231,12 @@ impl Gateway {
                 crate::acme::list_builtin_dns_provider_ids().join(", ")
             ));
         }
+        let normalized_provider = crate::acme::normalize_provider_id(&payload.dns_provider);
+        if normalized_provider != "manual" && payload.credentials.is_empty() {
+            return Err(anyhow!(
+                "credentials are required for dns provider {normalized_provider}"
+            ));
+        }
 
         let domains = payload.domains.clone();
         let mut candidate = current_config.clone();
@@ -1956,6 +2262,283 @@ impl Gateway {
             ));
         }
         Ok(domains)
+    }
+
+    async fn persist_on_demand_tls_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: OnDemandTlsUpsertRequest,
+    ) -> Result<serde_json::Value> {
+        let mut candidate = current_config.clone();
+        candidate.http.tls.on_demand.enabled = payload.enabled;
+        candidate.http.tls.on_demand.allow = payload.allow.clone();
+        if let Some(value) = payload.max_active_certs {
+            candidate.http.tls.on_demand.max_active_certs = value;
+        }
+        if let Some(value) = payload.max_issues_per_hour {
+            candidate.http.tls.on_demand.max_issues_per_hour = value;
+        }
+        if let Some(ref value) = payload.ask_url {
+            candidate.http.tls.on_demand.ask_url = value.clone();
+        }
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_on_demand_tls(&original, &payload)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "on-demand tls update was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(serde_json::json!({
+            "enabled": payload.enabled,
+            "allow": payload.allow,
+        }))
+    }
+
+    async fn trigger_managed_tls_issue(&self) -> Result<serde_json::Value> {
+        let state = self.current_state().await;
+        if state.config.http.tls.mode != TlsMode::AcmeManaged {
+            return Err(anyhow!(
+                "tls.mode must be acme_managed to issue certificates (current: {:?})",
+                state.config.http.tls.mode
+            ));
+        }
+        issue_managed_acme_certificate(
+            &state.config.http.tls,
+            &self.acme_http_challenges,
+            &self.acme_tls_alpn_certs,
+        )
+        .await
+        .context("managed ACME certificate issuance failed")?;
+        let tls = self.current_state().await.config.http.tls.clone();
+        Ok(serde_json::json!({
+            "cert_exists": tls.cert_path.exists(),
+            "key_exists": tls.key_path.exists(),
+            "cert_path": tls.cert_path.display().to_string(),
+            "key_path": tls.key_path.display().to_string(),
+        }))
+    }
+
+    async fn persist_sni_certificate_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: SniCertificateUpsertRequest,
+    ) -> Result<SniCertificateUpsertResult> {
+        if payload.domains.is_empty() || payload.domains.iter().any(|item| item.trim().is_empty()) {
+            return Err(anyhow!(
+                "domains must contain at least one non-empty hostname"
+            ));
+        }
+        let (cert_path, key_path) =
+            resolve_sni_certificate_material(&current_config.root_dir, &payload)?;
+
+        let certificate = TlsCertificateConfig {
+            domains: payload
+                .domains
+                .into_iter()
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect(),
+            cert_path,
+            key_path,
+        };
+
+        let mut candidate = current_config.clone();
+        let action = upsert_sni_certificate_config(
+            &mut candidate.http.tls.certificates,
+            certificate.clone(),
+        );
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_upserted_sni_certificate(&original, &certificate)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "sni certificate update was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(SniCertificateUpsertResult {
+            action,
+            certificate,
+        })
+    }
+
+    async fn persist_sni_certificate_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: SniCertificateDeleteRequest,
+    ) -> Result<()> {
+        if payload.cert_path.as_deref().unwrap_or("").trim().is_empty()
+            && payload.domain.as_deref().unwrap_or("").trim().is_empty()
+        {
+            return Err(anyhow!("cert_path or domain is required"));
+        }
+        let mut candidate = current_config.clone();
+        let before = candidate.http.tls.certificates.len();
+        candidate
+            .http
+            .tls
+            .certificates
+            .retain(|cert| !sni_certificate_matches_delete(cert, &payload));
+        if candidate.http.tls.certificates.len() == before {
+            return Err(anyhow!("sni certificate entry not found"));
+        }
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_sni_certificate(&original, &payload)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "sni certificate delete was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persist_filecloud_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        payload: FileCloudUpsertRequest,
+    ) -> Result<serde_json::Value> {
+        let password = if payload.password.trim().is_empty() {
+            current_config.services.filecloud.password.clone()
+        } else {
+            payload.password.clone()
+        };
+        let filecloud = FileCloudConfig {
+            enabled: payload.enabled,
+            path_prefix: payload.path_prefix,
+            root: payload.root,
+            password,
+            title: payload.title,
+            allow_upload: payload.allow_upload,
+            allow_delete: payload.allow_delete,
+            allow_mkdir: payload.allow_mkdir,
+            allow_move: payload.allow_move,
+            max_upload_bytes: payload
+                .max_upload_bytes
+                .unwrap_or(current_config.services.filecloud.max_upload_bytes),
+            cdn_cache_secs: payload
+                .cdn_cache_secs
+                .unwrap_or(current_config.services.filecloud.cdn_cache_secs),
+            session_ttl_secs: payload
+                .session_ttl_secs
+                .unwrap_or(current_config.services.filecloud.session_ttl_secs),
+            require_auth_for_download: payload.require_auth_for_download,
+        };
+
+        let mut candidate = current_config.clone();
+        candidate.services.filecloud = filecloud.clone();
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_filecloud(&original, &filecloud)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(error.context(
+                "filecloud update was written but reload failed; original file was restored",
+            ));
+        }
+        Ok(filecloud_admin_summary(&candidate))
+    }
+
+    async fn persist_tcp_listener_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        name: &str,
+    ) -> Result<()> {
+        let mut candidate = current_config.clone();
+        if !candidate.tcp.listeners.iter().any(|item| item.name == name) {
+            return Err(anyhow!("tcp listener {name} not found"));
+        }
+        candidate.tcp.listeners.retain(|item| item.name != name);
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_tcp_listener(&original, name)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(
+                error.context("delete was written but reload failed; original file was restored")
+            );
+        }
+        Ok(())
+    }
+
+    async fn persist_udp_listener_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        name: &str,
+    ) -> Result<()> {
+        let mut candidate = current_config.clone();
+        if !candidate.udp.listeners.iter().any(|item| item.name == name) {
+            return Err(anyhow!("udp listener {name} not found"));
+        }
+        candidate.udp.listeners.retain(|item| item.name != name);
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_udp_listener(&original, name)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(
+                error.context("delete was written but reload failed; original file was restored")
+            );
+        }
+        Ok(())
+    }
+
+    async fn persist_stream_route_delete_and_reload(
+        &self,
+        current_config: &GatewayConfig,
+        name: &str,
+    ) -> Result<()> {
+        let mut candidate = current_config.clone();
+        if !candidate
+            .tcp
+            .stream_routes
+            .iter()
+            .any(|item| item.name == name)
+        {
+            return Err(anyhow!("stream route {name} not found"));
+        }
+        candidate.tcp.stream_routes.retain(|item| item.name != name);
+        candidate.validate()?;
+
+        let original = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        let updated = render_config_with_deleted_stream_route(&original, name)?;
+
+        security::atomic_write(&self.config_path, &updated)?;
+        if let Err(error) = self.reload_from_disk().await {
+            let _ = security::atomic_write(&self.config_path, &original);
+            return Err(
+                error.context("delete was written but reload failed; original file was restored")
+            );
+        }
+        Ok(())
     }
 
     async fn persist_reverse_proxy_route_and_reload(
@@ -3030,6 +3613,37 @@ impl Gateway {
                     Bytes::from(value.value().clone()),
                     "proxysss://acme-http01",
                 ));
+            }
+        }
+
+        if let Some(internal_path) = map_admin_gateway_path(&state.config.admin, uri.path()) {
+            if state.config.admin.enabled {
+                let transport = if scheme == "https" {
+                    AdminTransport::GatewayHttps { host: host.clone() }
+                } else {
+                    AdminTransport::GatewayHttp
+                };
+                let response = self
+                    .serve_admin_api(method, internal_path, headers, body, remote_addr, transport)
+                    .await
+                    .expect("admin handler is infallible");
+                let (parts, response_body) = response.into_parts();
+                let body_bytes = response_body
+                    .collect()
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .unwrap_or_default();
+                let headers_out = parts
+                    .headers
+                    .into_iter()
+                    .filter_map(|(name, value)| name.map(|name| (name, value)))
+                    .collect::<Vec<_>>();
+                return Ok(GatewayHttpResponse {
+                    status: parts.status,
+                    headers: headers_out,
+                    body: body_bytes,
+                    upstream: "proxysss://admin-https".to_string(),
+                });
             }
         }
 
@@ -6961,6 +7575,115 @@ fn should_sample(sample_rate: f64, seed: &str) -> bool {
     score <= threshold
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdminTransport {
+    Loopback,
+    GatewayHttp,
+    GatewayHttps { host: String },
+}
+
+fn admin_request_is_write(method: &Method, path: &str) -> bool {
+    path != "/healthz" && *method == Method::POST
+}
+
+fn map_admin_gateway_path(admin: &AdminConfig, request_path: &str) -> Option<String> {
+    if !admin.https.enabled {
+        return None;
+    }
+    let prefix = crate::config::normalize_admin_https_path_prefix(&admin.https.path_prefix);
+    if request_path == prefix.as_str() {
+        return Some("/".to_string());
+    }
+    let nested = format!("{prefix}/");
+    if request_path == nested.as_str() {
+        return Some("/".to_string());
+    }
+    let rest = request_path.strip_prefix(&nested)?;
+    Some(format!("/{rest}"))
+}
+
+fn admin_https_host_allowed(admin: &AdminConfig, host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if admin.https.hosts.is_empty() {
+        return true;
+    }
+    admin
+        .https
+        .hosts
+        .iter()
+        .any(|pattern| crate::config::domain_matches_pattern(&host, pattern))
+}
+
+fn check_admin_transport_access(
+    config: &GatewayConfig,
+    transport: &AdminTransport,
+    remote_addr: SocketAddr,
+) -> Option<Response<Full<Bytes>>> {
+    match transport {
+        AdminTransport::Loopback => {
+            if config.admin.loopback_only
+                && !admin_loopback_only_allows(remote_addr, &config.admin.bind)
+            {
+                return Some(text_response(
+                    StatusCode::FORBIDDEN,
+                    "admin API is restricted to loopback clients",
+                ));
+            }
+        }
+        AdminTransport::GatewayHttp => {
+            return Some(text_response(
+                StatusCode::FORBIDDEN,
+                "admin API on the public gateway requires HTTPS; configure TLS first, then call the HTTPS admin path",
+            ));
+        }
+        AdminTransport::GatewayHttps { host } => {
+            if !config.admin.https.enabled {
+                return Some(text_response(
+                    StatusCode::FORBIDDEN,
+                    "admin https API is disabled",
+                ));
+            }
+            if !admin_https_host_allowed(&config.admin, host) {
+                return Some(text_response(
+                    StatusCode::FORBIDDEN,
+                    "admin host is not allowed for HTTPS admin API",
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn check_admin_mutation_access(
+    config: &GatewayConfig,
+    transport: &AdminTransport,
+) -> Option<Response<Full<Bytes>>> {
+    if !config.admin.enable_write_ops {
+        return Some(text_response(
+            StatusCode::FORBIDDEN,
+            "write operations disabled",
+        ));
+    }
+    match transport {
+        AdminTransport::Loopback => {}
+        AdminTransport::GatewayHttp => {
+            return Some(text_response(
+                StatusCode::FORBIDDEN,
+                "admin write operations require HTTPS on the public gateway",
+            ));
+        }
+        AdminTransport::GatewayHttps { .. } => {
+            if !gateway_tls_material_ready(config) {
+                return Some(text_response(
+                    StatusCode::FORBIDDEN,
+                    "TLS certificate material must exist before admin write operations over HTTPS; bootstrap ACME/TLS on loopback first",
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn is_authorized(header: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
     let Some(header) = header else {
         return false;
@@ -7022,6 +7745,70 @@ struct WildcardTlsUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct OnDemandTlsUpsertRequest {
+    enabled: bool,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    max_active_certs: Option<usize>,
+    #[serde(default)]
+    max_issues_per_hour: Option<u32>,
+    #[serde(default)]
+    ask_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SniCertificateUpsertRequest {
+    domains: Vec<String>,
+    #[serde(default)]
+    cert_path: Option<PathBuf>,
+    #[serde(default)]
+    key_path: Option<PathBuf>,
+    #[serde(default)]
+    cert_pem: Option<String>,
+    #[serde(default)]
+    key_pem: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SniCertificateDeleteRequest {
+    #[serde(default)]
+    cert_path: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileCloudUpsertRequest {
+    enabled: bool,
+    path_prefix: String,
+    root: PathBuf,
+    #[serde(default)]
+    password: String,
+    title: String,
+    #[serde(default = "default_true")]
+    allow_upload: bool,
+    #[serde(default = "default_true")]
+    allow_delete: bool,
+    #[serde(default = "default_true")]
+    allow_mkdir: bool,
+    #[serde(default = "default_true")]
+    allow_move: bool,
+    #[serde(default)]
+    max_upload_bytes: Option<u64>,
+    #[serde(default)]
+    cdn_cache_secs: Option<u64>,
+    #[serde(default)]
+    session_ttl_secs: Option<u64>,
+    #[serde(default)]
+    require_auth_for_download: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 struct UpstreamToggleRequest {
     key: String,
     #[serde(default)]
@@ -7053,11 +7840,103 @@ struct StreamRouteUpsertResult {
     route: StreamRouteConfig,
 }
 
+struct SniCertificateUpsertResult {
+    action: &'static str,
+    certificate: TlsCertificateConfig,
+}
+
+fn gateway_tls_material_ready(config: &GatewayConfig) -> bool {
+    (config.http.tls.cert_path.exists() && config.http.tls.key_path.exists())
+        || config
+            .http
+            .tls
+            .certificates
+            .iter()
+            .any(|cert| cert.cert_path.exists() && cert.key_path.exists())
+}
+
 #[derive(Debug, Deserialize)]
 struct BlacklistMutationRequest {
     ip: String,
     #[serde(default)]
     ban_secs: Option<u64>,
+}
+
+fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
+    let tls = &config.http.tls;
+    let mode = serde_json::to_value(tls.mode).unwrap_or(serde_json::Value::Null);
+    let challenge = serde_json::to_value(tls.acme.challenge).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mode": mode,
+        "challenge": challenge,
+        "server_name": tls.server_name,
+        "cert_path": tls.cert_path.display().to_string(),
+        "key_path": tls.key_path.display().to_string(),
+        "cert_exists": tls.cert_path.exists(),
+        "key_exists": tls.key_path.exists(),
+        "auto_https": {
+            "enabled": tls.auto_https.enabled,
+            "domains": tls.auto_https.domains,
+            "email": tls.auto_https.email,
+            "production": tls.auto_https.production,
+        },
+        "acme": {
+            "email": tls.acme.email,
+            "domains": tls.acme.domains,
+            "directory_production": tls.acme.directory_production,
+            "dns_provider": tls.acme.dns.provider,
+            "dns_credentials_configured": !tls.acme.dns.credentials.is_empty(),
+        },
+        "domain_routes_count": config.services.domain_routes.len(),
+        "on_demand": {
+            "enabled": tls.on_demand.enabled,
+            "allow": tls.on_demand.allow,
+            "max_active_certs": tls.on_demand.max_active_certs,
+            "max_issues_per_hour": tls.on_demand.max_issues_per_hour,
+            "ask_url": tls.on_demand.ask_url,
+        },
+        "sni_certificates": tls.certificates.iter().map(|cert| {
+            serde_json::json!({
+                "domains": cert.domains,
+                "cert_path": cert.cert_path.display().to_string(),
+                "key_path": cert.key_path.display().to_string(),
+                "cert_exists": cert.cert_path.exists(),
+                "key_exists": cert.key_path.exists(),
+            })
+        }).collect::<Vec<_>>(),
+        "write_ops_enabled": config.admin.enable_write_ops,
+        "expose_config": config.admin.expose_config,
+        "managed_acme_zero_external_deps": true,
+        "https_api": {
+            "enabled": config.admin.https.enabled,
+            "path_prefix": crate::config::normalize_admin_https_path_prefix(&config.admin.https.path_prefix),
+            "hosts": config.admin.https.hosts,
+            "tls_ready": gateway_tls_material_ready(config),
+            "loopback_bind": config.admin.bind,
+            "agent_note": "Bootstrap TLS/ACME on loopback admin; after cert material exists, drive automation over HTTPS at path_prefix/v1/*",
+        },
+    })
+}
+
+fn filecloud_admin_summary(config: &GatewayConfig) -> serde_json::Value {
+    let fc = &config.services.filecloud;
+    serde_json::json!({
+        "enabled": fc.enabled,
+        "path_prefix": fc.path_prefix,
+        "root": fc.root.display().to_string(),
+        "title": fc.title,
+        "password_configured": !fc.password.trim().is_empty(),
+        "allow_upload": fc.allow_upload,
+        "allow_delete": fc.allow_delete,
+        "allow_mkdir": fc.allow_mkdir,
+        "allow_move": fc.allow_move,
+        "max_upload_bytes": fc.max_upload_bytes,
+        "cdn_cache_secs": fc.cdn_cache_secs,
+        "session_ttl_secs": fc.session_ttl_secs,
+        "require_auth_for_download": fc.require_auth_for_download,
+        "ui_url": if fc.enabled { fc.path_prefix.clone() } else { String::new() },
+        "write_ops_enabled": config.admin.enable_write_ops,
+    })
 }
 
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
@@ -7084,6 +7963,13 @@ fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
         for value in credentials.values_mut() {
             *value = serde_json::Value::String("***".to_string());
         }
+    }
+    if let Some(password) = value
+        .get_mut("services")
+        .and_then(|item| item.get_mut("filecloud"))
+        .and_then(|item| item.get_mut("password"))
+    {
+        *password = serde_json::Value::String("***".to_string());
     }
 
     value
@@ -7464,6 +8350,377 @@ fn render_config_with_wildcard_tls(
         serde_yaml::Value::String("acme".to_string()),
         serde_yaml::Value::Mapping(acme),
     );
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_on_demand_tls(
+    original: &str,
+    payload: &OnDemandTlsUpsertRequest,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+    let http_key = serde_yaml::Value::String("http".to_string());
+    if !root.contains_key(&http_key) {
+        root.insert(
+            http_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let http = root
+        .get_mut(&http_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http must be a mapping"))?;
+    let tls_key = serde_yaml::Value::String("tls".to_string());
+    if !http.contains_key(&tls_key) {
+        http.insert(
+            tls_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let tls = http
+        .get_mut(&tls_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http.tls must be a mapping"))?;
+    let mut on_demand = serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("enabled".to_string()),
+            serde_yaml::Value::Bool(payload.enabled),
+        ),
+        (
+            serde_yaml::Value::String("allow".to_string()),
+            serde_yaml::Value::Sequence(
+                payload
+                    .allow
+                    .iter()
+                    .map(|item| serde_yaml::Value::String(item.clone()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    if let Some(value) = payload.max_active_certs {
+        on_demand.insert(
+            serde_yaml::Value::String("max_active_certs".to_string()),
+            serde_yaml::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = payload.max_issues_per_hour {
+        on_demand.insert(
+            serde_yaml::Value::String("max_issues_per_hour".to_string()),
+            serde_yaml::Value::Number(value.into()),
+        );
+    }
+    if let Some(value) = &payload.ask_url {
+        on_demand.insert(
+            serde_yaml::Value::String("ask_url".to_string()),
+            serde_yaml::Value::String(value.clone()),
+        );
+    }
+    tls.insert(
+        serde_yaml::Value::String("on_demand".to_string()),
+        serde_yaml::Value::Mapping(on_demand),
+    );
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_filecloud(original: &str, filecloud: &FileCloudConfig) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+    let services_key = serde_yaml::Value::String("services".to_string());
+    if !root.contains_key(&services_key) {
+        root.insert(
+            services_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let services = root
+        .get_mut(&services_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("services must be a mapping"))?;
+    services.insert(
+        serde_yaml::Value::String("filecloud".to_string()),
+        serde_yaml::to_value(filecloud).context("failed to serialize filecloud config")?,
+    );
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn sni_certificate_slug(domains: &[String]) -> String {
+    domains
+        .first()
+        .map(|domain| {
+            domain
+                .trim()
+                .trim_start_matches("*.")
+                .replace('.', "-")
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                .collect::<String>()
+        })
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "sni-cert".to_string())
+}
+
+fn resolve_sni_certificate_material(
+    root_dir: &Path,
+    payload: &SniCertificateUpsertRequest,
+) -> Result<(PathBuf, PathBuf)> {
+    if let (Some(cert_pem), Some(key_pem)) = (&payload.cert_pem, &payload.key_pem) {
+        if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+            return Err(anyhow!(
+                "cert_pem and key_pem cannot be empty when provided"
+            ));
+        }
+        let dir = root_dir.join("certs").join("sni");
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let slug = sni_certificate_slug(&payload.domains);
+        let cert_path = dir.join(format!("{slug}.crt"));
+        let key_path = dir.join(format!("{slug}.key"));
+        security::atomic_write(&cert_path, cert_pem.trim())?;
+        security::atomic_write(&key_path, key_pem.trim())?;
+        return Ok((cert_path, key_path));
+    }
+
+    let cert_path = payload
+        .cert_path
+        .clone()
+        .ok_or_else(|| anyhow!("cert_path is required unless cert_pem/key_pem are provided"))?;
+    let key_path = payload
+        .key_path
+        .clone()
+        .ok_or_else(|| anyhow!("key_path is required unless cert_pem/key_pem are provided"))?;
+    if !cert_path.exists() {
+        return Err(anyhow!("cert_path does not exist: {}", cert_path.display()));
+    }
+    if !key_path.exists() {
+        return Err(anyhow!("key_path does not exist: {}", key_path.display()));
+    }
+    Ok((cert_path, key_path))
+}
+
+fn sni_certificates_share_identity(
+    left: &TlsCertificateConfig,
+    right: &TlsCertificateConfig,
+) -> bool {
+    left.cert_path == right.cert_path
+        || left
+            .domains
+            .iter()
+            .any(|domain| right.domains.iter().any(|other| other == domain))
+}
+
+fn upsert_sni_certificate_config(
+    certificates: &mut Vec<TlsCertificateConfig>,
+    certificate: TlsCertificateConfig,
+) -> &'static str {
+    if let Some(existing) = certificates
+        .iter_mut()
+        .find(|item| sni_certificates_share_identity(item, &certificate))
+    {
+        *existing = certificate;
+        "updated"
+    } else {
+        certificates.push(certificate);
+        "created"
+    }
+}
+
+fn sni_certificate_matches_delete(
+    cert: &TlsCertificateConfig,
+    payload: &SniCertificateDeleteRequest,
+) -> bool {
+    if let Some(cert_path) = payload.cert_path.as_deref() {
+        if cert.cert_path.display().to_string() == cert_path {
+            return true;
+        }
+    }
+    if let Some(domain) = payload.domain.as_deref() {
+        let domain = domain.trim().to_ascii_lowercase();
+        if cert
+            .domains
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(&domain))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn render_config_with_upserted_sni_certificate(
+    original: &str,
+    certificate: &TlsCertificateConfig,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("top-level YAML config must be a mapping"))?;
+    let http_key = serde_yaml::Value::String("http".to_string());
+    if !root.contains_key(&http_key) {
+        root.insert(
+            http_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let http = root
+        .get_mut(&http_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http must be a mapping"))?;
+    let tls_key = serde_yaml::Value::String("tls".to_string());
+    if !http.contains_key(&tls_key) {
+        http.insert(
+            tls_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let tls = http
+        .get_mut(&tls_key)
+        .and_then(|item| item.as_mapping_mut())
+        .ok_or_else(|| anyhow!("http.tls must be a mapping"))?;
+    let certs_key = serde_yaml::Value::String("certificates".to_string());
+    if !tls.contains_key(&certs_key) {
+        tls.insert(certs_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let certificates = tls
+        .get_mut(&certs_key)
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("http.tls.certificates must be a sequence"))?;
+    let cert_value =
+        serde_yaml::to_value(certificate).context("failed to serialize sni certificate")?;
+    if let Some(existing) = certificates.iter_mut().find(|item| {
+        item.get("cert_path")
+            .and_then(|value| value.as_str())
+            .map(|path| path == certificate.cert_path.display().to_string())
+            .unwrap_or(false)
+            || item
+                .get("domains")
+                .and_then(|value| value.as_sequence())
+                .map(|domains| {
+                    domains
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .any(|domain| {
+                            certificate
+                                .domains
+                                .iter()
+                                .any(|configured| configured == domain)
+                        })
+                })
+                .unwrap_or(false)
+    }) {
+        *existing = cert_value;
+    } else {
+        certificates.push(cert_value);
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_sni_certificate(
+    original: &str,
+    payload: &SniCertificateDeleteRequest,
+) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let certificates = value
+        .get_mut("http")
+        .and_then(|item| item.get_mut("tls"))
+        .and_then(|item| item.get_mut("certificates"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("http.tls.certificates must be a sequence"))?;
+    let before = certificates.len();
+    certificates.retain(|item| {
+        let cert_path = item
+            .get("cert_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let domains = item
+            .get("domains")
+            .and_then(|value| value.as_sequence())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let pseudo = TlsCertificateConfig {
+            domains: domains.into_iter().map(str::to_string).collect(),
+            cert_path: PathBuf::from(cert_path),
+            key_path: PathBuf::new(),
+        };
+        !sni_certificate_matches_delete(&pseudo, payload)
+    });
+    if certificates.len() == before {
+        return Err(anyhow!("sni certificate entry not found"));
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_tcp_listener(original: &str, name: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let listeners = value
+        .get_mut("tcp")
+        .and_then(|item| item.get_mut("listeners"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("tcp.listeners must be a sequence"))?;
+    let before = listeners.len();
+    listeners.retain(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value != name)
+            .unwrap_or(true)
+    });
+    if listeners.len() == before {
+        return Err(anyhow!("tcp listener {name} not found"));
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_udp_listener(original: &str, name: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let listeners = value
+        .get_mut("udp")
+        .and_then(|item| item.get_mut("listeners"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("udp.listeners must be a sequence"))?;
+    let before = listeners.len();
+    listeners.retain(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value != name)
+            .unwrap_or(true)
+    });
+    if listeners.len() == before {
+        return Err(anyhow!("udp listener {name} not found"));
+    }
+    serde_yaml::to_string(&value).context("failed to render updated YAML config")
+}
+
+fn render_config_with_deleted_stream_route(original: &str, name: &str) -> Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(original).context("failed to parse existing YAML config")?;
+    let routes = value
+        .get_mut("tcp")
+        .and_then(|item| item.get_mut("stream_routes"))
+        .and_then(|item| item.as_sequence_mut())
+        .ok_or_else(|| anyhow!("tcp.stream_routes must be a sequence"))?;
+    let before = routes.len();
+    routes.retain(|item| {
+        item.get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value != name)
+            .unwrap_or(true)
+    });
+    if routes.len() == before {
+        return Err(anyhow!("stream route {name} not found"));
+    }
     serde_yaml::to_string(&value).context("failed to render updated YAML config")
 }
 
@@ -9587,6 +10844,30 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             text-align: center;
             color: var(--muted);
         }
+        .nav-card .button-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+        .nav-btn.active { background: rgba(89, 208, 255, 0.18); color: var(--accent); border: 1px solid rgba(89, 208, 255, 0.28); }
+        .view-hidden { display: none !important; }
+        .tls-panel { font-size: 16px; }
+        .tls-panel label { font-size: 14px; }
+        .tls-panel input, .tls-panel select, .tls-panel textarea {
+            font-size: 16px;
+            padding: 14px 16px;
+        }
+        .tls-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+        .tls-grid .full { grid-column: 1 / -1; }
+        textarea {
+            width: 100%;
+            min-height: 96px;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(255,255,255,0.05);
+            color: var(--text);
+            padding: 14px 16px;
+            border-radius: 12px;
+            outline: none;
+            resize: vertical;
+            font-family: inherit;
+        }
+        .hint { font-size: 14px; color: var(--muted); line-height: 1.5; }
         @media (max-width: 1180px) {
             .shell { grid-template-columns: 1fr; }
         }
@@ -9614,6 +10895,19 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <p class="muted">Reverse proxy health, live upstream state, and runtime stats in one place.</p>
             </div>
 
+            <section class="meta-card nav-card">
+                <h3>Console Views</h3>
+                <div class="button-row">
+                    <button class="ghost nav-btn active" data-view="dashboard">Dashboard</button>
+                    <button class="ghost nav-btn" data-view="tls">TLS / ACME</button>
+                    <button class="ghost nav-btn" data-view="domains">Domain Routes</button>
+                    <button class="ghost nav-btn" data-view="reverse">Reverse Proxy</button>
+                    <button class="ghost nav-btn" data-view="listeners">Listeners</button>
+                    <button class="ghost nav-btn" data-view="filecloud">FileCloud</button>
+                    <button class="ghost nav-btn" data-view="security">Security</button>
+                </div>
+            </section>
+
             <section class="login-card">
                 <h3>Quick Login</h3>
                 <label for="username">Username</label>
@@ -9632,7 +10926,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <p class="muted">Upstreams: <strong>/v1/upstreams</strong></p>
                 <p class="muted">Config: <strong>/v1/config</strong></p>
                 <p class="muted">Domain route upsert: <strong>/v1/domain-routes/upsert</strong></p>
+                <p class="muted">Auto HTTPS: <strong>/v1/tls/auto-https/upsert</strong></p>
+                <p class="muted">Wildcard DNS-01: <strong>/v1/tls/wildcard-dns/upsert</strong></p>
                 <p class="muted">Auth: <strong>Basic</strong> or <strong>Bearer &lt;token&gt;</strong></p>
+                <p class="muted">__ADMIN_HTTPS_HINT__</p>
             </section>
 
             <section class="meta-card">
@@ -9669,7 +10966,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             </section>
         </aside>
 
-        <section class="content">
+        <section class="content" id="view-dashboard">
             <div class="topbar">
                 <div>
                     <div class="eyebrow">Runtime Overview</div>
@@ -9734,6 +11031,194 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                     </div>
                     <pre id="upstreams-json">[]</pre>
                 </article>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-tls">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow">Built-in ACME</div>
+                    <h2>TLS / Certificates</h2>
+                    <p class="hint">Fully embedded — no acme.sh, certbot, or cloud CLI. HTTP-01/TLS-ALPN-01 for normal domains; DNS-01 for wildcard via built-in cloud providers or manual TXT.</p>
+                </div>
+                <div id="tls-state" class="status-dot">Loading TLS summary</div>
+            </div>
+
+            <section class="cards">
+                <article class="card"><span class="muted">TLS Mode</span><strong id="tls-mode">-</strong></article>
+                <article class="card"><span class="muted">Challenge</span><strong id="tls-challenge">-</strong></article>
+                <article class="card"><span class="muted">Cert Ready</span><strong id="tls-cert-ready">-</strong></article>
+                <article class="card"><span class="muted">Domain Routes</span><strong id="tls-route-count">0</strong></article>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>Current TLS Summary</h3><p class="muted">Live runtime state from <code>/v1/tls/summary</code></p></div></div>
+                <pre id="tls-summary-json">{}</pre>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>Auto HTTPS (HTTP-01 / TLS-ALPN-01)</h3><p class="muted">No DNS API key required.</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="auto-domains">Domains (one per line)</label><textarea id="auto-domains" placeholder="example.com&#10;www.example.com"></textarea></div>
+                    <div class="filter"><label for="auto-email">ACME Email</label><input id="auto-email" placeholder="admin@example.com" /></div>
+                    <div class="filter"><label for="auto-production">Production</label><select id="auto-production"><option value="true">Let's Encrypt Production</option><option value="false">Staging</option></select></div>
+                    <div class="filter full"><button id="save-auto-https" class="primary">Save Auto HTTPS</button><span class="hint" id="auto-https-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>Wildcard DNS-01</h3><p class="muted">Built-in Cloudflare / Aliyun / Tencent / Volcengine / AWS / Azure / Google, or <code>manual</code> without API key.</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="wildcard-domains">Domains (include <code>*.example.com</code>)</label><textarea id="wildcard-domains" placeholder="example.com&#10;*.example.com"></textarea></div>
+                    <div class="filter"><label for="wildcard-email">ACME Email</label><input id="wildcard-email" placeholder="admin@example.com" /></div>
+                    <div class="filter"><label for="wildcard-provider">DNS Provider</label><select id="wildcard-provider"></select></div>
+                    <div class="filter full" id="dns-credentials"></div>
+                    <div class="filter full"><button id="save-wildcard-tls" class="primary">Save Wildcard DNS-01</button><span class="hint" id="wildcard-tls-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>On-Demand TLS</h3><p class="muted">First-hit certificate issuance for allowed host patterns.</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="on-demand-enabled">Enabled</label><select id="on-demand-enabled"><option value="false">false</option><option value="true">true</option></select></div>
+                    <div class="filter full"><label for="on-demand-allow">Allow patterns (one per line)</label><textarea id="on-demand-allow" placeholder="*.example.com"></textarea></div>
+                    <div class="filter full"><button id="save-on-demand" class="primary">Save On-Demand TLS</button><button id="issue-tls-now" class="ghost">Issue Certificate Now</button><span class="hint" id="on-demand-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>SNI Manual Certificates</h3><p class="muted">Per-host TLS material under <code>http.tls.certificates</code>. Upload PEM inline or reference existing files.</p></div></div>
+                <div id="sni-certs-wrap" class="empty">Loading SNI certificates...</div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="sni-domains">Domains (one per line)</label><textarea id="sni-domains" placeholder="api.example.com&#10;*.internal.example.com"></textarea></div>
+                    <div class="filter"><label for="sni-cert-path">Cert Path (optional if PEM below)</label><input id="sni-cert-path" placeholder="./certs/sni/api.crt" /></div>
+                    <div class="filter"><label for="sni-key-path">Key Path (optional if PEM below)</label><input id="sni-key-path" placeholder="./certs/sni/api.key" /></div>
+                    <div class="filter full"><label for="sni-cert-pem">Cert PEM (optional upload)</label><textarea id="sni-cert-pem" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+                    <div class="filter full"><label for="sni-key-pem">Key PEM (optional upload)</label><textarea id="sni-key-pem" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+                    <div class="filter full"><button id="save-sni-cert" class="primary">Save SNI Certificate</button><span class="hint" id="sni-cert-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-domains">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow">Host Routing</div>
+                    <h2>Domain Routes</h2>
+                    <p class="hint">Persisted into <code>proxysss.yaml</code> and hot-reloaded. Requires <code>admin.enable_write_ops=true</code>.</p>
+                </div>
+                <div id="domain-state" class="status-dot">Loading routes</div>
+            </div>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>Active Domain Routes</h3></div><span class="muted" id="domain-route-count">0 routes</span></div>
+                <div id="domain-routes-wrap" class="empty">Refresh to load domain routes.</div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>Upsert Domain Route</h3></div></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="route-name">Route Name</label><input id="route-name" placeholder="api" /></div>
+                    <div class="filter"><label for="route-upstream">Upstream</label><input id="route-upstream" placeholder="http://127.0.0.1:8080" /></div>
+                    <div class="filter"><label for="route-path-prefix">Path Prefix</label><input id="route-path-prefix" value="/" /></div>
+                    <div class="filter full"><label for="route-domains">Hostnames (comma separated)</label><input id="route-domains" placeholder="api.example.com, *.api.example.com" /></div>
+                    <div class="filter full"><label for="route-upstreams">Extra Upstreams (one per line, optional)</label><textarea id="route-upstreams" placeholder="http://10.0.0.13:8080"></textarea></div>
+                    <div class="filter full"><label><input id="route-strip-prefix" type="checkbox" /> Strip path prefix before upstream</label></div>
+                    <div class="filter full"><button id="save-domain-route" class="primary">Save Domain Route</button><span class="hint" id="domain-route-result"></span><span class="hint">Advanced fields (weights, cache, ssl): use JSON API — see docs/AGENT-API.md</span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-reverse">
+            <div class="topbar"><div><div class="eyebrow">Path Routing</div><h2>Reverse Proxy Routes</h2></div><div id="reverse-state" class="status-dot">Loading</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>Active Routes</h3><span class="muted" id="reverse-count">0 routes</span></div>
+                <div id="reverse-routes-wrap" class="empty">Loading...</div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>Upsert Route</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="reverse-name">Name</label><input id="reverse-name" placeholder="api" /></div>
+                    <div class="filter"><label for="reverse-prefix">Path Prefix</label><input id="reverse-prefix" value="/api" /></div>
+                    <div class="filter"><label for="reverse-upstream">Upstream</label><input id="reverse-upstream" placeholder="http://127.0.0.1:8080" /></div>
+                    <div class="filter full"><label for="reverse-hosts">Hosts (comma separated, optional)</label><input id="reverse-hosts" placeholder="api.example.com" /></div>
+                    <div class="filter full"><label for="reverse-upstreams">Extra Upstreams (one per line, optional)</label><textarea id="reverse-upstreams" placeholder="http://127.0.0.1:9001"></textarea></div>
+                    <div class="filter full"><label><input id="reverse-strip-prefix" type="checkbox" checked /> Strip path prefix</label></div>
+                    <div class="filter full"><button id="save-reverse-route" class="primary">Save Route</button><span class="hint" id="reverse-route-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-listeners">
+            <div class="topbar"><div><div class="eyebrow">Stream Layer</div><h2>TCP / UDP / Stream Routes</h2></div><div id="listeners-state" class="status-dot">Loading</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>TCP Listeners</h3></div>
+                <div id="tcp-listeners-wrap" class="empty">Loading...</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="tcp-name">Name</label><input id="tcp-name" placeholder="game" /></div>
+                    <div class="filter"><label for="tcp-bind">Bind</label><input id="tcp-bind" placeholder="0.0.0.0:7000" /></div>
+                    <div class="filter"><label for="tcp-upstream">Upstream</label><input id="tcp-upstream" placeholder="127.0.0.1:9000" /></div>
+                    <div class="filter full"><button id="save-tcp-listener" class="primary">Save TCP Listener</button><span class="hint" id="tcp-listener-result"></span></div>
+                </div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>UDP Listeners</h3></div>
+                <div id="udp-listeners-wrap" class="empty">Loading...</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="udp-name">Name</label><input id="udp-name" placeholder="voice" /></div>
+                    <div class="filter"><label for="udp-bind">Bind</label><input id="udp-bind" placeholder="0.0.0.0:7001" /></div>
+                    <div class="filter"><label for="udp-upstream">Upstream</label><input id="udp-upstream" placeholder="127.0.0.1:9001" /></div>
+                    <div class="filter full"><button id="save-udp-listener" class="primary">Save UDP Listener</button><span class="hint" id="udp-listener-result"></span></div>
+                </div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>Stream Routes (SNI)</h3></div>
+                <div id="stream-routes-wrap" class="empty">Loading...</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="stream-name">Name</label><input id="stream-name" placeholder="redis-prod" /></div>
+                    <div class="filter"><label for="stream-listen">Listen</label><input id="stream-listen" placeholder="6379" /></div>
+                    <div class="filter"><label for="stream-upstream">Upstream</label><input id="stream-upstream" placeholder="127.0.0.1:6379" /></div>
+                    <div class="filter full"><label for="stream-domains">Domains (comma separated)</label><input id="stream-domains" placeholder="redis.example.com" /></div>
+                    <div class="filter full"><button id="save-stream-route" class="primary">Save Stream Route</button><span class="hint" id="stream-route-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-filecloud">
+            <div class="topbar"><div><div class="eyebrow">FileCloud</div><h2>Shared Folder</h2><p class="hint">Password-protected interactive file space — not nginx WebDAV. <a id="filecloud-open-link" href='#' target="_blank" rel="noopener" style="display:none">Open FileCloud UI</a></p></div><div id="filecloud-state" class="status-dot">Loading</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>Current FileCloud</h3></div>
+                <pre id="filecloud-summary-json">{}</pre>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>Configure FileCloud</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="fc-enabled">Enabled</label><select id="fc-enabled"><option value="false">false</option><option value="true">true</option></select></div>
+                    <div class="filter"><label for="fc-prefix">Path Prefix</label><input id="fc-prefix" value="/filecloud" /></div>
+                    <div class="filter"><label for="fc-root">Root Directory</label><input id="fc-root" placeholder="./filecloud-data" /></div>
+                    <div class="filter"><label for="fc-title">Title</label><input id="fc-title" placeholder="Shared Files" /></div>
+                    <div class="filter"><label for="fc-password">Password (blank keeps existing)</label><input id="fc-password" type="password" placeholder="new password" /></div>
+                    <div class="filter"><label for="fc-max-upload">Max Upload Bytes</label><input id="fc-max-upload" type="number" placeholder="536870912" /></div>
+                    <div class="filter"><label for="fc-cdn-cache">CDN Cache Secs</label><input id="fc-cdn-cache" type="number" placeholder="86400" /></div>
+                    <div class="filter full"><label><input id="fc-allow-upload" type="checkbox" checked /> Allow upload</label> <label><input id="fc-allow-delete" type="checkbox" checked /> Delete</label> <label><input id="fc-allow-mkdir" type="checkbox" checked /> Mkdir</label> <label><input id="fc-allow-move" type="checkbox" checked /> Move</label></div>
+                    <div class="filter full"><button id="save-filecloud" class="primary">Save FileCloud</button><span class="hint" id="filecloud-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-security">
+            <div class="topbar"><div><div class="eyebrow">Security</div><h2>Dynamic IP Blacklist</h2><p class="hint">Runtime bans persisted when <code>security.dynamic_blacklist.enabled=true</code>.</p></div><div id="security-state" class="status-dot">Loading</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>Active Bans</h3></div>
+                <div id="blacklist-wrap" class="empty">Loading...</div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>Add Ban</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="blacklist-ip">IP</label><input id="blacklist-ip" placeholder="203.0.113.5" /></div>
+                    <div class="filter"><label for="blacklist-ban-secs">Ban Seconds</label><input id="blacklist-ban-secs" type="number" placeholder="3600" /></div>
+                    <div class="filter full"><button id="save-blacklist-add" class="primary">Add Ban</button><span class="hint" id="blacklist-result"></span></div>
+                </div>
             </section>
         </section>
     </main>
@@ -10008,12 +11493,559 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 refreshDashboard();
             }
         });
+
+        const views = {
+            dashboard: document.getElementById('view-dashboard'),
+            tls: document.getElementById('view-tls'),
+            domains: document.getElementById('view-domains'),
+            reverse: document.getElementById('view-reverse'),
+            listeners: document.getElementById('view-listeners'),
+            filecloud: document.getElementById('view-filecloud'),
+            security: document.getElementById('view-security'),
+        };
+        let dnsProviders = [];
+
+        function switchView(name) {
+            Object.entries(views).forEach(([key, node]) => {
+                if (!node) return;
+                node.classList.toggle('view-hidden', key !== name);
+            });
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === name);
+            });
+            if (name === 'tls') refreshTlsPanel();
+            if (name === 'domains') refreshDomainRoutes();
+            if (name === 'reverse') refreshReverseRoutes();
+            if (name === 'listeners') refreshListenersPanel();
+            if (name === 'filecloud') refreshFileCloudPanel();
+            if (name === 'security') refreshSecurityPanel();
+        }
+
+        document.querySelectorAll('.nav-btn').forEach(btn => {
+            btn.addEventListener('click', () => switchView(btn.dataset.view));
+        });
+
+        function parseDomainLines(value) {
+            return value.split(/[\n,]+/).map(item => item.trim()).filter(Boolean);
+        }
+
+        function renderCredentialFields(providerId) {
+            const container = document.getElementById('dns-credentials');
+            container.innerHTML = '';
+            const provider = dnsProviders.find(item => item.id === providerId);
+            if (!provider || provider.id === 'manual') {
+                container.innerHTML = '<p class="hint">manual 模式无需 API Key：proxysss 会输出 TXT 记录并通过公网 DNS 轮询验证。</p>';
+                return;
+            }
+            for (const spec of provider.credential_keys || []) {
+                const optional = spec.endsWith('?');
+                const keys = spec.replace(/\?$/, '').split('+');
+                for (const key of keys) {
+                    const id = `cred-${key}`;
+                    container.insertAdjacentHTML('beforeend', `
+                        <div class="filter">
+                            <label for="${id}">${key}${optional ? ' (optional)' : ''}</label>
+                            <input id="${id}" data-cred-key="${key}" placeholder="${key}" />
+                        </div>`);
+                }
+            }
+        }
+
+        function collectCredentials() {
+            const credentials = {};
+            document.querySelectorAll('#dns-credentials [data-cred-key]').forEach(input => {
+                if (input.value.trim()) credentials[input.dataset.credKey] = input.value.trim();
+            });
+            return credentials;
+        }
+
+        async function postJson(path, payload) {
+            const response = await fetch(path, {
+                method: 'POST',
+                headers: {
+                    Authorization: authHeader(),
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `${path} -> ${response.status}`);
+            }
+            return data;
+        }
+
+        async function refreshTlsPanel() {
+            const tlsState = document.getElementById('tls-state');
+            try {
+                const [summaryPayload, providerPayloadRaw] = await Promise.all([
+                    loadJson('/v1/tls/summary'),
+                    dnsProviders.length ? Promise.resolve({ providers: dnsProviders }) : loadJson('/v1/tls/dns-providers'),
+                ]);
+                const tls = summaryPayload.tls || {};
+                const providerPayload = providerPayloadRaw.providers ? providerPayloadRaw : { providers: providerPayloadRaw.providers || [] };
+                dnsProviders = providerPayload.providers || providerPayloadRaw.providers || dnsProviders;
+                document.getElementById('tls-summary-json').textContent = JSON.stringify(tls, null, 2);
+                document.getElementById('tls-mode').textContent = tls.mode || '-';
+                document.getElementById('tls-challenge').textContent = tls.challenge || '-';
+                document.getElementById('tls-cert-ready').textContent = (tls.cert_exists && tls.key_exists) ? 'yes' : 'no';
+                document.getElementById('tls-route-count').textContent = tls.domain_routes_count || 0;
+                if (tls.auto_https?.domains?.length) {
+                    document.getElementById('auto-domains').value = tls.auto_https.domains.join('\n');
+                    document.getElementById('auto-email').value = tls.auto_https.email || '';
+                }
+                if (tls.acme?.domains?.length) {
+                    document.getElementById('wildcard-domains').value = tls.acme.domains.join('\n');
+                    document.getElementById('wildcard-email').value = tls.acme.email || '';
+                }
+                const providerSelect = document.getElementById('wildcard-provider');
+                if (!providerSelect.options.length) {
+                    providerSelect.innerHTML = dnsProviders.map(item => `<option value="${item.id}">${item.display_name} (${item.id})</option>`).join('');
+                    providerSelect.addEventListener('change', () => renderCredentialFields(providerSelect.value));
+                }
+                if (tls.acme?.dns_provider) providerSelect.value = tls.acme.dns_provider;
+                renderCredentialFields(providerSelect.value);
+                if (tls.on_demand) {
+                    document.getElementById('on-demand-enabled').value = tls.on_demand.enabled ? 'true' : 'false';
+                    document.getElementById('on-demand-allow').value = (tls.on_demand.allow || []).join('\n');
+                }
+                await refreshSniCertificates();
+                tlsState.textContent = tls.write_ops_enabled ? 'Write ops enabled' : 'Read-only (enable admin.enable_write_ops)';
+                tlsState.className = 'status-dot ' + (tls.write_ops_enabled ? 'ok' : 'warn');
+            } catch (error) {
+                tlsState.textContent = String(error);
+                tlsState.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshSniCertificates() {
+            const wrap = document.getElementById('sni-certs-wrap');
+            try {
+                const payload = await loadJson('/v1/tls/sni-certificates');
+                const items = payload.items || [];
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = 'No SNI certificates configured yet.';
+                    return;
+                }
+                wrap.className = '';
+                wrap.innerHTML = `<table><thead><tr><th>Domains</th><th>Cert</th><th>Key</th><th>Ready</th><th>Action</th></tr></thead><tbody>${items.map(item => `
+                    <tr>
+                        <td>${(item.domains || []).join('<br/>')}</td>
+                        <td><code>${item.cert_path}</code></td>
+                        <td><code>${item.key_path}</code></td>
+                        <td>${item.cert_exists && item.key_exists ? 'yes' : 'no'}</td>
+                        <td><button class="danger" data-delete-sni-domain="${(item.domains || [])[0] || ''}" data-delete-sni-cert="${item.cert_path}">Delete</button></td>
+                    </tr>`).join('')}</tbody></table>`;
+                wrap.querySelectorAll('[data-delete-sni-cert]').forEach(button => {
+                    button.onclick = async () => {
+                        if (!confirm(`Delete SNI certificate ${button.dataset.deleteSniCert}?`)) return;
+                        await postJson('/v1/tls/sni-certificates/delete', {
+                            cert_path: button.dataset.deleteSniCert,
+                            domain: button.dataset.deleteSniDomain || undefined,
+                        });
+                        await refreshSniCertificates();
+                    };
+                });
+            } catch (error) {
+                wrap.className = 'empty';
+                wrap.textContent = String(error);
+            }
+        }
+
+        async function refreshSecurityPanel() {
+            const state = document.getElementById('security-state');
+            const wrap = document.getElementById('blacklist-wrap');
+            try {
+                const payload = await loadJson('/v1/security/blacklist');
+                const items = payload.items || [];
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = 'No active IP bans.';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>IP</th><th>Action</th></tr></thead><tbody>${items.map(item => {
+                        const ip = typeof item === 'string' ? item : item.ip;
+                        return `<tr><td><code>${ip}</code></td><td><button class="danger" data-remove-blacklist="${ip}">Remove</button></td></tr>`;
+                    }).join('')}</tbody></table>`;
+                    wrap.querySelectorAll('[data-remove-blacklist]').forEach(button => {
+                        button.onclick = async () => {
+                            await postJson('/v1/security/blacklist/remove', { ip: button.dataset.removeBlacklist });
+                            await refreshSecurityPanel();
+                        };
+                    });
+                }
+                state.textContent = `${items.length} active bans`;
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshDomainRoutes() {
+            const domainState = document.getElementById('domain-state');
+            const wrap = document.getElementById('domain-routes-wrap');
+            try {
+                const payload = await loadJson('/v1/domain-routes');
+                const items = payload.items || [];
+                document.getElementById('domain-route-count').textContent = `${items.length} routes`;
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = 'No domain routes configured yet.';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>Name</th><th>Domains</th><th>Prefix</th><th>Upstream</th><th>Action</th></tr></thead><tbody>${items.map(item => `
+                        <tr>
+                            <td><code>${item.name}</code></td>
+                            <td>${(item.domains || []).join('<br/>')}</td>
+                            <td><code>${item.path_prefix || '/'}</code></td>
+                            <td><code>${item.upstream || ''}</code></td>
+                            <td><button class="danger" data-delete-domain="${item.name}">Delete</button></td>
+                        </tr>`).join('')}</tbody></table>`;
+                }
+                domainState.textContent = 'Routes loaded';
+                domainState.className = 'status-dot ok';
+            } catch (error) {
+                domainState.textContent = String(error);
+                domainState.className = 'status-dot bad';
+                wrap.className = 'empty';
+                wrap.textContent = String(error);
+            }
+        }
+
+        document.getElementById('save-auto-https').addEventListener('click', async () => {
+            const result = document.getElementById('auto-https-result');
+            try {
+                const data = await postJson('/v1/tls/auto-https/upsert', {
+                    domains: parseDomainLines(document.getElementById('auto-domains').value),
+                    email: document.getElementById('auto-email').value.trim(),
+                    production: document.getElementById('auto-production').value === 'true',
+                });
+                result.textContent = `Saved (${data.mode}) for ${(data.domains || []).join(', ')}`;
+                await refreshTlsPanel();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('save-wildcard-tls').addEventListener('click', async () => {
+            const result = document.getElementById('wildcard-tls-result');
+            try {
+                const data = await postJson('/v1/tls/wildcard-dns/upsert', {
+                    domains: parseDomainLines(document.getElementById('wildcard-domains').value),
+                    email: document.getElementById('wildcard-email').value.trim(),
+                    dns_provider: document.getElementById('wildcard-provider').value,
+                    credentials: collectCredentials(),
+                });
+                result.textContent = `Saved DNS-01 (${data.challenge}) for ${(data.domains || []).join(', ')}`;
+                await refreshTlsPanel();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('save-domain-route').addEventListener('click', async () => {
+            const result = document.getElementById('domain-route-result');
+            try {
+                const domains = document.getElementById('route-domains').value.split(',').map(item => item.trim()).filter(Boolean);
+                const upstreams = document.getElementById('route-upstreams').value.split('\n').map(item => item.trim()).filter(Boolean);
+                const payload = {
+                    name: document.getElementById('route-name').value.trim(),
+                    upstream: document.getElementById('route-upstream').value.trim(),
+                    path_prefix: document.getElementById('route-path-prefix').value.trim() || '/',
+                    domains,
+                    strip_prefix: document.getElementById('route-strip-prefix').checked,
+                };
+                if (upstreams.length) payload.upstreams = upstreams;
+                const data = await postJson('/v1/domain-routes/upsert', payload);
+                result.textContent = `${data.action} route ${data.name}`;
+                await refreshDomainRoutes();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('domain-routes-wrap').addEventListener('click', async (event) => {
+            const button = event.target.closest('[data-delete-domain]');
+            if (!button) return;
+            if (!confirm(`Delete domain route ${button.dataset.deleteDomain}?`)) return;
+            try {
+                await postJson('/v1/domain-routes/delete', { name: button.dataset.deleteDomain });
+                await refreshDomainRoutes();
+            } catch (error) {
+                document.getElementById('domain-route-result').textContent = String(error);
+            }
+        });
+
+        async function refreshReverseRoutes() {
+            const state = document.getElementById('reverse-state');
+            const wrap = document.getElementById('reverse-routes-wrap');
+            try {
+                const payload = await loadJson('/v1/reverse-proxy-routes');
+                const items = payload.items || [];
+                document.getElementById('reverse-count').textContent = `${items.length} routes`;
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = 'No reverse proxy routes yet.';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>Name</th><th>Prefix</th><th>Upstream</th><th>Hosts</th><th>Action</th></tr></thead><tbody>${items.map(item => `
+                        <tr><td><code>${item.name}</code></td><td><code>${item.path_prefix || '/'}</code></td><td><code>${item.upstream}</code></td><td>${(item.hosts || []).join('<br/>') || '-'}</td>
+                        <td><button class="danger" data-delete-reverse="${item.name}">Delete</button></td></tr>`).join('')}</tbody></table>`;
+                    wrap.querySelectorAll('[data-delete-reverse]').forEach(button => {
+                        button.onclick = async () => {
+                            if (!confirm(`Delete reverse route ${button.dataset.deleteReverse}?`)) return;
+                            await postJson('/v1/reverse-proxy-routes/delete', { name: button.dataset.deleteReverse });
+                            await refreshReverseRoutes();
+                        };
+                    });
+                }
+                state.textContent = 'Routes loaded';
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        function renderListenerTable(items, wrap, deletePath, attr) {
+            if (!items.length) {
+                wrap.className = 'empty';
+                wrap.textContent = 'No entries configured yet.';
+                return;
+            }
+            wrap.className = '';
+            wrap.innerHTML = `<table><thead><tr><th>Name</th><th>Bind/Listen</th><th>Upstream</th><th>Action</th></tr></thead><tbody>${items.map(item => `
+                <tr><td><code>${item.name}</code></td><td><code>${item.bind || item.listen}</code></td><td><code>${item.upstream}</code></td>
+                <td><button class="danger" data-${attr}="${item.name}">Delete</button></td></tr>`).join('')}</tbody></table>`;
+            wrap.querySelectorAll(`[data-${attr}]`).forEach(button => {
+                button.onclick = async () => {
+                    if (!confirm(`Delete ${button.dataset[attr]}?`)) return;
+                    await postJson(deletePath, { name: button.dataset[attr] });
+                    await refreshListenersPanel();
+                };
+            });
+        }
+
+        async function refreshListenersPanel() {
+            const state = document.getElementById('listeners-state');
+            try {
+                const [tcp, udp, stream] = await Promise.all([
+                    loadJson('/v1/tcp-listeners'),
+                    loadJson('/v1/udp-listeners'),
+                    loadJson('/v1/stream-routes'),
+                ]);
+                renderListenerTable(tcp.items || [], document.getElementById('tcp-listeners-wrap'), '/v1/tcp-listeners/delete', 'delete-tcp');
+                renderListenerTable(udp.items || [], document.getElementById('udp-listeners-wrap'), '/v1/udp-listeners/delete', 'delete-udp');
+                const streamWrap = document.getElementById('stream-routes-wrap');
+                const streamItems = stream.items || [];
+                if (!streamItems.length) {
+                    streamWrap.className = 'empty';
+                    streamWrap.textContent = 'No stream routes yet.';
+                } else {
+                    streamWrap.className = '';
+                    streamWrap.innerHTML = `<table><thead><tr><th>Name</th><th>Listen</th><th>Upstream</th><th>Domains</th><th>Action</th></tr></thead><tbody>${streamItems.map(item => `
+                        <tr><td><code>${item.name}</code></td><td><code>${item.listen}</code></td><td><code>${item.upstream}</code></td><td>${(item.domains || []).join('<br/>')}</td>
+                        <td><button class="danger" data-delete-stream="${item.name}">Delete</button></td></tr>`).join('')}</tbody></table>`;
+                    streamWrap.querySelectorAll('[data-delete-stream]').forEach(button => {
+                        button.onclick = async () => {
+                            if (!confirm(`Delete stream route ${button.dataset.deleteStream}?`)) return;
+                            await postJson('/v1/stream-routes/delete', { name: button.dataset.deleteStream });
+                            await refreshListenersPanel();
+                        };
+                    });
+                }
+                state.textContent = 'Listeners loaded';
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshFileCloudPanel() {
+            const state = document.getElementById('filecloud-state');
+            try {
+                const payload = await loadJson('/v1/filecloud/summary');
+                const fc = payload.filecloud || {};
+                document.getElementById('filecloud-summary-json').textContent = JSON.stringify(fc, null, 2);
+                document.getElementById('fc-enabled').value = fc.enabled ? 'true' : 'false';
+                document.getElementById('fc-prefix').value = fc.path_prefix || '/filecloud';
+                document.getElementById('fc-root').value = fc.root || '';
+                document.getElementById('fc-title').value = fc.title || 'FileCloud';
+                document.getElementById('fc-max-upload').value = fc.max_upload_bytes || '';
+                document.getElementById('fc-cdn-cache').value = fc.cdn_cache_secs || '';
+                document.getElementById('fc-allow-upload').checked = fc.allow_upload !== false;
+                document.getElementById('fc-allow-delete').checked = fc.allow_delete !== false;
+                document.getElementById('fc-allow-mkdir').checked = fc.allow_mkdir !== false;
+                document.getElementById('fc-allow-move').checked = fc.allow_move !== false;
+                const openLink = document.getElementById('filecloud-open-link');
+                if (fc.enabled && fc.ui_url) {
+                    openLink.href = fc.ui_url;
+                    openLink.style.display = '';
+                    state.textContent = `Enabled — ${fc.ui_url}`;
+                } else {
+                    openLink.style.display = 'none';
+                    state.textContent = 'Disabled';
+                }
+                state.className = 'status-dot ' + (fc.enabled ? 'ok' : '');
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        document.getElementById('save-on-demand').addEventListener('click', async () => {
+            const result = document.getElementById('on-demand-result');
+            try {
+                await postJson('/v1/tls/on-demand/upsert', {
+                    enabled: document.getElementById('on-demand-enabled').value === 'true',
+                    allow: parseDomainLines(document.getElementById('on-demand-allow').value),
+                });
+                result.textContent = 'On-demand TLS saved';
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('issue-tls-now').addEventListener('click', async () => {
+            const result = document.getElementById('on-demand-result');
+            try {
+                const data = await postJson('/v1/tls/issue-now', {});
+                result.textContent = `Issued: cert=${data.issued?.cert_exists} key=${data.issued?.key_exists}`;
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-reverse-route').addEventListener('click', async () => {
+            const result = document.getElementById('reverse-route-result');
+            try {
+                const hosts = document.getElementById('reverse-hosts').value.split(',').map(v => v.trim()).filter(Boolean);
+                const upstreams = document.getElementById('reverse-upstreams').value.split('\n').map(v => v.trim()).filter(Boolean);
+                const payload = {
+                    name: document.getElementById('reverse-name').value.trim(),
+                    path_prefix: document.getElementById('reverse-prefix').value.trim() || '/',
+                    upstream: document.getElementById('reverse-upstream').value.trim(),
+                    hosts,
+                    strip_prefix: document.getElementById('reverse-strip-prefix').checked,
+                };
+                if (upstreams.length) payload.upstreams = upstreams;
+                const data = await postJson('/v1/reverse-proxy-routes/upsert', payload);
+                result.textContent = `${data.action} ${data.name}`;
+                await refreshReverseRoutes();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-tcp-listener').addEventListener('click', async () => {
+            const result = document.getElementById('tcp-listener-result');
+            try {
+                await postJson('/v1/tcp-listeners/upsert', {
+                    name: document.getElementById('tcp-name').value.trim(),
+                    bind: document.getElementById('tcp-bind').value.trim(),
+                    upstream: document.getElementById('tcp-upstream').value.trim(),
+                });
+                result.textContent = 'TCP listener saved';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-udp-listener').addEventListener('click', async () => {
+            const result = document.getElementById('udp-listener-result');
+            try {
+                await postJson('/v1/udp-listeners/upsert', {
+                    name: document.getElementById('udp-name').value.trim(),
+                    bind: document.getElementById('udp-bind').value.trim(),
+                    upstream: document.getElementById('udp-upstream').value.trim(),
+                });
+                result.textContent = 'UDP listener saved';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-stream-route').addEventListener('click', async () => {
+            const result = document.getElementById('stream-route-result');
+            try {
+                await postJson('/v1/stream-routes/upsert', {
+                    name: document.getElementById('stream-name').value.trim(),
+                    listen: document.getElementById('stream-listen').value.trim(),
+                    upstream: document.getElementById('stream-upstream').value.trim(),
+                    domains: document.getElementById('stream-domains').value.split(',').map(v => v.trim()).filter(Boolean),
+                });
+                result.textContent = 'Stream route saved';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-filecloud').addEventListener('click', async () => {
+            const result = document.getElementById('filecloud-result');
+            try {
+                await postJson('/v1/filecloud/upsert', {
+                    enabled: document.getElementById('fc-enabled').value === 'true',
+                    path_prefix: document.getElementById('fc-prefix').value.trim(),
+                    root: document.getElementById('fc-root').value.trim(),
+                    password: document.getElementById('fc-password').value,
+                    title: document.getElementById('fc-title').value.trim(),
+                    allow_upload: document.getElementById('fc-allow-upload').checked,
+                    allow_delete: document.getElementById('fc-allow-delete').checked,
+                    allow_mkdir: document.getElementById('fc-allow-mkdir').checked,
+                    allow_move: document.getElementById('fc-allow-move').checked,
+                    max_upload_bytes: Number(document.getElementById('fc-max-upload').value) || undefined,
+                    cdn_cache_secs: Number(document.getElementById('fc-cdn-cache').value) || undefined,
+                });
+                result.textContent = 'FileCloud saved';
+                document.getElementById('fc-password').value = '';
+                await refreshFileCloudPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-sni-cert').addEventListener('click', async () => {
+            const result = document.getElementById('sni-cert-result');
+            try {
+                const payload = {
+                    domains: parseDomainLines(document.getElementById('sni-domains').value),
+                    cert_path: document.getElementById('sni-cert-path').value.trim() || undefined,
+                    key_path: document.getElementById('sni-key-path').value.trim() || undefined,
+                    cert_pem: document.getElementById('sni-cert-pem').value.trim() || undefined,
+                    key_pem: document.getElementById('sni-key-pem').value.trim() || undefined,
+                };
+                const data = await postJson('/v1/tls/sni-certificates/upsert', payload);
+                result.textContent = `${data.action} SNI cert for ${(data.domains || []).join(', ')}`;
+                document.getElementById('sni-cert-pem').value = '';
+                document.getElementById('sni-key-pem').value = '';
+                await refreshSniCertificates();
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-blacklist-add').addEventListener('click', async () => {
+            const result = document.getElementById('blacklist-result');
+            try {
+                const banSecs = Number(document.getElementById('blacklist-ban-secs').value);
+                await postJson('/v1/security/blacklist/add', {
+                    ip: document.getElementById('blacklist-ip').value.trim(),
+                    ban_secs: banSecs > 0 ? banSecs : undefined,
+                });
+                result.textContent = 'Ban added';
+                await refreshSecurityPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
     </script>
 </body>
 </html>"#;
 
     html.replace("__ADMIN_USER__", &config.admin.username)
         .replace("__ADMIN_PASS__", &config.admin.password)
+        .replace(
+            "__ADMIN_HTTPS_HINT__",
+            &if config.admin.https.enabled {
+                format!(
+                    "HTTPS agent API: <strong>https://&lt;host&gt;{}/v1/*</strong> (TLS required; writes after cert material exists)",
+                    crate::config::normalize_admin_https_path_prefix(&config.admin.https.path_prefix)
+                )
+            } else {
+                "Enable <code>admin.https.enabled</code> after TLS bootstrap for secure remote agent automation".to_string()
+            },
+        )
 }
 
 async fn connect_upgrade_upstream(url: &Url, allow_insecure: bool) -> Result<BoxedProxyIo> {
@@ -10385,6 +12417,84 @@ mod tests {
         let header = HeaderValue::from_static("Bearer cluster-secret");
 
         assert!(is_authorized(Some(&header), &admin));
+    }
+
+    #[test]
+    fn map_admin_gateway_path_strips_configured_prefix() {
+        let mut admin = AdminConfig::default();
+        admin.https.enabled = true;
+        admin.https.path_prefix = "/_proxysss/admin".to_string();
+        assert_eq!(
+            map_admin_gateway_path(&admin, "/_proxysss/admin/v1/stats").as_deref(),
+            Some("/v1/stats")
+        );
+        assert_eq!(
+            map_admin_gateway_path(&admin, "/_proxysss/admin").as_deref(),
+            Some("/")
+        );
+        assert!(map_admin_gateway_path(&admin, "/v1/stats").is_none());
+    }
+
+    #[test]
+    fn render_config_with_upserted_sni_certificate_appends_entry() {
+        let updated = render_config_with_upserted_sni_certificate(
+            "http:\n  tls:\n    certificates: []\n",
+            &TlsCertificateConfig {
+                domains: vec!["api.example.com".to_string()],
+                cert_path: PathBuf::from("certs/api.crt"),
+                key_path: PathBuf::from("certs/api.key"),
+            },
+        )
+        .expect("render sni cert");
+        assert!(updated.contains("api.example.com"));
+        assert!(updated.contains("certs/api.crt"));
+    }
+
+    #[test]
+    fn admin_https_writes_require_tls_material() {
+        let mut config = GatewayConfig::default();
+        config.admin.enable_write_ops = true;
+        config.admin.https.enabled = true;
+        let denied = check_admin_mutation_access(
+            &config,
+            &AdminTransport::GatewayHttps {
+                host: "ops.example.com".to_string(),
+            },
+        );
+        assert!(denied.is_some());
+
+        let cert_dir = std::env::temp_dir().join(format!(
+            "proxysss-admin-tls-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cert_dir).expect("cert dir");
+        let cert_path = cert_dir.join("cert.pem");
+        let key_path = cert_dir.join("key.pem");
+        std::fs::write(&cert_path, b"cert").expect("cert");
+        std::fs::write(&key_path, b"key").expect("key");
+        config.http.tls.cert_path = cert_path;
+        config.http.tls.key_path = key_path;
+        assert!(check_admin_mutation_access(
+            &config,
+            &AdminTransport::GatewayHttps {
+                host: "ops.example.com".to_string(),
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn admin_gateway_http_is_rejected() {
+        let config = GatewayConfig::default();
+        let denied = check_admin_transport_access(
+            &config,
+            &AdminTransport::GatewayHttp,
+            "127.0.0.1:7777".parse().expect("addr"),
+        );
+        assert!(denied.is_some());
     }
 
     #[test]

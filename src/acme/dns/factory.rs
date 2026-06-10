@@ -109,6 +109,19 @@ pub fn list_builtin_dns_provider_ids() -> Vec<&'static str> {
         .collect()
 }
 
+pub fn dns_providers_json() -> serde_json::Value {
+    serde_json::json!(BUILTIN_DNS_PROVIDERS
+        .iter()
+        .map(|descriptor| {
+            serde_json::json!({
+                "id": descriptor.id,
+                "display_name": descriptor.display_name,
+                "credential_keys": descriptor.credential_keys,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
 pub enum DnsProvider {
     Cloudflare(CloudflareDns),
     AliyunCn(AliyunCnDns),
