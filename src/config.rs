@@ -261,6 +261,7 @@ pub enum AcmeChallengeType {
     #[default]
     TlsAlpn01,
     Http01,
+    Dns01,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -665,6 +666,8 @@ pub struct ServicesConfig {
     #[serde(default)]
     pub webdav: WebDavConfig,
     #[serde(default)]
+    pub filecloud: FileCloudConfig,
+    #[serde(default)]
     pub static_sites: Vec<StaticSiteConfig>,
     #[serde(default)]
     pub ftp: FtpConfig,
@@ -950,6 +953,36 @@ pub struct WebDavConfig {
     pub root: PathBuf,
     #[serde(default = "default_true")]
     pub allow_write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCloudConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_filecloud_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default = "default_filecloud_root")]
+    pub root: PathBuf,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_filecloud_title")]
+    pub title: String,
+    #[serde(default = "default_true")]
+    pub allow_upload: bool,
+    #[serde(default = "default_true")]
+    pub allow_delete: bool,
+    #[serde(default = "default_true")]
+    pub allow_mkdir: bool,
+    #[serde(default = "default_true")]
+    pub allow_move: bool,
+    #[serde(default = "default_filecloud_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+    #[serde(default = "default_filecloud_cdn_cache_secs")]
+    pub cdn_cache_secs: u64,
+    #[serde(default = "default_filecloud_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    #[serde(default)]
+    pub require_auth_for_download: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1443,6 +1476,29 @@ impl GatewayConfig {
             }
         }
 
+        if self.services.filecloud.enabled {
+            if self.services.filecloud.path_prefix.trim().is_empty()
+                || !self.services.filecloud.path_prefix.starts_with('/')
+            {
+                errors.push("services.filecloud.path_prefix must start with /".to_string());
+            }
+            if self.services.filecloud.root.as_os_str().is_empty() {
+                errors.push(
+                    "services.filecloud.root cannot be empty when filecloud is enabled".to_string(),
+                );
+            }
+            if self.services.filecloud.password.trim().is_empty() {
+                errors.push(
+                    "services.filecloud.password cannot be empty when filecloud is enabled"
+                        .to_string(),
+                );
+            }
+            if self.services.filecloud.max_upload_bytes == 0 {
+                errors
+                    .push("services.filecloud.max_upload_bytes must be greater than 0".to_string());
+            }
+        }
+
         let mut static_names = HashSet::<String>::new();
         for site in &self.services.static_sites {
             if site.name.trim().is_empty() {
@@ -1690,6 +1746,9 @@ impl GatewayConfig {
                         "http.tls.acme.renew_interval_hours must be greater than 0".to_string(),
                     );
                 }
+                if self.uses_managed_dns01() {
+                    self.validate_acme_dns_settings(&mut errors);
+                }
                 if self.http.tls.mode == TlsMode::AcmeDnsExternal {
                     if !self
                         .http
@@ -1818,6 +1877,7 @@ impl GatewayConfig {
         self.root_dir = root_dir.clone();
         self.normalize_domain_tls(&root_dir);
         self.apply_auto_https();
+        self.normalize_acme_dns_config();
 
         if self.logging.filter.trim().is_empty() {
             self.logging.filter = default_filter_for_level(self.logging.level);
@@ -1854,6 +1914,7 @@ impl GatewayConfig {
         self.logging.access_log_path = absolutize(&root_dir, &self.logging.access_log_path);
         self.logging.error_log_path = absolutize(&root_dir, &self.logging.error_log_path);
         self.services.webdav.root = absolutize(&root_dir, &self.services.webdav.root);
+        self.services.filecloud.root = absolutize(&root_dir, &self.services.filecloud.root);
         for site in &mut self.services.static_sites {
             site.root = absolutize(&root_dir, &site.root);
         }
@@ -1942,6 +2003,64 @@ impl GatewayConfig {
                 if self.http.tls.auto_https.email.trim().is_empty() && !email.trim().is_empty() {
                     self.http.tls.auto_https.email = email;
                 }
+            }
+        }
+    }
+
+    pub fn uses_managed_dns01(&self) -> bool {
+        self.http.tls.mode == TlsMode::AcmeManaged
+            && self.http.tls.acme.challenge == AcmeChallengeType::Dns01
+    }
+
+    fn normalize_acme_dns_config(&mut self) {
+        if self.http.tls.mode == TlsMode::AcmeDnsExternal {
+            let provider = self.http.tls.acme.dns.provider.clone();
+            if crate::acme::is_builtin_dns_provider(&provider) {
+                self.http.tls.mode = TlsMode::AcmeManaged;
+                self.http.tls.acme.challenge = AcmeChallengeType::Dns01;
+            }
+        }
+
+        if self.uses_managed_dns01() {
+            self.http.tls.acme.dns.provider =
+                crate::acme::normalize_provider_id(&self.http.tls.acme.dns.provider);
+        }
+    }
+
+    fn validate_acme_dns_settings(&self, errors: &mut Vec<String>) {
+        if self.http.tls.acme.dns.provider.trim().is_empty() {
+            errors.push(
+                "http.tls.acme.dns.provider cannot be empty when using built-in DNS-01".to_string(),
+            );
+        } else if !crate::acme::is_builtin_dns_provider(&self.http.tls.acme.dns.provider) {
+            errors.push(format!(
+                "http.tls.acme.dns.provider '{}' is not a built-in DNS provider; supported: {}",
+                self.http.tls.acme.dns.provider,
+                crate::acme::list_builtin_dns_provider_ids().join(", ")
+            ));
+        }
+        if crate::acme::normalize_provider_id(&self.http.tls.acme.dns.provider) != "manual"
+            && self.http.tls.acme.dns.credentials.is_empty()
+        {
+            errors.push(
+                "http.tls.acme.dns.credentials cannot be empty when using built-in DNS-01"
+                    .to_string(),
+            );
+        }
+        if crate::acme::normalize_provider_id(&self.http.tls.acme.dns.provider) == "manual" {
+            return;
+        }
+        for (key, value) in &self.http.tls.acme.dns.credentials {
+            if key.trim().is_empty() {
+                errors.push(
+                    "http.tls.acme.dns.credentials cannot contain empty credential names"
+                        .to_string(),
+                );
+            }
+            if value.trim().is_empty() {
+                errors.push(format!(
+                    "http.tls.acme.dns.credentials.{key} cannot be empty when using built-in DNS-01"
+                ));
             }
         }
     }
@@ -2294,6 +2413,26 @@ impl Default for WebDavConfig {
             path_prefix: default_webdav_path_prefix(),
             root: default_webdav_root(),
             allow_write: default_true(),
+        }
+    }
+}
+
+impl Default for FileCloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_filecloud_path_prefix(),
+            root: default_filecloud_root(),
+            password: String::new(),
+            title: default_filecloud_title(),
+            allow_upload: default_true(),
+            allow_delete: default_true(),
+            allow_mkdir: default_true(),
+            allow_move: default_true(),
+            max_upload_bytes: default_filecloud_max_upload_bytes(),
+            cdn_cache_secs: default_filecloud_cdn_cache_secs(),
+            session_ttl_secs: default_filecloud_session_ttl_secs(),
+            require_auth_for_download: false,
         }
     }
 }
@@ -2952,6 +3091,30 @@ fn default_webdav_root() -> PathBuf {
     PathBuf::from("webdav")
 }
 
+fn default_filecloud_path_prefix() -> String {
+    "/filecloud".to_string()
+}
+
+fn default_filecloud_root() -> PathBuf {
+    PathBuf::from("filecloud-data")
+}
+
+fn default_filecloud_title() -> String {
+    "FileCloud".to_string()
+}
+
+fn default_filecloud_max_upload_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+fn default_filecloud_cdn_cache_secs() -> u64 {
+    86_400
+}
+
+fn default_filecloud_session_ttl_secs() -> u64 {
+    86_400 * 7
+}
+
 fn default_static_path_prefix() -> String {
     "/public".to_string()
 }
@@ -3505,6 +3668,29 @@ mod tests {
     }
 
     #[test]
+    fn acme_managed_dns01_accepts_builtin_provider_credentials() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-acme-managed-dns01-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "http:\n  tls:\n    mode: acme_managed\n    generate_self_signed_if_missing: false\n    acme:\n      email: admin@example.com\n      challenge: dns01\n      domains: [example.com, '*.example.com']\n      dns:\n        provider: aliyun_cn\n        credentials:\n          access_key_id: key\n          access_key_secret: secret\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
+        assert_eq!(config.http.tls.acme.challenge, AcmeChallengeType::Dns01);
+        assert_eq!(config.http.tls.acme.dns.provider, "aliyun_cn");
+        assert!(config.uses_managed_dns01());
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn acme_dns_external_accepts_acme_sh_dns_provider_credentials() {
         let base_dir = std::env::temp_dir().join(format!(
             "proxysss-acme-dns-external-test-{}",
@@ -3519,8 +3705,9 @@ mod tests {
         .expect("write config");
 
         let config = GatewayConfig::load(&config_path).expect("load config");
-        assert_eq!(config.http.tls.mode, TlsMode::AcmeDnsExternal);
-        assert_eq!(config.http.tls.acme.dns.provider, "dns_cf");
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
+        assert_eq!(config.http.tls.acme.challenge, AcmeChallengeType::Dns01);
+        assert_eq!(config.http.tls.acme.dns.provider, "cloudflare");
         assert_eq!(
             config
                 .http

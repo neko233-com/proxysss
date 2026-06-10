@@ -1,7 +1,9 @@
+mod acme;
 mod ai_proxy;
 mod bench;
 mod config;
 mod demo;
+mod filecloud;
 mod gateway;
 mod install;
 mod linux_tune;
@@ -292,6 +294,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
     ),
     (
+        "filecloud",
+        "proxysss-exclusive services.filecloud shared directory UI with password auth, CRUD, drag upload, search, and CDN-friendly /dl/* downloads; confined to services.filecloud.root",
+    ),
+    (
         "single yaml config",
         "recommended and enforced: keep runtime settings in one proxysss.yaml file and use -config/--config/-c only to point at a different YAML path",
     ),
@@ -317,7 +323,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "auto https",
-        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; http.tls.mode=acme_dns_external delegates wildcard DNS-01 to acme.sh",
+        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard DNS-01 uses built-in http.tls.mode=acme_managed + http.tls.acme.challenge=dns01 provider strategies",
     ),
     (
         "multi-cert sni",
@@ -365,7 +371,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "agent automation api",
-        "password/bearer admin API upserts and deletes routes, provisions ACME and acme.sh wildcard TLS, atomically persists YAML",
+        "password/bearer admin API upserts and deletes routes, provisions managed ACME and built-in wildcard DNS-01 TLS, atomically persists YAML",
     ),
     (
         "security hardening",
@@ -397,6 +403,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
 #[serde(rename_all = "snake_case")]
 enum ParityStatus {
     Supported,
+    #[allow(dead_code)]
     Partial,
 }
 
@@ -467,9 +474,9 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     },
     NginxParityItem {
         capability: "self-contained auto ssl",
-        status: ParityStatus::Partial,
-        evidence: "auto https uses managed ACME HTTP-01/TLS-ALPN-01 without acme.sh; wildcard DNS-01 is supported through explicit acme_dns_external acme.sh provider credentials",
-        next_gap: "native DNS provider integrations remain external by design",
+        status: ParityStatus::Supported,
+        evidence: "managed ACME covers HTTP-01/TLS-ALPN-01 without cloud tokens and built-in DNS-01 wildcard issuance via provider strategies (cloudflare, aliyun_cn, aliyun_intl, tencent, volcengine, aws, azure, google)",
+        next_gap: "",
     },
     NginxParityItem {
         capability: "access/error logging",
@@ -541,7 +548,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     CaddyFeatureItem {
         capability: "automatic HTTPS",
         status: ParityStatus::Supported,
-        evidence: "http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard certificates use explicit acme_dns_external through acme.sh DNS-01",
+        evidence: "http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard certificates use built-in managed DNS-01 provider strategies",
         next_gap: "",
     },
     CaddyFeatureItem {
@@ -989,6 +996,13 @@ fn render_redacted_config_yaml(config: &GatewayConfig) -> Result<String> {
             *value = serde_yaml::Value::String("***".to_string());
         }
     }
+    if let Some(password) = value
+        .get_mut("services")
+        .and_then(|item| item.get_mut("filecloud"))
+        .and_then(|item| item.get_mut("password"))
+    {
+        *password = serde_yaml::Value::String("***".to_string());
+    }
     serde_yaml::to_string(&value).context("failed to render redacted config")
 }
 
@@ -1268,6 +1282,13 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.webdav.root.display()
     );
     println!(
+        "filecloud         : enabled={}, prefix={}, root={}, title={}",
+        config.services.filecloud.enabled,
+        config.services.filecloud.path_prefix,
+        config.services.filecloud.root.display(),
+        config.services.filecloud.title
+    );
+    println!(
         "ftp               : enabled={}, bind={}, upstream={}",
         config.services.ftp.enabled, config.services.ftp.bind, config.services.ftp.upstream
     );
@@ -1406,6 +1427,22 @@ fn render_route_topology(config: &GatewayConfig) -> String {
             config.services.webdav.path_prefix,
             config.services.webdav.root.display(),
             config.services.webdav.allow_write
+        ));
+    } else {
+        output.push_str("disabled\n");
+    }
+
+    output.push_str("[filecloud]\n");
+    if config.services.filecloud.enabled {
+        output.push_str(&format!(
+            "path={} root={} title={} upload={} delete={} mkdir={} move={}\n",
+            config.services.filecloud.path_prefix,
+            config.services.filecloud.root.display(),
+            config.services.filecloud.title,
+            config.services.filecloud.allow_upload,
+            config.services.filecloud.allow_delete,
+            config.services.filecloud.allow_mkdir,
+            config.services.filecloud.allow_move
         ));
     } else {
         output.push_str("disabled\n");
@@ -2261,9 +2298,9 @@ mod tests {
             );
         }
 
-        assert!(NGINX_PARITY_MATRIX
-            .iter()
-            .any(|item| item.status == ParityStatus::Partial));
+        assert!(NGINX_PARITY_MATRIX.iter().any(|item| {
+            item.capability == "self-contained auto ssl" && item.status == ParityStatus::Supported
+        }));
     }
 
     #[test]
@@ -2321,9 +2358,10 @@ mod tests {
 
         assert!(readme.contains("token-bucket"));
         assert!(readme.contains("gRPC-over-HTTP/2"));
-        assert!(readme.contains("acme.sh DNS-01"));
+        assert!(readme.contains("dns01"));
         assert!(agents.contains("docs/architecture.html"));
-        assert!(agents.contains("acme_dns_external"));
+        assert!(agents.contains("aliyun_cn"));
+        assert!(agents.contains("aliyun_intl"));
     }
 
     #[test]
@@ -2343,16 +2381,14 @@ mod tests {
             .iter()
             .filter(|item| item.status == ParityStatus::Partial)
         {
-            if item.capability == "self-contained auto ssl" {
-                assert!(
-                    docs.contains("acme_dns_external") || docs.contains("acme.sh"),
-                    "built-in docs should document wildcard ACME boundary"
-                );
-            }
             if item.capability == "FTP" {
                 panic!("FTP must not regress to partial parity");
             }
         }
+        assert!(
+            docs.contains("dns01") || docs.contains("DNS-01"),
+            "built-in docs should document wildcard DNS-01"
+        );
     }
 
     #[test]

@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__FILECLOUD_TITLE__</title>
+  <style>
+    :root {
+      --bg: #f3f6fb;
+      --panel: #ffffff;
+      --line: #e5eaf3;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --primary: #1677ff;
+      --primary-soft: rgba(22, 119, 255, 0.12);
+      --danger: #ef4444;
+      --success: #16a34a;
+      --shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+      --radius: 16px;
+      --font: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font: 18px/1.55 var(--font); }
+    button, input { font: inherit; }
+    .app { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+      padding: 18px 24px; background: rgba(255,255,255,.92); backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 220px; }
+    .logo {
+      width: 44px; height: 44px; border-radius: 12px;
+      background: linear-gradient(135deg, #1677ff, #69b1ff);
+      color: #fff; display: grid; place-items: center; font-size: 22px; font-weight: 700;
+    }
+    .brand h1 { margin: 0; font-size: 28px; font-weight: 700; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 16px; }
+    .search {
+      flex: 1; min-width: 280px; display: flex; gap: 10px;
+    }
+    .search input {
+      flex: 1; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: #fff;
+    }
+    .toolbar { display: flex; gap: 10px; flex-wrap: wrap; }
+    .btn {
+      border: 1px solid var(--line); background: #fff; color: var(--text);
+      padding: 12px 16px; border-radius: 12px; cursor: pointer; transition: .15s ease;
+    }
+    .btn:hover { border-color: #c7d2fe; background: #f8fbff; }
+    .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .btn.primary:hover { filter: brightness(1.05); }
+    .btn.danger { color: var(--danger); border-color: #fecaca; background: #fff5f5; }
+    .layout {
+      display: grid; grid-template-columns: 360px 1fr; gap: 18px;
+      padding: 18px 24px 24px; min-height: 0;
+    }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+      box-shadow: var(--shadow); min-height: calc(100vh - 130px); display: flex; flex-direction: column;
+    }
+    .panel-head {
+      padding: 16px 18px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .panel-head strong { font-size: 20px; }
+    .breadcrumb { color: var(--muted); font-size: 16px; word-break: break-all; }
+    .tree, .list { overflow: auto; padding: 10px; }
+    .node, .row {
+      display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: center;
+      padding: 12px 14px; border-radius: 12px; cursor: pointer; user-select: none;
+    }
+    .node:hover, .row:hover { background: #f8fbff; }
+    .node.active, .row.active { background: var(--primary-soft); }
+    .node.drag-over { outline: 2px dashed var(--primary); background: var(--primary-soft); }
+    .icon { font-size: 20px; text-align: center; }
+    .meta { color: var(--muted); font-size: 16px; white-space: nowrap; }
+    .main-body { padding: 18px; display: grid; gap: 16px; }
+    .dropzone {
+      border: 2px dashed #bfd7ff; border-radius: 18px; padding: 28px; text-align: center;
+      background: linear-gradient(180deg, #f8fbff, #fff); color: var(--muted); font-size: 19px;
+    }
+    .dropzone.drag { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
+    .preview {
+      border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #fafcff;
+      min-height: 280px; display: grid; place-items: center;
+    }
+    .preview img, .preview video { max-width: 100%; max-height: 520px; display: block; }
+    .preview pre {
+      width: 100%; max-height: 520px; overflow: auto; margin: 0; padding: 18px;
+      font: 16px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap;
+    }
+    .links { display: flex; gap: 10px; flex-wrap: wrap; }
+    .toast {
+      position: fixed; right: 24px; bottom: 24px; z-index: 50;
+      background: #111827; color: #fff; padding: 14px 18px; border-radius: 12px; font-size: 17px;
+      opacity: 0; transform: translateY(8px); transition: .2s ease; pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .empty { padding: 40px 20px; text-align: center; color: var(--muted); font-size: 18px; }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .panel { min-height: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">FC</div>
+        <div>
+          <h1>__FILECLOUD_TITLE__</h1>
+          <p>FileCloud · 共享文件空间</p>
+        </div>
+      </div>
+      <div class="search">
+        <input id="searchInput" type="search" placeholder="搜索文件名…" />
+        <button class="btn primary" id="searchBtn">搜索</button>
+      </div>
+      <div class="toolbar">
+        <button class="btn" id="mkdirBtn">新建文件夹</button>
+        <button class="btn" id="uploadBtn">上传文件</button>
+        <button class="btn" id="renameBtn">重命名</button>
+        <button class="btn danger" id="deleteBtn">删除</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <section class="panel">
+        <div class="panel-head">
+          <strong>目录树</strong>
+          <span class="breadcrumb" id="cwdLabel">/</span>
+        </div>
+        <div class="tree" id="tree"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <strong id="detailTitle">当前目录</strong>
+          <span class="meta" id="detailMeta"></span>
+        </div>
+        <div class="main-body">
+          <div class="dropzone" id="dropzone">拖拽文件到此处上传 · 最大 __FILECLOUD_MAX_UPLOAD__ 字节</div>
+          <div class="list" id="fileList"></div>
+          <div class="links" id="actionLinks"></div>
+          <div class="preview" id="preview"><div class="empty">选择文件以预览或复制 CDN 链接</div></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <input id="fileInput" type="file" multiple hidden />
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const PREFIX = "__FILECLOUD_PREFIX__";
+    const MAX_UPLOAD = Number("__FILECLOUD_MAX_UPLOAD__") || 536870912;
+    const state = { cwd: "/", selected: null, nodes: [], searchResults: null, dragPath: null };
+
+    const treeEl = document.getElementById("tree");
+    const fileListEl = document.getElementById("fileList");
+    const previewEl = document.getElementById("preview");
+    const actionLinksEl = document.getElementById("actionLinks");
+    const cwdLabel = document.getElementById("cwdLabel");
+    const detailTitle = document.getElementById("detailTitle");
+    const detailMeta = document.getElementById("detailMeta");
+    const toastEl = document.getElementById("toast");
+    const dropzone = document.getElementById("dropzone");
+    const fileInput = document.getElementById("fileInput");
+
+    function toast(message) {
+      toastEl.textContent = message;
+      toastEl.classList.add("show");
+      clearTimeout(toastEl._timer);
+      toastEl._timer = setTimeout(() => toastEl.classList.remove("show"), 2400);
+    }
+
+    function formatSize(bytes) {
+      if (!bytes) return "—";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = bytes;
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+      return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function formatTime(ts) {
+      if (!ts) return "";
+      return new Date(ts * 1000).toLocaleString();
+    }
+
+    function dlUrl(path) {
+      const clean = path.replace(/^\/+/, "");
+      return `${PREFIX}/dl/${clean.split("/").map(encodeURIComponent).join("/")}`;
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(`${PREFIX}${path}`, {
+        credentials: "same-origin",
+        ...options,
+      });
+      if (res.status === 401) {
+        location.reload();
+        throw new Error("unauthorized");
+      }
+      const contentType = res.headers.get("content-type") || "";
+      const payload = contentType.includes("json") ? await res.json() : await res.text();
+      if (!res.ok) {
+        throw new Error(payload?.error || payload || `HTTP ${res.status}`);
+      }
+      return payload;
+    }
+
+    async function loadTree(path = state.cwd) {
+      const data = await api(`/api/tree?path=${encodeURIComponent(path)}`);
+      state.cwd = data.path || "/";
+      state.nodes = data.nodes || [];
+      state.searchResults = null;
+      render();
+    }
+
+    async function searchFiles() {
+      const q = document.getElementById("searchInput").value.trim();
+      if (!q) return loadTree(state.cwd);
+      const data = await api(`/api/search?path=${encodeURIComponent(state.cwd)}&q=${encodeURIComponent(q)}`);
+      state.searchResults = data.matches || [];
+      render();
+      toast(`找到 ${state.searchResults.length} 个结果`);
+    }
+
+    function render() {
+      cwdLabel.textContent = state.cwd;
+      detailTitle.textContent = state.searchResults ? "搜索结果" : "当前目录";
+      const nodes = state.searchResults || state.nodes;
+      detailMeta.textContent = `${nodes.length} 项`;
+
+      treeEl.innerHTML = "";
+      const up = document.createElement("div");
+      up.className = "node";
+      up.innerHTML = `<span class="icon">⬆</span><span>上级目录</span><span class="meta"></span>`;
+      up.onclick = () => {
+        if (state.cwd === "/") return;
+        const parts = state.cwd.split("/").filter(Boolean);
+        parts.pop();
+        loadTree(parts.length ? `/${parts.join("/")}` : "/");
+      };
+      treeEl.appendChild(up);
+
+      nodes.filter(n => n.is_dir).forEach(node => {
+        const el = document.createElement("div");
+        el.className = "node" + (state.selected?.path === node.path ? " active" : "");
+        el.draggable = true;
+        el.dataset.path = node.path;
+        el.innerHTML = `<span class="icon">📁</span><span>${escapeHtml(node.name)}</span><span class="meta">${formatSize(node.size)}</span>`;
+        el.onclick = () => { state.selected = node; enterDir(node.path); };
+        bindDrag(el, node);
+        treeEl.appendChild(el);
+      });
+
+      fileListEl.innerHTML = "";
+      nodes.forEach(node => {
+        const el = document.createElement("div");
+        el.className = "row" + (state.selected?.path === node.path ? " active" : "");
+        el.draggable = true;
+        el.dataset.path = node.path;
+        el.innerHTML = `<span class="icon">${node.is_dir ? "📁" : "📄"}</span><span>${escapeHtml(node.name)}</span><span class="meta">${formatSize(node.size)} · ${formatTime(node.modified)}</span>`;
+        el.onclick = () => { state.selected = node; renderSelection(); highlightRows(); };
+        el.ondblclick = () => node.is_dir ? enterDir(node.path) : openPreview(node);
+        bindDrag(el, node);
+        fileListEl.appendChild(el);
+      });
+
+      if (!nodes.length) {
+        fileListEl.innerHTML = `<div class="empty">此目录为空，拖拽文件上传</div>`;
+      }
+      renderSelection();
+    }
+
+    function highlightRows() {
+      [...document.querySelectorAll(".node, .row")].forEach(el => {
+        el.classList.toggle("active", el.dataset.path === state.selected?.path);
+      });
+    }
+
+    function enterDir(path) {
+      state.selected = null;
+      loadTree(path);
+    }
+
+    function renderSelection() {
+      actionLinksEl.innerHTML = "";
+      previewEl.innerHTML = `<div class="empty">选择文件以预览或复制 CDN 链接</div>`;
+      const node = state.selected;
+      if (!node) return;
+      if (!node.is_dir) {
+        const url = dlUrl(node.path);
+        actionLinksEl.innerHTML = `
+          <button class="btn primary" id="openBtn">打开</button>
+          <button class="btn" id="copyBtn">复制 CDN 链接</button>
+          <a class="btn" href="${url}" download="${escapeHtml(node.name)}">下载</a>`;
+        document.getElementById("openBtn").onclick = () => openPreview(node);
+        document.getElementById("copyBtn").onclick = async () => {
+          await navigator.clipboard.writeText(new URL(url, location.origin).href);
+          toast("CDN 链接已复制");
+        };
+        openPreview(node, false);
+      }
+    }
+
+    async function openPreview(node, focus = true) {
+      const url = dlUrl(node.path);
+      const lower = node.name.toLowerCase();
+      if (/\.(png|jpe?g|gif|webp|svg)$/.test(lower)) {
+        previewEl.innerHTML = `<img src="${url}" alt="${escapeHtml(node.name)}" />`;
+      } else if (/\.(mp4|webm|mov)$/.test(lower)) {
+        previewEl.innerHTML = `<video src="${url}" controls></video>`;
+      } else if (/\.(txt|md|json|js|ts|css|html|yaml|yml|log|csv)$/.test(lower)) {
+        const text = await fetch(url, { credentials: "same-origin" }).then(r => r.text());
+        previewEl.innerHTML = `<pre>${escapeHtml(text.slice(0, 200000))}</pre>`;
+      } else if (focus) {
+        window.open(url, "_blank");
+      }
+    }
+
+    function bindDrag(el, node) {
+      el.addEventListener("dragstart", e => {
+        state.dragPath = node.path;
+        e.dataTransfer.setData("text/plain", node.path);
+        e.dataTransfer.effectAllowed = "move";
+      });
+      el.addEventListener("dragover", e => {
+        if (!node.is_dir) return;
+        e.preventDefault();
+        el.classList.add("drag-over");
+      });
+      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+      el.addEventListener("drop", async e => {
+        e.preventDefault();
+        el.classList.remove("drag-over");
+        if (e.dataTransfer.files?.length) {
+          await uploadFiles(e.dataTransfer.files, node.is_dir ? node.path : state.cwd);
+          return;
+        }
+        const from = state.dragPath || e.dataTransfer.getData("text/plain");
+        if (!from || !node.is_dir || from === node.path) return;
+        const base = from.split("/").pop();
+        const dest = node.path === "/" ? `/${base}` : `${node.path}/${base}`;
+        await api("/api/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from, to: dest }),
+        });
+        toast("已移动");
+        loadTree(state.cwd);
+      });
+    }
+
+    async function uploadFiles(fileList, path = state.cwd) {
+      for (const file of fileList) {
+        if (file.size > MAX_UPLOAD) {
+          toast(`${file.name} 超过大小限制`);
+          continue;
+        }
+        const buffer = await file.arrayBuffer();
+        await api(`/api/upload?path=${encodeURIComponent(path)}&name=${encodeURIComponent(file.name)}`, {
+          method: "PUT",
+          body: buffer,
+        });
+      }
+      toast("上传完成");
+      loadTree(state.cwd);
+    }
+
+    document.getElementById("mkdirBtn").onclick = async () => {
+      const name = prompt("文件夹名称");
+      if (!name) return;
+      const path = state.cwd === "/" ? `/${name}` : `${state.cwd}/${name}`;
+      await api("/api/mkdir", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      toast("文件夹已创建");
+      loadTree(state.cwd);
+    };
+
+    document.getElementById("uploadBtn").onclick = () => fileInput.click();
+    fileInput.onchange = () => uploadFiles(fileInput.files);
+
+    document.getElementById("renameBtn").onclick = async () => {
+      if (!state.selected) return toast("请先选择一项");
+      const name = prompt("新名称", state.selected.name);
+      if (!name || name === state.selected.name) return;
+      await api("/api/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: state.selected.path, name }),
+      });
+      toast("已重命名");
+      loadTree(state.cwd);
+    };
+
+    document.getElementById("deleteBtn").onclick = async () => {
+      if (!state.selected) return toast("请先选择一项");
+      if (!confirm(`确定删除 ${state.selected.name} ?`)) return;
+      await api("/api/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: state.selected.path }),
+      });
+      state.selected = null;
+      toast("已删除");
+      loadTree(state.cwd);
+    };
+
+    document.getElementById("searchBtn").onclick = searchFiles;
+    document.getElementById("searchInput").addEventListener("keydown", e => {
+      if (e.key === "Enter") searchFiles();
+    });
+
+    ["dragenter", "dragover"].forEach(evt => dropzone.addEventListener(evt, e => {
+      e.preventDefault();
+      dropzone.classList.add("drag");
+    }));
+    ["dragleave", "drop"].forEach(evt => dropzone.addEventListener(evt, e => {
+      e.preventDefault();
+      dropzone.classList.remove("drag");
+    }));
+    dropzone.addEventListener("drop", e => uploadFiles(e.dataTransfer.files));
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    loadTree("/").catch(error => toast(error.message || "加载失败"));
+  </script>
+</body>
+</html>

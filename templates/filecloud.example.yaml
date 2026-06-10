@@ -1,0 +1,16 @@
+# FileCloud — proxysss 独占的交互式共享目录（非 nginx 风格 WebDAV）
+services:
+  filecloud:
+    enabled: true
+    path_prefix: /filecloud
+    root: ./filecloud-data
+    password: change-me
+    title: "共享文件"
+    allow_upload: true
+    allow_delete: true
+    allow_mkdir: true
+    allow_move: true
+    max_upload_bytes: 536870912
+    cdn_cache_secs: 86400
+    session_ttl_secs: 604800
+    require_auth_for_download: false

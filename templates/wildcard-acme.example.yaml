@@ -1,23 +1,50 @@
-# Wildcard TLS via acme.sh DNS-01 (non-default path).
+# Wildcard TLS via built-in managed ACME DNS-01.
 # Merge into your single proxysss.yaml — do NOT use runtime include files.
 #
-# Built-in managed ACME covers HTTP-01 and TLS-ALPN-01 only.
-# Wildcard certificates (*.example.com) require this explicit mode + acme.sh.
+# Without cloud credentials: use http.tls.auto_https (HTTP-01/TLS-ALPN-01) instead.
+# One cloud vendor = one provider strategy. aliyun_cn and aliyun_intl are separate.
 
 http:
   tls:
-    mode: acme_dns_external
+    mode: acme_managed
     cert_path: certs/proxysss-cert.pem
     key_path: certs/proxysss-key.pem
     generate_self_signed_if_missing: false
     server_name: example.com
     acme:
-      client: acme.sh
       email: admin@example.com
+      challenge: dns01
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12
       dns:
-        provider: dns_cf
+        provider: cloudflare
         credentials:
-          CF_Token: your-cloudflare-api-token
+          api_token: your-cloudflare-api-token
+
+# Built-in providers:
+#   cloudflare | aliyun_cn | aliyun_intl | tencent | volcengine | aws | azure | google
+#
+# AWS example:
+#   provider: aws
+#   credentials:
+#     access_key_id: AKIA...
+#     secret_access_key: ...
+#     hosted_zone_id: Z1234567890   # optional; auto-discovered if omitted
+#
+# Azure example:
+#   provider: azure
+#   credentials:
+#     tenant_id: ...
+#     client_id: ...
+#     client_secret: ...
+#     subscription_id: ...
+#     resource_group: dns-rg
+#
+# Google Cloud example:
+#   provider: google
+#   credentials:
+#     project_id: my-project
+#     managed_zone: example-com
+#     service_account_json: |
+#       {"type":"service_account","project_id":"...","private_key":"..."}

@@ -56,6 +56,7 @@ use url::Url;
 use uuid::Uuid;
 use zstd::stream::encode_all as zstd_encode_all;
 
+use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
     on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
     AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
@@ -105,7 +106,7 @@ struct DynamicState {
     script: Option<Arc<ScriptRuntime>>,
 }
 
-struct GatewayHttpResponse {
+pub(crate) struct GatewayHttpResponse {
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
@@ -395,6 +396,21 @@ impl Drop for HttpRateLimitLease {
 
 impl Gateway {
     pub async fn from_config(config_path: PathBuf, config: GatewayConfig) -> Result<Arc<Self>> {
+        let acme_http_challenges = Arc::new(DashMap::new());
+        let acme_tls_alpn_certs = Arc::new(DashMap::new());
+
+        if config.uses_managed_dns01()
+            && (!config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists())
+        {
+            issue_managed_acme_certificate(
+                &config.http.tls,
+                &acme_http_challenges,
+                &acme_tls_alpn_certs,
+            )
+            .await
+            .context("failed to issue initial managed DNS-01 certificate")?;
+        }
+
         prepare_tls_material(&config)?;
 
         let dynamic = Arc::new(build_dynamic_state(config.clone()).await?);
@@ -414,8 +430,8 @@ impl Gateway {
             stream_rate_limits: Arc::new(DashMap::new()),
             http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
-            acme_http_challenges: Arc::new(DashMap::new()),
-            acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            acme_http_challenges,
+            acme_tls_alpn_certs,
             on_demand_certs: Arc::new(DashMap::new()),
             on_demand_trigger,
             on_demand_issue_counts: Arc::new(DashMap::new()),
@@ -1549,7 +1565,7 @@ impl Gateway {
                 Ok(domains) => {
                     return Ok(json_response(
                         StatusCode::OK,
-                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_dns_external"}),
+                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_managed", "challenge": "dns01"}),
                     ));
                 }
                 Err(error) => {
@@ -1906,15 +1922,24 @@ impl Gateway {
             return Err(anyhow!("email is required for wildcard ACME"));
         }
         if payload.dns_provider.trim().is_empty() {
-            return Err(anyhow!("dns_provider is required for acme.sh DNS-01"));
+            return Err(anyhow!("dns_provider is required for wildcard DNS-01"));
+        }
+        if !crate::acme::is_builtin_dns_provider(&payload.dns_provider) {
+            return Err(anyhow!(
+                "dns_provider '{}' is not supported; built-in providers: {}",
+                payload.dns_provider,
+                crate::acme::list_builtin_dns_provider_ids().join(", ")
+            ));
         }
 
         let domains = payload.domains.clone();
         let mut candidate = current_config.clone();
-        candidate.http.tls.mode = TlsMode::AcmeDnsExternal;
+        candidate.http.tls.mode = TlsMode::AcmeManaged;
+        candidate.http.tls.acme.challenge = AcmeChallengeType::Dns01;
         candidate.http.tls.acme.email = payload.email.clone();
         candidate.http.tls.acme.domains = domains.clone();
-        candidate.http.tls.acme.dns.provider = payload.dns_provider.clone();
+        candidate.http.tls.acme.dns.provider =
+            crate::acme::normalize_provider_id(&payload.dns_provider);
         candidate.http.tls.acme.dns.credentials = payload.credentials.clone();
         candidate.http.tls.generate_self_signed_if_missing = false;
         candidate.validate()?;
@@ -3058,6 +3083,37 @@ impl Gateway {
                 .blocked_requests_total
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(response);
+        }
+
+        if state.config.services.filecloud.enabled
+            && crate::filecloud::path::path_matches(
+                &state.config.services.filecloud.path_prefix,
+                uri.path(),
+            )
+        {
+            let _rate_limit_lease = match self.apply_http_rate_limit(
+                &state.config.services.rate_limit.http,
+                &host,
+                &headers,
+                remote_addr,
+            ) {
+                Ok(lease) => lease,
+                Err(response) => return Ok(response),
+            };
+            let response = crate::filecloud::dispatch_filecloud(
+                &state.config.services.filecloud,
+                &method,
+                uri.path(),
+                uri.query(),
+                &headers,
+                body,
+            )
+            .await?;
+            return finalize_http_response(
+                &headers,
+                &state.config.services.response_policy.compression,
+                response,
+            );
         }
 
         if state.config.services.webdav.enabled
@@ -4749,7 +4805,7 @@ fn build_health_check_url(upstream: &str, path: &str) -> Result<Url> {
 }
 
 impl GatewayHttpResponse {
-    fn error(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Self {
         let body = Bytes::from(message.into());
         Self {
             status,
@@ -4762,7 +4818,7 @@ impl GatewayHttpResponse {
         }
     }
 
-    fn html(body: impl Into<String>, upstream: impl Into<String>) -> Self {
+    pub(crate) fn html(body: impl Into<String>, upstream: impl Into<String>) -> Self {
         Self::html_with_status(StatusCode::OK, body, upstream)
     }
 
@@ -4802,7 +4858,7 @@ impl GatewayHttpResponse {
         }
     }
 
-    fn bytes(
+    pub(crate) fn bytes(
         status: StatusCode,
         content_type: impl Into<String>,
         body: impl Into<Bytes>,
@@ -4816,6 +4872,42 @@ impl GatewayHttpResponse {
             body: body.into(),
             upstream: upstream.into(),
         }
+    }
+
+    pub(crate) fn json<T: Serialize>(
+        status: StatusCode,
+        value: &T,
+        upstream: impl Into<String>,
+    ) -> Result<Self> {
+        let body = serde_json::to_vec(value).context("failed to encode json response")?;
+        Ok(Self {
+            status,
+            headers: vec![(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            )],
+            body: Bytes::from(body),
+            upstream: upstream.into(),
+        })
+    }
+
+    pub(crate) fn push_header(&mut self, name: HeaderName, value: HeaderValue) {
+        self.headers.push((name, value));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn headers(&self) -> &[(HeaderName, HeaderValue)] {
+        &self.headers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body(&self) -> &Bytes {
+        &self.body
     }
 
     fn into_hyper(self) -> Response<Full<Bytes>> {
@@ -5350,7 +5442,15 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
             }
         }
         TlsMode::AcmeManaged => {
-            if config.http.tls.generate_self_signed_if_missing {
+            if config.http.tls.acme.challenge == AcmeChallengeType::Dns01 {
+                if !config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists() {
+                    return Err(anyhow!(
+                        "tls.mode=acme_managed with challenge=dns01 still missing cert/key after issuance attempt: {} {}",
+                        config.http.tls.cert_path.display(),
+                        config.http.tls.key_path.display()
+                    ));
+                }
+            } else if config.http.tls.generate_self_signed_if_missing {
                 install::ensure_cert_pair(
                     &config.http.tls.cert_path,
                     &config.http.tls.key_path,
@@ -5572,6 +5672,15 @@ async fn issue_managed_acme_certificate(
 
     let mut inserted_tokens = Vec::new();
     let mut inserted_tls_domains = Vec::new();
+    let mut inserted_dns_records = Vec::new();
+    let dns_provider = if tls.acme.challenge == AcmeChallengeType::Dns01 {
+        Some(DnsProvider::create(
+            &tls.acme.dns.provider,
+            tls.acme.dns.credentials.clone(),
+        )?)
+    } else {
+        None
+    };
     let result = async {
         let mut authorizations = order.authorizations();
         while let Some(authz) = authorizations.next().await {
@@ -5584,6 +5693,9 @@ async fn issue_managed_acme_certificate(
                 AcmeChallengeType::TlsAlpn01 => authz
                     .challenge(ChallengeType::TlsAlpn01)
                     .ok_or_else(|| anyhow!("acme server did not offer tls-alpn-01 challenge"))?,
+                AcmeChallengeType::Dns01 => authz
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or_else(|| anyhow!("acme server did not offer dns-01 challenge"))?,
             };
 
             match tls.acme.challenge {
@@ -5600,6 +5712,21 @@ async fn issue_managed_acme_certificate(
                     )?;
                     tls_alpn_certs.insert(identifier.clone(), Arc::new(certified));
                     inserted_tls_domains.push(identifier);
+                }
+                AcmeChallengeType::Dns01 => {
+                    let provider = dns_provider
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("managed dns-01 provider is not configured"))?;
+                    let fqdn = acme_challenge_fqdn(&identifier);
+                    let txt_value = challenge.key_authorization().dns_value();
+                    let handle = provider
+                        .upsert_txt_record(&fqdn, &txt_value)
+                        .await
+                        .with_context(|| {
+                            format!("failed to publish dns-01 txt record for {fqdn}")
+                        })?;
+                    inserted_dns_records.push((provider.id().to_string(), handle));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
             challenge
@@ -5648,6 +5775,13 @@ async fn issue_managed_acme_certificate(
     }
     for domain in inserted_tls_domains {
         tls_alpn_certs.remove(&domain);
+    }
+    if let Some(provider) = dns_provider.as_ref() {
+        for (_provider_id, handle) in inserted_dns_records {
+            if let Err(error) = provider.delete_txt_record(&handle).await {
+                tracing::warn!(?error, record = %handle.name, "failed to clean up dns-01 txt record");
+            }
+        }
     }
 
     result
@@ -5735,6 +5869,12 @@ fn run_acme_command(tls: &crate::config::TlsConfig, renew_only: bool) -> Result<
             }
             AcmeChallengeType::Http01 => {
                 issue.arg("--standalone");
+            }
+            AcmeChallengeType::Dns01 => {
+                for (name, value) in &acme.dns.credentials {
+                    issue.env(name.trim(), value);
+                }
+                issue.arg("--dns").arg(acme.dns.provider.trim());
             }
         }
     }
@@ -7263,7 +7403,7 @@ fn render_config_with_wildcard_tls(
         .ok_or_else(|| anyhow!("http.tls must be a mapping"))?;
     tls.insert(
         serde_yaml::Value::String("mode".to_string()),
-        serde_yaml::Value::String("acme_dns_external".to_string()),
+        serde_yaml::Value::String("acme_managed".to_string()),
     );
     tls.insert(
         serde_yaml::Value::String("generate_self_signed_if_missing".to_string()),
@@ -7283,12 +7423,12 @@ fn render_config_with_wildcard_tls(
     );
     let acme = serde_yaml::Mapping::from_iter([
         (
-            serde_yaml::Value::String("client".to_string()),
-            serde_yaml::Value::String("acme.sh".to_string()),
-        ),
-        (
             serde_yaml::Value::String("email".to_string()),
             serde_yaml::Value::String(payload.email.clone()),
+        ),
+        (
+            serde_yaml::Value::String("challenge".to_string()),
+            serde_yaml::Value::String("dns01".to_string()),
         ),
         (
             serde_yaml::Value::String("domains".to_string()),
@@ -7309,7 +7449,9 @@ fn render_config_with_wildcard_tls(
             serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
                 (
                     serde_yaml::Value::String("provider".to_string()),
-                    serde_yaml::Value::String(payload.dns_provider.clone()),
+                    serde_yaml::Value::String(crate::acme::normalize_provider_id(
+                        &payload.dns_provider,
+                    )),
                 ),
                 (
                     serde_yaml::Value::String("credentials".to_string()),
@@ -9089,8 +9231,8 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <pre>{}</pre>
                 <h3>FTP Native Control + Data Channels</h3>
                 <pre>{}</pre>
-                <h3 id="wildcard-ssl">Wildcard SSL with acme.sh DNS-01</h3>
-                <p class="muted">Use <code>http.tls.mode: acme_dns_external</code> only when wildcard certificates require DNS-01. The provider is passed to <code>acme.sh --dns</code>, and credentials are exported as environment variables. See <a class="ghost" href="https://github.com/acmesh-official/acme.sh/wiki/dnsapi">acme.sh DNS API</a>.</p>
+                <h3 id="wildcard-ssl">Wildcard SSL with built-in DNS-01</h3>
+                <p class="muted">Use <code>http.tls.mode: acme_managed</code> with <code>http.tls.acme.challenge: dns01</code> for wildcard certificates. Without cloud tokens, HTTP-01/TLS-ALPN-01 still works via <code>auto_https</code>. Built-in providers: <code>cloudflare</code>, <code>aliyun_cn</code>, <code>aliyun_intl</code>, <code>tencent</code>, <code>volcengine</code>, <code>aws</code>, <code>azure</code>, <code>google</code>.</p>
                 <pre>{}</pre>
                 <h3>Active Health, Maintenance Persistence, Alerts</h3>
                 <pre>{}</pre>
@@ -9108,7 +9250,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                     <tbody>
                         <tr><td>HTTP reverse proxy</td><td><span class="pill good">supported</span></td><td>host/path matching, upstream pools, strip prefix, header set/strip, retry, health, maintenance drain</td></tr>
                         <tr><td>AI API reverse proxy</td><td><span class="pill good">supported</span></td><td>native New API, sub2api, and OpenAI-compatible routes through services.ai_proxy</td></tr>
-                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME, acme.sh DNS-01 wildcard certificates, WebSocket, automatic redirect for managed domains</td></tr>
+                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME HTTP-01/TLS-ALPN-01/DNS-01, WebSocket, automatic redirect for managed domains</td></tr>
                         <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
                         <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
                         <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
@@ -9122,7 +9264,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Still Honest About What Remains</h2>
                 <div class="list">
                     <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
-                    <div><strong>Auto HTTPS boundary:</strong> wildcard DNS-01 stays on the explicit <code>acme_dns_external</code> + <code>acme.sh</code> path; built-in managed ACME covers HTTP-01/TLS-ALPN-01 only.</div>
+                    <div><strong>Auto HTTPS boundary:</strong> built-in managed ACME covers HTTP-01, TLS-ALPN-01, and DNS-01 wildcard issuance through provider strategies; legacy <code>acme_dns_external</code> remains for acme.sh-only providers.</div>
                 </div>
             </section>
         </section>
@@ -9167,7 +9309,7 @@ fn docs_template_ftp() -> &'static str {
 }
 
 fn docs_template_acme_dns() -> &'static str {
-    "http:\n  tls:\n    mode: acme_dns_external\n    cert_path: certs/proxysss-cert.pem\n    key_path: certs/proxysss-key.pem\n    generate_self_signed_if_missing: false\n    server_name: example.com\n    acme:\n      client: acme.sh\n      email: admin@example.com\n      domains: [example.com, \"*.example.com\"]\n      directory_production: true\n      renew_interval_hours: 12\n      dns:\n        provider: dns_cf\n        credentials:\n          CF_Token: your-cloudflare-api-token\n"
+    "http:\n  tls:\n    mode: acme_managed\n    cert_path: certs/proxysss-cert.pem\n    key_path: certs/proxysss-key.pem\n    generate_self_signed_if_missing: false\n    server_name: example.com\n    acme:\n      email: admin@example.com\n      challenge: dns01\n      domains: [example.com, \"*.example.com\"]\n      directory_production: true\n      renew_interval_hours: 12\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: your-cloudflare-api-token\n"
 }
 
 fn docs_template_health() -> &'static str {

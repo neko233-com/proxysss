@@ -265,29 +265,29 @@ http:
       production: true
 ```
 
-泛域名证书走单独的非默认模式，依赖外部 `acme.sh` 做 DNS-01：
+泛域名证书使用内建 managed DNS-01（一个云厂商 = 一个 provider 策略；`aliyun_cn` 与 `aliyun_intl` 分开）：
 
 ```yaml
 http:
   tls:
-    mode: acme_dns_external
+    mode: acme_managed
     cert_path: certs/proxysss-cert.pem
     key_path: certs/proxysss-key.pem
     generate_self_signed_if_missing: false
     server_name: example.com
     acme:
-      client: acme.sh
       email: admin@example.com
+      challenge: dns01
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12
       dns:
-        provider: dns_cf
+        provider: cloudflare
         credentials:
-          CF_Token: your-cloudflare-api-token
+          api_token: your-cloudflare-api-token
 ```
 
-`provider` 对应 `acme.sh --dns` 的 DNS API 名称，`credentials` 会作为环境变量传给 `acme.sh`。不同云厂商变量名不同，按官方文档填写：<https://github.com/acmesh-official/acme.sh/wiki/dnsapi>。
+内置 provider：`cloudflare`、`aliyun_cn`、`aliyun_intl`、`tencent`、`volcengine`、`aws`、`azure`、`google`。无云厂商 token 时使用 `http.tls.auto_https`（HTTP-01/TLS-ALPN-01），同样不依赖外部 ACME 客户端。
 
 ## 8. 健康检查与维护态
 

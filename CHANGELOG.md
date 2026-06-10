@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.0 - 2026-06-10
+
+- Added **FileCloud** (`services.filecloud`): proxysss-exclusive shared directory UI with single-password auth, file tree with sizes, drag upload/move, search, delete/rename/mkdir, and CDN-friendly `/dl/*` downloads; all operations are confined to `services.filecloud.root`. Existing nginx-style `services.webdav` is unchanged.
+- Added built-in managed ACME DNS-01 providers: Cloudflare, Alibaba Cloud CN/Intl, Tencent, Volcengine, AWS Route 53, Azure DNS, and Google Cloud DNS, with automatic migration from legacy `acme_dns_external` / acme.sh aliases.
+- Added **manual** DNS-01 provider (`provider: manual`) for wildcard certificates without cloud API keys: proxysss prints the TXT record and polls public DNS until propagation completes.
+- Non-wildcard automatic HTTPS still works without any DNS API key via built-in HTTP-01 / TLS-ALPN-01 (`http.tls.auto_https` or `acme_managed`).
+
 ## v1.1.2 - 2026-06-09
 
 - Stabilized benchmark automation by comparing proxysss directly against nginx, removing Caddy download/runtime dependencies, fixing Linux JSON row capture, and writing Windows benchmark JSON without a UTF-8 BOM.

@@ -186,10 +186,10 @@ In that example:
 
 Automatic certificate issuance and renewal are built in.
 
-- Challenge types: HTTP-01 and TLS-ALPN-01
+- Challenge types: HTTP-01, TLS-ALPN-01, and built-in DNS-01
 - No external ACME binary is required for the managed path
 - Domain-level `ssl.type: auto` and global `http.tls.auto_https` both expand into the managed ACME flow
-- Wildcard certificates use the non-default `http.tls.mode: acme_dns_external` path and delegate DNS-01 to `acme.sh`
+- Wildcard certificates use built-in managed DNS-01 via `http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01`
 
 Minimal public setup:
 
@@ -214,29 +214,29 @@ services:
       upstream: http://127.0.0.1:9000
 ```
 
-Wildcard setup through acme.sh DNS-01:
+Wildcard setup with built-in DNS-01:
 
 ```yaml
 http:
   tls:
-    mode: acme_dns_external
+    mode: acme_managed
     cert_path: certs/proxysss-cert.pem
     key_path: certs/proxysss-key.pem
     generate_self_signed_if_missing: false
     server_name: example.com
     acme:
-      client: acme.sh
       email: admin@example.com
+      challenge: dns01
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12
       dns:
-        provider: dns_cf
+        provider: cloudflare
         credentials:
-          CF_Token: your-cloudflare-api-token
+          api_token: your-cloudflare-api-token
 ```
 
-`provider` is the acme.sh DNS API name passed to `acme.sh --dns`, for example `dns_cf`, `dns_ali`, or `dns_dp`. `credentials` are exported as environment variables for the acme.sh process, so use the exact variable names required by the selected provider. See the official acme.sh DNS API reference: <https://github.com/acmesh-official/acme.sh/wiki/dnsapi>.
+Built-in DNS providers (one vendor = one strategy): `cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`. Without cloud credentials, use `http.tls.auto_https` or `acme_managed` with `http01` / `tls_alpn01` — no external ACME binary required.
 
 ## Commands you will actually use
 

@@ -15,7 +15,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Runtime configuration should live in a single YAML file by default, normally `proxysss.yaml`; custom locations are selected with `-config`, `--config`, or `-c`.
 - Admin API automation may update `services.domain_routes`, `services.reverse_proxy.routes`, `tcp.listeners`, and `udp.listeners` over token-authenticated HTTP, but the source of truth still persists back into the main YAML file.
 - Local token inspection and rotation should go through `proxysss token show` / `proxysss token set`; general config display paths should redact secrets instead of exposing them.
-- Wildcard ACME certificates are a non-default external path: use `http.tls.mode: acme_dns_external` with `acme.sh`, `http.tls.acme.dns.provider`, and redacted `http.tls.acme.dns.credentials`; ordinary automatic HTTPS remains built-in HTTP-01/TLS-ALPN-01.
+- Wildcard ACME certificates use built-in managed DNS-01: `http.tls.mode: acme_managed`, `http.tls.acme.challenge: dns01`, `http.tls.acme.dns.provider`, and redacted `http.tls.acme.dns.credentials`. One cloud vendor = one provider strategy (`aliyun_cn` vs `aliyun_intl` are separate). Legacy `acme_dns_external` + `acme.sh` remains for non-built-in providers only.
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
 - New API, sub2api, and OpenAI-compatible AI reverse proxy routes are first-class `services.ai_proxy` gateway behavior and must stay supported in code, docs, examples, tests, and generated config surfaces.
@@ -46,6 +46,7 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 | --- | --- | --- |
 | Install / update proxysss | `skills/proxysss-install/SKILL.md` | Bootstrap gateway, verify ports 80 and 7777 |
 | Monitor GitHub Actions | `skills/gh-cli/SKILL.md` | Inspect CI/release runs, logs, reruns, release assets |
+| ACME DNS-01 cloud providers | `skills/acme-dns-providers/SKILL.md` | Add/fix built-in DNS-01 strategies under `src/acme/dns/` |
 | Edit workflow YAML | `.github/skills/github-actions/SKILL.md` | Fix or extend `.github/workflows/*` locally |
 
 ## Local Agent Runtime Files
@@ -114,6 +115,6 @@ proxysss config nginx-parity --format yaml
 - On-demand TLS: `http.tls.on_demand` with managed ACME first-hit issuance, `allow` glob patterns, optional `ask_url`, and rate limits.
 - DDoS mitigation: `security.ddos` sliding-window bans, dynamic blacklist admin API (`/v1/security/blacklist/*`), and `services.access_control.stream`.
 - Rate limiting: supported with fixed-window, token-bucket, or leaky-bucket HTTP policies, stream shared zones, and HTTP connection caps.
-- Wildcard DNS-01 certificates stay on the explicit non-default `http.tls.mode: acme_dns_external` + `acme.sh` path. Built-in managed ACME covers HTTP-01/TLS-ALPN-01 only; native DNS provider integrations remain external by design.
+- Wildcard DNS-01 certificates are built into managed ACME via `http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01` and strategy-factory DNS providers (`cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`). Legacy `acme_dns_external` + `acme.sh` remains only for providers not yet implemented natively.
 
 These are tracked in `proxysss config nginx-parity` and should move toward `supported` with tests, not disappear from the matrix.
