@@ -6645,6 +6645,7 @@ fn finalize_http_response(
     compression: &ResponseCompressionConfig,
     mut response: GatewayHttpResponse,
 ) -> Result<GatewayHttpResponse> {
+    apply_streaming_response_headers(&mut response)?;
     if !compression.enabled || !response_allows_compression(&response) {
         return Ok(response);
     }
@@ -6681,6 +6682,23 @@ fn finalize_http_response(
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     ));
     Ok(response)
+}
+
+fn apply_streaming_response_headers(response: &mut GatewayHttpResponse) -> Result<()> {
+    if response.stream_body.is_none() && !response_content_type_is(response, "text/event-stream") {
+        return Ok(());
+    }
+
+    append_or_insert_header(&mut response.headers, CACHE_CONTROL, "no-cache")?;
+    append_or_insert_header(&mut response.headers, CACHE_CONTROL, "no-transform")?;
+    response
+        .headers
+        .retain(|(name, _)| name != CONTENT_LENGTH && name != CONTENT_ENCODING);
+    response.headers.push((
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    ));
+    Ok(())
 }
 
 fn gzip_bytes(body: &[u8]) -> Result<Vec<u8>> {
@@ -6783,8 +6801,10 @@ fn select_compression_encoding(
 
 fn response_allows_compression(response: &GatewayHttpResponse) -> bool {
     !response.body.is_empty()
+        && response.stream_body.is_none()
         && response.status != StatusCode::NO_CONTENT
         && response.status != StatusCode::NOT_MODIFIED
+        && !response_content_type_is(response, "text/event-stream")
         && !response
             .headers
             .iter()
@@ -6804,6 +6824,16 @@ fn content_type_matches(response: &GatewayHttpResponse, patterns: &[String]) -> 
         .iter()
         .map(|pattern| pattern.to_ascii_lowercase())
         .any(|pattern| content_type.starts_with(&pattern))
+}
+
+fn response_content_type_is(response: &GatewayHttpResponse, expected: &str) -> bool {
+    response
+        .headers
+        .iter()
+        .find(|(name, _)| name == CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim())
+        .is_some_and(|content_type| content_type.eq_ignore_ascii_case(expected))
 }
 
 fn append_or_insert_header(
@@ -12935,6 +12965,42 @@ mod tests {
             .headers
             .iter()
             .any(|(name, value)| name == CONTENT_ENCODING && value == "gzip"));
+    }
+
+    #[test]
+    fn finalize_http_response_marks_sse_as_unbuffered_and_untransformed() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br, gzip"));
+        let response = GatewayHttpResponse::bytes(
+            StatusCode::OK,
+            "text/event-stream; charset=utf-8",
+            Bytes::from_static(b"data: first\n\n"),
+            "http://127.0.0.1:9000",
+        );
+        let compression = ResponseCompressionConfig {
+            enabled: true,
+            algorithms: vec![CompressionAlgorithm::Brotli, CompressionAlgorithm::Gzip],
+            min_length: 1,
+            content_types: vec!["text/".to_string()],
+        };
+
+        let response = finalize_http_response(&request_headers, &compression, response)
+            .expect("finalize response");
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == CACHE_CONTROL
+                && value
+                    .to_str()
+                    .expect("cache-control")
+                    .contains("no-transform")
+        }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name.as_str() == "x-accel-buffering" && value == "no" }));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name == CONTENT_ENCODING));
     }
 
     #[test]

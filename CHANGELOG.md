@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.3 - 2026-06-11
+
+- Hardened AI/SSE reverse proxy responses by automatically emitting `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` for streamed or `text/event-stream` responses.
+- Prevented response compression from touching streamed bodies or SSE payloads, avoiding proxy/client buffering risks for Cline, Claude Code, and other streaming CLI clients.
+- Added regression coverage for SSE response headers and compression bypass behavior.
+
 ## v1.2.2 - 2026-06-11
 
 - Fixed AI reverse proxy streaming for New API, sub2api, OpenAI-compatible SSE, and Cline/CLI clients by forwarding upstream HTTP/1.1 and HTTP/2 response chunks directly instead of buffering the full response body.
