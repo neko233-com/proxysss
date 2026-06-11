@@ -11205,7 +11205,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             min-height: calc(100vh - 58px);
             margin: 0;
             display: grid;
-            grid-template-columns: 276px minmax(0, 1fr);
+            grid-template-columns: 252px minmax(0, 1fr);
             gap: 0;
         }
         .sidebar, .content {
@@ -11214,16 +11214,16 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             box-shadow: none;
         }
         .sidebar {
-            padding: 20px;
+            padding: 16px;
             display: grid;
             align-content: start;
-            gap: 16px;
+            gap: 12px;
             border-width: 0 1px 0 0;
             border-radius: 0;
         }
         .brand {
             display: grid;
-            gap: 8px;
+            gap: 6px;
         }
         .eyebrow {
             font-size: 11px;
@@ -11233,11 +11233,12 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             font-weight: 800;
         }
         h1, h2, h3, p { margin: 0; }
-        h1 { font-size: 26px; letter-spacing: 0; }
+        h1 { font-size: 22px; letter-spacing: 0; }
         h2 { font-size: 24px; letter-spacing: 0; }
+        h3 { font-size: 16px; }
         .muted { color: var(--muted); }
         .login-card, .meta-card {
-            padding: 14px;
+            padding: 12px;
             border-radius: 10px;
             background: var(--soft);
             border: 1px solid var(--line);
@@ -11280,7 +11281,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         .danger { background: rgba(251, 113, 133, 0.14); color: var(--bad); border-color: rgba(251, 113, 133, 0.25); }
         .success { background: rgba(74, 222, 128, 0.12); color: var(--good); border-color: rgba(74, 222, 128, 0.25); }
         .content {
-            padding: 22px;
+            padding: 18px;
             display: grid;
             gap: 14px;
             min-width: 0;
@@ -11313,11 +11314,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         .status-dot.bad::before { background: var(--bad); box-shadow: none; }
         .cards {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(7, minmax(0, 1fr));
             gap: 12px;
         }
         .card {
-            padding: 16px;
+            padding: 14px;
             border-radius: 10px;
             background: var(--panel-2);
             border: 1px solid var(--line);
@@ -11326,13 +11327,13 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .card strong {
             display: block;
-            font-size: 28px;
+            font-size: 24px;
             line-height: 1;
             margin-top: 8px;
             letter-spacing: -0.04em;
         }
         .surface {
-            padding: 16px;
+            padding: 14px;
             border-radius: 10px;
             background: var(--panel-2);
             border: 1px solid var(--line);
@@ -11344,8 +11345,17 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             justify-content: space-between;
             align-items: center;
             gap: 12px;
-            margin-bottom: 14px;
+            margin-bottom: 12px;
         }
+        .surface-title { display: grid; gap: 4px; }
+        .surface-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+        .compact-controls {
+            display: grid;
+            grid-template-columns: minmax(180px, 280px) 150px 140px;
+            gap: 8px;
+            align-items: end;
+        }
+        .compact-controls input, .compact-controls select { padding: 9px 10px; }
         .filters {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -11380,11 +11390,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 13px;
+            font-size: 12px;
         }
         th, td {
             text-align: left;
-            padding: 10px 12px;
+            padding: 9px 10px;
             border-bottom: 1px solid var(--line);
             vertical-align: top;
         }
@@ -11412,7 +11422,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             flex-wrap: wrap;
         }
         .table-actions button {
-            padding: 8px 10px;
+            padding: 7px 9px;
             font-size: 12px;
             border-radius: 10px;
         }
@@ -11464,12 +11474,16 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             font-family: inherit;
         }
         .hint { font-size: 14px; color: var(--muted); line-height: 1.5; }
+        details.meta-card summary { cursor: pointer; font-weight: 800; }
+        .meta-list { display: grid; gap: 6px; margin-top: 10px; font-size: 12px; }
         @media (max-width: 1180px) {
             .shell { grid-template-columns: 1fr; }
             .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+            .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
         }
         @media (max-width: 860px) {
             .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .compact-controls { grid-template-columns: 1fr; }
             .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .group-grid { grid-template-columns: 1fr; }
             .raw-grid { grid-template-columns: 1fr; }
@@ -11541,50 +11555,17 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 </div>
             </section>
 
-            <section class="meta-card">
-                <h3>Endpoints</h3>
-                <p class="muted">Stats: <strong>/v1/stats</strong></p>
-                <p class="muted">Upstreams: <strong>/v1/upstreams</strong></p>
-                <p class="muted">Config: <strong>/v1/config</strong></p>
-                <p class="muted">Domain route upsert: <strong>/v1/domain-routes/upsert</strong></p>
-                <p class="muted">Auto HTTPS: <strong>/v1/tls/auto-https/upsert</strong></p>
-                <p class="muted">Wildcard DNS-01: <strong>/v1/tls/wildcard-dns/upsert</strong></p>
-                <p class="muted">Auth: <strong>Basic</strong> or <strong>Bearer &lt;token&gt;</strong></p>
-                <p class="muted">__ADMIN_HTTPS_HINT__</p>
-            </section>
-
-            <section class="meta-card">
-                <h3>Tips</h3>
-                <p class="muted">Green means passive and active health are both passing.</p>
-                <p class="muted">Amber means the upstream has no active probe result yet.</p>
-                <p class="muted">Red means active probe failed or the upstream is quarantined.</p>
-            </section>
-
-            <section class="meta-card">
-                <h3>View Controls</h3>
-                <div class="filter">
-                    <label for="search">Search</label>
-                    <input id="search" placeholder="route, upstream, listener" />
+            <details class="meta-card">
+                <summary>API Endpoints</summary>
+                <div class="meta-list muted">
+                    <span>Stats: <strong>/v1/stats</strong></span>
+                    <span>Upstreams: <strong>/v1/upstreams</strong></span>
+                    <span>Config: <strong>/v1/config</strong></span>
+                    <span>Routes: <strong>/v1/domain-routes/upsert</strong></span>
+                    <span>Auth: <strong>Bearer token</strong></span>
+                    <span>__ADMIN_HTTPS_HINT__</span>
                 </div>
-                <div class="filter">
-                    <label for="health-filter">Health</label>
-                    <select id="health-filter">
-                        <option value="all">All</option>
-                        <option value="healthy">Healthy</option>
-                        <option value="degraded">Degraded</option>
-                        <option value="manual">Manual Offline</option>
-                    </select>
-                </div>
-                <div class="filter">
-                    <label for="group-by">Group By</label>
-                    <select id="group-by">
-                        <option value="route">Route</option>
-                        <option value="listener">Listener</option>
-                        <option value="protocol">Protocol</option>
-                        <option value="none">Flat Table</option>
-                    </select>
-                </div>
-            </section>
+            </details>
         </aside>
 
         <section class="content" id="view-dashboard">
@@ -11629,11 +11610,27 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
 
             <section class="surface">
                 <div class="surface-head">
-                    <div>
+                    <div class="surface-title">
                         <h3>Grouped View</h3>
-                        <p class="muted">Aggregate by route name, listener, or protocol for quick triage.</p>
                     </div>
-                    <span class="muted" id="group-count">0 groups</span>
+                    <div class="surface-actions">
+                        <div class="compact-controls">
+                            <input id="search" placeholder="Search route / upstream / listener" />
+                            <select id="health-filter">
+                                <option value="all">All health</option>
+                                <option value="healthy">Healthy</option>
+                                <option value="degraded">Degraded</option>
+                                <option value="manual">Manual offline</option>
+                            </select>
+                            <select id="group-by">
+                                <option value="route">Group: route</option>
+                                <option value="listener">Group: listener</option>
+                                <option value="protocol">Group: protocol</option>
+                                <option value="none">Flat</option>
+                            </select>
+                        </div>
+                        <span class="muted" id="group-count">0 groups</span>
+                    </div>
                 </div>
                 <div id="group-view-wrap" class="empty">Refresh the dashboard to build aggregated health groups.</div>
             </section>
@@ -11642,7 +11639,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <div class="surface-head">
                     <div>
                         <h3>Upstream Health Table</h3>
-                        <p class="muted">Passive quarantine, active probe result, route aggregation, TCP/HTTP liveness, and manual drain controls.</p>
+                        <p class="muted">Health, target, probe, and drain controls.</p>
                     </div>
                     <span class="muted" id="upstream-count">0 upstreams</span>
                 </div>
@@ -12085,23 +12082,24 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 const quarantine = item.quarantine_remaining_secs > 0 ? `${item.quarantine_remaining_secs}s` : '-';
                 const rtt = item.active_probe_rtt_ms ?? '-';
                 const routeNames = routeLabel(item);
+                const targetMeta = `${item.protocol} / ${item.listener}`;
+                const probeMeta = [
+                    `active ${probePill(item)}`,
+                    `passive ${item.passive_healthy ? '<span class="pill good">pass</span>' : '<span class="pill bad">quarantined</span>'}`,
+                    `http ${status}`,
+                    `rtt ${rtt}ms`,
+                    `fail ${item.consecutive_failures}`,
+                    quarantine !== '-' ? `quarantine ${quarantine}` : '',
+                ].filter(Boolean).join(' ');
                 const actionButton = item.manually_disabled
                     ? `<button class="success" data-action="enable" data-key="${item.key}">Restore</button>`
                     : `<button class="danger" data-action="disable" data-key="${item.key}">Take Offline</button>`;
                 return `
                     <tr>
                         <td>${healthPill(item)}</td>
-                        <td>${item.protocol}</td>
-                        <td>${item.listener}</td>
-                        <td><code>${item.upstream}</code><div class="muted">${routeNames}</div>${error}</td>
+                        <td><code>${item.upstream}</code><div class="muted">${routeNames}</div><div class="muted">${targetMeta}</div>${error}</td>
                         <td>${item.active_connections}</td>
-                        <td>${probePill(item)}</td>
-                        <td>${item.passive_healthy ? '<span class="pill good">pass</span>' : '<span class="pill bad">quarantined</span>'}</td>
-                        <td>${item.active_probe_kind ?? '-'}</td>
-                        <td>${status}</td>
-                        <td>${rtt}</td>
-                        <td>${item.consecutive_failures}</td>
-                        <td>${quarantine}</td>
+                        <td><div class="group-meta">${probeMeta}</div><div class="muted">${item.active_probe_kind ?? '-'}</div></td>
                         <td>${item.manual_reason ?? '-'}</td>
                         <td><div class="table-actions">${actionButton}</div></td>
                         <td>${formatTimestamp(item.active_probe_checked_at_unix_ms)}</td>
@@ -12114,17 +12112,9 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                     <thead>
                         <tr>
                             <th>Health</th>
-                            <th>Protocol</th>
-                            <th>Listener</th>
-                            <th>Upstream</th>
+                            <th>Target</th>
                             <th>Active</th>
-                            <th>Active Probe</th>
-                            <th>Passive</th>
-                            <th>Probe Kind</th>
-                            <th>HTTP</th>
-                            <th>RTT ms</th>
-                            <th>Failures</th>
-                            <th>Quarantine</th>
+                            <th>Probe</th>
                             <th>Manual</th>
                             <th>Action</th>
                             <th>Last Check</th>

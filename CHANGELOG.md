@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.8 - 2026-06-11
+
+- Reduced admin dashboard clutter by folding endpoint docs, moving filters into the main dashboard, and compacting upstream health details.
+- Simplified the upstream health table into fewer scan-friendly columns so long route lists no longer crowd the first screen.
+
 ## v1.2.7 - 2026-06-11
 
 - Added `/v1/login` for dedicated admin login sessions with signed Bearer tokens and automatic dashboard entry until token expiry.
