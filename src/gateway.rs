@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -239,6 +239,25 @@ struct GatewayStats {
     script_fail_total: AtomicU64,
     blocked_requests_total: AtomicU64,
     ddos_bans_total: AtomicU64,
+    process_metrics: Mutex<ProcessMetricsSampler>,
+}
+
+#[derive(Default)]
+struct ProcessMetricsSampler {
+    previous: Option<ProcessMetricsSample>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessMetricsSample {
+    wall: Instant,
+    cpu_time_secs: f64,
+}
+
+struct ProcessMetricsSnapshot {
+    pid: u32,
+    cpu_percent: Option<f64>,
+    memory_bytes: Option<u64>,
+    memory_percent: Option<f64>,
 }
 
 struct UpstreamLease {
@@ -5581,6 +5600,7 @@ where
 
 impl GatewayStats {
     fn snapshot_json(&self) -> serde_json::Value {
+        let process = self.process_snapshot();
         serde_json::json!({
             "http_requests": self.http_requests.load(Ordering::Relaxed),
             "http_errors": self.http_errors.load(Ordering::Relaxed),
@@ -5595,10 +5615,18 @@ impl GatewayStats {
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
             "blocked_requests_total": self.blocked_requests_total.load(Ordering::Relaxed),
             "ddos_bans_total": self.ddos_bans_total.load(Ordering::Relaxed),
+            "process": {
+                "pid": process.pid,
+                "cpu_percent": process.cpu_percent,
+                "memory_bytes": process.memory_bytes,
+                "memory_mb": process.memory_bytes.map(|value| value as f64 / 1024.0 / 1024.0),
+                "memory_percent": process.memory_percent,
+            },
         })
     }
 
     fn snapshot_prometheus(&self) -> String {
+        let process = self.process_snapshot();
         let metrics = [
             (
                 "proxysss_http_requests_total",
@@ -5674,9 +5702,276 @@ impl GatewayStats {
             "proxysss_tcp_sessions_active {}",
             self.tcp_sessions_active.load(Ordering::Relaxed)
         ));
+        if let Some(cpu_percent) = process.cpu_percent {
+            lines.push(
+                "# HELP proxysss_process_cpu_percent Current process CPU usage percentage"
+                    .to_string(),
+            );
+            lines.push("# TYPE proxysss_process_cpu_percent gauge".to_string());
+            lines.push(format!("proxysss_process_cpu_percent {cpu_percent:.3}"));
+        }
+        if let Some(memory_bytes) = process.memory_bytes {
+            lines.push(
+                "# HELP proxysss_process_memory_bytes Current process resident memory in bytes"
+                    .to_string(),
+            );
+            lines.push("# TYPE proxysss_process_memory_bytes gauge".to_string());
+            lines.push(format!("proxysss_process_memory_bytes {memory_bytes}"));
+        }
+        if let Some(memory_percent) = process.memory_percent {
+            lines.push(
+                "# HELP proxysss_process_memory_percent Current process resident memory percentage"
+                    .to_string(),
+            );
+            lines.push("# TYPE proxysss_process_memory_percent gauge".to_string());
+            lines.push(format!(
+                "proxysss_process_memory_percent {memory_percent:.3}"
+            ));
+        }
         lines.push(String::new());
         lines.join("\n")
     }
+
+    fn process_snapshot(&self) -> ProcessMetricsSnapshot {
+        let mut sampler = self
+            .process_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sampler.snapshot()
+    }
+}
+
+impl ProcessMetricsSampler {
+    fn snapshot(&mut self) -> ProcessMetricsSnapshot {
+        let sample = current_process_cpu_sample();
+        let cpu_percent = sample.and_then(|current| {
+            let previous = self.previous;
+            self.previous = Some(current);
+            previous.and_then(|previous| {
+                let wall_secs = current.wall.duration_since(previous.wall).as_secs_f64();
+                if wall_secs <= 0.0 {
+                    return None;
+                }
+                let cpu_delta = (current.cpu_time_secs - previous.cpu_time_secs).max(0.0);
+                Some((cpu_delta / wall_secs / available_parallelism() as f64) * 100.0)
+            })
+        });
+
+        ProcessMetricsSnapshot {
+            pid: std::process::id(),
+            cpu_percent,
+            memory_bytes: current_process_memory_bytes(),
+            memory_percent: current_process_memory_percent(),
+        }
+    }
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(unix)]
+fn current_process_cpu_sample() -> Option<ProcessMetricsSample> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let user = usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0;
+    let system = usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1_000_000.0;
+    Some(ProcessMetricsSample {
+        wall: Instant::now(),
+        cpu_time_secs: user + system,
+    })
+}
+
+#[cfg(windows)]
+fn current_process_cpu_sample() -> Option<ProcessMetricsSample> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        low_date_time: u32,
+        high_date_time: u32,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut std::ffi::c_void,
+            creation_time: *mut FileTime,
+            exit_time: *mut FileTime,
+            kernel_time: *mut FileTime,
+            user_time: *mut FileTime,
+        ) -> i32;
+    }
+
+    fn filetime_to_u64(value: FileTime) -> u64 {
+        ((value.high_date_time as u64) << 32) | value.low_date_time as u64
+    }
+
+    let mut creation = FileTime {
+        low_date_time: 0,
+        high_date_time: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let cpu_100ns = filetime_to_u64(kernel).saturating_add(filetime_to_u64(user));
+    Some(ProcessMetricsSample {
+        wall: Instant::now(),
+        cpu_time_secs: cpu_100ns as f64 / 10_000_000.0,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_process_cpu_sample() -> Option<ProcessMetricsSample> {
+    None
+}
+
+#[cfg(unix)]
+fn current_process_memory_bytes() -> Option<u64> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(resident_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(windows)]
+fn current_process_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut counters = ProcessMemoryCounters {
+        cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        page_fault_count: 0,
+        peak_working_set_size: 0,
+        working_set_size: 0,
+        quota_peak_paged_pool_usage: 0,
+        quota_paged_pool_usage: 0,
+        quota_peak_non_paged_pool_usage: 0,
+        quota_non_paged_pool_usage: 0,
+        pagefile_usage: 0,
+        peak_pagefile_usage: 0,
+    };
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(counters.working_set_size as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_process_memory_bytes() -> Option<u64> {
+    None
+}
+
+fn current_process_memory_percent() -> Option<f64> {
+    let memory = current_process_memory_bytes()? as f64;
+    let total = total_system_memory_bytes()? as f64;
+    if total <= 0.0 {
+        return None;
+    }
+    Some(memory / total * 100.0)
+}
+
+#[cfg(unix)]
+fn total_system_memory_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn total_system_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.total_phys == 0 {
+        return None;
+    }
+    Some(status.total_phys)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn total_system_memory_bytes() -> Option<u64> {
+    None
 }
 
 fn decorate_error_response(
@@ -11103,6 +11398,18 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                     <span class="muted">Degraded Upstreams</span>
                     <strong id="card-degraded">0</strong>
                 </article>
+                <article class="card">
+                    <span class="muted">Process CPU</span>
+                    <strong id="card-process-cpu">warming</strong>
+                </article>
+                <article class="card">
+                    <span class="muted">Process Memory</span>
+                    <strong id="card-process-memory">0 MB</strong>
+                </article>
+                <article class="card">
+                    <span class="muted">Memory %</span>
+                    <strong id="card-process-memory-percent">0%</strong>
+                </article>
             </section>
 
             <section class="surface">
@@ -11365,6 +11672,16 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             return new Intl.NumberFormat().format(value || 0);
         }
 
+        function formatPercent(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return 'warming';
+            return Number(value).toFixed(1) + '%';
+        }
+
+        function formatMegabytes(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return 'unknown';
+            return Number(value).toFixed(1) + ' MB';
+        }
+
         function formatTimestamp(value) {
             if (!value) return 'never';
             try {
@@ -11381,6 +11698,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             document.getElementById('card-http-errors').textContent = formatNumber(stats.http_errors);
             document.getElementById('card-healthy').textContent = formatNumber(healthy);
             document.getElementById('card-degraded').textContent = formatNumber(degraded);
+            const process = stats.process || {};
+            document.getElementById('card-process-cpu').textContent = formatPercent(process.cpu_percent);
+            document.getElementById('card-process-memory').textContent = formatMegabytes(process.memory_mb);
+            document.getElementById('card-process-memory-percent').textContent = formatPercent(process.memory_percent);
             upstreamCount.textContent = `${upstreams.length} upstreams`;
         }
 
@@ -13171,9 +13492,18 @@ mod tests {
     fn snapshot_prometheus_emits_counter_lines() {
         let stats = GatewayStats::default();
         stats.http_requests.store(42, Ordering::Relaxed);
+        let _ = stats.snapshot_json();
+        std::thread::sleep(Duration::from_millis(5));
+        let payload = stats.snapshot_json();
         let body = stats.snapshot_prometheus();
         assert!(body.contains("proxysss_http_requests_total 42"));
         assert!(body.contains("# TYPE proxysss_http_requests_total counter"));
+        assert!(body.contains("proxysss_process_memory_bytes"));
+        assert_eq!(
+            payload["process"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+        assert!(payload["process"]["memory_mb"].as_f64().is_some());
     }
 
     #[test]

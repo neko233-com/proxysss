@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.5 - 2026-06-11
+
+- Added proxysss process resource metrics to `/v1/stats` and Prometheus output: PID, CPU percentage, resident memory bytes/MB, and memory percentage.
+- Updated the built-in admin dashboard with live Process CPU, Process Memory, and Memory % cards.
+
 ## v1.2.4 - 2026-06-11
 
 - Made SSE hardening headers idempotent so existing upstream `Cache-Control: no-cache` and `X-Accel-Buffering: no` values are preserved without duplicated tokens.
