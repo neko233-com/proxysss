@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.6 - 2026-06-11
+
+- Reworked the built-in admin console into a dedicated login-first experience with session-scoped credentials.
+- Removed the inline Quick Login card and stopped embedding the configured admin password into the generated HTML.
+- Restyled the admin UI with a cleaner light dashboard layout inspired by new-api while keeping the single-binary built-in console.
+
 ## v1.2.5 - 2026-06-11
 
 - Added proxysss process resource metrics to `/v1/stats` and Prometheus output: PID, CPU percentage, resident memory bytes/MB, and memory percentage.

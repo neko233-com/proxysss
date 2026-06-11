@@ -10996,49 +10996,106 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
     <title>proxysss admin</title>
     <style>
         :root {
-            --bg: #06111b;
-            --bg-2: #0c1b2b;
-            --panel: rgba(10, 20, 34, 0.86);
-            --panel-2: rgba(14, 28, 46, 0.92);
-            --line: rgba(146, 191, 255, 0.14);
-            --text: #eef6ff;
-            --muted: #93a8c4;
-            --accent: #59d0ff;
-            --accent-2: #7ef4b0;
-            --warn: #ffbf5f;
-            --bad: #ff7b7b;
-            --good: #7ef4b0;
+            --bg: #f5f7fb;
+            --panel: #ffffff;
+            --panel-2: #ffffff;
+            --line: #e6e8ef;
+            --text: #111827;
+            --muted: #6b7280;
+            --accent: #1677ff;
+            --accent-2: #4096ff;
+            --warn: #d97706;
+            --bad: #dc2626;
+            --good: #16a34a;
+            --soft: #f3f6fb;
+            --shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             min-height: 100vh;
-            font-family: "Segoe UI", "PingFang SC", sans-serif;
+            font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
             color: var(--text);
+            background: var(--bg);
+        }
+        .login-screen {
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 32px 16px;
             background:
-                radial-gradient(circle at top left, rgba(89, 208, 255, 0.18), transparent 30%),
-                radial-gradient(circle at top right, rgba(126, 244, 176, 0.16), transparent 28%),
-                linear-gradient(160deg, var(--bg), var(--bg-2));
+                radial-gradient(circle at 20% 10%, rgba(22, 119, 255, 0.12), transparent 34%),
+                linear-gradient(180deg, #ffffff 0%, #f5f7fb 100%);
+        }
+        .login-panel {
+            width: min(420px, 100%);
+            display: grid;
+            gap: 18px;
+            padding: 34px;
+            border-radius: 18px;
+            background: #fff;
+            border: 1px solid var(--line);
+            box-shadow: var(--shadow);
+        }
+        .login-logo {
+            width: 44px;
+            height: 44px;
+            display: grid;
+            place-items: center;
+            border-radius: 12px;
+            background: var(--accent);
+            color: #fff;
+            font-weight: 900;
+            font-size: 22px;
+        }
+        .login-title {
+            display: grid;
+            gap: 8px;
+        }
+        .login-title h1 { font-size: 28px; letter-spacing: 0; }
+        .login-form {
+            display: grid;
+            gap: 14px;
+        }
+        .login-error {
+            min-height: 20px;
+            color: var(--bad);
+            font-size: 13px;
+        }
+        .login-screen.hidden, .app-hidden { display: none !important; }
+        .admin-top {
+            min-height: 58px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 0 24px;
+            background: #fff;
+            border-bottom: 1px solid var(--line);
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
         .shell {
-            width: min(1440px, calc(100vw - 28px));
-            margin: 14px auto;
+            width: 100%;
+            min-height: calc(100vh - 58px);
+            margin: 0;
             display: grid;
-            grid-template-columns: 340px minmax(0, 1fr);
-            gap: 14px;
+            grid-template-columns: 276px minmax(0, 1fr);
+            gap: 0;
         }
         .sidebar, .content {
             background: var(--panel);
             border: 1px solid var(--line);
-            border-radius: 24px;
-            box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
-            backdrop-filter: blur(16px);
+            box-shadow: none;
         }
         .sidebar {
-            padding: 22px;
+            padding: 20px;
             display: grid;
             align-content: start;
-            gap: 18px;
+            gap: 16px;
+            border-width: 0 1px 0 0;
+            border-radius: 0;
         }
         .brand {
             display: grid;
@@ -11046,18 +11103,20 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .eyebrow {
             font-size: 11px;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.10em;
             text-transform: uppercase;
-            color: var(--accent-2);
+            color: var(--accent);
+            font-weight: 800;
         }
         h1, h2, h3, p { margin: 0; }
-        h1 { font-size: 30px; letter-spacing: -0.04em; }
+        h1 { font-size: 26px; letter-spacing: 0; }
+        h2 { font-size: 24px; letter-spacing: 0; }
         .muted { color: var(--muted); }
         .login-card, .meta-card {
-            padding: 16px;
-            border-radius: 18px;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 14px;
+            border-radius: 10px;
+            background: var(--soft);
+            border: 1px solid var(--line);
             display: grid;
             gap: 10px;
         }
@@ -11067,39 +11126,43 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         input {
             width: 100%;
-            border: 1px solid rgba(255,255,255,0.10);
-            background: rgba(255,255,255,0.05);
+            border: 1px solid #d9dde7;
+            background: #fff;
             color: var(--text);
-            padding: 12px 14px;
-            border-radius: 12px;
+            padding: 11px 12px;
+            border-radius: 8px;
             outline: none;
         }
+        input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(22,119,255,.12); }
         select {
             width: 100%;
-            border: 1px solid rgba(255,255,255,0.10);
-            background: rgba(255,255,255,0.05);
+            border: 1px solid #d9dde7;
+            background: #fff;
             color: var(--text);
-            padding: 12px 14px;
-            border-radius: 12px;
+            padding: 11px 12px;
+            border-radius: 8px;
             outline: none;
         }
         .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
         button {
-            border: 0;
-            border-radius: 12px;
-            padding: 12px 14px;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            padding: 10px 13px;
             font-weight: 700;
             cursor: pointer;
         }
-        .primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04111a; }
-        .ghost { background: rgba(255,255,255,0.06); color: var(--text); }
-        .danger { background: rgba(255, 123, 123, 0.16); color: var(--bad); }
-        .success { background: rgba(126, 244, 176, 0.16); color: var(--good); }
+        .primary { background: var(--accent); color: #fff; }
+        .ghost { background: #fff; color: var(--text); border-color: var(--line); }
+        .danger { background: #fff1f0; color: var(--bad); border-color: #fecaca; }
+        .success { background: #f0fdf4; color: var(--good); border-color: #bbf7d0; }
         .content {
-            padding: 18px;
+            padding: 22px;
             display: grid;
             gap: 14px;
             min-width: 0;
+            border: 0;
+            border-radius: 0;
+            background: var(--bg);
         }
         .topbar {
             display: flex;
@@ -11116,14 +11179,14 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .status-dot::before {
             content: "";
-            width: 10px;
-            height: 10px;
+            width: 8px;
+            height: 8px;
             border-radius: 999px;
             background: var(--warn);
-            box-shadow: 0 0 0 6px rgba(255, 191, 95, 0.16);
+            box-shadow: none;
         }
-        .status-dot.ok::before { background: var(--good); box-shadow: 0 0 0 6px rgba(126, 244, 176, 0.14); }
-        .status-dot.bad::before { background: var(--bad); box-shadow: 0 0 0 6px rgba(255, 123, 123, 0.14); }
+        .status-dot.ok::before { background: var(--good); box-shadow: none; }
+        .status-dot.bad::before { background: var(--bad); box-shadow: none; }
         .cards {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -11131,10 +11194,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .card {
             padding: 16px;
-            border-radius: 18px;
+            border-radius: 10px;
             background: var(--panel-2);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--line);
             min-width: 0;
+            box-shadow: 0 8px 24px rgba(15,23,42,.04);
         }
         .card strong {
             display: block;
@@ -11145,10 +11209,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .surface {
             padding: 16px;
-            border-radius: 20px;
+            border-radius: 10px;
             background: var(--panel-2);
-            border: 1px solid rgba(255,255,255,0.05);
+            border: 1px solid var(--line);
             min-width: 0;
+            box-shadow: 0 8px 24px rgba(15,23,42,.04);
         }
         .surface-head {
             display: flex;
@@ -11173,9 +11238,9 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         .group-card {
             padding: 14px;
-            border-radius: 16px;
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 10px;
+            background: var(--soft);
+            border: 1px solid var(--line);
             display: grid;
             gap: 8px;
         }
@@ -11196,13 +11261,13 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         th, td {
             text-align: left;
             padding: 10px 12px;
-            border-bottom: 1px solid rgba(255,255,255,0.06);
+            border-bottom: 1px solid var(--line);
             vertical-align: top;
         }
         th { color: var(--muted); font-weight: 600; }
         td code {
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            color: #d8ecff;
+            color: #1f2937;
             word-break: break-all;
         }
         .pill {
@@ -11212,11 +11277,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             border-radius: 999px;
             font-size: 12px;
             font-weight: 700;
-            background: rgba(255,255,255,0.08);
+            background: #eef2f7;
         }
-        .pill.good { background: rgba(126, 244, 176, 0.14); color: var(--good); }
-        .pill.bad { background: rgba(255, 123, 123, 0.14); color: var(--bad); }
-        .pill.warn { background: rgba(255, 191, 95, 0.16); color: var(--warn); }
+        .pill.good { background: #dcfce7; color: var(--good); }
+        .pill.bad { background: #fee2e2; color: var(--bad); }
+        .pill.warn { background: #fef3c7; color: var(--warn); }
         .table-actions {
             display: flex;
             gap: 8px;
@@ -11236,22 +11301,23 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             margin: 0;
             min-height: 220px;
             padding: 14px;
-            border-radius: 16px;
+            border-radius: 10px;
             overflow: auto;
-            background: rgba(2, 8, 18, 0.82);
-            border: 1px solid rgba(255,255,255,0.05);
-            color: #d6e8ff;
+            background: #0f172a;
+            border: 1px solid #111827;
+            color: #dbeafe;
             font-size: 12px;
         }
         .empty {
             padding: 28px;
-            border-radius: 16px;
-            border: 1px dashed rgba(255,255,255,0.10);
+            border-radius: 10px;
+            border: 1px dashed #cfd6e4;
             text-align: center;
             color: var(--muted);
         }
         .nav-card .button-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
-        .nav-btn.active { background: rgba(89, 208, 255, 0.18); color: var(--accent); border: 1px solid rgba(89, 208, 255, 0.28); }
+        .nav-btn { justify-content: flex-start; }
+        .nav-btn.active { background: #e6f4ff; color: var(--accent); border: 1px solid #91caff; }
         .view-hidden { display: none !important; }
         .tls-panel { font-size: 16px; }
         .tls-panel label { font-size: 14px; }
@@ -11264,11 +11330,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         textarea {
             width: 100%;
             min-height: 96px;
-            border: 1px solid rgba(255,255,255,0.10);
-            background: rgba(255,255,255,0.05);
+            border: 1px solid #d9dde7;
+            background: #fff;
             color: var(--text);
             padding: 14px 16px;
-            border-radius: 12px;
+            border-radius: 8px;
             outline: none;
             resize: vertical;
             font-family: inherit;
@@ -11276,6 +11342,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         .hint { font-size: 14px; color: var(--muted); line-height: 1.5; }
         @media (max-width: 1180px) {
             .shell { grid-template-columns: 1fr; }
+            .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
         }
         @media (max-width: 860px) {
             .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -11284,8 +11351,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             .raw-grid { grid-template-columns: 1fr; }
         }
         @media (max-width: 640px) {
-            .shell { width: calc(100vw - 16px); margin: 8px auto; }
-            .sidebar, .content { border-radius: 20px; }
+            .shell { width: 100%; margin: 0; }
+            .admin-top { padding: 0 14px; }
             .cards { grid-template-columns: 1fr; }
             .filters { grid-template-columns: 1fr; }
             th:nth-child(2), td:nth-child(2), th:nth-child(6), td:nth-child(6), th:nth-child(7), td:nth-child(7), th:nth-child(10), td:nth-child(10), th:nth-child(11), td:nth-child(11) { display: none; }
@@ -11293,12 +11360,40 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
     </style>
 </head>
 <body>
-    <main class="shell">
+    <section id="login-screen" class="login-screen">
+        <form id="login-form" class="login-panel">
+            <div class="login-logo">p</div>
+            <div class="login-title">
+                <div class="eyebrow">Admin Console</div>
+                <h1>登录 proxysss</h1>
+                <p class="muted">进入网关管理后台。</p>
+            </div>
+            <div class="login-form">
+                <div class="filter">
+                    <label for="login-username">Username</label>
+                    <input id="login-username" autocomplete="username" value="__ADMIN_USER__" autofocus />
+                </div>
+                <div class="filter">
+                    <label for="login-password">Password</label>
+                    <input id="login-password" type="password" autocomplete="current-password" />
+                </div>
+                <button id="login-submit" class="primary" type="submit">登录</button>
+                <div id="login-error" class="login-error"></div>
+            </div>
+        </form>
+    </section>
+
+    <header id="admin-top" class="admin-top app-hidden">
+        <div><strong>proxysss</strong> <span class="muted">Admin Console</span></div>
+        <button id="logout" class="ghost" type="button">退出登录</button>
+    </header>
+
+    <main id="admin-app" class="shell app-hidden">
         <aside class="sidebar">
             <div class="brand">
                 <div class="eyebrow">admin console</div>
                 <h1>proxysss</h1>
-                <p class="muted">Reverse proxy health, live upstream state, and runtime stats in one place.</p>
+                <p class="muted">Reverse proxy health, upstream state, and runtime stats.</p>
             </div>
 
             <section class="meta-card nav-card">
@@ -11314,12 +11409,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 </div>
             </section>
 
-            <section class="login-card">
-                <h3>Quick Login</h3>
-                <label for="username">Username</label>
-                <input id="username" value="__ADMIN_USER__" />
-                <label for="password">Password</label>
-                <input id="password" type="password" value="__ADMIN_PASS__" />
+            <section class="meta-card">
+                <h3>Controls</h3>
                 <div class="button-row">
                     <button id="load" class="primary">Refresh Dashboard</button>
                     <button id="toggle-auto" class="ghost">Auto Refresh: Off</button>
@@ -11653,14 +11744,53 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         const searchInput = document.getElementById('search');
         const healthFilter = document.getElementById('health-filter');
         const groupBy = document.getElementById('group-by');
+        const sessionKey = 'proxysss.admin.auth';
+        const loginScreen = document.getElementById('login-screen');
+        const adminTop = document.getElementById('admin-top');
+        const adminApp = document.getElementById('admin-app');
+        const loginForm = document.getElementById('login-form');
+        const loginError = document.getElementById('login-error');
+        let authValue = '';
         let autoRefresh = false;
         let autoTimer = null;
         let latestUpstreams = [];
 
         function authHeader() {
-            const user = document.getElementById('username').value;
-            const pass = document.getElementById('password').value;
-            return 'Basic ' + btoa(user + ':' + pass);
+            return authValue;
+        }
+
+        function persistAuth(user, pass) {
+            authValue = 'Basic ' + btoa(user + ':' + pass);
+            sessionStorage.setItem(sessionKey, JSON.stringify({ user, auth: authValue }));
+        }
+
+        function clearAuth() {
+            authValue = '';
+            sessionStorage.removeItem(sessionKey);
+        }
+
+        function showLogin(message) {
+            loginScreen.classList.remove('hidden');
+            adminTop.classList.add('app-hidden');
+            adminApp.classList.add('app-hidden');
+            if (message) loginError.textContent = message;
+        }
+
+        function showApp() {
+            loginScreen.classList.add('hidden');
+            adminTop.classList.remove('app-hidden');
+            adminApp.classList.remove('app-hidden');
+            loginError.textContent = '';
+        }
+
+        async function verifyAuth() {
+            const response = await fetch('/v1/stats', {
+                headers: { Authorization: authHeader() },
+            });
+            if (!response.ok) {
+                throw new Error(response.status === 401 ? '用户名或密码错误' : `/v1/stats -> ${response.status}`);
+            }
+            return response.json();
         }
 
         function setState(message, kind) {
@@ -11870,6 +12000,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             const response = await fetch(path, {
                 headers: { Authorization: authHeader() },
             });
+            if (response.status === 401) {
+                clearAuth();
+                showLogin('登录已失效，请重新登录');
+            }
             if (!response.ok) {
                 throw new Error(`${path} -> ${response.status} ${response.statusText}`);
             }
@@ -11903,6 +12037,30 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
 
         document.getElementById('load').addEventListener('click', refreshDashboard);
+        loginForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            loginError.textContent = '';
+            const user = document.getElementById('login-username').value.trim();
+            const pass = document.getElementById('login-password').value;
+            persistAuth(user, pass);
+            try {
+                const stats = await verifyAuth();
+                showApp();
+                statsJson.textContent = JSON.stringify(stats, null, 2);
+                await refreshDashboard();
+            } catch (error) {
+                clearAuth();
+                showLogin(String(error.message || error));
+            }
+        });
+        document.getElementById('logout').addEventListener('click', () => {
+            clearAuth();
+            clearInterval(autoTimer);
+            autoRefresh = false;
+            autoToggle.textContent = 'Auto Refresh: Off';
+            showLogin('');
+            document.getElementById('login-password').value = '';
+        });
         [searchInput, healthFilter, groupBy].forEach(node => {
             node.addEventListener('input', refreshDashboard);
             node.addEventListener('change', refreshDashboard);
@@ -12461,12 +12619,29 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 await refreshSecurityPanel();
             } catch (error) { result.textContent = String(error); }
         });
+
+        (async function bootAdmin() {
+            try {
+                const saved = JSON.parse(sessionStorage.getItem(sessionKey) || 'null');
+                if (!saved || !saved.auth) {
+                    showLogin('');
+                    return;
+                }
+                authValue = saved.auth;
+                if (saved.user) document.getElementById('login-username').value = saved.user;
+                await verifyAuth();
+                showApp();
+                await refreshDashboard();
+            } catch {
+                clearAuth();
+                showLogin('');
+            }
+        })();
     </script>
 </body>
 </html>"#;
 
     html.replace("__ADMIN_USER__", &config.admin.username)
-        .replace("__ADMIN_PASS__", &config.admin.password)
         .replace(
             "__ADMIN_HTTPS_HINT__",
             &if config.admin.https.enabled {
@@ -13928,6 +14103,23 @@ mod tests {
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));
         assert!(html.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn admin_console_uses_login_screen_without_embedding_password() {
+        let mut config = GatewayConfig::default();
+        config.admin.username = "ops-admin".to_string();
+        config.admin.password = "super-secret-password".to_string();
+
+        let html = render_admin_console_html(&config);
+
+        assert!(html.contains("id=\"login-screen\""));
+        assert!(html.contains("id=\"admin-app\" class=\"shell app-hidden\""));
+        assert!(html.contains("sessionStorage"));
+        assert!(html.contains("value=\"ops-admin\""));
+        assert!(!html.contains("Quick Login"));
+        assert!(!html.contains("super-secret-password"));
+        assert!(!html.contains("__ADMIN_PASS__"));
     }
 
     #[test]
