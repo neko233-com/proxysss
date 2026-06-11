@@ -164,6 +164,33 @@ pub async fn spawn_json_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> 
     })
 }
 
+pub async fn spawn_sse_hold_upstream(port: u16) -> tokio::task::JoinHandle<()> {
+    let bind = format!("127.0.0.1:{port}");
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(&bind).await.expect("bind sse upstream");
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let head = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "content-type: text/event-stream\r\n",
+                    "cache-control: no-cache\r\n",
+                    "connection: close\r\n",
+                    "\r\n",
+                    "data: first\r\n\r\n"
+                );
+                if stream.write_all(head.as_bytes()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+        }
+    })
+}
+
 pub async fn spawn_ws_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> {
     let bind = format!("127.0.0.1:{port}");
     tokio::spawn(async move {

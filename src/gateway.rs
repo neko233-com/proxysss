@@ -17,6 +17,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
 use http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -25,8 +26,8 @@ use http::header::{
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -111,8 +112,12 @@ pub(crate) struct GatewayHttpResponse {
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
+    stream_body: Option<GatewayBody>,
     upstream: String,
 }
+
+type GatewayBody = UnsyncBoxBody<Bytes, anyhow::Error>;
+type GatewayResponse = Response<GatewayBody>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionEncoding {
@@ -3472,7 +3477,7 @@ impl Gateway {
         mut request: Request<Incoming>,
         remote_addr: SocketAddr,
         scheme: &'static str,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<GatewayResponse, Infallible> {
         self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
 
         let started = Instant::now();
@@ -3642,6 +3647,7 @@ impl Gateway {
                     status: parts.status,
                     headers: headers_out,
                     body: body_bytes,
+                    stream_body: None,
                     upstream: "proxysss://admin-https".to_string(),
                 });
             }
@@ -3956,20 +3962,6 @@ impl Gateway {
                 .filter(|(name, _)| !is_hop_header(name.as_str()))
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect::<Vec<_>>();
-            let response_body = match upstream_response.bytes().await {
-                Ok(body_bytes) => body_bytes,
-                Err(error) => {
-                    self.on_upstream_failure(
-                        &state.config,
-                        "http",
-                        route.runtime_scope.as_deref(),
-                        upstream,
-                    );
-                    last_error = Some(anyhow!("failed reading upstream response body: {error}"));
-                    continue;
-                }
-            };
-
             if status.is_server_error() && attempt + 1 < max_attempts {
                 self.on_upstream_failure(
                     &state.config,
@@ -3985,10 +3977,33 @@ impl Gateway {
             }
 
             self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
+            let (body, stream_body) = if version == "HTTP/3" || cache_key.is_some() {
+                let response_body = match upstream_response.bytes().await {
+                    Ok(body_bytes) => body_bytes,
+                    Err(error) => {
+                        self.on_upstream_failure(
+                            &state.config,
+                            "http",
+                            route.runtime_scope.as_deref(),
+                            upstream,
+                        );
+                        last_error =
+                            Some(anyhow!("failed reading upstream response body: {error}"));
+                        continue;
+                    }
+                };
+                (response_body, None)
+            } else {
+                (
+                    Bytes::new(),
+                    Some(streaming_body(upstream_response.bytes_stream())),
+                )
+            };
             let response = GatewayHttpResponse {
                 status,
                 headers: response_headers,
-                body: response_body,
+                body,
+                stream_body,
                 upstream: upstream.clone(),
             };
             if let Some(cache_key) = cache_key.as_deref() {
@@ -4060,6 +4075,7 @@ impl Gateway {
                 status,
                 headers: response_headers,
                 body: leftover.unwrap_or_default(),
+                stream_body: None,
                 upstream,
             });
         }
@@ -4095,6 +4111,7 @@ impl Gateway {
             status,
             headers: response_headers,
             body: Bytes::new(),
+            stream_body: None,
             upstream,
         })
     }
@@ -4131,6 +4148,7 @@ impl Gateway {
             status: entry.status,
             headers: entry.headers.clone(),
             body: entry.body.clone(),
+            stream_body: None,
             upstream: entry.upstream.clone(),
         };
 
@@ -4252,6 +4270,7 @@ impl Gateway {
             status,
             headers: response_headers,
             body: response_body,
+            stream_body: None,
             upstream,
         };
         self.store_cached_http_response(&state.config, cache_key, &route.cache, &cached);
@@ -5428,6 +5447,7 @@ impl GatewayHttpResponse {
                 HeaderValue::from_static("text/plain; charset=utf-8"),
             )],
             body,
+            stream_body: None,
             upstream: "-".to_string(),
         }
     }
@@ -5448,6 +5468,7 @@ impl GatewayHttpResponse {
                 HeaderValue::from_static("text/html; charset=utf-8"),
             )],
             body: Bytes::from(body.into()),
+            stream_body: None,
             upstream: upstream.into(),
         }
     }
@@ -5468,6 +5489,7 @@ impl GatewayHttpResponse {
             status,
             headers: vec![(LOCATION, header)],
             body: Bytes::new(),
+            stream_body: None,
             upstream: upstream.into(),
         }
     }
@@ -5484,6 +5506,7 @@ impl GatewayHttpResponse {
             status,
             headers: vec![(CONTENT_TYPE, content_type)],
             body: body.into(),
+            stream_body: None,
             upstream: upstream.into(),
         }
     }
@@ -5501,6 +5524,7 @@ impl GatewayHttpResponse {
                 HeaderValue::from_static("application/json; charset=utf-8"),
             )],
             body: Bytes::from(body),
+            stream_body: None,
             upstream: upstream.into(),
         })
     }
@@ -5524,18 +5548,35 @@ impl GatewayHttpResponse {
         &self.body
     }
 
-    fn into_hyper(self) -> Response<Full<Bytes>> {
+    fn into_hyper(self) -> GatewayResponse {
         let mut builder = Response::builder().status(self.status);
         for (name, value) in self.headers {
             builder = builder.header(name, value);
         }
-        builder.body(Full::new(self.body)).unwrap_or_else(|_| {
+        let body = self.stream_body.unwrap_or_else(|| full_body(self.body));
+        builder.body(body).unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from_static(b"response build failure")))
+                .body(full_body(Bytes::from_static(b"response build failure")))
                 .expect("static response build should never fail")
         })
     }
+}
+
+fn full_body(body: Bytes) -> GatewayBody {
+    Full::new(body)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn streaming_body<S>(stream: S) -> GatewayBody
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let stream = stream
+        .map_ok(Frame::data)
+        .map_err(|error| anyhow!("upstream response stream failed: {error}"));
+    StreamBody::new(stream).boxed_unsync()
 }
 
 impl GatewayStats {
@@ -5643,6 +5684,10 @@ fn decorate_error_response(
     request_headers: &HeaderMap,
     response: GatewayHttpResponse,
 ) -> GatewayHttpResponse {
+    if response.stream_body.is_some() {
+        return response;
+    }
+
     if !response.status.is_client_error() && !response.status.is_server_error() {
         return response;
     }

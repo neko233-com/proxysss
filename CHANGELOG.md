@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.2 - 2026-06-11
+
+- Fixed AI reverse proxy streaming for New API, sub2api, OpenAI-compatible SSE, and Cline/CLI clients by forwarding upstream HTTP/1.1 and HTTP/2 response chunks directly instead of buffering the full response body.
+- Kept response cache and HTTP/3 paths on buffered bodies so cache correctness and existing QUIC behavior stay stable.
+- Added an e2e SSE regression test that verifies the first AI proxy event arrives while the upstream connection remains open.
+
 ## v1.2.1 - 2026-06-10
 
 - Added **HTTPS admin API** (`admin.https`): expose the full `/v1/*` automation surface on the main TLS listener at `admin.https.path_prefix` (default `/_proxysss/admin`); bootstrap TLS/ACME on loopback first, then drive agents over HTTPS with Bearer auth.

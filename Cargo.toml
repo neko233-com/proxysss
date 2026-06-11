@@ -1,6 +1,6 @@
 [package]
 name = "proxysss"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 license = "MIT"
 description = "General-purpose Rust gateway built to replace nginx with HTTP, HTTPS, HTTP/2, HTTP/3, TCP, UDP, FTP, WebDAV, and script hooks"
