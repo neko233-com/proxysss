@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.9 - 2026-06-11
+
+- Added browser-language-aware admin UI localization for English and Simplified Chinese, with a manual language selector.
+- Localized login, dashboard navigation, metric labels, filters, empty states, status text, and upstream health table labels.
+
 ## v1.2.8 - 2026-06-11
 
 - Reduced admin dashboard clutter by folding endpoint docs, moving filters into the main dashboard, and compacting upstream health details.

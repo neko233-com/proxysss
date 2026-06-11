@@ -11200,6 +11200,16 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             top: 0;
             z-index: 10;
         }
+        .top-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .language-select {
+            width: auto;
+            min-width: 112px;
+            padding: 9px 10px;
+        }
         .shell {
             width: 100%;
             min-height: calc(100vh - 58px);
@@ -11502,61 +11512,68 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         <form id="login-form" class="login-panel">
             <div class="login-logo">p</div>
             <div class="login-title">
-                <div class="eyebrow">Admin Console</div>
-                <h1>登录 proxysss</h1>
-                <p class="muted">进入网关管理后台。</p>
+                <div class="eyebrow" data-i18n="adminConsole">Admin Console</div>
+                <h1 data-i18n="loginTitle">登录 proxysss</h1>
+                <p class="muted" data-i18n="loginSubtitle">进入网关管理后台。</p>
             </div>
             <div class="login-form">
                 <div class="filter">
-                    <label for="login-username">Username</label>
+                    <label for="login-username" data-i18n="username">Username</label>
                     <input id="login-username" autocomplete="username" value="__ADMIN_USER__" autofocus />
                 </div>
                 <div class="filter">
-                    <label for="login-password">Password</label>
+                    <label for="login-password" data-i18n="password">Password</label>
                     <input id="login-password" type="password" autocomplete="current-password" />
                 </div>
-                <button id="login-submit" class="primary" type="submit">登录</button>
+                <button id="login-submit" class="primary" type="submit" data-i18n="login">登录</button>
                 <div id="login-error" class="login-error"></div>
             </div>
         </form>
     </section>
 
     <header id="admin-top" class="admin-top app-hidden">
-        <div><strong>proxysss</strong> <span class="muted">Admin Console</span></div>
-        <button id="logout" class="ghost" type="button">退出登录</button>
+        <div><strong>proxysss</strong> <span class="muted" data-i18n="adminConsole">Admin Console</span></div>
+        <div class="top-actions">
+            <select id="language-select" class="language-select ghost" aria-label="Language">
+                <option value="auto">Auto</option>
+                <option value="zh-CN">中文</option>
+                <option value="en-US">English</option>
+            </select>
+            <button id="logout" class="ghost" type="button" data-i18n="logout">退出登录</button>
+        </div>
     </header>
 
     <main id="admin-app" class="shell app-hidden">
         <aside class="sidebar">
             <div class="brand">
-                <div class="eyebrow">admin console</div>
+                <div class="eyebrow" data-i18n="adminConsole">admin console</div>
                 <h1>proxysss</h1>
-                <p class="muted">Reverse proxy health, upstream state, and runtime stats.</p>
+                <p class="muted" data-i18n="brandSubtitle">Reverse proxy health, upstream state, and runtime stats.</p>
             </div>
 
             <section class="meta-card nav-card">
-                <h3>Console Views</h3>
+                <h3 data-i18n="consoleViews">Console Views</h3>
                 <div class="button-row">
-                    <button class="ghost nav-btn active" data-view="dashboard">Dashboard</button>
+                    <button class="ghost nav-btn active" data-view="dashboard" data-i18n="dashboard">Dashboard</button>
                     <button class="ghost nav-btn" data-view="tls">TLS / ACME</button>
-                    <button class="ghost nav-btn" data-view="domains">Domain Routes</button>
-                    <button class="ghost nav-btn" data-view="reverse">Reverse Proxy</button>
-                    <button class="ghost nav-btn" data-view="listeners">Listeners</button>
+                    <button class="ghost nav-btn" data-view="domains" data-i18n="domainRoutes">Domain Routes</button>
+                    <button class="ghost nav-btn" data-view="reverse" data-i18n="reverseProxy">Reverse Proxy</button>
+                    <button class="ghost nav-btn" data-view="listeners" data-i18n="listeners">Listeners</button>
                     <button class="ghost nav-btn" data-view="filecloud">FileCloud</button>
-                    <button class="ghost nav-btn" data-view="security">Security</button>
+                    <button class="ghost nav-btn" data-view="security" data-i18n="security">Security</button>
                 </div>
             </section>
 
             <section class="meta-card">
-                <h3>Controls</h3>
+                <h3 data-i18n="controls">Controls</h3>
                 <div class="button-row">
-                    <button id="load" class="primary">Refresh Dashboard</button>
+                    <button id="load" class="primary" data-i18n="refreshDashboard">Refresh Dashboard</button>
                     <button id="toggle-auto" class="ghost">Auto Refresh: Off</button>
                 </div>
             </section>
 
             <details class="meta-card">
-                <summary>API Endpoints</summary>
+                <summary data-i18n="apiEndpoints">API Endpoints</summary>
                 <div class="meta-list muted">
                     <span>Stats: <strong>/v1/stats</strong></span>
                     <span>Upstreams: <strong>/v1/upstreams</strong></span>
@@ -11571,39 +11588,39 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         <section class="content" id="view-dashboard">
             <div class="topbar">
                 <div>
-                    <div class="eyebrow">Runtime Overview</div>
-                    <h2>Reverse Proxy Health</h2>
+                    <div class="eyebrow" data-i18n="runtimeOverview">Runtime Overview</div>
+                    <h2 data-i18n="reverseProxyHealth">Reverse Proxy Health</h2>
                 </div>
-                <div id="load-state" class="status-dot">Waiting for refresh</div>
+                <div id="load-state" class="status-dot" data-i18n="waitingRefresh">Waiting for refresh</div>
             </div>
 
             <section class="cards">
                 <article class="card">
-                    <span class="muted">HTTP Requests</span>
+                    <span class="muted" data-i18n="httpRequests">HTTP Requests</span>
                     <strong id="card-http-requests">0</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">HTTP Errors</span>
+                    <span class="muted" data-i18n="httpErrors">HTTP Errors</span>
                     <strong id="card-http-errors">0</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">Healthy Upstreams</span>
+                    <span class="muted" data-i18n="healthyUpstreams">Healthy Upstreams</span>
                     <strong id="card-healthy">0</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">Degraded Upstreams</span>
+                    <span class="muted" data-i18n="degradedUpstreams">Degraded Upstreams</span>
                     <strong id="card-degraded">0</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">Process CPU</span>
+                    <span class="muted" data-i18n="processCpu">Process CPU</span>
                     <strong id="card-process-cpu">warming</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">Process Memory</span>
+                    <span class="muted" data-i18n="processMemory">Process Memory</span>
                     <strong id="card-process-memory">0 MB</strong>
                 </article>
                 <article class="card">
-                    <span class="muted">Memory %</span>
+                    <span class="muted" data-i18n="memoryPercent">Memory %</span>
                     <strong id="card-process-memory-percent">0%</strong>
                 </article>
             </section>
@@ -11611,39 +11628,39 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             <section class="surface">
                 <div class="surface-head">
                     <div class="surface-title">
-                        <h3>Grouped View</h3>
+                        <h3 data-i18n="groupedView">Grouped View</h3>
                     </div>
                     <div class="surface-actions">
                         <div class="compact-controls">
-                            <input id="search" placeholder="Search route / upstream / listener" />
+                            <input id="search" placeholder="Search route / upstream / listener" data-i18n-placeholder="searchPlaceholder" />
                             <select id="health-filter">
-                                <option value="all">All health</option>
-                                <option value="healthy">Healthy</option>
-                                <option value="degraded">Degraded</option>
-                                <option value="manual">Manual offline</option>
+                                <option value="all" data-i18n="allHealth">All health</option>
+                                <option value="healthy" data-i18n="healthy">Healthy</option>
+                                <option value="degraded" data-i18n="degraded">Degraded</option>
+                                <option value="manual" data-i18n="manualOffline">Manual offline</option>
                             </select>
                             <select id="group-by">
-                                <option value="route">Group: route</option>
-                                <option value="listener">Group: listener</option>
-                                <option value="protocol">Group: protocol</option>
-                                <option value="none">Flat</option>
+                                <option value="route" data-i18n="groupRoute">Group: route</option>
+                                <option value="listener" data-i18n="groupListener">Group: listener</option>
+                                <option value="protocol" data-i18n="groupProtocol">Group: protocol</option>
+                                <option value="none" data-i18n="flat">Flat</option>
                             </select>
                         </div>
                         <span class="muted" id="group-count">0 groups</span>
                     </div>
                 </div>
-                <div id="group-view-wrap" class="empty">Refresh the dashboard to build aggregated health groups.</div>
+                <div id="group-view-wrap" class="empty" data-i18n="refreshGroupsHint">Refresh the dashboard to build aggregated health groups.</div>
             </section>
 
             <section class="surface">
                 <div class="surface-head">
                     <div>
-                        <h3>Upstream Health Table</h3>
-                        <p class="muted">Health, target, probe, and drain controls.</p>
+                        <h3 data-i18n="upstreamHealthTable">Upstream Health Table</h3>
+                        <p class="muted" data-i18n="upstreamTableHint">Health, target, probe, and drain controls.</p>
                     </div>
                     <span class="muted" id="upstream-count">0 upstreams</span>
                 </div>
-                <div id="upstream-table-wrap" class="empty">Refresh the dashboard to load upstream health data.</div>
+                <div id="upstream-table-wrap" class="empty" data-i18n="refreshUpstreamsHint">Refresh the dashboard to load upstream health data.</div>
             </section>
 
             <section class="raw-grid">
@@ -11871,13 +11888,191 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         const adminApp = document.getElementById('admin-app');
         const loginForm = document.getElementById('login-form');
         const loginError = document.getElementById('login-error');
+        const languageSelect = document.getElementById('language-select');
+        const i18n = {
+            'en-US': {
+                adminConsole: 'Admin Console',
+                loginTitle: 'Sign in to proxysss',
+                loginSubtitle: 'Enter the gateway admin console.',
+                username: 'Username',
+                password: 'Password',
+                login: 'Sign in',
+                logout: 'Sign out',
+                brandSubtitle: 'Reverse proxy health, upstream state, and runtime stats.',
+                consoleViews: 'Console Views',
+                dashboard: 'Dashboard',
+                domainRoutes: 'Domain Routes',
+                reverseProxy: 'Reverse Proxy',
+                listeners: 'Listeners',
+                security: 'Security',
+                controls: 'Controls',
+                refreshDashboard: 'Refresh Dashboard',
+                autoRefreshOff: 'Auto Refresh: Off',
+                autoRefreshOn: 'Auto Refresh: On',
+                apiEndpoints: 'API Endpoints',
+                runtimeOverview: 'Runtime Overview',
+                reverseProxyHealth: 'Reverse Proxy Health',
+                waitingRefresh: 'Waiting for refresh',
+                refreshingDashboard: 'Refreshing dashboard',
+                dashboardFresh: 'Dashboard fresh',
+                refreshFailed: 'Refresh failed',
+                httpRequests: 'HTTP Requests',
+                httpErrors: 'HTTP Errors',
+                healthyUpstreams: 'Healthy Upstreams',
+                degradedUpstreams: 'Degraded Upstreams',
+                processCpu: 'Process CPU',
+                processMemory: 'Process Memory',
+                memoryPercent: 'Memory %',
+                groupedView: 'Grouped View',
+                searchPlaceholder: 'Search route / upstream / listener',
+                allHealth: 'All health',
+                healthy: 'Healthy',
+                degraded: 'Degraded',
+                manualOffline: 'Manual offline',
+                groupRoute: 'Group: route',
+                groupListener: 'Group: listener',
+                groupProtocol: 'Group: protocol',
+                flat: 'Flat',
+                refreshGroupsHint: 'Refresh the dashboard to build aggregated health groups.',
+                noUpstreamsMatch: 'No upstreams match the current filters.',
+                upstreamHealthTable: 'Upstream Health Table',
+                upstreamTableHint: 'Health, target, probe, and drain controls.',
+                refreshUpstreamsHint: 'Refresh the dashboard to load upstream health data.',
+                noUpstreamState: 'No upstream runtime state recorded yet. Send traffic or enable active health checks.',
+                groups: 'groups',
+                upstreams: 'upstreams',
+                invalidCredentials: 'Invalid username or password',
+                loginExpired: 'Session expired. Please sign in again.',
+                takeOffline: 'Take Offline',
+                restore: 'Restore',
+                tableHealth: 'Health',
+                tableTarget: 'Target',
+                tableActive: 'Active',
+                tableProbe: 'Probe',
+                tableManual: 'Manual',
+                tableAction: 'Action',
+                tableLastCheck: 'Last Check',
+                warming: 'warming',
+                unknown: 'unknown',
+                pass: 'pass',
+                fail: 'fail',
+                quarantined: 'quarantined',
+                unmapped: 'unmapped',
+                active: 'active',
+                passive: 'passive',
+                rtt: 'rtt',
+                failureShort: 'fail',
+                quarantine: 'quarantine',
+            },
+            'zh-CN': {
+                adminConsole: '管理控制台',
+                loginTitle: '登录 proxysss',
+                loginSubtitle: '进入网关管理后台。',
+                username: '用户名',
+                password: '密码',
+                login: '登录',
+                logout: '退出登录',
+                brandSubtitle: '反向代理健康、上游状态、运行指标。',
+                consoleViews: '控制台视图',
+                dashboard: '仪表盘',
+                domainRoutes: '域名路由',
+                reverseProxy: '反向代理',
+                listeners: '监听器',
+                security: '安全',
+                controls: '操作',
+                refreshDashboard: '刷新仪表盘',
+                autoRefreshOff: '自动刷新：关',
+                autoRefreshOn: '自动刷新：开',
+                apiEndpoints: 'API 端点',
+                runtimeOverview: '运行概览',
+                reverseProxyHealth: '反向代理健康',
+                waitingRefresh: '等待刷新',
+                refreshingDashboard: '正在刷新',
+                dashboardFresh: '仪表盘已刷新',
+                refreshFailed: '刷新失败',
+                httpRequests: 'HTTP 请求',
+                httpErrors: 'HTTP 错误',
+                healthyUpstreams: '健康上游',
+                degradedUpstreams: '异常上游',
+                processCpu: '进程 CPU',
+                processMemory: '进程内存',
+                memoryPercent: '内存占比',
+                groupedView: '分组视图',
+                searchPlaceholder: '搜索路由 / 上游 / 监听器',
+                allHealth: '全部健康状态',
+                healthy: '健康',
+                degraded: '异常',
+                manualOffline: '手动下线',
+                groupRoute: '分组：路由',
+                groupListener: '分组：监听器',
+                groupProtocol: '分组：协议',
+                flat: '平铺',
+                refreshGroupsHint: '刷新仪表盘后显示聚合健康分组。',
+                noUpstreamsMatch: '没有上游匹配当前筛选。',
+                upstreamHealthTable: '上游健康表',
+                upstreamTableHint: '健康、目标、探测和摘流操作。',
+                refreshUpstreamsHint: '刷新仪表盘后加载上游健康数据。',
+                noUpstreamState: '暂无上游运行状态。请先产生流量或开启主动健康检查。',
+                groups: '组',
+                upstreams: '上游',
+                invalidCredentials: '用户名或密码错误',
+                loginExpired: '登录已失效，请重新登录',
+                takeOffline: '下线',
+                restore: '恢复',
+                tableHealth: '健康',
+                tableTarget: '目标',
+                tableActive: '活跃',
+                tableProbe: '探测',
+                tableManual: '手动',
+                tableAction: '操作',
+                tableLastCheck: '最后检查',
+                warming: '预热中',
+                unknown: '未知',
+                pass: '通过',
+                fail: '失败',
+                quarantined: '隔离',
+                unmapped: '未映射',
+                active: '主动',
+                passive: '被动',
+                rtt: '延迟',
+                failureShort: '失败',
+                quarantine: '隔离',
+            },
+        };
+        let currentLocale = 'en-US';
         let authValue = '';
         let autoRefresh = false;
         let autoTimer = null;
         let latestUpstreams = [];
+        let latestStats = null;
 
         function authHeader() {
             return authValue;
+        }
+
+        function detectLocale() {
+            const saved = localStorage.getItem('proxysss.admin.locale') || 'auto';
+            languageSelect.value = saved;
+            if (saved !== 'auto') return saved;
+            const languages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || 'en-US'];
+            return languages.some(value => String(value).toLowerCase().startsWith('zh')) ? 'zh-CN' : 'en-US';
+        }
+
+        function t(key) {
+            return (i18n[currentLocale] && i18n[currentLocale][key]) || i18n['en-US'][key] || key;
+        }
+
+        function applyLocale() {
+            currentLocale = detectLocale();
+            document.documentElement.lang = currentLocale;
+            document.querySelectorAll('[data-i18n]').forEach(node => {
+                node.textContent = t(node.dataset.i18n);
+            });
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(node => {
+                node.placeholder = t(node.dataset.i18nPlaceholder);
+            });
+            autoToggle.textContent = autoRefresh ? t('autoRefreshOn') : t('autoRefreshOff');
+            if (stateNode.dataset.stateKey) stateNode.textContent = t(stateNode.dataset.stateKey);
         }
 
         function persistAuth(user, token, expiresAt) {
@@ -11912,7 +12107,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                throw new Error(data.error || '用户名或密码错误');
+                throw new Error(data.error || t('invalidCredentials'));
             }
             persistAuth(data.username || user, data.access_token, data.expires_at);
             return data;
@@ -11923,13 +12118,14 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 headers: { Authorization: authHeader() },
             });
             if (!response.ok) {
-                throw new Error(response.status === 401 ? '用户名或密码错误' : `/v1/stats -> ${response.status}`);
+                throw new Error(response.status === 401 ? t('invalidCredentials') : `/v1/stats -> ${response.status}`);
             }
             return response.json();
         }
 
-        function setState(message, kind) {
-            stateNode.textContent = message;
+        function setState(message, kind, key) {
+            stateNode.textContent = key ? t(key) : message;
+            stateNode.dataset.stateKey = key || '';
             stateNode.className = 'status-dot ' + (kind || '');
         }
 
@@ -11938,12 +12134,12 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
 
         function formatPercent(value) {
-            if (value === null || value === undefined || Number.isNaN(Number(value))) return 'warming';
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return t('warming');
             return Number(value).toFixed(1) + '%';
         }
 
         function formatMegabytes(value) {
-            if (value === null || value === undefined || Number.isNaN(Number(value))) return 'unknown';
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return t('unknown');
             return Number(value).toFixed(1) + ' MB';
         }
 
@@ -11967,24 +12163,24 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             document.getElementById('card-process-cpu').textContent = formatPercent(process.cpu_percent);
             document.getElementById('card-process-memory').textContent = formatMegabytes(process.memory_mb);
             document.getElementById('card-process-memory-percent').textContent = formatPercent(process.memory_percent);
-            upstreamCount.textContent = `${upstreams.length} upstreams`;
+            upstreamCount.textContent = `${upstreams.length} ${t('upstreams')}`;
         }
 
         function healthPill(item) {
-            if (item.manually_disabled) return '<span class="pill warn">manual offline</span>';
-            if (item.healthy) return '<span class="pill good">healthy</span>';
-            if (item.active_healthy === null || item.active_healthy === undefined) return '<span class="pill warn">warming</span>';
-            return '<span class="pill bad">degraded</span>';
+            if (item.manually_disabled) return `<span class="pill warn">${t('manualOffline')}</span>`;
+            if (item.healthy) return `<span class="pill good">${t('healthy')}</span>`;
+            if (item.active_healthy === null || item.active_healthy === undefined) return `<span class="pill warn">${t('warming')}</span>`;
+            return `<span class="pill bad">${t('degraded')}</span>`;
         }
 
         function probePill(item) {
-            if (item.active_healthy === true) return '<span class="pill good">pass</span>';
-            if (item.active_healthy === false) return '<span class="pill bad">fail</span>';
-            return '<span class="pill warn">unknown</span>';
+            if (item.active_healthy === true) return `<span class="pill good">${t('pass')}</span>`;
+            if (item.active_healthy === false) return `<span class="pill bad">${t('fail')}</span>`;
+            return `<span class="pill warn">${t('unknown')}</span>`;
         }
 
         function routeLabel(item) {
-            return (item.route_names && item.route_names.length ? item.route_names.join(', ') : 'unmapped');
+            return (item.route_names && item.route_names.length ? item.route_names.join(', ') : t('unmapped'));
         }
 
         function filteredUpstreams() {
@@ -12022,8 +12218,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         function renderGroups(upstreams) {
             if (!upstreams.length) {
                 groupWrap.className = 'empty';
-                groupWrap.textContent = 'No upstreams match the current filters.';
-                groupCount.textContent = '0 groups';
+                groupWrap.textContent = t('noUpstreamsMatch');
+                groupCount.textContent = `0 ${t('groups')}`;
                 return;
             }
 
@@ -12034,7 +12230,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 grouped.get(key).push(item);
             }
 
-            groupCount.textContent = `${grouped.size} groups`;
+            groupCount.textContent = `${grouped.size} ${t('groups')}`;
             groupWrap.className = 'group-grid';
             groupWrap.innerHTML = Array.from(grouped.entries()).map(([key, items]) => {
                 const healthy = items.filter(item => item.healthy).length;
@@ -12044,8 +12240,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                     <article class="group-card">
                         <strong>${key}</strong>
                         <div class="group-meta">
-                            <span class="pill ${healthy === items.length ? 'good' : healthy === 0 ? 'bad' : 'warn'}">${healthy}/${items.length} healthy</span>
-                            ${manual ? `<span class="pill warn">${manual} manual offline</span>` : ''}
+                            <span class="pill ${healthy === items.length ? 'good' : healthy === 0 ? 'bad' : 'warn'}">${healthy}/${items.length} ${t('healthy')}</span>
+                            ${manual ? `<span class="pill warn">${manual} ${t('manualOffline')}</span>` : ''}
                             <span class="pill">${protocols}</span>
                         </div>
                         <div class="muted">${items.map(item => item.upstream).join('<br/>')}</div>
@@ -12072,7 +12268,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         function renderUpstreams(upstreams) {
             if (!upstreams.length) {
                 upstreamWrap.className = 'empty';
-                upstreamWrap.textContent = 'No upstream runtime state recorded yet. Send traffic or enable active health checks.';
+                upstreamWrap.textContent = t('noUpstreamState');
                 return;
             }
 
@@ -12084,16 +12280,16 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 const routeNames = routeLabel(item);
                 const targetMeta = `${item.protocol} / ${item.listener}`;
                 const probeMeta = [
-                    `active ${probePill(item)}`,
-                    `passive ${item.passive_healthy ? '<span class="pill good">pass</span>' : '<span class="pill bad">quarantined</span>'}`,
+                    `${t('active')} ${probePill(item)}`,
+                    `${t('passive')} ${item.passive_healthy ? `<span class="pill good">${t('pass')}</span>` : `<span class="pill bad">${t('quarantined')}</span>`}`,
                     `http ${status}`,
-                    `rtt ${rtt}ms`,
-                    `fail ${item.consecutive_failures}`,
-                    quarantine !== '-' ? `quarantine ${quarantine}` : '',
+                    `${t('rtt')} ${rtt}ms`,
+                    `${t('failureShort')} ${item.consecutive_failures}`,
+                    quarantine !== '-' ? `${t('quarantine')} ${quarantine}` : '',
                 ].filter(Boolean).join(' ');
                 const actionButton = item.manually_disabled
-                    ? `<button class="success" data-action="enable" data-key="${item.key}">Restore</button>`
-                    : `<button class="danger" data-action="disable" data-key="${item.key}">Take Offline</button>`;
+                    ? `<button class="success" data-action="enable" data-key="${item.key}">${t('restore')}</button>`
+                    : `<button class="danger" data-action="disable" data-key="${item.key}">${t('takeOffline')}</button>`;
                 return `
                     <tr>
                         <td>${healthPill(item)}</td>
@@ -12111,13 +12307,13 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <table>
                     <thead>
                         <tr>
-                            <th>Health</th>
-                            <th>Target</th>
-                            <th>Active</th>
-                            <th>Probe</th>
-                            <th>Manual</th>
-                            <th>Action</th>
-                            <th>Last Check</th>
+                            <th>${t('tableHealth')}</th>
+                            <th>${t('tableTarget')}</th>
+                            <th>${t('tableActive')}</th>
+                            <th>${t('tableProbe')}</th>
+                            <th>${t('tableManual')}</th>
+                            <th>${t('tableAction')}</th>
+                            <th>${t('tableLastCheck')}</th>
                         </tr>
                     </thead>
                     <tbody>${rows}</tbody>
@@ -12130,7 +12326,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             });
             if (response.status === 401) {
                 clearAuth();
-                showLogin('登录已失效，请重新登录');
+                showLogin(t('loginExpired'));
             }
             if (!response.ok) {
                 throw new Error(`${path} -> ${response.status} ${response.statusText}`);
@@ -12139,12 +12335,13 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
 
         async function refreshDashboard() {
-            setState('Refreshing dashboard', '');
+            setState('', '', 'refreshingDashboard');
             try {
                 const [stats, upstreamsPayload] = await Promise.all([
                     loadJson('/v1/stats'),
                     loadJson('/v1/upstreams'),
                 ]);
+                latestStats = stats;
                 latestUpstreams = upstreamsPayload.items || [];
                 const upstreams = filteredUpstreams();
                 statsJson.textContent = JSON.stringify(stats, null, 2);
@@ -12152,9 +12349,9 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 renderSummary(stats, latestUpstreams);
                 renderGroups(upstreams);
                 renderUpstreams(upstreams);
-                setState('Dashboard fresh', upstreams.every(item => item.healthy) ? 'ok' : 'bad');
+                setState('', upstreams.every(item => item.healthy) ? 'ok' : 'bad', 'dashboardFresh');
             } catch (error) {
-                setState('Refresh failed', 'bad');
+                setState('', 'bad', 'refreshFailed');
                 statsJson.textContent = String(error);
                 upstreamsJson.textContent = String(error);
                 upstreamWrap.className = 'empty';
@@ -12186,9 +12383,19 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             clearAuth();
             clearInterval(autoTimer);
             autoRefresh = false;
-            autoToggle.textContent = 'Auto Refresh: Off';
+            autoToggle.textContent = t('autoRefreshOff');
             showLogin('');
             document.getElementById('login-password').value = '';
+        });
+        languageSelect.addEventListener('change', () => {
+            localStorage.setItem('proxysss.admin.locale', languageSelect.value);
+            applyLocale();
+            if (latestUpstreams.length) {
+                const upstreams = filteredUpstreams();
+                if (latestStats) renderSummary(latestStats, latestUpstreams);
+                renderGroups(upstreams);
+                renderUpstreams(upstreams);
+            }
         });
         [searchInput, healthFilter, groupBy].forEach(node => {
             node.addEventListener('input', refreshDashboard);
@@ -12205,7 +12412,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         });
         autoToggle.addEventListener('click', () => {
             autoRefresh = !autoRefresh;
-            autoToggle.textContent = `Auto Refresh: ${autoRefresh ? 'On' : 'Off'}`;
+            autoToggle.textContent = autoRefresh ? t('autoRefreshOn') : t('autoRefreshOff');
             clearInterval(autoTimer);
             if (autoRefresh) {
                 autoTimer = setInterval(refreshDashboard, 5000);
@@ -12748,6 +12955,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 await refreshSecurityPanel();
             } catch (error) { result.textContent = String(error); }
         });
+
+        applyLocale();
 
         (async function bootAdmin() {
             try {
