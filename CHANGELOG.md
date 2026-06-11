@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.4 - 2026-06-11
+
+- Made SSE hardening headers idempotent so existing upstream `Cache-Control: no-cache` and `X-Accel-Buffering: no` values are preserved without duplicated tokens.
+- Kept the v1.2.3 streaming safeguards: SSE/streaming responses bypass compression and carry `no-transform` plus unbuffered proxy hints.
+
 ## v1.2.3 - 2026-06-11
 
 - Hardened AI/SSE reverse proxy responses by automatically emitting `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` for streamed or `text/event-stream` responses.

@@ -6689,15 +6689,16 @@ fn apply_streaming_response_headers(response: &mut GatewayHttpResponse) -> Resul
         return Ok(());
     }
 
-    append_or_insert_header(&mut response.headers, CACHE_CONTROL, "no-cache")?;
-    append_or_insert_header(&mut response.headers, CACHE_CONTROL, "no-transform")?;
+    append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-cache")?;
+    append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-transform")?;
     response
         .headers
         .retain(|(name, _)| name != CONTENT_LENGTH && name != CONTENT_ENCODING);
-    response.headers.push((
+    set_header(
+        &mut response.headers,
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
-    ));
+    );
     Ok(())
 }
 
@@ -6858,6 +6859,41 @@ fn append_or_insert_header(
         headers.push((name, header_value));
     }
     Ok(())
+}
+
+fn append_header_token_once(
+    headers: &mut Vec<(HeaderName, HeaderValue)>,
+    name: HeaderName,
+    value: &str,
+) -> Result<()> {
+    let existing_name = name.clone();
+    if let Some((_, existing)) = headers
+        .iter_mut()
+        .find(|(header_name, _)| *header_name == existing_name)
+    {
+        let existing_value = existing
+            .to_str()
+            .with_context(|| format!("invalid existing header value for {}", name.as_str()))?;
+        if existing_value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case(value))
+        {
+            return Ok(());
+        }
+        let merged = format!("{existing_value}, {value}");
+        *existing = HeaderValue::from_str(merged.trim_matches(|c| c == ',' || c == ' '))
+            .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+    } else {
+        let header_value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+        headers.push((name, header_value));
+    }
+    Ok(())
+}
+
+fn set_header(headers: &mut Vec<(HeaderName, HeaderValue)>, name: HeaderName, value: HeaderValue) {
+    headers.retain(|(header_name, _)| *header_name != name);
+    headers.push((name, value));
 }
 
 fn cache_lookup_key(
@@ -12971,11 +13007,16 @@ mod tests {
     fn finalize_http_response_marks_sse_as_unbuffered_and_untransformed() {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br, gzip"));
-        let response = GatewayHttpResponse::bytes(
+        let mut response = GatewayHttpResponse::bytes(
             StatusCode::OK,
             "text/event-stream; charset=utf-8",
             Bytes::from_static(b"data: first\n\n"),
             "http://127.0.0.1:9000",
+        );
+        response.push_header(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        response.push_header(
+            HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
         );
         let compression = ResponseCompressionConfig {
             enabled: true,
@@ -12997,6 +13038,31 @@ mod tests {
             .headers
             .iter()
             .any(|(name, value)| { name.as_str() == "x-accel-buffering" && value == "no" }));
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .filter(|(name, _)| name.as_str() == "x-accel-buffering")
+                .count(),
+            1
+        );
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .filter(|(name, value)| {
+                    name == CACHE_CONTROL
+                        && value
+                            .to_str()
+                            .expect("cache-control")
+                            .split(',')
+                            .filter(|token| token.trim().eq_ignore_ascii_case("no-cache"))
+                            .count()
+                            == 1
+                })
+                .count(),
+            1
+        );
         assert!(!response
             .headers
             .iter()
