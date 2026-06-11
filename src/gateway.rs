@@ -19,6 +19,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
+use hmac::{Hmac, Mac};
 use http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
     COOKIE, HOST, LOCATION, SET_COOKIE, VARY,
@@ -45,6 +46,7 @@ use rustls::sign::CertifiedKey;
 use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::io::{
     copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
     BufReader as TokioBufReader,
@@ -933,6 +935,49 @@ impl Gateway {
             return Ok(text_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "admin authentication temporarily locked",
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/login" {
+            let payload = match serde_json::from_slice::<AdminLoginRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid login payload: {error}")}),
+                    ));
+                }
+            };
+            if payload.username != state.config.admin.username
+                || payload.password != state.config.admin.password
+            {
+                self.stats
+                    .admin_auth_fail_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.admin_auth_guard
+                    .record_failure(&auth_key, &state.config.admin.auth_rate_limit);
+                return Ok(json_response(
+                    StatusCode::UNAUTHORIZED,
+                    serde_json::json!({"ok": false, "error": "invalid credentials"}),
+                ));
+            }
+            self.admin_auth_guard.clear_failures(&auth_key);
+            let Some((token, expires_at)) = issue_admin_session_token(&state.config.admin) else {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": "failed to issue admin session"}),
+                ));
+            };
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "token_type": "Bearer",
+                    "access_token": token,
+                    "expires_at": expires_at,
+                    "expires_in": ADMIN_SESSION_TTL_SECS,
+                    "username": state.config.admin.username,
+                }),
             ));
         }
 
@@ -8100,7 +8145,8 @@ fn is_authorized(header: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
     };
 
     if let Some(token) = value.strip_prefix("Bearer ") {
-        return !admin.bearer_token.is_empty() && token == admin.bearer_token;
+        return (!admin.bearer_token.is_empty() && token == admin.bearer_token)
+            || verify_admin_session_token(token, admin);
     }
 
     if !value.starts_with("Basic ") {
@@ -8121,6 +8167,79 @@ fn is_authorized(header: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
     };
 
     username == admin.username && password == admin.password
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminLoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminSessionClaims {
+    sub: String,
+    exp: u64,
+    iat: u64,
+    scope: String,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+const ADMIN_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn admin_session_signing_key(admin: &AdminConfig) -> Vec<u8> {
+    format!(
+        "proxysss-admin-session:{}:{}:{}",
+        admin.username, admin.password, admin.bearer_token
+    )
+    .into_bytes()
+}
+
+fn sign_admin_session_payload(payload: &str, admin: &AdminConfig) -> Option<String> {
+    let mut mac = HmacSha256::new_from_slice(&admin_session_signing_key(admin)).ok()?;
+    mac.update(payload.as_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn issue_admin_session_token(admin: &AdminConfig) -> Option<(String, u64)> {
+    let now = now_unix_secs();
+    let expires_at = now.saturating_add(ADMIN_SESSION_TTL_SECS);
+    let claims = AdminSessionClaims {
+        sub: admin.username.clone(),
+        exp: expires_at,
+        iat: now,
+        scope: "admin".to_string(),
+    };
+    let payload = serde_json::to_vec(&claims).ok()?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let signature = sign_admin_session_payload(&payload, admin)?;
+    Some((format!("{payload}.{signature}"), expires_at))
+}
+
+fn verify_admin_session_token(token: &str, admin: &AdminConfig) -> bool {
+    let Some((payload, signature)) = token.split_once('.') else {
+        return false;
+    };
+    let Some(expected) = sign_admin_session_payload(payload, admin) else {
+        return false;
+    };
+    if signature != expected {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<AdminSessionClaims>(&decoded) else {
+        return false;
+    };
+    claims.sub == admin.username && claims.scope == "admin" && claims.exp > now_unix_secs()
 }
 
 #[derive(Debug, Deserialize)]
@@ -10996,19 +11115,19 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
     <title>proxysss admin</title>
     <style>
         :root {
-            --bg: #f5f7fb;
-            --panel: #ffffff;
-            --panel-2: #ffffff;
-            --line: #e6e8ef;
-            --text: #111827;
-            --muted: #6b7280;
-            --accent: #1677ff;
-            --accent-2: #4096ff;
-            --warn: #d97706;
-            --bad: #dc2626;
-            --good: #16a34a;
-            --soft: #f3f6fb;
-            --shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
+            --bg: #090f1c;
+            --panel: #111827;
+            --panel-2: #0f172a;
+            --line: rgba(148, 163, 184, 0.18);
+            --text: #e5e7eb;
+            --muted: #94a3b8;
+            --accent: #3b82f6;
+            --accent-2: #22c55e;
+            --warn: #f59e0b;
+            --bad: #fb7185;
+            --good: #4ade80;
+            --soft: rgba(148, 163, 184, 0.08);
+            --shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
         }
         * { box-sizing: border-box; }
         body {
@@ -11016,7 +11135,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             min-height: 100vh;
             font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
             color: var(--text);
-            background: var(--bg);
+            background:
+                radial-gradient(circle at 15% 0%, rgba(59, 130, 246, 0.18), transparent 30%),
+                radial-gradient(circle at 92% 8%, rgba(34, 197, 94, 0.12), transparent 26%),
+                var(--bg);
         }
         .login-screen {
             min-height: 100vh;
@@ -11024,8 +11146,9 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             place-items: center;
             padding: 32px 16px;
             background:
-                radial-gradient(circle at 20% 10%, rgba(22, 119, 255, 0.12), transparent 34%),
-                linear-gradient(180deg, #ffffff 0%, #f5f7fb 100%);
+                radial-gradient(circle at 24% 12%, rgba(59, 130, 246, 0.22), transparent 34%),
+                radial-gradient(circle at 78% 10%, rgba(34, 197, 94, 0.12), transparent 28%),
+                linear-gradient(180deg, #0b1220 0%, #090f1c 100%);
         }
         .login-panel {
             width: min(420px, 100%);
@@ -11033,9 +11156,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             gap: 18px;
             padding: 34px;
             border-radius: 18px;
-            background: #fff;
+            background: rgba(15, 23, 42, 0.92);
             border: 1px solid var(--line);
             box-shadow: var(--shadow);
+            backdrop-filter: blur(18px);
         }
         .login-logo {
             width: 44px;
@@ -11043,7 +11167,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             display: grid;
             place-items: center;
             border-radius: 12px;
-            background: var(--accent);
+            background: linear-gradient(135deg, var(--accent), #2563eb);
             color: #fff;
             font-weight: 900;
             font-size: 22px;
@@ -11070,7 +11194,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             justify-content: space-between;
             gap: 16px;
             padding: 0 24px;
-            background: #fff;
+            background: rgba(15, 23, 42, 0.92);
             border-bottom: 1px solid var(--line);
             position: sticky;
             top: 0;
@@ -11126,18 +11250,18 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         }
         input {
             width: 100%;
-            border: 1px solid #d9dde7;
-            background: #fff;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(15, 23, 42, 0.86);
             color: var(--text);
             padding: 11px 12px;
             border-radius: 8px;
             outline: none;
         }
-        input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(22,119,255,.12); }
+        input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
         select {
             width: 100%;
-            border: 1px solid #d9dde7;
-            background: #fff;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(15, 23, 42, 0.86);
             color: var(--text);
             padding: 11px 12px;
             border-radius: 8px;
@@ -11151,10 +11275,10 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             font-weight: 700;
             cursor: pointer;
         }
-        .primary { background: var(--accent); color: #fff; }
-        .ghost { background: #fff; color: var(--text); border-color: var(--line); }
-        .danger { background: #fff1f0; color: var(--bad); border-color: #fecaca; }
-        .success { background: #f0fdf4; color: var(--good); border-color: #bbf7d0; }
+        .primary { background: linear-gradient(135deg, var(--accent), #2563eb); color: #fff; }
+        .ghost { background: rgba(148, 163, 184, 0.08); color: var(--text); border-color: var(--line); }
+        .danger { background: rgba(251, 113, 133, 0.14); color: var(--bad); border-color: rgba(251, 113, 133, 0.25); }
+        .success { background: rgba(74, 222, 128, 0.12); color: var(--good); border-color: rgba(74, 222, 128, 0.25); }
         .content {
             padding: 22px;
             display: grid;
@@ -11162,7 +11286,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             min-width: 0;
             border: 0;
             border-radius: 0;
-            background: var(--bg);
+            background: transparent;
         }
         .topbar {
             display: flex;
@@ -11198,7 +11322,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             background: var(--panel-2);
             border: 1px solid var(--line);
             min-width: 0;
-            box-shadow: 0 8px 24px rgba(15,23,42,.04);
+            box-shadow: 0 14px 34px rgba(0,0,0,.18);
         }
         .card strong {
             display: block;
@@ -11213,7 +11337,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             background: var(--panel-2);
             border: 1px solid var(--line);
             min-width: 0;
-            box-shadow: 0 8px 24px rgba(15,23,42,.04);
+            box-shadow: 0 14px 34px rgba(0,0,0,.18);
         }
         .surface-head {
             display: flex;
@@ -11267,7 +11391,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         th { color: var(--muted); font-weight: 600; }
         td code {
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            color: #1f2937;
+            color: #bfdbfe;
             word-break: break-all;
         }
         .pill {
@@ -11277,11 +11401,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             border-radius: 999px;
             font-size: 12px;
             font-weight: 700;
-            background: #eef2f7;
+            background: rgba(148, 163, 184, 0.12);
         }
-        .pill.good { background: #dcfce7; color: var(--good); }
-        .pill.bad { background: #fee2e2; color: var(--bad); }
-        .pill.warn { background: #fef3c7; color: var(--warn); }
+        .pill.good { background: rgba(74, 222, 128, 0.12); color: var(--good); }
+        .pill.bad { background: rgba(251, 113, 133, 0.14); color: var(--bad); }
+        .pill.warn { background: rgba(245, 158, 11, 0.14); color: var(--warn); }
         .table-actions {
             display: flex;
             gap: 8px;
@@ -11303,21 +11427,21 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             padding: 14px;
             border-radius: 10px;
             overflow: auto;
-            background: #0f172a;
-            border: 1px solid #111827;
+            background: #020617;
+            border: 1px solid rgba(148, 163, 184, 0.16);
             color: #dbeafe;
             font-size: 12px;
         }
         .empty {
             padding: 28px;
             border-radius: 10px;
-            border: 1px dashed #cfd6e4;
+            border: 1px dashed rgba(148, 163, 184, 0.25);
             text-align: center;
             color: var(--muted);
         }
         .nav-card .button-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
         .nav-btn { justify-content: flex-start; }
-        .nav-btn.active { background: #e6f4ff; color: var(--accent); border: 1px solid #91caff; }
+        .nav-btn.active { background: rgba(59, 130, 246, 0.16); color: #93c5fd; border: 1px solid rgba(96, 165, 250, 0.30); }
         .view-hidden { display: none !important; }
         .tls-panel { font-size: 16px; }
         .tls-panel label { font-size: 14px; }
@@ -11330,8 +11454,8 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
         textarea {
             width: 100%;
             min-height: 96px;
-            border: 1px solid #d9dde7;
-            background: #fff;
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            background: rgba(15, 23, 42, 0.86);
             color: var(--text);
             padding: 14px 16px;
             border-radius: 8px;
@@ -11759,9 +11883,9 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             return authValue;
         }
 
-        function persistAuth(user, pass) {
-            authValue = 'Basic ' + btoa(user + ':' + pass);
-            sessionStorage.setItem(sessionKey, JSON.stringify({ user, auth: authValue }));
+        function persistAuth(user, token, expiresAt) {
+            authValue = 'Bearer ' + token;
+            sessionStorage.setItem(sessionKey, JSON.stringify({ user, auth: authValue, expiresAt }));
         }
 
         function clearAuth() {
@@ -11781,6 +11905,20 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             adminTop.classList.remove('app-hidden');
             adminApp.classList.remove('app-hidden');
             loginError.textContent = '';
+        }
+
+        async function loginWithPassword(user, pass) {
+            const response = await fetch('/v1/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: user, password: pass }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || '用户名或密码错误');
+            }
+            persistAuth(data.username || user, data.access_token, data.expires_at);
+            return data;
         }
 
         async function verifyAuth() {
@@ -12042,10 +12180,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             loginError.textContent = '';
             const user = document.getElementById('login-username').value.trim();
             const pass = document.getElementById('login-password').value;
-            persistAuth(user, pass);
             try {
+                await loginWithPassword(user, pass);
                 const stats = await verifyAuth();
                 showApp();
+                document.getElementById('login-password').value = '';
                 statsJson.textContent = JSON.stringify(stats, null, 2);
                 await refreshDashboard();
             } catch (error) {
@@ -12624,6 +12763,11 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
             try {
                 const saved = JSON.parse(sessionStorage.getItem(sessionKey) || 'null');
                 if (!saved || !saved.auth) {
+                    showLogin('');
+                    return;
+                }
+                if (saved.expiresAt && Number(saved.expiresAt) <= Math.floor(Date.now() / 1000)) {
+                    clearAuth();
                     showLogin('');
                     return;
                 }
@@ -14117,9 +14261,33 @@ mod tests {
         assert!(html.contains("id=\"admin-app\" class=\"shell app-hidden\""));
         assert!(html.contains("sessionStorage"));
         assert!(html.contains("value=\"ops-admin\""));
+        assert!(html.contains("/v1/login"));
+        assert!(html.contains("Bearer "));
         assert!(!html.contains("Quick Login"));
         assert!(!html.contains("super-secret-password"));
         assert!(!html.contains("__ADMIN_PASS__"));
+        assert!(!html.contains("btoa(user + ':' + pass)"));
+    }
+
+    #[test]
+    fn admin_session_token_authorizes_until_expiry() {
+        let mut config = GatewayConfig::default();
+        config.admin.username = "ops-admin".to_string();
+        config.admin.password = "super-secret-password".to_string();
+        config.admin.bearer_token = "static-token".to_string();
+
+        let (token, expires_at) =
+            issue_admin_session_token(&config.admin).expect("issue admin session token");
+
+        assert!(expires_at > now_unix_secs());
+        assert!(verify_admin_session_token(&token, &config.admin));
+        assert!(is_authorized(
+            Some(&HeaderValue::from_str(&format!("Bearer {token}")).expect("header")),
+            &config.admin
+        ));
+
+        config.admin.password = "rotated-password".to_string();
+        assert!(!verify_admin_session_token(&token, &config.admin));
     }
 
     #[test]

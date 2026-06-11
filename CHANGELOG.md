@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.7 - 2026-06-11
+
+- Added `/v1/login` for dedicated admin login sessions with signed Bearer tokens and automatic dashboard entry until token expiry.
+- Restored the admin console to a dark default style while keeping login and dashboard as separate UI screens.
+- Kept admin passwords out of generated HTML and browser session storage; only short-lived signed session tokens are stored.
+
 ## v1.2.6 - 2026-06-11
 
 - Reworked the built-in admin console into a dedicated login-first experience with session-scoped credentials.
