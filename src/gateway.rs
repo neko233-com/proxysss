@@ -4041,28 +4041,35 @@ impl Gateway {
             }
 
             self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
-            let (body, stream_body) = if version == "HTTP/3" || cache_key.is_some() {
-                let response_body = match upstream_response.bytes().await {
-                    Ok(body_bytes) => body_bytes,
-                    Err(error) => {
-                        self.on_upstream_failure(
-                            &state.config,
-                            "http",
-                            route.runtime_scope.as_deref(),
-                            upstream,
-                        );
-                        last_error =
-                            Some(anyhow!("failed reading upstream response body: {error}"));
-                        continue;
-                    }
+            let is_sse = response_headers
+                .iter()
+                .find(|(name, _)| name == CONTENT_TYPE)
+                .and_then(|(_, value)| value.to_str().ok())
+                .map(|value| value.starts_with("text/event-stream"))
+                .unwrap_or(false);
+            let (body, stream_body) =
+                if version == "HTTP/3" || cache_key.is_some() || !is_sse {
+                    let response_body = match upstream_response.bytes().await {
+                        Ok(body_bytes) => body_bytes,
+                        Err(error) => {
+                            self.on_upstream_failure(
+                                &state.config,
+                                "http",
+                                route.runtime_scope.as_deref(),
+                                upstream,
+                            );
+                            last_error =
+                                Some(anyhow!("failed reading upstream response body: {error}"));
+                            continue;
+                        }
+                    };
+                    (response_body, None)
+                } else {
+                    (
+                        Bytes::new(),
+                        Some(streaming_body(upstream_response.bytes_stream())),
+                    )
                 };
-                (response_body, None)
-            } else {
-                (
-                    Bytes::new(),
-                    Some(streaming_body(upstream_response.bytes_stream())),
-                )
-            };
             let response = GatewayHttpResponse {
                 status,
                 headers: response_headers,
