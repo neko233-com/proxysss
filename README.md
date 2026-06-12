@@ -14,12 +14,12 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 **Upgrade to a specific version:**
 ```bash
-proxysss update --version v1.2.9
+proxysss update --version v1.2.11
 ```
 
-proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, and static delivery in one Rust binary while keeping the operational model straightforward.
+proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP/KCP-style datagrams, MQTT/IoT stream gateways, FTP, WebDAV, AI API reverse proxying, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v1.2.9
+Current version: v1.2.11
 
 ## Why proxysss
 
@@ -35,12 +35,15 @@ Current version: v1.2.9
 ## Supported gateway surface
 
 - HTTP/1.1, HTTPS, HTTP/2, HTTP/3, and WebSocket
-- TCP and UDP stream proxying
+- Low-latency TCP stream proxying with `TCP_NODELAY` and upstream connect timeout controls
+- UDP/KCP-style stream proxying with per-listener association TTL and caps for large game, voice, realtime, and device fleets
+- MQTT and IoT gateway patterns: MQTT TCP, MQTT TLS passthrough, MQTT over WebSocket, CoAP-style UDP, and stream rate policies
 - FTP nginx module directive-level parity with control-channel proxying, passive and active data-channel rewriting, allow/deny policy, command/transfer hooks, and per-user policies
 - WebDAV and static file serving
 - First-class AI reverse proxy routes for New API, sub2api, and OpenAI-compatible upstreams through `services.ai_proxy`
-- Managed ACME with HTTP-01 and TLS-ALPN-01, plus explicit acme.sh DNS-01 for wildcard certificates
+- Managed ACME with HTTP-01, TLS-ALPN-01, and built-in DNS-01 wildcard certificates; legacy `acme_dns_external` + acme.sh remains only for non-built-in DNS providers
 - Shared cache zones with stale-while-revalidate, compression, access control, fixed-window/token-bucket/leaky-bucket HTTP and stream rate limiting, retries, and active health checks
+- Runtime watchdog with critical background task restart, heartbeat metrics, and nonblocking access/error logging
 - Prometheus metrics on `/metrics`, weighted load balancing, round-robin, least-connections, source-hash, and rendezvous affinity
 - gRPC-over-HTTP/2, WebSocket, sticky sessions, passive quarantine (circuit breaker), and upstream failover retries
 
@@ -83,6 +86,8 @@ Validate the default config:
 ```bash
 proxysss -config ./proxysss.yaml check-config
 ```
+
+For production release gates and HA hardening, see [docs/PRODUCTION-HARDENING.md](docs/PRODUCTION-HARDENING.md).
 
 Run the gateway:
 
@@ -152,6 +157,12 @@ services:
         success_threshold: 2
 ```
 
+In that example:
+
+- `example.com` has one backend machine.
+- `neko233.store` reuses that same machine and adds one more backend.
+- each domain route is its own service group with its own routing, health, cache, compression, and TLS policy.
+
 ## Example: AI API reverse proxy
 
 Use `services.ai_proxy` for New API, sub2api, and OpenAI-compatible upstreams when the gateway should own path rewrites and provider metadata without custom business code.
@@ -176,11 +187,91 @@ services:
         rewrite_base_path: /v1
 ```
 
-In that example:
+## Example: game TCP and KCP-style UDP edge
 
-- `example.com` has one backend machine.
-- `neko233.store` reuses that same machine and adds one more backend.
-- each domain route is its own service group with its own routing, health, cache, compression, and TLS policy.
+Use direct stream listeners for latency-sensitive game servers, AI tool bridges, device gateways, voice, or KCP-style UDP protocols. `protocol` is an observability hint; TCP disables Nagle by default, and UDP listeners prune idle associations so churn cannot grow without bound.
+
+```yaml
+tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:9000
+        - 127.0.0.1:9001
+
+udp:
+  listeners:
+    - name: game-kcp
+      bind: 0.0.0.0:7001
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:9100
+        - 127.0.0.1:9101
+
+load_balance:
+  active_health:
+    enabled: true
+    http_enabled: true
+    tcp_enabled: true
+    udp_enabled: true
+    udp_payload: proxysss-health
+    udp_expect_response: true
+
+runtime:
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30
+```
+
+## Example: MQTT and IoT edge
+
+MQTT brokers usually stay protocol-aware upstreams; proxysss keeps the edge transparent and handles listener binding, TLS passthrough, WebSocket upgrades, upstream pools, rate limits, health, and observability.
+
+```yaml
+tcp:
+  listeners:
+    - name: mqtt
+      bind: 0.0.0.0:1883
+      protocol: mqtt
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:18831
+        - 127.0.0.1:18832
+  stream_routes:
+    - name: mqtt-tls
+      domains: [mqtt.example.com]
+      listen: 0.0.0.0:8883
+      upstream: 127.0.0.1:88831
+      protocol: mqtt
+      tls_mode: passthrough
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      protocol: coap
+      session_ttl_secs: 120
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:56831
+
+services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-websocket
+        hosts: [mqtt-ws.example.com]
+        path_prefix: /mqtt
+        upstream: ws://127.0.0.1:8083
+```
 
 ## Automatic HTTPS
 

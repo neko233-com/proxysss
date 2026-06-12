@@ -315,6 +315,9 @@ curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/upsert \
   -d '{
     "name": "game",
     "bind": "0.0.0.0:7000",
+    "protocol": "game_tcp",
+    "nodelay": true,
+    "connect_timeout_ms": 3000,
     "upstream": "127.0.0.1:9000",
     "upstreams": ["127.0.0.1:9001"]
   }'
@@ -323,8 +326,11 @@ curl -X POST http://127.0.0.1:7777/v1/udp-listeners/upsert \
   -u ops:change-me \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "voice",
+    "name": "voice-kcp",
     "bind": "0.0.0.0:7001",
+    "protocol": "kcp",
+    "session_ttl_secs": 180,
+    "max_associations": 262144,
     "upstream": "127.0.0.1:9001"
   }'
 
@@ -336,8 +342,21 @@ curl -X POST http://127.0.0.1:7777/v1/tcp-listeners/delete \
 curl -X POST http://127.0.0.1:7777/v1/udp-listeners/delete \
   -u ops:change-me \
   -H "Content-Type: application/json" \
-  -d '{"name": "voice"}'
+  -d '{"name": "voice-kcp"}'
 ```
+
+TCP listener upserts accept `protocol`, `nodelay`, and `connect_timeout_ms`. UDP listener upserts accept `protocol`, `session_ttl_secs`, and `max_associations` so automation can provision game/KCP/voice fleets without custom scripts.
+
+## Production health surfaces
+
+Use `/metrics` plus `/v1/upstreams` to verify release health after automation:
+
+```bash
+curl http://127.0.0.1:7777/metrics -u ops:change-me
+curl http://127.0.0.1:7777/v1/upstreams -u ops:change-me
+```
+
+Watch `proxysss_critical_task_failures_total`, `proxysss_watchdog_heartbeat_total`, active health status, and manual drain state before promoting a node.
 
 ## Kubernetes ingress-style mappings (config-gated)
 

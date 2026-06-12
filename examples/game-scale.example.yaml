@@ -1,0 +1,57 @@
+# Large-scale game / AI tool bridge / realtime stream edge example.
+# Copy the sections you need into proxysss.yaml.
+
+tcp:
+  listeners:
+    - name: game-login-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:9000
+        - 127.0.0.1:9001
+      upstream_weights:
+        "127.0.0.1:9000": 1
+        "127.0.0.1:9001": 1
+
+udp:
+  listeners:
+    - name: game-kcp
+      bind: 0.0.0.0:7001
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:9100
+        - 127.0.0.1:9101
+      upstream_weights:
+        "127.0.0.1:9100": 1
+        "127.0.0.1:9101": 1
+
+services:
+  rate_limit:
+    stream:
+      enabled: true
+      algorithm: token_bucket
+      connections: 120
+      window_ms: 60000
+      burst: 240
+
+load_balance:
+  active_health:
+    enabled: true
+    http_enabled: true
+    tcp_enabled: true
+    udp_enabled: true
+    interval_secs: 10
+    timeout_ms: 2000
+    udp_payload: proxysss-health
+    udp_expect_response: true
+
+runtime:
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30

@@ -325,6 +325,14 @@ pub struct TcpListenerConfig {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub upstream_weights: BTreeMap<String, u32>,
+    /// Observability hint: game_tcp, mqtt, custom-binary, etc.
+    #[serde(default)]
+    pub protocol: String,
+    /// Disable Nagle for latency-sensitive streams such as games and AI tool bridges.
+    #[serde(default = "default_true")]
+    pub nodelay: bool,
+    #[serde(default = "default_stream_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -343,6 +351,15 @@ pub struct UdpListenerConfig {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub upstream_weights: BTreeMap<String, u32>,
+    /// Observability hint: kcp, quic-game, voip, custom-datagram, etc.
+    #[serde(default)]
+    pub protocol: String,
+    /// Idle UDP association TTL. KCP and game traffic should keep this above client heartbeat interval.
+    #[serde(default = "default_udp_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Per-listener association cap. 0 disables the cap.
+    #[serde(default = "default_udp_max_associations")]
+    pub max_associations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +444,8 @@ pub struct ActiveHealthConfig {
     pub http_enabled: bool,
     #[serde(default = "default_true")]
     pub tcp_enabled: bool,
+    #[serde(default)]
+    pub udp_enabled: bool,
     #[serde(default = "default_active_health_interval_secs")]
     pub interval_secs: u64,
     #[serde(default = "default_active_health_timeout_ms")]
@@ -443,6 +462,10 @@ pub struct ActiveHealthConfig {
     pub jitter_percent: u8,
     #[serde(default)]
     pub alert_webhooks: Vec<String>,
+    #[serde(default = "default_active_health_udp_payload")]
+    pub udp_payload: String,
+    #[serde(default = "default_true")]
+    pub udp_expect_response: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -645,6 +668,20 @@ pub struct RuntimeConfig {
     pub hot_reload: HotReloadConfig,
     #[serde(default)]
     pub maintenance_state: MaintenanceStateConfig,
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchdogConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub restart_critical_tasks: bool,
+    #[serde(default = "default_watchdog_restart_backoff_secs")]
+    pub restart_backoff_secs: u64,
+    #[serde(default = "default_watchdog_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1121,6 +1158,19 @@ impl GatewayConfig {
             errors.push("runtime.maintenance_state.path cannot be empty".to_string());
         }
 
+        if self.runtime.watchdog.enabled {
+            if self.runtime.watchdog.restart_backoff_secs == 0 {
+                errors.push(
+                    "runtime.watchdog.restart_backoff_secs must be greater than 0".to_string(),
+                );
+            }
+            if self.runtime.watchdog.heartbeat_interval_secs == 0 {
+                errors.push(
+                    "runtime.watchdog.heartbeat_interval_secs must be greater than 0".to_string(),
+                );
+            }
+        }
+
         if !self.include.is_disabled() {
             errors.push(
                 "include is removed in v1.0: merge every referenced file into proxysss.yaml and delete the include block"
@@ -1161,9 +1211,11 @@ impl GatewayConfig {
         if self.load_balance.active_health.enabled {
             if !self.load_balance.active_health.http_enabled
                 && !self.load_balance.active_health.tcp_enabled
+                && !self.load_balance.active_health.udp_enabled
             {
                 errors.push(
-                    "load_balance.active_health requires http_enabled or tcp_enabled".to_string(),
+                    "load_balance.active_health requires http_enabled, tcp_enabled, or udp_enabled"
+                        .to_string(),
                 );
             }
             if self.load_balance.active_health.interval_secs == 0 {
@@ -1200,6 +1252,11 @@ impl GatewayConfig {
             }
             if self.load_balance.active_health.jitter_percent > 100 {
                 errors.push("load_balance.active_health.jitter_percent must be <= 100".to_string());
+            }
+            if self.load_balance.active_health.udp_enabled
+                && self.load_balance.active_health.udp_payload.is_empty()
+            {
+                errors.push("load_balance.active_health.udp_payload cannot be empty".to_string());
             }
             for (index, webhook) in self
                 .load_balance
@@ -1673,6 +1730,12 @@ impl GatewayConfig {
                     listener.name
                 ));
             }
+            if listener.connect_timeout_ms == 0 {
+                errors.push(format!(
+                    "tcp.listeners.{}.connect_timeout_ms must be greater than 0",
+                    listener.name
+                ));
+            }
         }
 
         let mut udp_names = HashSet::<String>::new();
@@ -1698,6 +1761,12 @@ impl GatewayConfig {
             {
                 errors.push(format!(
                     "udp.listeners.{} requires upstream/upstreams when script.enabled=false",
+                    listener.name
+                ));
+            }
+            if listener.session_ttl_secs == 0 {
+                errors.push(format!(
+                    "udp.listeners.{}.session_ttl_secs must be greater than 0",
                     listener.name
                 ));
             }
@@ -2319,6 +2388,7 @@ impl Default for ActiveHealthConfig {
             enabled: default_true(),
             http_enabled: default_true(),
             tcp_enabled: default_true(),
+            udp_enabled: false,
             interval_secs: default_active_health_interval_secs(),
             timeout_ms: default_active_health_timeout_ms(),
             path: default_active_health_path(),
@@ -2327,6 +2397,8 @@ impl Default for ActiveHealthConfig {
             success_threshold: default_active_health_success_threshold(),
             jitter_percent: 0,
             alert_webhooks: Vec::new(),
+            udp_payload: default_active_health_udp_payload(),
+            udp_expect_response: default_true(),
         }
     }
 }
@@ -2452,6 +2524,17 @@ impl Default for MaintenanceStateConfig {
         Self {
             enabled: default_true(),
             path: default_maintenance_state_path(),
+        }
+    }
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            restart_critical_tasks: default_true(),
+            restart_backoff_secs: default_watchdog_restart_backoff_secs(),
+            heartbeat_interval_secs: default_watchdog_heartbeat_interval_secs(),
         }
     }
 }
@@ -2945,6 +3028,18 @@ fn default_udp_listeners() -> Vec<UdpListenerConfig> {
     Vec::new()
 }
 
+fn default_stream_connect_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_udp_session_ttl_secs() -> u64 {
+    180
+}
+
+fn default_udp_max_associations() -> usize {
+    262_144
+}
+
 fn default_script_entry() -> PathBuf {
     PathBuf::from(DEFAULT_SCRIPT_FILE_NAME)
 }
@@ -3135,6 +3230,18 @@ fn default_active_health_failure_threshold() -> u32 {
 
 fn default_active_health_success_threshold() -> u32 {
     2
+}
+
+fn default_active_health_udp_payload() -> String {
+    "proxysss-health".to_string()
+}
+
+fn default_watchdog_restart_backoff_secs() -> u64 {
+    2
+}
+
+fn default_watchdog_heartbeat_interval_secs() -> u64 {
+    30
 }
 
 fn normalize_active_health_override(config: &mut ActiveHealthOverrideConfig) {
@@ -3563,11 +3670,21 @@ mod tests {
         assert!(config.load_balance.active_health.enabled);
         assert!(config.load_balance.active_health.http_enabled);
         assert!(config.load_balance.active_health.tcp_enabled);
+        assert!(!config.load_balance.active_health.udp_enabled);
         assert_eq!(config.load_balance.active_health.interval_secs, 10);
         assert_eq!(config.load_balance.active_health.timeout_ms, 2000);
         assert_eq!(config.load_balance.active_health.path, "/healthz");
+        assert_eq!(
+            config.load_balance.active_health.udp_payload,
+            "proxysss-health"
+        );
+        assert!(config.load_balance.active_health.udp_expect_response);
         assert_eq!(config.load_balance.passive_health.fail_threshold, 3);
         assert_eq!(config.load_balance.passive_health.quarantine_secs, 15);
+        assert!(config.runtime.watchdog.enabled);
+        assert!(config.runtime.watchdog.restart_critical_tasks);
+        assert_eq!(config.runtime.watchdog.restart_backoff_secs, 2);
+        assert_eq!(config.runtime.watchdog.heartbeat_interval_secs, 30);
     }
 
     #[test]
@@ -3576,13 +3693,14 @@ mod tests {
         config.load_balance.active_health.enabled = true;
         config.load_balance.active_health.http_enabled = false;
         config.load_balance.active_health.tcp_enabled = false;
+        config.load_balance.active_health.udp_enabled = false;
 
         let error = config
             .validate()
             .expect_err("expected invalid active health protocol selection");
-        assert!(error
-            .to_string()
-            .contains("load_balance.active_health requires http_enabled or tcp_enabled"));
+        assert!(error.to_string().contains(
+            "load_balance.active_health requires http_enabled, tcp_enabled, or udp_enabled"
+        ));
     }
 
     #[test]
@@ -3964,6 +4082,9 @@ mod tests {
             upstream: String::new(),
             upstreams: Vec::new(),
             upstream_weights: BTreeMap::new(),
+            protocol: String::new(),
+            nodelay: true,
+            connect_timeout_ms: 3_000,
         });
 
         let error = config
@@ -3972,6 +4093,60 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires upstream/upstreams when script.enabled=false"));
+    }
+
+    #[test]
+    fn stream_listener_defaults_are_game_ready() {
+        let yaml = r#"
+tcp:
+  listeners:
+    - name: game-tcp
+      bind: 127.0.0.1:7000
+      upstream: 127.0.0.1:9000
+udp:
+  listeners:
+    - name: game-kcp
+      bind: 127.0.0.1:7001
+      upstream: 127.0.0.1:9001
+"#;
+        let config: GatewayConfig = serde_yaml::from_str(yaml).expect("config yaml");
+
+        assert!(config.tcp.listeners[0].nodelay);
+        assert_eq!(config.tcp.listeners[0].connect_timeout_ms, 3_000);
+        assert_eq!(config.udp.listeners[0].session_ttl_secs, 180);
+        assert_eq!(config.udp.listeners[0].max_associations, 262_144);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_stream_listener_tuning() {
+        let mut config = GatewayConfig::default();
+        config.tcp.listeners.push(TcpListenerConfig {
+            name: "game-tcp".to_string(),
+            bind: "127.0.0.1:7000".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            protocol: "game_tcp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 0,
+        });
+        config.udp.listeners.push(UdpListenerConfig {
+            name: "game-kcp".to_string(),
+            bind: "127.0.0.1:7001".to_string(),
+            upstream: "127.0.0.1:9001".to_string(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            protocol: "kcp".to_string(),
+            session_ttl_secs: 0,
+            max_associations: 1,
+        });
+
+        let error = config
+            .validate()
+            .expect_err("expected invalid stream listener tuning");
+        let message = error.to_string();
+        assert!(message.contains("connect_timeout_ms"));
+        assert!(message.contains("session_ttl_secs"));
     }
 
     #[test]

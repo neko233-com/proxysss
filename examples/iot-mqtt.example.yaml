@@ -1,0 +1,70 @@
+# MQTT / IoT edge gateway example.
+# proxysss stays transparent; MQTT/CoAP protocol semantics remain in upstream brokers/services.
+
+tcp:
+  listeners:
+    - name: mqtt
+      bind: 0.0.0.0:1883
+      protocol: mqtt
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:18831
+        - 127.0.0.1:18832
+      upstream_weights:
+        "127.0.0.1:18831": 1
+        "127.0.0.1:18832": 1
+  stream_routes:
+    - name: mqtt-tls
+      domains: [mqtt.example.com]
+      listen: 0.0.0.0:8883
+      upstream: 127.0.0.1:88831
+      protocol: mqtt
+      tls_mode: passthrough
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      protocol: coap
+      session_ttl_secs: 120
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:56831
+
+services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-websocket
+        hosts: [mqtt-ws.example.com]
+        path_prefix: /mqtt
+        upstream: ws://127.0.0.1:8083
+  access_control:
+    stream:
+      enabled: true
+      deny: []
+  rate_limit:
+    stream:
+      enabled: true
+      algorithm: token_bucket
+      connections: 600
+      window_ms: 60000
+      burst: 1200
+
+load_balance:
+  active_health:
+    enabled: true
+    http_enabled: true
+    tcp_enabled: true
+    udp_enabled: false
+    interval_secs: 10
+    timeout_ms: 2000
+    udp_payload: proxysss-health
+    udp_expect_response: true
+
+runtime:
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30

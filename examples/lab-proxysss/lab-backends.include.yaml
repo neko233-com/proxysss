@@ -29,8 +29,16 @@ tcp:
   listeners:
     - name: tcp-affinity-demo
       bind: 0.0.0.0:26379
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstream: 127.0.0.1:26380
 
 udp:
   listeners:
     - name: udp-affinity-demo
       bind: 0.0.0.0:2053
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstream: 127.0.0.1:2054

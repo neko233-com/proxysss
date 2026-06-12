@@ -1,6 +1,7 @@
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::fs;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Cursor};
 use std::net::{IpAddr, SocketAddr};
@@ -110,6 +111,11 @@ struct DynamicState {
     script: Option<Arc<ScriptRuntime>>,
 }
 
+struct UdpAssociation {
+    socket: Arc<UdpSocket>,
+    last_seen_epoch: AtomicU64,
+}
+
 pub(crate) struct GatewayHttpResponse {
     status: StatusCode,
     headers: Vec<(HeaderName, HeaderValue)>,
@@ -214,6 +220,8 @@ struct ResolvedActiveHealthConfig {
     success_threshold: u32,
     jitter_percent: u8,
     alert_webhooks: Vec<String>,
+    udp_payload: String,
+    udp_expect_response: bool,
 }
 
 #[derive(Debug)]
@@ -241,6 +249,8 @@ struct GatewayStats {
     script_fail_total: AtomicU64,
     blocked_requests_total: AtomicU64,
     ddos_bans_total: AtomicU64,
+    critical_task_failures_total: AtomicU64,
+    watchdog_heartbeat_total: AtomicU64,
     process_metrics: Mutex<ProcessMetricsSampler>,
 }
 
@@ -479,31 +489,54 @@ impl Gateway {
         let mut tasks = JoinSet::new();
 
         if self.bootstrap_config.runtime.hot_reload.enabled {
-            let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_hot_reload_loop().await });
+            Self::spawn_supervised_task(&mut tasks, self.clone(), "hot_reload", |gateway| async {
+                gateway.run_hot_reload_loop().await
+            });
         }
 
         match self.bootstrap_config.http.tls.mode {
             TlsMode::AcmeManaged => {
-                let gateway = self.clone();
-                tasks.spawn(async move { gateway.run_managed_acme_renew_loop().await });
+                Self::spawn_supervised_task(
+                    &mut tasks,
+                    self.clone(),
+                    "managed_acme_renew",
+                    |gateway| async { gateway.run_managed_acme_renew_loop().await },
+                );
             }
             TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal => {
-                let gateway = self.clone();
-                tasks.spawn(async move { gateway.run_acme_renew_loop().await });
+                Self::spawn_supervised_task(
+                    &mut tasks,
+                    self.clone(),
+                    "external_acme_renew",
+                    |gateway| async { gateway.run_acme_renew_loop().await },
+                );
             }
             TlsMode::SelfSigned | TlsMode::Manual => {}
         }
 
-        let gateway = self.clone();
-        tasks.spawn(async move { gateway.run_listener_supervisor().await });
+        Self::spawn_supervised_task(
+            &mut tasks,
+            self.clone(),
+            "listener_supervisor",
+            |gateway| async { gateway.run_listener_supervisor().await },
+        );
 
-        let gateway = self.clone();
-        tasks.spawn(async move { gateway.run_active_health_loop().await });
+        Self::spawn_supervised_task(&mut tasks, self.clone(), "active_health", |gateway| async {
+            gateway.run_active_health_loop().await
+        });
 
         if self.bootstrap_config.http.tls.on_demand.enabled {
+            Self::spawn_supervised_task(
+                &mut tasks,
+                self.clone(),
+                "on_demand_tls_cleanup",
+                |gateway| async { gateway.run_on_demand_tls_cleanup_loop().await },
+            );
+        }
+
+        if self.bootstrap_config.runtime.watchdog.enabled {
             let gateway = self.clone();
-            tasks.spawn(async move { gateway.run_on_demand_tls_cleanup_loop().await });
+            tasks.spawn(async move { gateway.run_watchdog_loop().await });
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -511,6 +544,73 @@ impl Gateway {
         }
 
         Ok(())
+    }
+
+    fn spawn_supervised_task<F, Fut>(
+        tasks: &mut JoinSet<Result<()>>,
+        gateway: Arc<Self>,
+        name: &'static str,
+        run: F,
+    ) where
+        F: Fn(Arc<Self>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        tasks.spawn(async move {
+            loop {
+                let result = run.clone()(gateway.clone()).await;
+                gateway
+                    .stats
+                    .critical_task_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+
+                let watchdog = {
+                    let state = gateway.current_state().await;
+                    state.config.runtime.watchdog.clone()
+                };
+
+                match &result {
+                    Ok(()) => tracing::warn!(task = name, "critical gateway task exited"),
+                    Err(error) => {
+                        tracing::error!(task = name, ?error, "critical gateway task failed")
+                    }
+                }
+
+                if !watchdog.enabled || !watchdog.restart_critical_tasks {
+                    return result.with_context(|| format!("critical task {name} stopped"));
+                }
+
+                let backoff = Duration::from_secs(watchdog.restart_backoff_secs.max(1));
+                tracing::warn!(
+                    task = name,
+                    backoff_secs = backoff.as_secs(),
+                    "restarting critical gateway task"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        });
+    }
+
+    async fn run_watchdog_loop(self: Arc<Self>) -> Result<()> {
+        loop {
+            let interval = {
+                let state = self.current_state().await;
+                Duration::from_secs(state.config.runtime.watchdog.heartbeat_interval_secs.max(1))
+            };
+            tokio::time::sleep(interval).await;
+            self.stats
+                .watchdog_heartbeat_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                http_requests = self.stats.http_requests.load(Ordering::Relaxed),
+                tcp_sessions_active = self.stats.tcp_sessions_active.load(Ordering::Relaxed),
+                udp_packets_total = self.stats.udp_packets_total.load(Ordering::Relaxed),
+                critical_task_failures_total = self
+                    .stats
+                    .critical_task_failures_total
+                    .load(Ordering::Relaxed),
+                "watchdog heartbeat"
+            );
+        }
     }
 
     async fn run_hot_reload_loop(self: Arc<Self>) -> Result<()> {
@@ -2967,10 +3067,18 @@ impl Gateway {
         loop {
             let (mut inbound, remote_addr) =
                 listener.accept().await.context("tcp accept failed")?;
+            if listener_config.nodelay {
+                inbound
+                    .set_nodelay(true)
+                    .with_context(|| format!("failed setting TCP_NODELAY for {remote_addr}"))?;
+            }
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
             let listener_bind = listener_config.bind.clone();
             let listener_default_upstream = listener_config.upstream.clone();
+            let listener_protocol = listener_config.protocol.clone();
+            let listener_nodelay = listener_config.nodelay;
+            let listener_connect_timeout_ms = listener_config.connect_timeout_ms;
             let stream_rate_limit = self
                 .current_state()
                 .await
@@ -3156,13 +3264,32 @@ impl Gateway {
                     for upstream in upstream_plan.iter().take(max_attempts) {
                         let lease =
                             gateway.acquire_upstream_lease("tcp", Some(&listener_name), upstream);
-                        match TcpStream::connect(upstream).await {
-                            Ok(stream) => {
+                        match tokio::time::timeout(
+                            Duration::from_millis(listener_connect_timeout_ms.max(1)),
+                            TcpStream::connect(upstream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => {
+                                if listener_nodelay {
+                                    stream.set_nodelay(true).with_context(|| {
+                                        format!("failed setting TCP_NODELAY for upstream {upstream}")
+                                    })?;
+                                }
+                                if !listener_protocol.trim().is_empty() {
+                                    tracing::debug!(
+                                        protocol = %listener_protocol,
+                                        listener = %listener_name,
+                                        upstream = %upstream,
+                                        %remote_addr,
+                                        "tcp protocol hint selected"
+                                    );
+                                }
                                 gateway.on_upstream_success("tcp", Some(&listener_name), upstream);
                                 selected = Some((stream, lease, upstream.clone()));
                                 break;
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
                                 gateway.on_upstream_failure(
                                     &state.config,
                                     "tcp",
@@ -3171,6 +3298,17 @@ impl Gateway {
                                 );
                                 last_error = Some(anyhow!(
                                     "failed to connect tcp upstream {upstream}: {error}"
+                                ));
+                            }
+                            Err(_) => {
+                                gateway.on_upstream_failure(
+                                    &state.config,
+                                    "tcp",
+                                    Some(&listener_name),
+                                    upstream,
+                                );
+                                last_error = Some(anyhow!(
+                                    "timed out connecting tcp upstream {upstream} after {listener_connect_timeout_ms}ms"
                                 ));
                             }
                         }
@@ -3380,7 +3518,10 @@ impl Gateway {
                 .await
                 .with_context(|| format!("failed to bind udp listener {}", bind_addr))?,
         );
-        let associations = Arc::new(DashMap::<SocketAddr, Arc<UdpSocket>>::new());
+        let associations = Arc::new(DashMap::<SocketAddr, Arc<UdpAssociation>>::new());
+        let session_ttl_secs = listener_config.session_ttl_secs.max(1);
+        let max_associations = listener_config.max_associations;
+        let protocol_hint = listener_config.protocol.clone();
 
         tracing::info!(listener = %listener_config.name, bind = %bind_addr, "udp listener ready");
 
@@ -3400,6 +3541,7 @@ impl Gateway {
             let listener_name = listener_config.name.clone();
             let listener_socket = listener_socket.clone();
             let associations = associations.clone();
+            let protocol_hint = protocol_hint.clone();
 
             tokio::spawn(async move {
                 let request_id = Uuid::new_v4().to_string();
@@ -3408,8 +3550,23 @@ impl Gateway {
                     let state = gateway.current_state().await;
 
                     let upstream_socket = if let Some(existing) = associations.get(&client_addr) {
-                        existing.clone()
+                        existing
+                            .last_seen_epoch
+                            .store(now_unix_secs(), Ordering::Relaxed);
+                        existing.socket.clone()
                     } else {
+                        prune_udp_associations(&associations, session_ttl_secs, max_associations);
+                        if max_associations > 0 && associations.len() >= max_associations {
+                            gateway
+                                .stats
+                                .blocked_requests_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(anyhow!(
+                                "udp listener {} reached max_associations {}",
+                                listener_name,
+                                max_associations
+                            ));
+                        }
                         let player_id = extract_stream_player_id(&payload, &state.config.affinity.stream);
                         let route = if let Some(route) = configured_udp_listener_route(
                             &state.config,
@@ -3495,24 +3652,64 @@ impl Gateway {
                         let (socket, lease) = selected
                             .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("failed to connect any udp upstream")))?;
 
+                        if !protocol_hint.trim().is_empty() {
+                            tracing::debug!(
+                                protocol = %protocol_hint,
+                                listener = %listener_name,
+                                %client_addr,
+                                "udp protocol hint selected"
+                            );
+                        }
                         let read_socket = socket.clone();
                         let send_socket = listener_socket.clone();
-                        associations.insert(client_addr, socket.clone());
+                        let association = Arc::new(UdpAssociation {
+                            socket: socket.clone(),
+                            last_seen_epoch: AtomicU64::new(now_unix_secs()),
+                        });
+                        associations.insert(client_addr, association);
+                        let associations_for_reader = associations.clone();
 
                         tokio::spawn(async move {
                             let _lease = lease;
                             let mut response = vec![0_u8; 65_536];
+                            let check_interval = Duration::from_secs(session_ttl_secs.clamp(1, 30));
                             loop {
-                                match read_socket.recv(&mut response).await {
-                                    Ok(size) => {
+                                match tokio::time::timeout(
+                                    check_interval,
+                                    read_socket.recv(&mut response),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(size)) => {
                                         if let Err(error) = send_socket.send_to(&response[..size], client_addr).await {
                                             tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
+                                            associations_for_reader.remove(&client_addr);
                                             break;
                                         }
                                     }
-                                    Err(error) => {
+                                    Ok(Err(error)) => {
                                         tracing::warn!(?error, %client_addr, "udp upstream association closed");
+                                        associations_for_reader.remove(&client_addr);
                                         break;
+                                    }
+                                    Err(_) => {
+                                        let expired = associations_for_reader
+                                            .get(&client_addr)
+                                            .map(|entry| {
+                                                now_unix_secs().saturating_sub(
+                                                    entry.last_seen_epoch.load(Ordering::Relaxed),
+                                                ) > session_ttl_secs
+                                            })
+                                            .unwrap_or(true);
+                                        if expired {
+                                            associations_for_reader.remove(&client_addr);
+                                            tracing::debug!(
+                                                %client_addr,
+                                                ttl_secs = session_ttl_secs,
+                                                "udp upstream association expired"
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -4969,6 +5166,9 @@ impl Gateway {
                 ActiveHealthKind::Tcp => {
                     probe_tcp_upstream(&target.upstream, &target.settings).await
                 }
+                ActiveHealthKind::Udp => {
+                    probe_udp_upstream(&target.upstream, &target.settings).await
+                }
             };
 
             let mut alert_payload = None;
@@ -5107,6 +5307,7 @@ struct ActiveHealthTarget {
 enum ActiveHealthKind {
     Http,
     Tcp,
+    Udp,
 }
 
 impl ActiveHealthKind {
@@ -5114,6 +5315,7 @@ impl ActiveHealthKind {
         match self {
             Self::Http => "http",
             Self::Tcp => "tcp",
+            Self::Udp => "udp",
         }
     }
 }
@@ -5211,6 +5413,33 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                 kind: ActiveHealthKind::Tcp,
                 settings: resolve_global_active_health_config(&config.load_balance.active_health),
             });
+        }
+    }
+
+    if config.load_balance.active_health.enabled && config.load_balance.active_health.udp_enabled {
+        for listener in &config.udp.listeners {
+            for upstream in normalize_candidates(&RouteDecision {
+                upstream: listener.upstream.clone(),
+                upstreams: listener.upstreams.clone(),
+                upstream_weights: listener.upstream_weights.clone(),
+                affinity_key: None,
+                rewrite_path: None,
+                set_headers: BTreeMap::new(),
+                strip_headers: Vec::new(),
+                status: None,
+                content_type: None,
+            }) {
+                let key = runtime_scope_key("udp", Some(&listener.name), &upstream);
+                upstreams.entry(key).or_insert(ActiveHealthTarget {
+                    protocol: "udp".to_string(),
+                    listener: Some(listener.name.clone()),
+                    upstream,
+                    kind: ActiveHealthKind::Udp,
+                    settings: resolve_global_active_health_config(
+                        &config.load_balance.active_health,
+                    ),
+                });
+            }
         }
     }
 
@@ -5313,6 +5542,125 @@ async fn probe_tcp_upstream(
             None,
             Some(format!(
                 "tcp connect timeout after {}ms",
+                timeout.as_millis()
+            )),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        ),
+    }
+}
+
+async fn probe_udp_upstream(
+    upstream: &str,
+    settings: &ResolvedActiveHealthConfig,
+) -> (bool, Option<u16>, Option<String>, Option<u64>) {
+    let started_at = Instant::now();
+    let timeout = Duration::from_millis(settings.timeout_ms.max(100));
+    let target = match tcp_probe_target(upstream) {
+        Ok(target) => target,
+        Err(error) => return (false, None, Some(error.to_string()), None),
+    };
+    let bind_any = if target.contains(':') && !target.contains('.') {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match UdpSocket::bind(bind_any).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            return (
+                false,
+                None,
+                Some(error.to_string()),
+                Some(
+                    started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+            )
+        }
+    };
+    if let Err(error) = socket.connect(&target).await {
+        return (
+            false,
+            None,
+            Some(error.to_string()),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        );
+    }
+    if let Err(error) = socket.send(settings.udp_payload.as_bytes()).await {
+        return (
+            false,
+            None,
+            Some(error.to_string()),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        );
+    }
+    if !settings.udp_expect_response {
+        return (
+            true,
+            None,
+            None,
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        );
+    }
+
+    let mut buffer = [0_u8; 2048];
+    match tokio::time::timeout(timeout, socket.recv(&mut buffer)).await {
+        Ok(Ok(_)) => (
+            true,
+            None,
+            None,
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        ),
+        Ok(Err(error)) => (
+            false,
+            None,
+            Some(error.to_string()),
+            Some(
+                started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        ),
+        Err(_) => (
+            false,
+            None,
+            Some(format!(
+                "udp response timeout after {}ms",
                 timeout.as_millis()
             )),
             Some(
@@ -5666,6 +6014,8 @@ impl GatewayStats {
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
             "blocked_requests_total": self.blocked_requests_total.load(Ordering::Relaxed),
             "ddos_bans_total": self.ddos_bans_total.load(Ordering::Relaxed),
+            "critical_task_failures_total": self.critical_task_failures_total.load(Ordering::Relaxed),
+            "watchdog_heartbeat_total": self.watchdog_heartbeat_total.load(Ordering::Relaxed),
             "process": {
                 "pid": process.pid,
                 "cpu_percent": process.cpu_percent,
@@ -5738,6 +6088,16 @@ impl GatewayStats {
                 "proxysss_ddos_bans_total",
                 "Connections temporarily banned by DDoS mitigation",
                 self.ddos_bans_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_critical_task_failures_total",
+                "Critical gateway background tasks that exited or failed",
+                self.critical_task_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_watchdog_heartbeat_total",
+                "Runtime watchdog heartbeat ticks",
+                self.watchdog_heartbeat_total.load(Ordering::Relaxed),
             ),
         ];
 
@@ -6352,6 +6712,9 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
             upstream: config.services.ftp.upstream.clone(),
             upstreams: Vec::new(),
             upstream_weights: BTreeMap::new(),
+            protocol: "ftp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 3_000,
         }));
     }
 
@@ -6368,6 +6731,12 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
             upstream: default_upstream,
             upstreams: Vec::new(),
             upstream_weights: BTreeMap::new(),
+            protocol: routes
+                .first()
+                .map(|route| route.protocol.clone())
+                .unwrap_or_default(),
+            nodelay: true,
+            connect_timeout_ms: 3_000,
         }));
     }
 
@@ -8198,6 +8567,36 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn prune_udp_associations(
+    associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
+    session_ttl_secs: u64,
+    max_associations: usize,
+) {
+    let now = now_unix_secs();
+    associations.retain(|_, association| {
+        now.saturating_sub(association.last_seen_epoch.load(Ordering::Relaxed)) <= session_ttl_secs
+    });
+
+    if max_associations == 0 || associations.len() < max_associations {
+        return;
+    }
+
+    let mut oldest = associations
+        .iter()
+        .map(|entry| (*entry.key(), entry.last_seen_epoch.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>();
+    oldest.sort_by_key(|(_, last_seen)| *last_seen);
+
+    let remove_count = associations.len().saturating_sub(
+        max_associations
+            .saturating_sub(max_associations / 10)
+            .max(1),
+    );
+    for (addr, _) in oldest.into_iter().take(remove_count) {
+        associations.remove(&addr);
+    }
 }
 
 fn admin_session_signing_key(admin: &AdminConfig) -> Vec<u8> {
@@ -10057,6 +10456,8 @@ fn resolve_active_health_config(
         } else {
             override_config.alert_webhooks.clone()
         },
+        udp_payload: base.udp_payload.clone(),
+        udp_expect_response: base.udp_expect_response,
     }
 }
 
@@ -10070,6 +10471,8 @@ fn resolve_global_active_health_config(base: &ActiveHealthConfig) -> ResolvedAct
         success_threshold: base.success_threshold,
         jitter_percent: base.jitter_percent,
         alert_webhooks: base.alert_webhooks.clone(),
+        udp_payload: base.udp_payload.clone(),
+        udp_expect_response: base.udp_expect_response,
     }
 }
 
@@ -10894,6 +11297,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
     let static_site = docs_template_static_site();
     let webdav = docs_template_webdav();
     let streams = docs_template_streams();
+    let iot = docs_template_iot();
     let ftp = docs_template_ftp();
     let acme_dns = docs_template_acme_dns();
     let health = docs_template_health();
@@ -11017,6 +11421,8 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <pre>{}</pre>
                 <h3>TCP / UDP Streams</h3>
                 <pre>{}</pre>
+                <h3>MQTT / IoT Gateways</h3>
+                <pre>{}</pre>
                 <h3>FTP Native Control + Data Channels</h3>
                 <pre>{}</pre>
                 <h3 id="wildcard-ssl">Wildcard SSL with built-in DNS-01</h3>
@@ -11042,6 +11448,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                         <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
                         <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
                         <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
+                        <tr><td>MQTT / IoT</td><td><span class="pill good">supported</span></td><td>MQTT TCP, MQTT TLS passthrough, MQTT over WebSocket, CoAP-style UDP, stream policies, and watchdog/health metrics</td></tr>
                         <tr><td>FTP</td><td><span class="pill good">supported</span></td><td>nginx ftp module directive parity: bind/proxy_pass, passive range, pasv_address, allow/deny, command and transfer policies, per-user rules, lifecycle logs</td></tr>
                     </tbody>
                 </table>
@@ -11064,6 +11471,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
         static_site,
         webdav,
         streams,
+        iot,
         ftp,
         acme_dns,
         health,
@@ -11089,7 +11497,11 @@ fn docs_template_webdav() -> &'static str {
 }
 
 fn docs_template_streams() -> &'static str {
-    "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstreams: [127.0.0.1:9000, 127.0.0.1:9001]\nudp:\n  listeners:\n    - name: realtime\n      bind: 0.0.0.0:7001\n      upstreams: [127.0.0.1:9100, 127.0.0.1:9101]\n"
+    "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      protocol: game_tcp\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams: [127.0.0.1:9000, 127.0.0.1:9001]\nudp:\n  listeners:\n    - name: game-kcp\n      bind: 0.0.0.0:7001\n      protocol: kcp\n      session_ttl_secs: 180\n      max_associations: 262144\n      upstreams: [127.0.0.1:9100, 127.0.0.1:9101]\n"
+}
+
+fn docs_template_iot() -> &'static str {
+    "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams: [127.0.0.1:18831, 127.0.0.1:18832]\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams: [127.0.0.1:56831]\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n"
 }
 
 fn docs_template_ftp() -> &'static str {
@@ -11101,7 +11513,7 @@ fn docs_template_acme_dns() -> &'static str {
 }
 
 fn docs_template_health() -> &'static str {
-    "load_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    interval_secs: 10\n    timeout_ms: 2000\n    path: /healthz\n    expected_statuses: [200, 204]\n    failure_threshold: 2\n    success_threshold: 2\n    jitter_percent: 20\n    alert_webhooks:\n      - https://ops.example.com/webhooks/proxysss\n"
+    "load_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    interval_secs: 10\n    timeout_ms: 2000\n    path: /healthz\n    expected_statuses: [200, 204]\n    failure_threshold: 2\n    success_threshold: 2\n    jitter_percent: 20\n    udp_payload: proxysss-health\n    udp_expect_response: true\n    alert_webhooks:\n      - https://ops.example.com/webhooks/proxysss\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
 }
 
 fn docs_template_error_pages() -> &'static str {
@@ -13547,6 +13959,9 @@ mod tests {
                 upstream: "127.0.0.1:9100".to_string(),
                 upstreams: vec!["127.0.0.1:9101".to_string()],
                 upstream_weights: BTreeMap::new(),
+                protocol: "game_tcp".to_string(),
+                nodelay: true,
+                connect_timeout_ms: 3_000,
             },
         )
         .expect("render updated config");
@@ -13564,7 +13979,10 @@ mod tests {
                 bind: "0.0.0.0:8001".to_string(),
                 upstream: String::new(),
                 upstreams: vec!["127.0.0.1:9300".to_string()],
-            upstream_weights: BTreeMap::new(),
+                upstream_weights: BTreeMap::new(),
+                protocol: "kcp".to_string(),
+                session_ttl_secs: 180,
+                max_associations: 262_144,
             },
         )
         .expect("render updated config");
@@ -14022,6 +14440,8 @@ mod tests {
         let body = stats.snapshot_prometheus();
         assert!(body.contains("proxysss_http_requests_total 42"));
         assert!(body.contains("# TYPE proxysss_http_requests_total counter"));
+        assert!(body.contains("proxysss_critical_task_failures_total"));
+        assert!(body.contains("proxysss_watchdog_heartbeat_total"));
         assert!(body.contains("proxysss_process_memory_bytes"));
         assert_eq!(
             payload["process"]["pid"].as_u64(),
@@ -14572,6 +14992,9 @@ mod tests {
             upstream: "127.0.0.1:9000".to_string(),
             upstreams: vec!["127.0.0.1:9001".to_string()],
             upstream_weights: BTreeMap::new(),
+            protocol: "game_tcp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 3_000,
         });
         config.udp.listeners.push(UdpListenerConfig {
             name: "game-udp".to_string(),
@@ -14579,6 +15002,9 @@ mod tests {
             upstream: String::new(),
             upstreams: vec!["127.0.0.1:9100".to_string(), "127.0.0.1:9101".to_string()],
             upstream_weights: BTreeMap::new(),
+            protocol: "kcp".to_string(),
+            session_ttl_secs: 180,
+            max_associations: 262_144,
         });
 
         let tcp = configured_tcp_listener_route(&config, "game-tcp", Some("pid-1".to_string()))
@@ -14590,6 +15016,69 @@ mod tests {
         let udp = configured_udp_listener_route(&config, "game-udp", None).expect("udp route");
         assert_eq!(udp.upstream, "127.0.0.1:9100");
         assert_eq!(udp.upstreams.len(), 2);
+    }
+
+    #[test]
+    fn active_health_collects_udp_targets_when_enabled() {
+        let mut config = GatewayConfig::default();
+        config.load_balance.active_health.http_enabled = false;
+        config.load_balance.active_health.tcp_enabled = false;
+        config.load_balance.active_health.udp_enabled = true;
+        config.udp.listeners.push(UdpListenerConfig {
+            name: "game-kcp".to_string(),
+            bind: "0.0.0.0:7001".to_string(),
+            upstream: String::new(),
+            upstreams: vec!["127.0.0.1:9100".to_string(), "127.0.0.1:9101".to_string()],
+            upstream_weights: BTreeMap::new(),
+            protocol: "kcp".to_string(),
+            session_ttl_secs: 180,
+            max_associations: 262_144,
+        });
+
+        let targets = collect_active_health_targets(&config);
+        let udp_targets = targets
+            .iter()
+            .filter(|target| target.kind.as_str() == "udp")
+            .collect::<Vec<_>>();
+
+        assert_eq!(udp_targets.len(), 2);
+        assert!(udp_targets
+            .iter()
+            .any(|target| target.upstream == "127.0.0.1:9100"));
+        assert!(udp_targets
+            .iter()
+            .all(|target| target.settings.udp_payload == "proxysss-health"));
+    }
+
+    #[tokio::test]
+    async fn udp_association_prune_expires_and_caps_entries() {
+        let associations = DashMap::<SocketAddr, Arc<UdpAssociation>>::new();
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp socket");
+        std_socket.set_nonblocking(true).expect("nonblocking");
+        let socket = Arc::new(UdpSocket::from_std(std_socket).expect("tokio udp socket"));
+        let now = now_unix_secs();
+
+        for port in 20_000..20_005 {
+            associations.insert(
+                format!("127.0.0.1:{port}").parse().expect("addr"),
+                Arc::new(UdpAssociation {
+                    socket: socket.clone(),
+                    last_seen_epoch: AtomicU64::new(now.saturating_sub(1_000 + port as u64)),
+                }),
+            );
+        }
+        associations.insert(
+            "127.0.0.1:30000".parse().expect("addr"),
+            Arc::new(UdpAssociation {
+                socket,
+                last_seen_epoch: AtomicU64::new(now),
+            }),
+        );
+
+        prune_udp_associations(&associations, 180, 4);
+
+        assert_eq!(associations.len(), 1);
+        assert!(associations.contains_key(&"127.0.0.1:30000".parse::<SocketAddr>().expect("addr")));
     }
 
     #[test]

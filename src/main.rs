@@ -202,6 +202,7 @@ enum ConfigTemplateKind {
     StaticSite,
     Webdav,
     Script,
+    Iot,
 }
 
 #[derive(Subcommand, Debug)]
@@ -279,8 +280,18 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ("https/http2 termination", "supported"),
     ("http3/quic", "supported"),
     ("websocket/ws/wss", "supported"),
-    ("tcp stream proxy", "supported"),
-    ("udp stream proxy", "supported"),
+    (
+        "tcp stream proxy",
+        "supported; nodelay and upstream connect timeout are configurable for latency-sensitive AI tool bridges and game gateways",
+    ),
+    (
+        "udp stream proxy",
+        "supported; per-listener association TTL and caps protect large-scale game/voice/KCP traffic",
+    ),
+    (
+        "mqtt/iot gateway",
+        "supported through transparent MQTT TCP, MQTT TLS passthrough, MQTT over WebSocket, CoAP/UDP, stream policies, and IoT templates",
+    ),
     (
         "static files",
         "built-in services.static_sites runtime for GET/HEAD, index files, and optional autoindex",
@@ -351,7 +362,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "active health checks",
-        "load_balance.active_health performs periodic HTTP/TCP upstream probes and exposes results plus manual drain state in /v1/upstreams and the admin dashboard",
+        "load_balance.active_health performs periodic HTTP/TCP/UDP upstream probes and exposes results plus manual drain state in /v1/upstreams and the admin dashboard",
     ),
     (
         "manual upstream drain",
@@ -457,7 +468,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TCP/UDP stream proxy",
         status: ParityStatus::Supported,
-        evidence: "tcp.listeners and udp.listeners support YAML upstream/upstreams with optional script extension hooks",
+        evidence: "tcp.listeners support nodelay/connect_timeout_ms and udp.listeners support protocol/session_ttl_secs/max_associations with YAML upstream pools and optional script extension hooks",
         next_gap: "",
     },
     NginxParityItem {
@@ -512,7 +523,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "active health checks",
         status: ParityStatus::Supported,
-        evidence: "load_balance.active_health probes reverse proxy HTTP upstreams and stream TCP upstreams on a schedule and feeds runtime health state into selection and admin APIs",
+        evidence: "load_balance.active_health probes reverse proxy HTTP upstreams plus stream TCP/UDP upstreams on a schedule and feeds runtime health state into selection and admin APIs",
         next_gap: "",
     },
     NginxParityItem {
@@ -533,6 +544,12 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         status: ParityStatus::Supported,
         evidence:
             "services.ai_proxy provides first-class New API, sub2api, and OpenAI-compatible reverse proxy routes with path rewrite and provider headers; optional plugins remain extension-only",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "MQTT/IoT stream gateway",
+        status: ParityStatus::Supported,
+        evidence: "tcp.listeners proxy MQTT on 1883, tcp.stream_routes support MQTT TLS passthrough/SNI on 8883, services.reverse_proxy can proxy MQTT over WebSocket, and udp.listeners cover CoAP-style IoT datagrams",
         next_gap: "",
     },
     NginxParityItem {
@@ -602,7 +619,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     CaddyFeatureItem {
         capability: "active upstream health checks",
         status: ParityStatus::Supported,
-        evidence: "load_balance.active_health periodically probes HTTP and TCP upstreams and surfaces the result plus manual drain state in the admin API/dashboard",
+        evidence: "load_balance.active_health periodically probes HTTP, TCP, and UDP upstreams and surfaces the result plus manual drain state in the admin API/dashboard",
         next_gap: "",
     },
 ];
@@ -1227,10 +1244,11 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.reverse_proxy.routes.len()
     );
     println!(
-        "active health     : enabled={}, http_enabled={}, tcp_enabled={}, path={}, interval_secs={}, timeout_ms={}, expected_statuses={}",
+        "active health     : enabled={}, http_enabled={}, tcp_enabled={}, udp_enabled={}, path={}, interval_secs={}, timeout_ms={}, expected_statuses={}, udp_expect_response={}",
         config.load_balance.active_health.enabled,
         config.load_balance.active_health.http_enabled,
         config.load_balance.active_health.tcp_enabled,
+        config.load_balance.active_health.udp_enabled,
         config.load_balance.active_health.path,
         config.load_balance.active_health.interval_secs,
         config.load_balance.active_health.timeout_ms,
@@ -1241,7 +1259,15 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
             .iter()
             .map(|value| value.to_string())
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        config.load_balance.active_health.udp_expect_response
+    );
+    println!(
+        "watchdog          : enabled={}, restart_critical_tasks={}, restart_backoff_secs={}, heartbeat_interval_secs={}",
+        config.runtime.watchdog.enabled,
+        config.runtime.watchdog.restart_critical_tasks,
+        config.runtime.watchdog.restart_backoff_secs,
+        config.runtime.watchdog.heartbeat_interval_secs
     );
     println!(
         "error pages       : enabled={}, show_details={}, custom_pages={}",
@@ -1380,10 +1406,11 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     ));
     output.push_str("[active_health]\n");
     output.push_str(&format!(
-        "enabled={} http_enabled={} tcp_enabled={} path={} interval_secs={} timeout_ms={} expected_statuses={}\n",
+        "enabled={} http_enabled={} tcp_enabled={} udp_enabled={} path={} interval_secs={} timeout_ms={} expected_statuses={} udp_expect_response={}\n",
         config.load_balance.active_health.enabled,
         config.load_balance.active_health.http_enabled,
         config.load_balance.active_health.tcp_enabled,
+        config.load_balance.active_health.udp_enabled,
         config.load_balance.active_health.path,
         config.load_balance.active_health.interval_secs,
         config.load_balance.active_health.timeout_ms,
@@ -1394,7 +1421,8 @@ fn render_route_topology(config: &GatewayConfig) -> String {
             .iter()
             .map(|value| value.to_string())
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        config.load_balance.active_health.udp_expect_response
     ));
     output.push_str("[access_control]\n");
     output.push_str(&format!(
@@ -1454,11 +1482,14 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     } else {
         for listener in &config.tcp.listeners {
             output.push_str(&format!(
-                "{} bind={} upstream={} upstreams={}\n",
+                "{} bind={} upstream={} upstreams={} protocol={} nodelay={} connect_timeout_ms={}\n",
                 listener.name,
                 listener.bind,
                 blank_as_disabled(&listener.upstream),
-                listener.upstreams.len()
+                listener.upstreams.len(),
+                blank_as_disabled(&listener.protocol),
+                listener.nodelay,
+                listener.connect_timeout_ms
             ));
         }
         if config.services.ftp.enabled {
@@ -1484,11 +1515,14 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     } else {
         for listener in &config.udp.listeners {
             output.push_str(&format!(
-                "{} bind={} upstream={} upstreams={}\n",
+                "{} bind={} upstream={} upstreams={} protocol={} session_ttl_secs={} max_associations={}\n",
                 listener.name,
                 listener.bind,
                 blank_as_disabled(&listener.upstream),
-                listener.upstreams.len()
+                listener.upstreams.len(),
+                blank_as_disabled(&listener.protocol),
+                listener.session_ttl_secs,
+                listener.max_associations
             ));
         }
     }
@@ -1570,22 +1604,23 @@ fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
         ConfigTemplateKind::StaticSite => "static-site",
         ConfigTemplateKind::Webdav => "webdav",
         ConfigTemplateKind::Script => "script",
+        ConfigTemplateKind::Iot => "iot",
     }
 }
 
 fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
     match kind {
         ConfigTemplateKind::Full => {
-            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  error_pages:\n    enabled: true\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>proxysss could not match this route.</p></body></html>\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    path: /healthz\n    failure_threshold: 2\n    success_threshold: 2\nruntime:\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      active_health:\n        path: /healthz\n"
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  error_pages:\n    enabled: true\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>proxysss could not match this route.</p></body></html>\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    path: /healthz\n    failure_threshold: 2\n    success_threshold: 2\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      active_health:\n        path: /healthz\n"
         }
         ConfigTemplateKind::Http => {
             "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n      active_health:\n        path: /readyz\n        failure_threshold: 2\n        success_threshold: 2\n"
         }
         ConfigTemplateKind::Tcp => {
-            "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
+            "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      protocol: game_tcp\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
         }
         ConfigTemplateKind::Udp => {
-            "udp:\n  listeners:\n    - name: realtime\n      bind: 0.0.0.0:7001\n      upstreams:\n        - 127.0.0.1:9100\n        - 127.0.0.1:9101\n"
+            "udp:\n  listeners:\n    - name: game-kcp\n      bind: 0.0.0.0:7001\n      protocol: kcp\n      session_ttl_secs: 180\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:9100\n        - 127.0.0.1:9101\n"
         }
         ConfigTemplateKind::StaticSite => {
             "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
@@ -1595,6 +1630,9 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
         }
         ConfigTemplateKind::Script => {
             "script:\n  enabled: true\n  entry: gateway.ts\n  cwd: .\n  timeout_ms: 500\n  memory_limit_mb: 64\n  max_stack_size_kb: 512\nplugins:\n  enabled: false\n"
+        }
+        ConfigTemplateKind::Iot => {
+            "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams:\n        - 127.0.0.1:18831\n        - 127.0.0.1:18832\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:56831\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n  rate_limit:\n    stream:\n      enabled: true\n      algorithm: token_bucket\n      connections: 600\n      window_ms: 60000\n      burst: 1200\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
         }
     }
 }
@@ -2207,6 +2245,9 @@ mod tests {
             upstream: "127.0.0.1:9000".to_string(),
             upstreams: vec!["127.0.0.1:9001".to_string()],
             upstream_weights: std::collections::BTreeMap::new(),
+            protocol: "game_tcp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 3_000,
         });
         config.udp.listeners.push(crate::config::UdpListenerConfig {
             name: "realtime".to_string(),
@@ -2214,6 +2255,9 @@ mod tests {
             upstream: String::new(),
             upstreams: vec!["127.0.0.1:9100".to_string()],
             upstream_weights: std::collections::BTreeMap::new(),
+            protocol: "kcp".to_string(),
+            session_ttl_secs: 180,
+            max_associations: 262_144,
         });
 
         let topology = render_route_topology(&config);
@@ -2253,11 +2297,20 @@ mod tests {
     }
 
     #[test]
+    fn capability_matrix_mentions_mqtt_iot() {
+        assert!(CAPABILITY_MATRIX
+            .iter()
+            .any(|(name, status)| *name == "mqtt/iot gateway" && status.contains("MQTT")));
+    }
+
+    #[test]
     fn config_templates_cover_http_and_stream_learning_paths() {
         assert!(render_config_template(ConfigTemplateKind::Http).contains("services:"));
         assert!(render_config_template(ConfigTemplateKind::Http).contains("domain_routes"));
         assert!(render_config_template(ConfigTemplateKind::Tcp).contains("tcp:"));
         assert!(render_config_template(ConfigTemplateKind::Udp).contains("udp:"));
+        assert!(render_config_template(ConfigTemplateKind::Iot).contains("protocol: mqtt"));
+        assert!(render_config_template(ConfigTemplateKind::Iot).contains("mqtt-websocket"));
         assert!(render_config_template(ConfigTemplateKind::Script).contains("script:"));
     }
 

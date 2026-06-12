@@ -299,17 +299,27 @@ load_balance:
     enabled: true
     http_enabled: true
     tcp_enabled: true
+    udp_enabled: false
     path: /healthz
     failure_threshold: 2
     success_threshold: 2
+    udp_payload: proxysss-health
+    udp_expect_response: true
     alert_webhooks:
       - https://ops.example.com/webhooks/proxysss
 
 runtime:
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30
   maintenance_state:
     enabled: true
     path: ./runtime/maintenance-state.json
 ```
+
+UDP 健康检查默认关闭，因为很多 KCP/游戏协议不会回显通用探测包；如果后端能处理探测包，可以启用 `udp_enabled`。watchdog 会在关键后台任务异常退出时记录指标并按配置重启任务。
 
 路由级覆写：
 
@@ -369,14 +379,52 @@ tcp:
   listeners:
     - name: game-tcp
       bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
       upstreams: [127.0.0.1:9000, 127.0.0.1:9001]
 
 udp:
   listeners:
-    - name: realtime
+    - name: game-kcp
       bind: 0.0.0.0:7001
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144
       upstreams: [127.0.0.1:9100, 127.0.0.1:9101]
 ```
+
+`protocol` 只用于可观测性，不解析业务 payload。TCP 默认 `nodelay: true`，适合游戏、AI 工具桥接、设备长连接等低延迟流量。UDP/KCP 通过 `session_ttl_secs` 刷新透明客户端关联，并用 `max_associations` 给大规模移动端重连/掉线风暴设置上限。
+
+MQTT/IoT 也走同一套网关面：
+
+```yaml
+tcp:
+  listeners:
+    - name: mqtt
+      bind: 0.0.0.0:1883
+      protocol: mqtt
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams: [127.0.0.1:18831, 127.0.0.1:18832]
+  stream_routes:
+    - name: mqtt-tls
+      domains: [mqtt.example.com]
+      listen: 0.0.0.0:8883
+      upstream: 127.0.0.1:88831
+      protocol: mqtt
+      tls_mode: passthrough
+
+services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-websocket
+        hosts: [mqtt-ws.example.com]
+        path_prefix: /mqtt
+        upstream: ws://127.0.0.1:8083
+```
+
+proxysss 不是 MQTT broker；它是 broker/device service 前面的边缘网关，负责监听、TLS passthrough、WebSocket upgrade、上游池、限流、访问控制、健康检查和可观测性。
 
 ## 12. FTP
 

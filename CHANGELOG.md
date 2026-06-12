@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.11 - 2026-06-12
+
+- Added production hardening for critical gateway operation: supervised runtime watchdog, watchdog heartbeat metrics, and critical task failure counters.
+- Added opt-in UDP active health probes for game/KCP/IoT datagram services, alongside existing HTTP/TCP active health.
+- Added first-class game, MQTT, and IoT configuration surfaces: low-latency TCP tuning, UDP association caps/TTL, MQTT TCP, MQTT TLS passthrough, MQTT over WebSocket, and CoAP-style UDP examples.
+- Added production hardening documentation and release gate guidance covering benchmark baselines, HA patterns, Linux tuning, and operational watch points.
+
 ## v1.2.10 - 2026-06-12
 
 - Fixed reverse proxy streaming normal HTTP responses (HTML, JSON, etc.) as if they were SSE, which stripped `Content-Length` and caused incomplete response bodies.

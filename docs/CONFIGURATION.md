@@ -17,7 +17,7 @@ udp:           # datagram listeners
 script:        # embedded TypeScript entry
 plugins:       # auto-loaded plugin directory
 logging:       # access/error logs and levels
-runtime:       # hot reload and maintenance state
+runtime:       # hot reload, watchdog, and maintenance state
 ```
 
 ## AI reverse proxy
@@ -118,9 +118,32 @@ load_balance:
     quarantine_secs: 15
   active_health:
     enabled: true
+    http_enabled: true
+    tcp_enabled: true
+    udp_enabled: false
     path: /healthz
     interval_secs: 10
+    timeout_ms: 2000
+    udp_payload: proxysss-health
+    udp_expect_response: true
 ```
+
+UDP probes are opt-in because many KCP/game protocols do not echo generic health payloads. When `udp_expect_response=false`, proxysss records a successful UDP send as the health signal.
+
+## Runtime watchdog
+
+Critical background loops are supervised by `runtime.watchdog`. If a supervised task exits unexpectedly, proxysss increments `proxysss_critical_task_failures_total`; when `restart_critical_tasks=true`, it restarts the task after `restart_backoff_secs`.
+
+```yaml
+runtime:
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30
+```
+
+Heartbeat ticks are exposed as `proxysss_watchdog_heartbeat_total` on `/metrics`. For strict process-manager deployments, set `restart_critical_tasks=false` so a critical task failure terminates the process and lets systemd/supervisor restart the whole gateway.
 
 ## TLS, HTTP/2, HTTP/3, WebSocket, gRPC
 
@@ -206,6 +229,89 @@ tcp:
 ```
 
 `listen` accepts `0.0.0.0:6379` or shorthand `6379`. `protocol` is an observability hint. Per-route `access_control` supports allow/deny IP lists.
+
+## Direct TCP/UDP listeners for games, AI tools, and KCP-style traffic
+
+Direct listeners are for large realtime fleets that do not need HTTP semantics: game TCP, KCP-style UDP, voice, MQTT/IoT device protocols, AI tool bridges, and other long-lived binary connections.
+
+```yaml
+tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstream: 127.0.0.1:9000
+      upstreams:
+        - 127.0.0.1:9000
+        - 127.0.0.1:9001
+
+udp:
+  listeners:
+    - name: game-kcp
+      bind: 0.0.0.0:7001
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:9100
+        - 127.0.0.1:9101
+```
+
+- `tcp.listeners[].nodelay` defaults to `true` so latency-sensitive streams do not wait on Nagle batching.
+- `tcp.listeners[].connect_timeout_ms` defaults to `3000`; tune lower for hot failover, higher for cold backends.
+- `udp.listeners[].session_ttl_secs` defaults to `180`; keep it above the client heartbeat interval for KCP or mobile reconnect traffic.
+- `udp.listeners[].max_associations` defaults to `262144`; set `0` only for controlled labs where unbounded UDP association growth is acceptable.
+- `protocol` is an observability hint only. The hot path stays transparent and does not parse KCP/game payloads.
+
+## MQTT and IoT patterns
+
+Use proxysss as the edge and keep MQTT/CoAP protocol semantics in the upstream broker or device service.
+
+```yaml
+tcp:
+  listeners:
+    - name: mqtt
+      bind: 0.0.0.0:1883
+      protocol: mqtt
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:18831
+        - 127.0.0.1:18832
+  stream_routes:
+    - name: mqtt-tls
+      domains: [mqtt.example.com]
+      listen: 0.0.0.0:8883
+      upstream: 127.0.0.1:88831
+      protocol: mqtt
+      tls_mode: passthrough
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      protocol: coap
+      session_ttl_secs: 120
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:56831
+
+services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-websocket
+        hosts: [mqtt-ws.example.com]
+        path_prefix: /mqtt
+        upstream: ws://127.0.0.1:8083
+```
+
+- MQTT TCP on `1883` uses transparent TCP proxying with upstream pools.
+- MQTT TLS on `8883` can be routed by SNI with `tcp.stream_routes` and `tls_mode: passthrough`.
+- MQTT over WebSocket uses the normal HTTP/WebSocket reverse proxy path.
+- CoAP and proprietary UDP device traffic use `udp.listeners` with TTL/cap controls.
+- Use `services.rate_limit.stream`, `services.access_control.stream`, active health, and watchdog metrics for production IoT fleets.
 
 ## TLS, on-demand certificates, and wildcards
 

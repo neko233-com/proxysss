@@ -199,6 +199,7 @@
         <button class="topic-btn" data-topic="reverse-proxy">Reverse Proxy &amp; LB</button>
         <button class="topic-btn" data-topic="tls">TLS / Auto HTTPS</button>
         <button class="topic-btn" data-topic="websocket-grpc">WebSocket &amp; gRPC</button>
+        <button class="topic-btn" data-topic="streams">TCP / UDP / KCP</button>
         <button class="topic-btn" data-topic="rate-limit">Rate Limiting</button>
         <button class="topic-btn" data-topic="cache">Cache &amp; Compression</button>
         <button class="topic-btn" data-topic="ftp">FTP</button>
@@ -216,9 +217,9 @@
         <h2>Single-binary edge gateway</h2>
         <p>proxysss terminates protocols, matches routes, enforces policy, proxies to upstream pools, and exposes observability — optional TypeScript plugins extend business logic without sitting on every hot-path byte.</p>
         <div class="cards">
-          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, TCP/UDP streams, FTP, WebDAV, static files, AI reverse proxy, cache, compression, rate limits.</p></article>
+          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, low-latency TCP, UDP/KCP-style streams, MQTT/IoT, FTP, WebDAV, static files, AI reverse proxy, cache, compression, rate limits.</p></article>
           <article class="card"><strong>Config</strong><p>One YAML file (<code>proxysss.yaml</code>) is the source of truth with hot reload fingerprinting.</p></article>
-          <article class="card"><strong>Extensions</strong><p>Embedded QuickJS + in-process TypeScript strip — no Node/Deno/tsc sidecar.</p></article>
+          <article class="card"><strong>Runtime</strong><p>Active health, watchdog heartbeat metrics, and supervised critical background loops.</p></article>
         </div>
         <div class="flow">
           <svg viewBox="0 0 720 180" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -287,6 +288,32 @@
         </div>
       </section>
 
+      <section class="panel" id="streams">
+        <div class="eyebrow">Realtime Streams</div>
+        <h2>TCP, UDP, and KCP-style fleets</h2>
+        <p>Direct stream listeners keep game, voice, device, and AI tool bridge payloads transparent while bounding connection churn in the Rust hot path.</p>
+        <div class="cards">
+          <article class="card"><strong>TCP</strong><p><code>tcp.listeners[].nodelay</code> defaults true; <code>connect_timeout_ms</code> bounds upstream dial latency.</p></article>
+          <article class="card"><strong>UDP/KCP</strong><p><code>session_ttl_secs</code> refreshes on each datagram; idle associations are pruned automatically.</p></article>
+          <article class="card"><strong>Scale guard</strong><p><code>max_associations</code> caps per-listener client mappings for churn-heavy realtime fleets.</p></article>
+          <article class="card"><strong>MQTT/IoT</strong><p>MQTT TCP, MQTT TLS passthrough/SNI, MQTT over WebSocket, and CoAP-style UDP stay transparent at the edge.</p></article>
+        </div>
+        <pre>tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+udp:
+  listeners:
+    - name: game-kcp
+      bind: 0.0.0.0:7001
+      protocol: kcp
+      session_ttl_secs: 180
+      max_associations: 262144</pre>
+      </section>
+
       <section class="panel" id="rate-limit">
         <div class="eyebrow">Shaping</div>
         <h2>Rate limiting</h2>
@@ -295,6 +322,10 @@
           <article class="card"><strong>HTTP</strong><p><code>services.rate_limit.http</code> — fixed window, token bucket, or leaky bucket; optional connection caps per zone key.</p></article>
           <article class="card"><strong>Streams</strong><p><code>services.rate_limit.stream</code> — limits new TCP connections per client IP in a shared zone.</p></article>
           <article class="card"><strong>Keys</strong><p>Scope by remote IP, Host header, or arbitrary header value for API-key style quotas.</p></article>
+        </div>
+        <div class="list">
+          <div><strong>Health:</strong> <code>load_balance.active_health</code> supports HTTP, TCP, and opt-in UDP probes; UDP can require a response or record a successful send.</div>
+          <div><strong>Watchdog:</strong> <code>runtime.watchdog</code> restarts failed critical loops when enabled and exposes heartbeat/failure counters on <code>/metrics</code>.</div>
         </div>
       </section>
 
