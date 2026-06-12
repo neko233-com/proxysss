@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.10 - 2026-06-12
+
+- Fixed reverse proxy streaming normal HTTP responses (HTML, JSON, etc.) as if they were SSE, which stripped `Content-Length` and caused incomplete response bodies.
+- Now only `text/event-stream` responses are streamed; all other responses are fully buffered to preserve original Content-Length and ensure delivery完整性.
+
 ## v1.2.9 - 2026-06-11
 
 - Added browser-language-aware admin UI localization for English and Simplified Chinese, with a manual language selector.
