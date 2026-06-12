@@ -3,435 +3,1279 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>proxysss Architecture</title>
+  <title>proxysss Architecture Lab</title>
   <style>
     :root {
-      --bg: #0b1020;
-      --panel: #121a2f;
-      --panel-2: #18233d;
-      --text: #e8eefc;
-      --muted: #9fb0d0;
-      --accent: #5eead4;
-      --accent-2: #60a5fa;
-      --warn: #fbbf24;
-      --good: #34d399;
-      --border: rgba(255,255,255,.08);
-      --shadow: 0 20px 60px rgba(0,0,0,.35);
+      color-scheme: dark;
+      --ink: #edf7ff;
+      --soft: #a9bbce;
+      --dim: #6f8399;
+      --bg: #071019;
+      --line: rgba(237, 247, 255, .13);
+      --line-strong: rgba(130, 225, 255, .35);
+      --glass: rgba(13, 27, 39, .72);
+      --glass-2: rgba(16, 39, 50, .82);
+      --accent: #5ce7c9;
+      --accent-2: #80b7ff;
+      --warn: #ffd166;
+      --hot: #ff8a7a;
+      --good: #71f6a8;
+      --max: 1180px;
     }
-    * { box-sizing: border-box; }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
     body {
       margin: 0;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      background: radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 60%),
-                  radial-gradient(900px 500px at 100% 0%, #134e4a 0%, transparent 55%),
-                  var(--bg);
-      color: var(--text);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(92, 231, 201, .17), transparent 28%),
+        radial-gradient(circle at 86% 0%, rgba(128, 183, 255, .16), transparent 32%),
+        linear-gradient(180deg, #081520 0%, #071019 50%, #050b12 100%);
+      color: var(--ink);
       min-height: 100vh;
+      overflow-x: hidden;
     }
-    .layout {
-      display: grid;
-      grid-template-columns: 260px 1fr;
-      min-height: 100vh;
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,.032) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,.9), rgba(0,0,0,.25));
     }
-    aside {
-      border-right: 1px solid var(--border);
-      background: rgba(10,14,28,.75);
-      backdrop-filter: blur(12px);
-      padding: 1.25rem .75rem;
+
+    a {
+      color: inherit;
+    }
+
+    .shell {
+      width: min(var(--max), calc(100vw - 32px));
+      margin: 0 auto;
+    }
+
+    .topbar {
       position: sticky;
       top: 0;
-      height: 100vh;
-      overflow: auto;
+      z-index: 30;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 16, 25, .82);
+      backdrop-filter: blur(18px);
     }
-    .brand {
-      padding: .5rem .75rem 1.25rem;
+
+    .topbar-inner {
+      width: min(var(--max), calc(100vw - 32px));
+      margin: 0 auto;
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
     }
-    .brand h1 {
-      margin: 0;
-      font-size: 1.35rem;
+
+    .mark {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .logo {
+      width: 34px;
+      height: 34px;
+      border: 2px solid var(--accent);
+      border-radius: 11px;
+      transform: rotate(-4deg);
+      position: relative;
+      box-shadow: 0 0 28px rgba(92, 231, 201, .24);
+      flex: 0 0 auto;
+    }
+
+    .logo::after {
+      content: "";
+      position: absolute;
+      inset: 7px;
+      border: 2px solid var(--accent-2);
+      border-radius: 8px;
+      transform: rotate(7deg);
+    }
+
+    .mark strong {
+      display: block;
+      font-size: 15px;
       letter-spacing: .02em;
     }
-    .brand p {
-      margin: .35rem 0 0;
-      color: var(--muted);
-      font-size: .85rem;
-      line-height: 1.4;
+
+    .mark span {
+      display: block;
+      color: var(--soft);
+      font-size: 12px;
+      white-space: nowrap;
     }
-    nav { display: flex; flex-direction: column; gap: .35rem; }
-    .topic-btn {
+
+    .nav {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .nav a {
+      text-decoration: none;
+      color: var(--soft);
       border: 1px solid transparent;
-      background: transparent;
-      color: var(--muted);
-      text-align: left;
-      padding: .65rem .85rem;
-      border-radius: .65rem;
-      cursor: pointer;
-      font: inherit;
-      transition: .2s ease;
+      padding: 8px 10px;
+      border-radius: 7px;
+      font-size: 13px;
+      transition: color .2s ease, border-color .2s ease, background .2s ease;
     }
-    .topic-btn:hover {
-      color: var(--text);
+
+    .nav a:hover {
+      color: var(--ink);
+      border-color: var(--line);
       background: rgba(255,255,255,.04);
     }
-    .topic-btn.active {
-      color: var(--text);
-      border-color: rgba(94,234,212,.35);
-      background: linear-gradient(135deg, rgba(94,234,212,.12), rgba(96,165,250,.08));
-      box-shadow: inset 0 0 0 1px rgba(94,234,212,.08);
-    }
-    main {
-      padding: 2rem clamp(1rem, 3vw, 3rem) 4rem;
-      max-width: 1100px;
-    }
-    .panel {
-      display: none;
-      animation: fadeSlide .45s ease;
-    }
-    .panel.active { display: block; }
-    @keyframes fadeSlide {
-      from { opacity: 0; transform: translateY(12px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-    .eyebrow {
-      color: var(--accent);
-      text-transform: uppercase;
-      letter-spacing: .14em;
-      font-size: .72rem;
-      font-weight: 700;
-    }
-    h2 {
-      margin: .35rem 0 1rem;
-      font-size: clamp(1.6rem, 3vw, 2.2rem);
-    }
-    p, li { color: var(--muted); line-height: 1.65; }
-    .cards {
+
+    .hero {
+      position: relative;
+      min-height: calc(100svh - 64px);
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 1rem;
-      margin: 1.25rem 0;
+      align-items: center;
+      padding: clamp(42px, 7vw, 86px) 0;
+      overflow: clip;
     }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 1rem;
-      padding: 1rem 1.1rem;
-      box-shadow: var(--shadow);
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(420px, .86fr);
+      gap: clamp(28px, 5vw, 76px);
+      align-items: center;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      color: var(--accent);
+      font-size: 12px;
+      line-height: 1;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(48px, 9vw, 106px);
+      line-height: .88;
+      letter-spacing: 0;
+      max-width: 820px;
+    }
+
+    .lede {
+      margin: 22px 0 0;
+      max-width: 650px;
+      color: var(--soft);
+      font-size: clamp(17px, 2vw, 22px);
+      line-height: 1.55;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 30px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 0 16px;
+      border-radius: 7px;
+      text-decoration: none;
+      font-weight: 800;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.05);
+      transition: transform .18s ease, background .18s ease, border-color .18s ease;
+    }
+
+    .button.primary {
+      color: #031017;
+      background: linear-gradient(135deg, var(--accent), #a0f0ff);
+      border-color: transparent;
+    }
+
+    .button:hover {
+      transform: translateY(-2px);
+      border-color: var(--line-strong);
+      background: rgba(255,255,255,.08);
+    }
+
+    .button.primary:hover {
+      background: linear-gradient(135deg, #76f2d9, #b7f6ff);
+    }
+
+    .lab-visual {
+      position: relative;
+      min-height: 500px;
+    }
+
+    .orbit {
+      position: absolute;
+      inset: 2% 0 auto 7%;
+      width: min(480px, 92vw);
+      aspect-ratio: 1;
+      border: 1px solid rgba(128, 183, 255, .2);
+      border-radius: 50%;
+      opacity: .9;
+      animation: slowTurn 28s linear infinite;
+    }
+
+    .orbit::before,
+    .orbit::after {
+      content: "";
+      position: absolute;
+      inset: 12%;
+      border: 1px solid rgba(92, 231, 201, .18);
+      border-radius: 50%;
+    }
+
+    .orbit::after {
+      inset: 29%;
+      border-color: rgba(255, 209, 102, .22);
+      animation: slowTurn 17s linear infinite reverse;
+    }
+
+    @keyframes slowTurn {
+      to { transform: rotate(360deg); }
+    }
+
+    .gateway-core {
+      position: absolute;
+      inset: 0;
+      margin: auto;
+      width: min(330px, 74vw);
+      aspect-ratio: 1;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle, rgba(92, 231, 201, .16), rgba(128, 183, 255, .08) 48%, rgba(255,255,255,.03) 70%, transparent 71%);
+      filter: drop-shadow(0 26px 70px rgba(0,0,0,.32));
+    }
+
+    .gateway-core::before {
+      content: "";
+      width: 168px;
+      height: 168px;
+      border-radius: 50%;
+      border: 1px solid var(--line-strong);
+      background: linear-gradient(180deg, rgba(9, 29, 40, .94), rgba(7, 19, 28, .9));
+      box-shadow: inset 0 0 40px rgba(92,231,201,.12);
+    }
+
+    .gateway-label {
+      position: absolute;
+      text-align: center;
+    }
+
+    .gateway-label strong {
+      display: block;
+      font-size: 28px;
+    }
+
+    .gateway-label span {
+      display: block;
+      margin-top: 6px;
+      color: var(--soft);
+      font-size: 12px;
+    }
+
+    .node {
+      position: absolute;
+      min-width: 112px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(9, 22, 33, .88);
+      box-shadow: 0 20px 50px rgba(0,0,0,.24);
+      animation: float 5s ease-in-out infinite;
+    }
+
+    .node strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .node span {
+      display: block;
+      margin-top: 4px;
+      color: var(--soft);
+      font-size: 12px;
+    }
+
+    .node.client { left: 2%; top: 18%; }
+    .node.policy { right: 0; top: 14%; animation-delay: .8s; }
+    .node.upstream { right: 6%; bottom: 12%; animation-delay: 1.6s; }
+    .node.config { left: 6%; bottom: 10%; animation-delay: 2.2s; }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-10px); }
+    }
+
+    .packet {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 22px var(--accent);
+      offset-path: path("M 40 115 C 160 30, 275 80, 305 245 S 465 420, 575 315");
+      animation: packetMove 4.4s cubic-bezier(.62,.01,.36,1) infinite;
+    }
+
+    .packet:nth-of-type(2) {
+      background: var(--accent-2);
+      box-shadow: 0 0 22px var(--accent-2);
+      animation-delay: 1.15s;
+    }
+
+    .packet:nth-of-type(3) {
+      background: var(--warn);
+      box-shadow: 0 0 22px var(--warn);
+      animation-delay: 2.35s;
+    }
+
+    @keyframes packetMove {
+      0% { offset-distance: 0%; opacity: 0; transform: scale(.6); }
+      10% { opacity: 1; transform: scale(1); }
+      82% { opacity: 1; transform: scale(1); }
+      100% { offset-distance: 100%; opacity: 0; transform: scale(.7); }
+    }
+
+    section {
+      padding: clamp(70px, 9vw, 112px) 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(260px, .5fr);
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 34px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: .96;
+      letter-spacing: 0;
+    }
+
+    .section-head p,
+    .plain {
+      margin: 0;
+      color: var(--soft);
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    .lesson-grid {
+      display: grid;
+      grid-template-columns: 290px minmax(0, 1fr);
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .protocol-menu {
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .protocol-btn {
+      width: 100%;
+      text-align: left;
+      cursor: pointer;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.035);
+      color: var(--soft);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font: inherit;
+      transition: color .18s ease, background .18s ease, border-color .18s ease, transform .18s ease;
+    }
+
+    .protocol-btn strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 3px;
+      font-size: 14px;
+    }
+
+    .protocol-btn span {
+      display: block;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .protocol-btn:hover {
+      transform: translateX(3px);
+      border-color: var(--line-strong);
+    }
+
+    .protocol-btn.active {
+      color: var(--ink);
+      background: linear-gradient(135deg, rgba(92,231,201,.16), rgba(128,183,255,.1));
+      border-color: rgba(92,231,201,.42);
+    }
+
+    .stage {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: linear-gradient(180deg, rgba(12, 31, 45, .78), rgba(7, 18, 27, .92));
+      min-height: 620px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .stage-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 24px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stage h3 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 42px);
+      line-height: 1;
+    }
+
+    .stage-summary {
+      color: var(--soft);
+      margin: 10px 0 0;
+      line-height: 1.58;
+      max-width: 650px;
+    }
+
+    .status-chip {
+      flex: 0 0 auto;
+      padding: 8px 10px;
+      color: #041017;
+      background: var(--accent);
+      border-radius: 7px;
+      font-weight: 900;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .protocol-svg {
+      width: 100%;
+      height: 280px;
+      display: block;
+      background:
+        linear-gradient(90deg, transparent 0 48%, rgba(255,255,255,.04) 48% 52%, transparent 52%),
+        radial-gradient(circle at 50% 42%, rgba(92,231,201,.12), transparent 36%);
+    }
+
+    .wire {
+      fill: none;
+      stroke: rgba(169, 187, 206, .32);
+      stroke-width: 2;
+      stroke-dasharray: 8 7;
+    }
+
+    .wire-hot {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 3;
+      stroke-linecap: round;
+      stroke-dasharray: 380;
+      stroke-dashoffset: 380;
+      animation: drawWire 2.9s ease-in-out infinite;
+    }
+
+    .wire-hot.back {
+      stroke: var(--accent-2);
+      animation-delay: 1.15s;
+    }
+
+    @keyframes drawWire {
+      0% { stroke-dashoffset: 380; opacity: 0; }
+      15% { opacity: 1; }
+      72% { stroke-dashoffset: 0; opacity: 1; }
+      100% { stroke-dashoffset: 0; opacity: 0; }
+    }
+
+    .svg-box {
+      fill: rgba(7, 16, 25, .92);
+      stroke: rgba(237, 247, 255, .16);
+      stroke-width: 1.3;
+    }
+
+    .svg-core {
+      fill: rgba(92, 231, 201, .16);
+      stroke: rgba(92, 231, 201, .48);
+      stroke-width: 1.5;
+    }
+
+    .svg-text {
+      fill: var(--ink);
+      font: 700 14px Inter, "Segoe UI", sans-serif;
+    }
+
+    .svg-muted {
+      fill: var(--soft);
+      font: 12px Inter, "Segoe UI", sans-serif;
+    }
+
+    .protocol-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(250px, .62fr);
+      gap: 22px;
+      padding: 22px 24px 24px;
+    }
+
+    .steps {
+      display: grid;
+      gap: 10px;
+      counter-reset: step;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      color: var(--soft);
+      line-height: 1.55;
+      opacity: 1;
       transform: translateY(8px);
-      opacity: 0;
-      animation: cardIn .6s ease forwards;
+      animation: stepIn .42s ease forwards;
     }
-    .card:nth-child(2) { animation-delay: .08s; }
-    .card:nth-child(3) { animation-delay: .16s; }
-    @keyframes cardIn {
+
+    .step:nth-child(2) { animation-delay: .06s; }
+    .step:nth-child(3) { animation-delay: .12s; }
+    .step:nth-child(4) { animation-delay: .18s; }
+    .step:nth-child(5) { animation-delay: .24s; }
+
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: #031017;
+      background: var(--accent);
+      font-weight: 900;
+    }
+
+    @keyframes stepIn {
       to { opacity: 1; transform: translateY(0); }
     }
-    .card strong { color: var(--text); display: block; margin-bottom: .35rem; }
-    .flow {
-      margin: 1.5rem 0;
-      padding: 1rem;
-      border-radius: 1rem;
-      background: var(--panel-2);
-      border: 1px solid var(--border);
-      overflow-x: auto;
+
+    .explain-box {
+      border-left: 1px solid var(--line-strong);
+      padding-left: 18px;
+      display: grid;
+      align-content: start;
+      gap: 14px;
     }
-    .flow svg { width: 100%; min-width: 520px; height: auto; }
-    .pulse {
-      animation: pulse 2.4s ease-in-out infinite;
+
+    .explain-box p {
+      margin: 0;
+      color: var(--soft);
+      line-height: 1.7;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: .55; }
-      50% { opacity: 1; }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    code, pre {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: .85rem;
-    }
-    pre {
-      background: #0a0f1c;
-      border: 1px solid var(--border);
-      border-radius: .75rem;
-      padding: 1rem;
-      overflow: auto;
-      color: #d6e4ff;
-    }
-    .pill {
-      display: inline-block;
-      padding: .15rem .55rem;
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 9px;
+      border: 1px solid var(--line);
       border-radius: 999px;
-      font-size: .75rem;
-      font-weight: 600;
+      color: var(--soft);
+      font-size: 12px;
+      background: rgba(255,255,255,.035);
     }
-    .pill.good { background: rgba(52,211,153,.15); color: var(--good); }
-    .pill.warn { background: rgba(251,191,36,.15); color: var(--warn); }
-    .list { display: grid; gap: .75rem; margin-top: 1rem; }
-    .list div {
-      padding: .85rem 1rem;
-      border-radius: .75rem;
-      background: rgba(255,255,255,.03);
-      border: 1px solid var(--border);
+
+    .map {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: rgba(255,255,255,.025);
     }
-    .list strong { color: var(--text); }
-    @media (max-width: 860px) {
-      .layout { grid-template-columns: 1fr; }
-      aside {
-        position: static;
-        height: auto;
+
+    .map-item {
+      min-height: 168px;
+      padding: 18px;
+      border-right: 1px solid var(--line);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .map-item:last-child {
+      border-right: 0;
+    }
+
+    .map-item::after {
+      content: "";
+      position: absolute;
+      width: 90px;
+      height: 90px;
+      border: 1px solid rgba(92,231,201,.26);
+      border-radius: 50%;
+      right: -34px;
+      bottom: -34px;
+    }
+
+    .map-item strong {
+      display: block;
+      font-size: 18px;
+      margin-bottom: 10px;
+    }
+
+    .map-item p {
+      margin: 0;
+      color: var(--soft);
+      line-height: 1.6;
+      font-size: 14px;
+    }
+
+    .code-row {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    pre {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px;
+      background: rgba(3, 10, 16, .84);
+      color: #dff7ff;
+      overflow: auto;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      border: 1px solid var(--line);
+      background: var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .roadmap article {
+      min-height: 190px;
+      background: rgba(9, 22, 33, .94);
+      padding: 18px;
+    }
+
+    .roadmap strong {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 17px;
+    }
+
+    .roadmap p {
+      margin: 0;
+      color: var(--soft);
+      line-height: 1.65;
+      font-size: 14px;
+    }
+
+    .footer {
+      padding: 44px 0 70px;
+      color: var(--dim);
+      border-top: 1px solid var(--line);
+    }
+
+    .reveal {
+      opacity: .98;
+      transform: translateY(0);
+      transition: opacity .7s ease, transform .7s ease;
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: .01ms !important;
+      }
+    }
+
+    @media (max-width: 960px) {
+      .hero-grid,
+      .section-head,
+      .lesson-grid,
+      .protocol-body,
+      .code-row {
+        grid-template-columns: 1fr;
+      }
+
+      .lab-visual {
+        min-height: 420px;
+      }
+
+      .protocol-menu {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .map,
+      .roadmap {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .map-item:nth-child(2) {
         border-right: 0;
-        border-bottom: 1px solid var(--border);
       }
-      nav {
-        flex-direction: row;
-        flex-wrap: wrap;
+
+      .map-item {
+        border-bottom: 1px solid var(--line);
       }
-      .topic-btn { flex: 1 1 auto; }
+    }
+
+    @media (max-width: 640px) {
+      .topbar-inner {
+        align-items: flex-start;
+        padding: 12px 0;
+        flex-direction: column;
+      }
+
+      .nav {
+        justify-content: flex-start;
+      }
+
+      .hero {
+        min-height: auto;
+      }
+
+      .protocol-menu,
+      .map,
+      .roadmap {
+        grid-template-columns: 1fr;
+      }
+
+      .map-item {
+        border-right: 0;
+      }
+
+      .stage-top {
+        flex-direction: column;
+      }
+
+      .status-chip {
+        align-self: flex-start;
+      }
+
+      .protocol-svg {
+        height: 230px;
+      }
+
+      h1 {
+        font-size: clamp(44px, 17vw, 72px);
+      }
     }
   </style>
 </head>
 <body>
-  <div class="layout">
-    <aside>
-      <div class="brand">
-        <h1>proxysss</h1>
-        <p>Interactive architecture map — one Rust binary, nginx-class edge duties.</p>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="mark">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <strong>proxysss Architecture Lab</strong>
+          <span>protocols explained like a first-year network lab</span>
+        </div>
       </div>
-      <nav id="topics">
-        <button class="topic-btn active" data-topic="overview">Overview</button>
-        <button class="topic-btn" data-topic="reverse-proxy">Reverse Proxy &amp; LB</button>
-        <button class="topic-btn" data-topic="tls">TLS / Auto HTTPS</button>
-        <button class="topic-btn" data-topic="websocket-grpc">WebSocket &amp; gRPC</button>
-        <button class="topic-btn" data-topic="streams">TCP / UDP / KCP</button>
-        <button class="topic-btn" data-topic="rate-limit">Rate Limiting</button>
-        <button class="topic-btn" data-topic="cache">Cache &amp; Compression</button>
-        <button class="topic-btn" data-topic="ftp">FTP</button>
-        <button class="topic-btn" data-topic="admin">Admin / Agent API</button>
-        <button class="topic-btn" data-topic="security">Security</button>
-        <button class="topic-btn" data-topic="kubernetes">Kubernetes Mode</button>
-        <button class="topic-btn" data-topic="scripts">TypeScript Plugins</button>
-        <button class="topic-btn" data-topic="reload">Hot Reload</button>
+      <nav class="nav" aria-label="Page sections">
+        <a href="#lesson">Protocol lab</a>
+        <a href="#map">Architecture</a>
+        <a href="#yaml">YAML</a>
+        <a href="#improve">Improve</a>
       </nav>
-    </aside>
+    </div>
+  </header>
 
-    <main>
-      <section class="panel active" id="overview">
-        <div class="eyebrow">Big Picture</div>
-        <h2>Single-binary edge gateway</h2>
-        <p>proxysss terminates protocols, matches routes, enforces policy, proxies to upstream pools, and exposes observability — optional TypeScript plugins extend business logic without sitting on every hot-path byte.</p>
-        <div class="cards">
-          <article class="card"><strong>Core (Rust)</strong><p>HTTP/HTTPS/H2/H3, low-latency TCP, UDP/KCP-style streams, MQTT/IoT, FTP, WebDAV, static files, AI reverse proxy, cache, compression, rate limits.</p></article>
-          <article class="card"><strong>Config</strong><p>One YAML file (<code>proxysss.yaml</code>) is the source of truth with hot reload fingerprinting.</p></article>
-          <article class="card"><strong>Runtime</strong><p>Active health, watchdog heartbeat metrics, and supervised critical background loops.</p></article>
+  <main>
+    <section class="hero">
+      <div class="shell hero-grid">
+        <div>
+          <span class="eyebrow">Gateway mental model</span>
+          <h1>One doorway, many network languages.</h1>
+          <p class="lede">Imagine proxysss as the smart front desk of a campus lab. Students arrive speaking HTTP, WebSocket, FTP, MQTT, TCP, UDP, or TLS. The front desk checks rules, chooses the right room, and keeps traffic moving without asking every service to stand at the public gate.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="#lesson">Start the animation</a>
+            <a class="button" href="#map">See the request path</a>
+          </div>
         </div>
-        <div class="flow">
-          <svg viewBox="0 0 720 180" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <defs>
-              <linearGradient id="g" x1="0" x2="1"><stop offset="0%" stop-color="#5eead4"/><stop offset="100%" stop-color="#60a5fa"/></linearGradient>
-            </defs>
-            <rect x="10" y="60" width="110" height="60" rx="12" fill="#18233d" stroke="#ffffff22"/>
-            <text x="65" y="95" fill="#e8eefc" text-anchor="middle" font-size="14">Clients</text>
-            <rect class="pulse" x="150" y="40" width="140" height="100" rx="14" fill="url(#g)" opacity=".25" stroke="#5eead4"/>
-            <text x="220" y="88" fill="#e8eefc" text-anchor="middle" font-size="15" font-weight="600">proxysss</text>
-            <text x="220" y="108" fill="#9fb0d0" text-anchor="middle" font-size="11">gateway core</text>
-            <rect x="330" y="50" width="120" height="80" rx="12" fill="#18233d" stroke="#ffffff22"/>
-            <text x="390" y="88" fill="#e8eefc" text-anchor="middle" font-size="13">Upstreams</text>
-            <rect x="490" y="50" width="110" height="80" rx="12" fill="#18233d" stroke="#ffffff22"/>
-            <text x="545" y="88" fill="#e8eefc" text-anchor="middle" font-size="13">Admin API</text>
-            <rect x="630" y="65" width="70" height="50" rx="10" fill="#18233d" stroke="#ffffff22"/>
-            <text x="665" y="95" fill="#9fb0d0" text-anchor="middle" font-size="11">YAML</text>
-            <path d="M120 90 H150" stroke="#5eead4" stroke-width="2" marker-end="url(#arrow)"/>
-            <path d="M290 90 H330" stroke="#60a5fa" stroke-width="2"/>
-            <path d="M450 90 H490" stroke="#60a5fa" stroke-width="2"/>
-            <path d="M600 90 H630" stroke="#fbbf24" stroke-width="2" stroke-dasharray="5 4"/>
-          </svg>
+        <div class="lab-visual" aria-hidden="true">
+          <div class="orbit"></div>
+          <div class="gateway-core">
+            <div class="gateway-label">
+              <strong>proxysss</strong>
+              <span>route, protect, proxy</span>
+            </div>
+          </div>
+          <div class="node client"><strong>Client</strong><span>browser, app, device</span></div>
+          <div class="node policy"><strong>Policy</strong><span>rate, auth, cache</span></div>
+          <div class="node upstream"><strong>Upstream</strong><span>service pool</span></div>
+          <div class="node config"><strong>YAML</strong><span>single source</span></div>
+          <div class="packet"></div>
+          <div class="packet"></div>
+          <div class="packet"></div>
         </div>
-      </section>
+      </div>
+    </section>
 
-      <section class="panel" id="reverse-proxy">
-        <div class="eyebrow">HTTP Path</div>
-        <h2>Reverse proxy &amp; load balancing</h2>
-        <p>Requests hit plain/TLS/H3 listeners, pass access control and rate limits, then match static sites, WebDAV, native AI proxy routes, domain routes, reverse-proxy routes, or script hooks.</p>
-        <div class="list">
-          <div><strong>Domain-first routing:</strong> <code>services.domain_routes</code> groups host/path upstream pools with per-route compression, cache, and rate limits.</div>
-          <div><strong>AI API routes:</strong> <code>services.ai_proxy</code> handles New API, sub2api, and OpenAI-compatible upstreams with path rewrite and provider metadata before generic HTTP routes.</div>
-          <div><strong>Algorithms:</strong> rendezvous (default), round-robin, least-connections, source-hash, weighted — with sticky affinity and active health probes.</div>
-          <div><strong>Resilience:</strong> retry policy, passive quarantine, manual upstream drain via admin API, forwarding headers (X-Forwarded-*, Forwarded).</div>
+    <section id="lesson" class="reveal">
+      <div class="shell">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Animated protocol lab</span>
+            <h2>Click a protocol and watch the traffic idea change.</h2>
+          </div>
+          <p>For a freshman: every protocol is just an agreement about how two computers talk. proxysss does not need to understand every business meaning inside the bytes. It only needs enough edge knowledge to accept, protect, route, tunnel, and observe the traffic.</p>
         </div>
-        <pre>services:
+
+        <div class="lesson-grid">
+          <div class="protocol-menu" id="protocolMenu" aria-label="Protocol choices"></div>
+
+          <article class="stage" aria-live="polite">
+            <div class="stage-top">
+              <div>
+                <h3 id="protocolTitle">HTTP reverse proxy</h3>
+                <p class="stage-summary" id="protocolSummary">A browser sends a request with a host and path. proxysss matches the route, forwards to an upstream, and streams the response back.</p>
+              </div>
+              <div class="status-chip" id="protocolChip">request</div>
+            </div>
+
+            <svg class="protocol-svg" viewBox="0 0 900 280" role="img" aria-labelledby="svgTitle svgDesc">
+              <title id="svgTitle">Protocol animation</title>
+              <desc id="svgDesc">Animated packet flow from client to proxysss to upstream and back.</desc>
+              <path class="wire" d="M110 140 C210 60 320 60 410 140" />
+              <path class="wire" d="M490 140 C580 60 690 60 790 140" />
+              <path class="wire" d="M790 170 C690 240 580 240 490 170" />
+              <path class="wire" d="M410 170 C320 240 210 240 110 170" />
+              <path class="wire-hot" id="pathA" d="M110 140 C210 60 320 60 410 140" />
+              <path class="wire-hot" id="pathB" d="M490 140 C580 60 690 60 790 140" />
+              <path class="wire-hot back" id="pathC" d="M790 170 C690 240 580 240 490 170" />
+              <path class="wire-hot back" id="pathD" d="M410 170 C320 240 210 240 110 170" />
+              <rect class="svg-box" x="30" y="96" width="150" height="88" rx="12" />
+              <rect class="svg-core" x="360" y="78" width="180" height="124" rx="18" />
+              <rect class="svg-box" x="720" y="96" width="150" height="88" rx="12" />
+              <text class="svg-text" x="105" y="130" text-anchor="middle" id="svgClient">Client</text>
+              <text class="svg-muted" x="105" y="152" text-anchor="middle" id="svgClientHint">browser/app</text>
+              <text class="svg-text" x="450" y="126" text-anchor="middle">proxysss</text>
+              <text class="svg-muted" x="450" y="150" text-anchor="middle" id="svgProxyHint">match + policy</text>
+              <text class="svg-text" x="795" y="130" text-anchor="middle" id="svgUpstream">Upstream</text>
+              <text class="svg-muted" x="795" y="152" text-anchor="middle" id="svgUpstreamHint">service pool</text>
+              <text class="svg-muted" x="260" y="72" text-anchor="middle" id="svgForward">request</text>
+              <text class="svg-muted" x="640" y="72" text-anchor="middle" id="svgForwardTwo">forward</text>
+              <text class="svg-muted" x="640" y="235" text-anchor="middle" id="svgBackTwo">response</text>
+              <text class="svg-muted" x="260" y="235" text-anchor="middle" id="svgBack">return</text>
+            </svg>
+
+            <div class="protocol-body">
+              <div class="steps" id="protocolSteps"></div>
+              <aside class="explain-box">
+                <p id="freshmanNote">Think of HTTP like ordering food at a counter: "Host is this restaurant, path is this dish, headers are small notes." proxysss reads the order slip and sends it to the right kitchen.</p>
+                <div class="tag-row" id="protocolTags"></div>
+              </aside>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="map" class="reveal">
+      <div class="shell">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Data path</span>
+            <h2>The gateway is a pipeline, not magic.</h2>
+          </div>
+          <p>A request enters a listener, goes through safety and routing decisions, then becomes either a proxied HTTP exchange, a bidirectional stream, a static/WebDAV/FTP operation, or an admin/docs response.</p>
+        </div>
+
+        <div class="map">
+          <div class="map-item">
+            <strong>1. Listen</strong>
+            <p>Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams.</p>
+          </div>
+          <div class="map-item">
+            <strong>2. Understand enough</strong>
+            <p>HTTP gets host/path/header parsing. TCP and UDP stay mostly transparent. TLS uses SNI and ALPN where needed.</p>
+          </div>
+          <div class="map-item">
+            <strong>3. Apply policy</strong>
+            <p>Access control, DDoS windows, rate limits, cache, compression, active health, and maintenance state shape the route.</p>
+          </div>
+          <div class="map-item">
+            <strong>4. Proxy or serve</strong>
+            <p>proxysss forwards to upstream pools, serves static/WebDAV/docs, bridges FTP data channels, or answers admin API calls.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="yaml" class="reveal">
+      <div class="shell">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Single config</span>
+            <h2>YAML is the lab notebook.</h2>
+          </div>
+          <p>nginx spreads power across directives and includes. proxysss keeps the full edge shape in one YAML file so people and agents can inspect it quickly.</p>
+        </div>
+
+        <div class="code-row">
+          <pre>services:
   domain_routes:
-    - name: api
-      domains: [api.example.com]
-      upstream: http://127.0.0.1:8080
-      upstreams: [http://127.0.0.1:8081]
-      upstream_weights:
-        http://127.0.0.1:8080: 1
-        http://127.0.0.1:8081: 3</pre>
-      </section>
+    - name: app
+      domains: [example.com]
+      path_prefix: /
+      upstream: http://127.0.0.1:9000
 
-      <section class="panel" id="tls">
-        <div class="eyebrow">Certificates</div>
-        <h2>TLS &amp; automatic HTTPS</h2>
-        <p>Default public TLS listens on <code>0.0.0.0:443</code>. Managed ACME uses built-in HTTP-01 and TLS-ALPN-01 without external tooling.</p>
-        <div class="list">
-          <div><strong>Built-in path:</strong> <code>http.tls.auto_https</code> / <code>acme_managed</code> — ordinary hostname certificates.</div>
-          <div><strong>Wildcard boundary:</strong> <span class="pill ok">built-in</span> Use <code>http.tls.mode: acme_managed</code> + <code>http.tls.acme.challenge: dns01</code> with embedded providers (<code>cloudflare</code>, <code>aliyun_cn</code>, <code>aliyun_intl</code>, <code>tencent</code>, <code>volcengine</code>, <code>aws</code>, <code>azure</code>, <code>google</code>, or <code>manual</code>). No acme.sh/certbot required. Legacy <code>acme_dns_external</code> remains for non-built-in providers only.</div>
-          <div><strong>On-demand TLS:</strong> <code>http.tls.on_demand</code> issues managed ACME certs on first SNI hit when <code>allow</code> patterns match (optional <code>ask_url</code> gate).</div>
-          <div><strong>SNI:</strong> Multi-cert selection via <code>http.tls.certificates</code> and per-domain manual SSL on routes.</div>
-        </div>
-      </section>
-
-      <section class="panel" id="websocket-grpc">
-        <div class="eyebrow">Long-lived HTTP</div>
-        <h2>WebSocket &amp; gRPC-over-H2</h2>
-        <p>WebSocket upgrades tunnel bidirectionally after a successful <code>101 Switching Protocols</code> handshake to compatible upstreams.</p>
-        <div class="list">
-          <div><strong>WebSocket:</strong> Route to <code>ws://</code> or <code>wss://</code> upstreams; hop-by-hop headers are stripped appropriately.</div>
-          <div><strong>gRPC:</strong> <span class="pill good">transparent</span> HTTP/2 reverse proxy forwards <code>application/grpc</code> payloads when upstreams speak HTTP/2 — no special directive required.</div>
-        </div>
-      </section>
-
-      <section class="panel" id="streams">
-        <div class="eyebrow">Realtime Streams</div>
-        <h2>TCP, UDP, and KCP-style fleets</h2>
-        <p>Direct stream listeners keep game, voice, device, and AI tool bridge payloads transparent while bounding connection churn in the Rust hot path.</p>
-        <div class="cards">
-          <article class="card"><strong>TCP</strong><p><code>tcp.listeners[].nodelay</code> defaults true; <code>connect_timeout_ms</code> bounds upstream dial latency.</p></article>
-          <article class="card"><strong>UDP/KCP</strong><p><code>session_ttl_secs</code> refreshes on each datagram; idle associations are pruned automatically.</p></article>
-          <article class="card"><strong>Scale guard</strong><p><code>max_associations</code> caps per-listener client mappings for churn-heavy realtime fleets.</p></article>
-          <article class="card"><strong>MQTT/IoT</strong><p>MQTT TCP, MQTT TLS passthrough/SNI, MQTT over WebSocket, and CoAP-style UDP stay transparent at the edge.</p></article>
-        </div>
-        <pre>tcp:
+  ai_proxy:
+    enabled: true
+    routes:
+      - name: new-api
+        provider: new-api
+        match_host: ai.example.com
+        upstream: http://127.0.0.1:3000</pre>
+          <pre>tcp:
   listeners:
-    - name: game-tcp
-      bind: 0.0.0.0:7000
-      protocol: game_tcp
+    - name: mqtt
+      bind: 0.0.0.0:1883
+      protocol: mqtt
       nodelay: true
-      connect_timeout_ms: 3000
+      upstreams:
+        - 127.0.0.1:18831
+
 udp:
   listeners:
     - name: game-kcp
       bind: 0.0.0.0:7001
       protocol: kcp
-      session_ttl_secs: 180
       max_associations: 262144</pre>
-      </section>
-
-      <section class="panel" id="rate-limit">
-        <div class="eyebrow">Shaping</div>
-        <h2>Rate limiting</h2>
-        <p>Shared-zone policies protect HTTP routes and TCP stream listeners using the same algorithm implementations.</p>
-        <div class="cards">
-          <article class="card"><strong>HTTP</strong><p><code>services.rate_limit.http</code> — fixed window, token bucket, or leaky bucket; optional connection caps per zone key.</p></article>
-          <article class="card"><strong>Streams</strong><p><code>services.rate_limit.stream</code> — limits new TCP connections per client IP in a shared zone.</p></article>
-          <article class="card"><strong>Keys</strong><p>Scope by remote IP, Host header, or arbitrary header value for API-key style quotas.</p></article>
         </div>
-        <div class="list">
-          <div><strong>Health:</strong> <code>load_balance.active_health</code> supports HTTP, TCP, and opt-in UDP probes; UDP can require a response or record a successful send.</div>
-          <div><strong>Watchdog:</strong> <code>runtime.watchdog</code> restarts failed critical loops when enabled and exposes heartbeat/failure counters on <code>/metrics</code>.</div>
-        </div>
-      </section>
+      </div>
+    </section>
 
-      <section class="panel" id="cache">
-        <div class="eyebrow">Response policy</div>
-        <h2>Cache &amp; compression</h2>
-        <p>Global defaults in <code>services.response_policy</code>; routes override compression and cache. Zones can be memory-backed with optional disk files.</p>
-        <div class="list">
-          <div><strong>Behaviors:</strong> <code>bypass</code>, <code>respect_origin</code>, <code>override</code>, <code>no_cache</code> with edge/browser TTL and optional <code>CDN-Cache-Control</code>.</div>
-          <div><strong>Cache keys:</strong> <code>key_prefix</code> and <code>vary_headers</code> (e.g. <code>Accept-Encoding</code>) build variant-aware keys.</div>
-          <div><strong>Stale policies:</strong> <code>stale_while_revalidate_secs</code> background refresh; <code>stale_if_error_secs</code> serves stale on upstream failure.</div>
-          <div><strong>PURGE:</strong> Active invalidation when <code>allow_purge: true</code>.</div>
-          <div><strong>Compression:</strong> Negotiates zstd, brotli, or gzip based on <code>Accept-Encoding</code>, content-type allowlist, and minimum body size.</div>
+    <section id="improve" class="reveal">
+      <div class="shell">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">What can improve next</span>
+            <h2>Stable gateways keep earning trust.</h2>
+          </div>
+          <p>The current design already covers the nginx-replacement surface. The next wins are deeper measurement, more protocol test fixtures, and sharper production runbooks.</p>
         </div>
-      </section>
 
-      <section class="panel" id="ftp">
-        <div class="eyebrow">Control + data</div>
-        <h2>FTP gateway</h2>
-        <p>When <code>services.ftp.native_control=true</code>, proxysss provides nginx ftp module directive-level parity: control-channel proxying, passive (PASV/EPSV) and active (PORT/EPRT) data rewriting, policy hooks, and structured lifecycle logs.</p>
-        <div class="list">
-          <div><strong>Policy:</strong> <code>command_allow</code> / <code>command_deny</code> plus <code>transfer_allow</code> / <code>transfer_deny</code> and per-user <code>user_policies</code>.</div>
-          <div><strong>Observability:</strong> Structured logs for control commands, transfer hooks, and data-channel bridge lifecycle.</div>
-          <div><strong>Directive mapping:</strong> <code>bind</code>, <code>proxy_pass</code>/<code>upstream</code>, <code>pasv_address</code>/<code>public_ip</code>, passive port range, timeout, login, and rate knobs map into <code>services.ftp</code>.</div>
+        <div class="roadmap">
+          <article>
+            <strong>Benchmark matrix</strong>
+            <p>Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming.</p>
+          </article>
+          <article>
+            <strong>Chaos testing</strong>
+            <p>Inject upstream resets, slow bodies, packet loss, DNS failure, log backpressure, reload races, and certificate renewal failures.</p>
+          </article>
+          <article>
+            <strong>Protocol fixtures</strong>
+            <p>Keep small upstream simulators for MQTT, CoAP-style UDP, FTP active/passive, WebDAV clients, and SSE token streaming.</p>
+          </article>
+          <article>
+            <strong>Kernel tuning guide</strong>
+            <p>Document Linux socket backlog, file descriptors, ephemeral ports, UDP buffers, QUIC UDP settings, and systemd restart policy.</p>
+          </article>
+          <article>
+            <strong>Observability packs</strong>
+            <p>Ship dashboard queries and alert rules for p95 latency, upstream quarantine, dropped UDP associations, watchdog restarts, and ACME renewal.</p>
+          </article>
+          <article>
+            <strong>Plugin safety budgets</strong>
+            <p>Add examples for script timeout, memory budget, hook placement, and how to keep business logic away from byte-copy hot paths.</p>
+          </article>
         </div>
-      </section>
+      </div>
+    </section>
+  </main>
 
-      <section class="panel" id="admin">
-        <div class="eyebrow">Control plane</div>
-        <h2>Admin &amp; agent API</h2>
-        <p>Loopback dashboard on <code>127.0.0.1:7777</code> exposes health, stats, upstream drain, plugin load/unload, and automation endpoints.</p>
-        <div class="list">
-          <div><strong>Read-only defaults:</strong> <code>enable_write_ops=false</code> until operators enable cluster automation.</div>
-          <div><strong>Upserts:</strong> Bearer-token <code>POST /v1/domain-routes/upsert</code> (and TCP/UDP/listener siblings) persist into YAML and reload in-process.</div>
-          <div><strong>Inspection CLI:</strong> <code>proxysss config explain</code>, <code>capabilities</code>, <code>nginx-parity</code>, <code>reload-plan</code>.</div>
-        </div>
-      </section>
-
-      <section class="panel" id="security">
-        <div class="eyebrow">Hardening</div>
-        <h2>Security model</h2>
-        <div class="list">
-          <div><strong>SSRF guards:</strong> Blocked upstream host lists and mutation validation.</div>
-          <div><strong>HTTP/1 smuggling:</strong> Ambiguous requests rejected when enabled.</div>
-          <div><strong>Admin auth:</strong> Rate-limited failed logins with lockout windows.</div>
-          <div><strong>Secrets:</strong> Redacted in <code>proxysss config show</code>; atomic YAML writes on automation.</div>
-        </div>
-      </section>
-
-      <section class="panel" id="kubernetes">
-        <div class="eyebrow">In-cluster</div>
-        <h2>Kubernetes ingress-style mode</h2>
-        <p>When <code>kubernetes.enabled=true</code>, service DNS mappings expand into <code>services.domain_routes</code> on each load/reload — useful for in-cluster edge registration without hand-editing every pod hostname.</p>
-        <pre>kubernetes:
-  enabled: true
-  namespace: prod
-  cluster_domain: cluster.local
-  mappings:
-    - name: api
-      service: api-svc
-      port: 8080
-      domains: [api.example.com]</pre>
-      </section>
-
-      <section class="panel" id="scripts">
-        <div class="eyebrow">Extensions</div>
-        <h2>Embedded TypeScript runtime</h2>
-        <p>Scripts run inside the binary via QuickJS with in-process TypeScript stripping (SWC). Hooks like <code>access</code>, <code>routeHttp</code>, and plugin modules are optional — the default gateway path avoids script calls on hot paths.</p>
-        <div class="list">
-          <div><strong>Main script:</strong> <code>gateway.ts</code> exported default plugin object.</div>
-          <div><strong>Auto plugins:</strong> <code>plugins/*.ts</code> with optional <code>&lt;name&gt;.plugin.yaml</code> sidecars.</div>
-          <div><strong>Not supported:</strong> Node/Deno/tsc, npm module graphs, or external runtimes.</div>
-        </div>
-      </section>
-
-      <section class="panel" id="reload">
-        <div class="eyebrow">Operations</div>
-        <h2>Hot reload boundaries</h2>
-        <div class="list">
-          <div><strong>Hot:</strong> Routes, policies, scripts, plugins, most <code>services.*</code> values, upstream health overrides.</div>
-          <div><strong>Restart:</strong> Listener binds, TLS mode, admin bind, FTP enable/bind, logging sink paths/format.</div>
-          <div><strong>Inspect:</strong> <code>proxysss config reload-plan</code> lists what changes need a process restart vs in-process reload.</div>
-        </div>
-      </section>
-    </main>
-  </div>
+  <footer class="footer">
+    <div class="shell">
+      Open the CLI views after editing config: <code>proxysss config explain</code>, <code>proxysss config routes</code>, <code>proxysss config reload-plan</code>, and <code>proxysss config nginx-parity --format yaml</code>.
+    </div>
+  </footer>
 
   <script>
-    const buttons = document.querySelectorAll('.topic-btn');
-    const panels = document.querySelectorAll('.panel');
-    function show(topic) {
-      buttons.forEach(btn => btn.classList.toggle('active', btn.dataset.topic === topic));
-      panels.forEach(panel => {
-        const active = panel.id === topic;
-        panel.classList.toggle('active', active);
-        if (active) {
-          panel.style.animation = 'none';
-          panel.offsetHeight;
-          panel.style.animation = '';
+    const protocols = [
+      {
+        key: "http",
+        name: "HTTP reverse proxy",
+        hint: "host + path route",
+        chip: "request",
+        summary: "A browser sends a request with a host and path. proxysss matches the route, forwards to an upstream, and streams the response back.",
+        note: "Think of HTTP like ordering food at a counter: Host is the restaurant, path is the dish, headers are small notes. proxysss reads the order slip and sends it to the right kitchen.",
+        labels: ["browser", "match + policy", "app service", "request", "forward", "response", "return"],
+        tags: ["HTTP/1.1", "domain_routes", "cache", "compression"],
+        steps: [
+          "Client opens a connection on port 80 or 443 and sends a method, host, path, headers, and optional body.",
+          "proxysss checks access control and rate limits, then chooses the most specific domain/path route.",
+          "The upstream pool is filtered by health state, load-balancing policy, and retry settings.",
+          "The response can be cached, compressed, logged, and streamed back to the client."
+        ]
+      },
+      {
+        key: "tls",
+        name: "HTTPS, TLS, and ACME",
+        hint: "secure handshake",
+        chip: "encrypt",
+        summary: "TLS is the locked envelope. The client and proxy agree on keys first, then HTTP travels inside the encrypted tunnel.",
+        note: "For a freshman: TLS is like agreeing on a secret code before passing notes. ACME is the automatic office that proves the domain belongs to you and issues the certificate.",
+        labels: ["browser", "SNI + ALPN", "upstream", "hello", "route", "encrypted response", "secure return"],
+        tags: ["TLS", "HTTP/2", "HTTP/3", "ACME DNS-01"],
+        steps: [
+          "Client sends ClientHello with SNI, so proxysss knows which hostname certificate to present.",
+          "proxysss selects or obtains the certificate through manual config, managed ACME, on-demand TLS, or DNS-01 wildcard issuance.",
+          "ALPN chooses HTTP/1.1, HTTP/2, or HTTP/3 behavior where applicable.",
+          "After the handshake, the normal route pipeline handles the decrypted HTTP request."
+        ]
+      },
+      {
+        key: "websocket",
+        name: "WebSocket",
+        hint: "upgrade to tunnel",
+        chip: "duplex",
+        summary: "WebSocket starts as HTTP, then upgrades into a long-lived two-way byte stream for chat, dashboards, games, and realtime control.",
+        note: "HTTP is like sending forms. WebSocket is like opening a phone call after the first form says, please upgrade this conversation.",
+        labels: ["browser", "upgrade + tunnel", "ws upstream", "Upgrade", "duplex", "messages", "messages"],
+        tags: ["ws://", "wss://", "101 Switching Protocols"],
+        steps: [
+          "The client sends an HTTP request with Upgrade and Connection headers.",
+          "proxysss validates the route and forwards the upgrade to a ws or wss upstream.",
+          "After 101 Switching Protocols, both sides can send frames whenever they want.",
+          "The gateway copies traffic both ways while timeouts, access policy, and logs protect the edge."
+        ]
+      },
+      {
+        key: "grpc",
+        name: "gRPC over HTTP/2",
+        hint: "typed calls on streams",
+        chip: "h2",
+        summary: "gRPC is structured service calls over HTTP/2. proxysss treats it as HTTP/2 traffic and keeps the stream moving.",
+        note: "If REST is filling out forms, gRPC is a typed lab worksheet. Both sides agree on exact fields, and HTTP/2 carries many streams efficiently.",
+        labels: ["client SDK", "HTTP/2 route", "gRPC server", "call", "stream", "trailers", "result"],
+        tags: ["HTTP/2", "application/grpc", "streaming"],
+        steps: [
+          "The client opens an HTTP/2 request with gRPC content type.",
+          "proxysss keeps headers, body frames, and trailers flowing through the HTTP/2 route.",
+          "Load balancing and health checks pick a live upstream.",
+          "The response stream returns with status metadata and optional trailers."
+        ]
+      },
+      {
+        key: "tcp",
+        name: "TCP stream",
+        hint: "reliable byte pipe",
+        chip: "stream",
+        summary: "TCP is a reliable ordered byte pipe. proxysss accepts a connection, dials an upstream, and copies bytes both ways.",
+        note: "TCP is like a numbered conveyor belt. If a box is missing, the sender knows and retries. proxysss connects two belts together.",
+        labels: ["client", "connect + policy", "service", "SYN", "bytes", "bytes", "ACK"],
+        tags: ["TCP_NODELAY", "stream_routes", "SNI passthrough"],
+        steps: [
+          "Client opens a TCP connection to a configured listener.",
+          "proxysss checks stream access control and rate limits, then selects an upstream.",
+          "With nodelay enabled, small packets are sent promptly for latency-sensitive traffic.",
+          "Bytes are copied in both directions until either side closes."
+        ]
+      },
+      {
+        key: "udp",
+        name: "UDP and KCP-style traffic",
+        hint: "datagrams + association",
+        chip: "datagram",
+        summary: "UDP has no connection handshake. proxysss creates a temporary client-to-upstream association and refreshes it when packets arrive.",
+        note: "UDP is like tossing labeled postcards. Fast, simple, no built-in promise that every card arrives. KCP-style protocols add their own reliability above UDP.",
+        labels: ["game/device", "association", "udp service", "datagram", "forward", "datagram", "reply"],
+        tags: ["KCP", "CoAP", "voice", "max_associations"],
+        steps: [
+          "A datagram arrives on a UDP listener, often from a game, voice, or device client.",
+          "proxysss maps that client address to an upstream and stores the association.",
+          "Each packet refreshes the session TTL; idle associations are pruned.",
+          "max_associations caps memory use under huge churn."
+        ]
+      },
+      {
+        key: "mqtt",
+        name: "MQTT and IoT",
+        hint: "device messaging",
+        chip: "iot",
+        summary: "MQTT devices usually talk to brokers. proxysss stays transparent at the edge and handles TCP, TLS passthrough, WebSocket, and rate policy.",
+        note: "MQTT is like a bulletin board for sensors. Devices publish messages to topics, and other clients subscribe. The broker understands topics; proxysss guards the door.",
+        labels: ["device", "transparent edge", "broker", "CONNECT", "route", "PUBLISH", "SUBSCRIBE"],
+        tags: ["MQTT TCP", "MQTT TLS", "MQTT WebSocket", "CoAP UDP"],
+        steps: [
+          "Devices connect on MQTT TCP, MQTT TLS passthrough, or MQTT over WebSocket.",
+          "proxysss applies listener policy and chooses a broker upstream.",
+          "The MQTT protocol stays inside the stream for the broker to parse.",
+          "Observability uses protocol hints without adding hot-path payload parsing."
+        ]
+      },
+      {
+        key: "ftp",
+        name: "FTP",
+        hint: "control + data",
+        chip: "dual path",
+        summary: "FTP is unusual because commands and file data can use separate connections. proxysss tracks both and rewrites passive/active data addresses.",
+        note: "FTP is like using one classroom phone to say what file you want, then opening a second door where the actual boxes move.",
+        labels: ["ftp client", "control policy", "ftp server", "USER/LIST", "data setup", "file bytes", "226 done"],
+        tags: ["PASV/EPSV", "PORT/EPRT", "per-user policy"],
+        steps: [
+          "The control channel carries login and commands such as LIST, RETR, and STOR.",
+          "proxysss applies allow/deny, command, transfer, and per-user policies.",
+          "For passive or active transfers, the gateway rewrites data-channel addresses and ports.",
+          "Structured logs record control and transfer lifecycle events."
+        ]
+      },
+      {
+        key: "ai",
+        name: "AI API reverse proxy",
+        hint: "streaming tokens",
+        chip: "sse",
+        summary: "AI providers often stream tokens as Server-Sent Events. proxysss has native routes for New API, sub2api, and OpenAI-compatible upstreams.",
+        note: "An AI stream is like the teacher writing the answer word by word instead of waiting until the whole essay is finished.",
+        labels: ["app/client", "ai_proxy", "AI upstream", "chat", "rewrite", "tokens", "SSE"],
+        tags: ["New API", "sub2api", "OpenAI-compatible", "SSE"],
+        steps: [
+          "The client calls a provider-shaped endpoint such as /v1/chat/completions.",
+          "services.ai_proxy matches host/path and rewrites the base path when needed.",
+          "Provider metadata and headers are shaped by gateway config.",
+          "Streaming responses are flushed back without waiting for the whole body."
+        ]
+      },
+      {
+        key: "reload",
+        name: "Hot reload and admin API",
+        hint: "change without guessing",
+        chip: "ops",
+        summary: "The admin API and config reload path let automation update routes and listeners while keeping dangerous write operations disabled by default.",
+        note: "Think of YAML as the lab schedule. Hot reload means changing which rooms are open without rebuilding the whole building.",
+        labels: ["agent", "admin + reload", "yaml/runtime", "token", "persist", "state", "metrics"],
+        tags: ["127.0.0.1:7777", "token", "reload-plan", "metrics"],
+        steps: [
+          "Operators inspect the gateway with config explain, routes, capabilities, and nginx-parity.",
+          "Token-authenticated admin calls can upsert domain routes, reverse proxy routes, TCP listeners, UDP listeners, and blacklists.",
+          "Writes persist atomically into the YAML config and reload eligible changes in process.",
+          "Listener identity, TLS mode, and logging sink changes still require restart."
+        ]
+      }
+    ];
+
+    const menu = document.getElementById("protocolMenu");
+    const title = document.getElementById("protocolTitle");
+    const summary = document.getElementById("protocolSummary");
+    const chip = document.getElementById("protocolChip");
+    const note = document.getElementById("freshmanNote");
+    const steps = document.getElementById("protocolSteps");
+    const tags = document.getElementById("protocolTags");
+    const labels = [
+      document.getElementById("svgClientHint"),
+      document.getElementById("svgProxyHint"),
+      document.getElementById("svgUpstreamHint"),
+      document.getElementById("svgForward"),
+      document.getElementById("svgForwardTwo"),
+      document.getElementById("svgBackTwo"),
+      document.getElementById("svgBack")
+    ];
+    const hotPaths = ["pathA", "pathB", "pathC", "pathD"].map((id) => document.getElementById(id));
+
+    function restartAnimation() {
+      hotPaths.forEach((path) => {
+        path.style.animation = "none";
+        path.getBoundingClientRect();
+        path.style.animation = "";
+      });
+    }
+
+    function setProtocol(protocol) {
+      title.textContent = protocol.name;
+      summary.textContent = protocol.summary;
+      chip.textContent = protocol.chip;
+      note.textContent = protocol.note;
+      labels.forEach((label, index) => {
+        label.textContent = protocol.labels[index];
+      });
+      steps.innerHTML = protocol.steps.map((step) => `<div class="step">${step}</div>`).join("");
+      tags.innerHTML = protocol.tags.map((tag) => `<span class="tag">${tag}</span>`).join("");
+      document.querySelectorAll(".protocol-btn").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.key === protocol.key);
+      });
+      restartAnimation();
+    }
+
+    protocols.forEach((protocol) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "protocol-btn";
+      button.dataset.key = protocol.key;
+      button.innerHTML = `<strong>${protocol.name}</strong><span>${protocol.hint}</span>`;
+      button.addEventListener("click", () => setProtocol(protocol));
+      menu.appendChild(button);
+    });
+
+    setProtocol(protocols[0]);
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("visible");
         }
       });
-      history.replaceState(null, '', '#' + topic);
-    }
-    buttons.forEach(btn => btn.addEventListener('click', () => show(btn.dataset.topic)));
-    const initial = location.hash.replace('#', '') || 'overview';
-    if (document.getElementById(initial)) show(initial);
+    }, { threshold: .16 });
+
+    document.querySelectorAll(".reveal").forEach((section) => observer.observe(section));
   </script>
 </body>
 </html>

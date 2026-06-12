@@ -75,11 +75,12 @@ One YAML file is intentional: agents and humans can reason about the entire edge
 
 ## Interactive visualization
 
-Open [architecture.html](./architecture.html) in a browser for an animated, topic-based walkthrough of listeners, policy chains, extension hooks, and reload boundaries.
+Open [architecture.html](./architecture.html) in a browser for an animated first-year-student protocol lab. It explains HTTP, TLS/ACME, WebSocket, gRPC, TCP, UDP/KCP-style traffic, MQTT/IoT, FTP, AI API streaming, admin reload, listeners, policy chains, extension hooks, and reload boundaries without external JavaScript dependencies.
 
 ## Related docs
 
 - [CONFIGURATION.md](./CONFIGURATION.md) — field-by-field tutorial
 - [PRODUCTION-HARDENING.md](./PRODUCTION-HARDENING.md) — release gates, benchmark baselines, HA, and watch points
+- [IMPROVEMENT-BACKLOG.md](./IMPROVEMENT-BACKLOG.md) — stability, performance, protocol, security, and operations backlog
 - [../nginx-to-proxysss.md](../nginx-to-proxysss.md) — migration mapping
 - [../ts-how-to-use.md](../ts-how-to-use.md) — scripting guide
