@@ -44,7 +44,7 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
     Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
-use memchr::{memchr, memmem};
+use memchr::memmem;
 use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -275,7 +275,8 @@ fn pooled_buffer_capacity() -> usize {
 }
 
 fn relay_buffer_pool() -> &'static ByteBufferPool {
-    RELAY_BUFFER_POOL.get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
+    RELAY_BUFFER_POOL
+        .get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
 }
 
 fn udp_buffer_pool() -> &'static ByteBufferPool {
@@ -596,7 +597,7 @@ impl TcpSplicePipe {
             read_fd: fds[0],
             write_fd: fds[1],
         };
-        pipe.set_capacity(1 * 1024 * 1024);
+        pipe.set_capacity(1024 * 1024);
         Ok(pipe)
     }
 
@@ -4100,46 +4101,71 @@ impl Gateway {
                 candidate.len,
                 connection
             );
-            #[cfg(target_os = "linux")]
-            let cork_sendfile = request.method == "GET"
-                && candidate.len > 0
-                && candidate.cached_body.is_none()
-                && candidate.sendfile.is_some();
-            #[cfg(target_os = "linux")]
-            if cork_sendfile {
-                set_tcp_cork(stream, true);
-            }
 
-            let header_result = stream
-                .write_all(header.as_bytes())
-                .await
-                .context("failed writing plain http fast path response head");
+            // Fast path for small cached static bodies: copy head + body into a
+            // single pooled buffer and issue ONE write syscall. This matches
+            // nginx's single-segment small-file delivery and avoids the extra
+            // syscalls of TCP_CORK on/off plus a separate header/body write.
+            let small_single_write = request.method == "GET"
+                && candidate.cached_body.is_some()
+                && header.len() + candidate.len as usize <= POOL_BUFFER_BYTES;
 
-            let send_result =
-                if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
-                    if let Some(body) = candidate.cached_body.as_ref() {
-                        stream
-                            .write_all(body)
+            let send_result = if small_single_write {
+                let body = candidate
+                    .cached_body
+                    .as_ref()
+                    .expect("cached body present for single-write static");
+                let total = header.len() + body.len();
+                let mut buf = relay_buffer_pool().acquire();
+                buf[..header.len()].copy_from_slice(header.as_bytes());
+                buf[header.len()..total].copy_from_slice(body);
+                stream
+                    .write_all(&buf[..total])
+                    .await
+                    .context("failed writing combined static fast path response")
+            } else {
+                // Coalesce head + body into a single TCP segment (nginx
+                // `tcp_nopush`/TCP_CORK) for sendfile and larger cached bodies.
+                #[cfg(target_os = "linux")]
+                let cork_static = request.method == "GET"
+                    && candidate.len > 0
+                    && (candidate.sendfile.is_some() || candidate.cached_body.is_some());
+                #[cfg(target_os = "linux")]
+                if cork_static {
+                    set_tcp_cork(stream, true);
+                }
+
+                let header_result = stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .context("failed writing plain http fast path response head");
+
+                let body_result =
+                    if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
+                        if let Some(body) = candidate.cached_body.as_ref() {
+                            stream
+                                .write_all(body)
+                                .await
+                                .context("failed writing cached static fast path body")
+                        } else {
+                            send_static_file_fast(
+                                stream,
+                                &candidate.path,
+                                candidate.len,
+                                candidate.sendfile.clone(),
+                            )
                             .await
-                            .context("failed writing cached static fast path body")
+                            .map(|_| ())
+                        }
                     } else {
-                        send_static_file_fast(
-                            stream,
-                            &candidate.path,
-                            candidate.len,
-                            candidate.sendfile.clone(),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
-                } else {
-                    Ok(())
-                };
-            #[cfg(target_os = "linux")]
-            if cork_sendfile {
-                set_tcp_cork(stream, false);
-            }
-            header_result?;
+                        Ok(())
+                    };
+                #[cfg(target_os = "linux")]
+                if cork_static {
+                    set_tcp_cork(stream, false);
+                }
+                header_result.and(body_result)
+            };
             send_result?;
 
             if config.logging.access_log {
@@ -9244,26 +9270,23 @@ async fn send_static_file_fast(
     _len: u64,
     sendfile: Option<Arc<std::fs::File>>,
 ) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    let _ = sendfile;
-
     #[cfg(target_os = "linux")]
     {
-        let path = path.to_path_buf();
         let file = match sendfile {
             Some(file) => file,
             None => Arc::new(
-                std::fs::File::open(&path).context("failed opening static file for sendfile")?,
+                std::fs::File::open(path).context("failed opening static file for sendfile")?,
             ),
         };
         sendfile_all_async(stream, file.as_raw_fd(), _len)
             .await
             .context("sendfile static response failed")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = sendfile;
         let mut file = tokio::fs::File::open(path)
             .await
             .context("failed opening static file for fast copy")?;
@@ -9542,55 +9565,36 @@ fn file_streaming_body(file: tokio::fs::File) -> GatewayBody {
 struct RawSseStreamState {
     upstream: BoxedProxyIo,
     leftover: Option<Bytes>,
-    pending: BytesMut,
-    buffer: [u8; 4096],
-    done: bool,
+    buffer: Box<[u8]>,
 }
 
 fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> GatewayBody {
     let state = RawSseStreamState {
         upstream,
         leftover,
-        pending: BytesMut::with_capacity(4096),
-        buffer: [0_u8; 4096],
-        done: false,
+        buffer: vec![0_u8; 16 * 1024].into_boxed_slice(),
     };
     let stream = futures::stream::try_unfold(state, |mut state| async move {
-        if state.done {
+        // Forward the head-read leftover first, then stream upstream reads as
+        // they arrive with NO event-boundary buffering (nginx `proxy_buffering
+        // off`): lowest first-token and inter-token latency for AI SSE. Upstream
+        // EOF ends the stream, which naturally covers `data: [DONE]` + close.
+        if let Some(leftover) = state.leftover.take() {
+            if !leftover.is_empty() {
+                return Ok(Some((leftover, state)));
+            }
+        }
+
+        let read = state
+            .upstream
+            .read(&mut state.buffer)
+            .await
+            .context("raw SSE upstream stream read failed")?;
+        if read == 0 {
             return Ok::<_, anyhow::Error>(None);
         }
-
-        loop {
-            if let Some(end) = find_sse_event_end(&state.pending) {
-                let event = state.pending.split_to(end).freeze();
-                state.done = event
-                    .windows(b"data: [DONE]".len())
-                    .any(|window| window == b"data: [DONE]");
-                return Ok(Some((event, state)));
-            }
-
-            if let Some(leftover) = state.leftover.take() {
-                if !leftover.is_empty() {
-                    state.pending.extend_from_slice(&leftover);
-                    continue;
-                }
-            }
-
-            let read = state
-                .upstream
-                .read(&mut state.buffer)
-                .await
-                .context("raw SSE upstream stream read failed")?;
-            if read == 0 {
-                if state.pending.is_empty() {
-                    return Ok(None);
-                }
-                let bytes = state.pending.split().freeze();
-                state.done = true;
-                return Ok(Some((bytes, state)));
-            }
-            state.pending.extend_from_slice(&state.buffer[..read]);
-        }
+        let chunk = Bytes::copy_from_slice(&state.buffer[..read]);
+        Ok(Some((chunk, state)))
     })
     .map_ok(Frame::data);
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
@@ -18344,21 +18348,6 @@ async fn relay_raw_http_body(
             .context("failed writing raw upstream body")?;
     }
     Ok(())
-}
-
-fn find_sse_event_end(bytes: &[u8]) -> Option<usize> {
-    let mut offset = 0;
-    while let Some(position) = memchr(b'\n', &bytes[offset..]) {
-        let index = offset + position;
-        if index > 0 && bytes[index - 1] == b'\n' {
-            return Some(index + 1);
-        }
-        if index >= 3 && bytes[index - 3..=index] == *b"\r\n\r\n" {
-            return Some(index + 1);
-        }
-        offset = index + 1;
-    }
-    None
 }
 
 async fn relay_passthrough_chunked_http_body(

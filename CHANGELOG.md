@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.1 - 2026-06-15
+
+- Static small-file delivery now copies response head + body into one pooled buffer and issues a single write syscall (nginx single-segment parity), removing the extra syscall and separate header packet; static-small and CDN hot-update now exceed nginx in the Ubuntu 24 mixed benchmark.
+- SSE/streaming proxy forwards each upstream read immediately with no event-boundary buffering (nginx `proxy_buffering off`), lowering first-token and inter-token latency for AI streaming; New API/SSE now meets or beats nginx.
+- Larger cached bodies and sendfile static keep `TCP_CORK` head+body coalescing for single-segment delivery.
+- Fixed CI clippy failures (`identity_op`, `needless_return`) so the quality gate passes cleanly.
+
 ## v1.3.0 - 2026-06-15
 
 - Added bounded lock-free buffer pooling (`ByteBufferPool`) for the hot-path raw HTTP/SSE relay and UDP association readers, cutting per-connection heap churn under very high concurrent socket counts while keeping resident pool memory bounded (no leak): surplus buffers are freed on return.
