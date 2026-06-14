@@ -22,7 +22,12 @@ RUN_DIR="$BENCH_ROOT/runs/latest"
 WWW_DIR="$RUN_DIR/www"
 PID_FILE="$RUN_DIR/pids.txt"
 RESULTS_FILE="$RUN_DIR/results.json"
-PROXY_BIN="$ROOT/target/release/proxysss"
+BUILD_PROFILE_WAS_SET="${BUILD_PROFILE+x}"
+BUILD_PROFILE="${BUILD_PROFILE:-release}"
+if [[ "$QUICK" == "1" && -z "$BUILD_PROFILE_WAS_SET" ]]; then
+  BUILD_PROFILE="release-fast"
+fi
+PROXY_BIN="${PROXY_BIN:-$ROOT/target/$BUILD_PROFILE/proxysss}"
 
 stop_bench_processes() {
   if [[ -f "$PID_FILE" ]]; then
@@ -34,7 +39,7 @@ stop_bench_processes() {
 }
 
 if [[ ! -x "$PROXY_BIN" ]]; then
-  cargo build --release --locked
+  cargo build --profile "$BUILD_PROFILE" --locked
 fi
 
 stop_bench_processes

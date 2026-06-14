@@ -22,7 +22,7 @@ runtime:       # hot reload, watchdog, and maintenance state
 
 ## AI reverse proxy
 
-`services.ai_proxy` is the native surface for New API, sub2api, and OpenAI-compatible upstreams. It runs before generic domain/reverse-proxy routes, supports host/path matching, path rewrite, provider headers, and header strip/set behavior.
+`services.ai_proxy` is the native surface for New API, sub2api, and OpenAI-compatible upstreams. It runs before generic domain/reverse-proxy routes, supports host/path matching, path rewrite, optional provider metadata headers, and header strip/set behavior.
 
 ```yaml
 services:
@@ -36,6 +36,7 @@ services:
         path_prefix: /v1
         upstream: http://127.0.0.1:3000
         rewrite_base_path: /v1
+        emit_metadata_headers: false # optional: skip proxysss-ai-* upstream metadata headers
       - name: sub2api
         provider: sub2api
         match_host: sub2api.example.com
@@ -90,6 +91,7 @@ services:
         hosts: [internal.local]
         path_prefix: /v1
         upstream: http://127.0.0.1:9000
+        forward_headers: false # optional: skip automatic X-Forwarded-* / Forwarded headers
 ```
 
 ## Load balancing
@@ -130,6 +132,29 @@ load_balance:
 
 UDP probes are opt-in because many KCP/game protocols do not echo generic health payloads. When `udp_expect_response=false`, proxysss records a successful UDP send as the health signal.
 
+## Runtime performance
+
+`runtime.performance` is enabled by default. It does not write sysctl files during normal gateway startup; instead it adapts runtime socket behavior to the detected host and prints the selected plan once on every process start/restart. Ubuntu 24.x enables the extreme socket policy, while older Ubuntu, Debian, unknown Linux, and non-Linux hosts log the reason they fall back or skip.
+
+Data-plane CPU parallelism is intentionally not configurable in YAML. On Linux, proxysss derives HTTP accept workers, TCP stream accept workers, and the dedicated stream runtime worker count from detected CPU cores. This keeps high-core production machines scaling automatically and avoids performance regressions from user-supplied worker counts that are too low or too high.
+
+`profile` selects the Linux socket/sysctl tuning family (`edge`, `bulk`, or `latency`). `traffic_profile` selects the runtime data-path tradeoff. The default `small` profile favors cached small static files, HTTP/2/SSE first-token latency, TCP long connections, and UDP/KCP-style realtime traffic. Use `bulk` for large static/file transfer deployments that prefer sendfile/zero-copy behavior; use `balanced` when one gateway must preload both small hot files and bulk sendfile descriptors.
+
+```yaml
+runtime:
+  performance:
+    enabled: true
+    profile: edge   # edge, bulk, or latency
+    traffic_profile: small   # small, balanced, or bulk
+    adaptive_system: true
+    socket_extreme: true
+    log_on_start: true
+```
+
+After config load, proxysss preloads eligible static index/top-level files according to `traffic_profile`: `small` warms bounded in-memory hot objects, `bulk` prepares sendfile descriptors, and `balanced` does both where applicable. Listener counts remain automatic; users should choose traffic shape, not worker counts.
+
+Use `proxysss tune linux --apply` only when you intentionally want persistent `/etc/sysctl.d` host tuning. The apply path is guarded by default: it logs SSH/session safety scope, skips unsupported sysctl keys, skips unavailable congestion controls such as `bbr` when the kernel does not expose them, backs up the previous proxysss profile, and restores it if `sysctl --system` fails. Use `--unsafe-apply` only for lab machines where losing the session is acceptable.
+
 ## Runtime watchdog
 
 Critical background loops are supervised by `runtime.watchdog`. If a supervised task exits unexpectedly, proxysss increments `proxysss_critical_task_failures_total`; when `restart_critical_tasks=true`, it restarts the task after `restart_backoff_secs`.
@@ -149,7 +174,7 @@ Heartbeat ticks are exposed as `proxysss_watchdog_heartbeat_total` on `/metrics`
 
 - Terminate TLS on `http.tls_bind` (default `0.0.0.0:443`).
 - HTTP/2 and HTTP/3 share the TLS listener configuration.
-- WebSocket upgrades are proxied when routes use `ws://` or `wss://` upstreams.
+- WebSocket upgrades are proxied when routes use `ws://` or `wss://` upstreams. In Linux performance mode, simple no-policy `ws://` reverse proxy routes can use the raw WebSocket fast lane before the general HTTP upgrade path.
 - gRPC (`application/grpc`, `application/grpc+proto`) works over HTTP/2 reverse proxying without extra directives.
 
 ## Access control and rate limits
@@ -261,6 +286,7 @@ udp:
 
 - `tcp.listeners[].nodelay` defaults to `true` so latency-sensitive streams do not wait on Nagle batching.
 - `tcp.listeners[].connect_timeout_ms` defaults to `3000`; tune lower for hot failover, higher for cold backends.
+- Linux `runtime.performance.enabled=true` fans TCP stream binds out across CPU-adaptive `SO_REUSEPORT` accept workers. A single-upstream TCP listener with scripts, affinity, active health, passive health, and extra upstreams disabled uses the direct fast path and bypasses the generic upstream planner.
 - `udp.listeners[].session_ttl_secs` defaults to `180`; keep it above the client heartbeat interval for KCP or mobile reconnect traffic.
 - `udp.listeners[].max_associations` defaults to `262144`; set `0` only for controlled labs where unbounded UDP association growth is acceptable.
 - `protocol` is an observability hint only. The hot path stays transparent and does not parse KCP/game payloads.
@@ -410,7 +436,9 @@ proxysss config reload-plan
 proxysss config routes
 ```
 
-Hot reload covers routes, scripts, plugins, and most `services.*` values. Listener binds, TLS mode, and logging sink paths require a process restart.
+Manual reload is the default high-performance mode: call `POST /v1/reload` on the admin API, or use the token-authenticated admin mutation APIs, which persist YAML and reload eligible changes immediately. Background file watching is opt-in with `runtime.hot_reload.enabled: true`; when enabled, the watcher fingerprints the main YAML file, the main script, and auto-loaded plugin scripts at `runtime.hot_reload.interval_ms`.
+
+Reload covers routes, scripts, plugins, and most `services.*` values. Listener binds, TLS mode, and logging sink paths require a process restart.
 
 ## Learning templates
 

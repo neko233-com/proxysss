@@ -7,6 +7,7 @@ Configuration model:
 - Keep runtime configuration in a single YAML file, usually `proxysss.yaml`.
 - Use `-config`, `--config`, or `-c` when you want a different YAML path.
 - Use YAML first for gateway behavior and reserve TypeScript plugins for optional business logic.
+- Treat Linux mixed-load validation as the migration performance proof: enable the same YAML surfaces you plan to run together, then compare proxysss and nginx with CDN/static, reverse proxy, New API/SSE, WebSocket, TCP, UDP, and KCP-style traffic running concurrently per gateway. The default release proof prioritizes aggregate throughput plus game/realtime TCP, UDP, and KCP-style long-connection scenarios; WebSocket/static/reverse/SSE must remain above the soft floor with low errors; HTTPS static and static-large remain reported but are gates only when explicitly requested. Single-route or single-protocol benchmarks are useful for diagnosis, not final migration sign-off.
 
 ## Domain service groups
 
@@ -72,6 +73,8 @@ services:
 
 - `strip_prefix: true` 对应 nginx `location /api/` + `proxy_pass .../`
 - 常见 `Host` / `X-Real-IP` / `X-Forwarded-*` 会自动补齐
+- 如果 nginx 配置只设置 `Host`、没有追加 `X-Forwarded-*` / `Forwarded`，可以在 `domain_routes`、`reverse_proxy.routes` 或 `ai_proxy.routes` 上设置 `forward_headers: false`，让语义和高吞吐基准更接近 nginx 默认反代路径
+- 对 New API/SSE 迁移，如果上游不需要 `proxysss-ai-*` 元数据头，可以在 `ai_proxy.routes` 上设置 `emit_metadata_headers: false`，保留路径 rewrite 和 provider 路由，同时减少每请求 header 工作
 
 ## 2. 反代某个域名 = 后面整个服务器
 
@@ -309,6 +312,13 @@ load_balance:
       - https://ops.example.com/webhooks/proxysss
 
 runtime:
+  performance:
+    enabled: true
+    profile: edge
+    traffic_profile: small
+    adaptive_system: true
+    socket_extreme: true
+    log_on_start: true
   watchdog:
     enabled: true
     restart_critical_tasks: true
@@ -319,7 +329,7 @@ runtime:
     path: ./runtime/maintenance-state.json
 ```
 
-UDP 健康检查默认关闭，因为很多 KCP/游戏协议不会回显通用探测包；如果后端能处理探测包，可以启用 `udp_enabled`。watchdog 会在关键后台任务异常退出时记录指标并按配置重启任务。
+UDP 健康检查默认关闭，因为很多 KCP/游戏协议不会回显通用探测包；如果后端能处理探测包，可以启用 `udp_enabled`。`runtime.performance` 默认开启，启动/重启时会记录识别到的系统版本、启用的 Linux socket 策略，以及 Ubuntu 22/Debian/未知版本等降级原因。watchdog 会在关键后台任务异常退出时记录指标并按配置重启任务。
 
 路由级覆写：
 
@@ -394,7 +404,7 @@ udp:
       upstreams: [127.0.0.1:9100, 127.0.0.1:9101]
 ```
 
-`protocol` 只用于可观测性，不解析业务 payload。TCP 默认 `nodelay: true`，适合游戏、AI 工具桥接、设备长连接等低延迟流量。UDP/KCP 通过 `session_ttl_secs` 刷新透明客户端关联，并用 `max_associations` 给大规模移动端重连/掉线风暴设置上限。
+`protocol` 只用于可观测性，不解析业务 payload。TCP 默认 `nodelay: true`，适合游戏、AI 工具桥接、设备长连接等低延迟流量。Linux 上启用 `runtime.performance` 时，TCP stream bind 会像高性能 nginx stream 部署一样通过 `SO_REUSEPORT` 拆成多 accept worker；当脚本、亲和、主动健康、被动健康和多上游策略都关闭时，单上游 TCP 直连会完全绕过通用 upstream plan。UDP/KCP 通过 `session_ttl_secs` 刷新透明客户端关联，并用 `max_associations` 给大规模移动端重连/掉线风暴设置上限。
 
 MQTT/IoT 也走同一套网关面：
 

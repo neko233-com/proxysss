@@ -625,6 +625,7 @@ pub fn apply_kubernetes_routes(
             strip_prefix: mapping.strip_prefix,
             set_headers: Default::default(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: Default::default(),
             cache: Default::default(),
             rate_limit: Default::default(),

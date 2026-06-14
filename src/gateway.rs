@@ -1,4 +1,5 @@
-use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashSet};
+use std::borrow::Cow;
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::future::Future;
@@ -6,15 +7,18 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Cursor};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use brotli::CompressorWriter;
 use bytes::{Buf, Bytes, BytesMut};
+use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -22,21 +26,25 @@ use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    COOKIE, HOST, LOCATION, SET_COOKIE, VARY,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE, TRANSFER_ENCODING, VARY,
 };
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
 };
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Body as HyperBody, SizeHint};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
     Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
+use memchr::{memchr, memmem};
 use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -48,17 +56,23 @@ use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{
     copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
     BufReader as TokioBufReader,
 };
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::RwLock;
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
 use zstd::stream::encode_all as zstd_encode_all;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::sync::OnceLock;
 
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
@@ -67,11 +81,12 @@ use crate::config::{
     FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig,
     HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig,
     RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig,
-    StreamRouteConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig,
-    WebDavConfig,
+    ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile, StaticSiteConfig,
+    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
+    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
+use crate::linux_tune::{self, TcpTuneProfile};
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
 use crate::security::{
     self, admin_loopback_only_allows, ip_access_is_denied, stream_access_is_denied,
@@ -85,6 +100,7 @@ use crate::stream_routes::{parse_tls_client_hello_sni, StreamRouteTable};
 pub struct Gateway {
     config_path: PathBuf,
     bootstrap_config: GatewayConfig,
+    bootstrap_fast_lane: FastLaneState,
     dynamic: Arc<RwLock<Arc<DynamicState>>>,
     stats: Arc<GatewayStats>,
     sticky_affinity: Arc<DashMap<String, StickyEntry>>,
@@ -94,6 +110,11 @@ pub struct Gateway {
     stream_rate_limits: Arc<DashMap<String, RateLimitBucket>>,
     http_connection_limits: Arc<DashMap<String, u32>>,
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
+    raw_http_pools: Arc<DashMap<String, Arc<RawHttpUpstreamPool>>>,
+    static_route_cache: Arc<DashMap<String, PathBuf>>,
+    static_file_cache: Arc<DashMap<String, CachedStaticFile>>,
+    static_file_cache_bytes: Arc<AtomicU64>,
+    static_file_load_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
     acme_tls_alpn_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
@@ -107,13 +128,818 @@ pub struct Gateway {
 
 struct DynamicState {
     config: GatewayConfig,
+    fast_lane: FastLaneState,
     http_client: reqwest::Client,
+    http_fast_client: HyperClient<HttpConnector, Full<Bytes>>,
     script: Option<Arc<ScriptRuntime>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FastLaneState {
+    plain_http_static_sendfile: bool,
+    simple_http_proxy: bool,
+    raw_sse_proxy: bool,
+    raw_reverse_proxy: bool,
+    raw_websocket_proxy: bool,
+}
+
+impl FastLaneState {
+    fn compile(config: &GatewayConfig) -> Self {
+        let performance_enabled = config.runtime.performance.enabled;
+        let simple_http_proxy = performance_enabled && simple_http_proxy_fast_path_allowed(config);
+        Self {
+            plain_http_static_sendfile: performance_enabled
+                && cfg!(target_os = "linux")
+                && plain_static_fast_path_allowed(config),
+            simple_http_proxy,
+            raw_sse_proxy: simple_http_proxy,
+            raw_reverse_proxy: simple_http_proxy,
+            raw_websocket_proxy: simple_http_proxy,
+        }
+    }
+}
+
+struct RawHttpUpstreamPool {
+    host: String,
+    port: u16,
+    idle: ArrayQueue<TcpStream>,
+}
+
+impl RawHttpUpstreamPool {
+    fn new(host: String, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            idle: ArrayQueue::new(raw_http_pool_idle_capacity()),
+        }
+    }
+
+    async fn checkout(&self) -> Result<TcpStream> {
+        if let Some(stream) = self.idle.pop() {
+            return Ok(stream);
+        }
+
+        let stream = TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed connecting raw HTTP upstream {}:{}",
+                    self.host, self.port
+                )
+            })?;
+        let _ = stream.set_nodelay(true);
+        tune_tcp_stream_for_gateway(&stream);
+        Ok(stream)
+    }
+
+    fn checkin(&self, stream: TcpStream) {
+        let _ = self.idle.push(stream);
+    }
+}
+
+fn raw_http_pool_idle_capacity() -> usize {
+    adaptive_data_plane_workers(1).saturating_mul(64).max(64)
+}
+
+/// Bounded, lock-free pool of reusable heap buffers for hot-path relay and
+/// streaming loops. Caps steady-state allocation churn under very high
+/// connection counts (target 100k-1M concurrent sockets) without unbounded
+/// growth: the backing queue is bounded, so surplus buffers are freed on return
+/// and the pool's resident memory stays predictable (no leak, no runaway).
+struct ByteBufferPool {
+    idle: ArrayQueue<Box<[u8]>>,
+    buf_size: usize,
+}
+
+impl ByteBufferPool {
+    fn new(capacity: usize, buf_size: usize) -> Self {
+        Self {
+            idle: ArrayQueue::new(capacity.max(1)),
+            buf_size,
+        }
+    }
+
+    fn acquire(&'static self) -> PooledBuffer {
+        let buffer = self
+            .idle
+            .pop()
+            .unwrap_or_else(|| vec![0_u8; self.buf_size].into_boxed_slice());
+        PooledBuffer {
+            buffer: Some(buffer),
+            pool: self,
+        }
+    }
+}
+
+/// RAII handle that returns its buffer to the pool on drop. When the pool is
+/// full the buffer is simply freed, so the pool never exceeds its bound.
+struct PooledBuffer {
+    buffer: Option<Box<[u8]>>,
+    pool: &'static ByteBufferPool,
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            // Bounded queue: push fails when full -> buffer is freed here.
+            let _ = self.pool.idle.push(buffer);
+        }
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.buffer.as_deref().expect("pooled buffer present")
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_deref_mut().expect("pooled buffer present")
+    }
+}
+
+const POOL_BUFFER_BYTES: usize = 64 * 1024;
+
+static RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
+static UDP_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
+
+fn pooled_buffer_capacity() -> usize {
+    // Scales with cores but stays bounded so idle pool memory is capped at
+    // capacity * 64 KiB. In-flight relay/UDP buffers are served from the pool
+    // first and fall back to a one-off allocation only on a miss.
+    adaptive_data_plane_workers(1)
+        .saturating_mul(1024)
+        .clamp(1024, 65_536)
+}
+
+fn relay_buffer_pool() -> &'static ByteBufferPool {
+    RELAY_BUFFER_POOL.get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
+}
+
+fn udp_buffer_pool() -> &'static ByteBufferPool {
+    UDP_BUFFER_POOL.get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
+}
+
+struct UpstreamHttpResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: UpstreamHttpBody,
+}
+
+enum UpstreamHttpBody {
+    Reqwest(reqwest::Response),
+    Hyper(Incoming),
+}
+
+impl DynamicState {
+    async fn dispatch_upstream_http(
+        &self,
+        method: Method,
+        upstream_target: UpstreamHttpTarget,
+        upstream_headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<UpstreamHttpResponse> {
+        if let UpstreamHttpTarget::Hyper(upstream_uri) = upstream_target {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(upstream_uri)
+                .body(Full::new(body))
+                .context("failed building upstream request")?;
+            *request.headers_mut() = upstream_headers;
+            let response = self
+                .http_fast_client
+                .request(request)
+                .await
+                .context("upstream request failed")?;
+            let (parts, body) = response.into_parts();
+            return Ok(UpstreamHttpResponse {
+                status: parts.status,
+                headers: parts.headers,
+                body: UpstreamHttpBody::Hyper(body),
+            });
+        }
+
+        let UpstreamHttpTarget::Reqwest(upstream_url) = upstream_target else {
+            unreachable!("hyper upstream target handled above")
+        };
+        let response = self
+            .http_client
+            .request(method, upstream_url)
+            .headers(upstream_headers)
+            .body(body)
+            .send()
+            .await
+            .context("upstream request failed")?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        Ok(UpstreamHttpResponse {
+            status,
+            headers,
+            body: UpstreamHttpBody::Reqwest(response),
+        })
+    }
+}
+
+enum UpstreamHttpTarget {
+    Hyper(Uri),
+    Reqwest(Url),
+}
+
+impl UpstreamHttpResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    async fn bytes(self) -> Result<Bytes> {
+        match self.body {
+            UpstreamHttpBody::Reqwest(response) => response
+                .bytes()
+                .await
+                .context("failed reading upstream response body"),
+            UpstreamHttpBody::Hyper(body) => body
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .context("failed reading upstream response body"),
+        }
+    }
+
+    fn into_stream_body(self) -> GatewayBody {
+        match self.body {
+            UpstreamHttpBody::Reqwest(response) => streaming_body(response.bytes_stream()),
+            UpstreamHttpBody::Hyper(body) => GatewayBody::Stream(
+                body.map_err(|error| anyhow!("upstream response stream failed: {error}"))
+                    .boxed_unsync(),
+            ),
+        }
+    }
+}
+
+async fn collect_request_body_if_needed(
+    method: &Method,
+    headers: &HeaderMap,
+    body: &mut Incoming,
+) -> Result<Bytes, hyper::Error> {
+    if request_body_declared_empty(method, headers) {
+        return Ok(Bytes::new());
+    }
+
+    body.collect().await.map(|collected| collected.to_bytes())
+}
+
+fn request_body_declared_empty(method: &Method, headers: &HeaderMap) -> bool {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return false;
+    }
+
+    if let Some(length) = headers.get(CONTENT_LENGTH) {
+        return length
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|value| value == 0)
+            .unwrap_or(false);
+    }
+
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        || method == Method::TRACE
+}
+
+async fn copy_tcp_bidirectional_parallel(
+    mut left: TcpStream,
+    mut right: TcpStream,
+    _left_to_right_buffer: usize,
+    _right_to_left_buffer: usize,
+) -> Result<(u64, u64)> {
+    let (left_bytes, right_bytes) = tokio::io::copy_bidirectional(&mut left, &mut right)
+        .await
+        .context("tcp bidirectional copy failed")?;
+    Ok((left_bytes, right_bytes))
+}
+
+async fn copy_tcp_bidirectional_adaptive(
+    left: TcpStream,
+    right: TcpStream,
+    performance_enabled: bool,
+    profile: TcpRelayProfile,
+) -> Result<(u64, u64)> {
+    if performance_enabled
+        && matches!(profile, TcpRelayProfile::Bulk)
+        && tcp_splice_fast_path_enabled()
+    {
+        return copy_tcp_bidirectional_splice(left, right).await;
+    }
+
+    match profile {
+        TcpRelayProfile::Latency => copy_tcp_bidirectional_latency(left, right).await,
+        TcpRelayProfile::Bulk => {
+            copy_tcp_bidirectional_parallel(left, right, 64 * 1024, 64 * 1024).await
+        }
+    }
+}
+
+struct DirectTcpFastPath<'a> {
+    upstream: String,
+    listener_name: &'a str,
+    protocol: &'a str,
+    nodelay: bool,
+    connect_timeout_ms: u64,
+    first_payload: BytesMut,
+    remote_addr: SocketAddr,
+    worker_index: usize,
+}
+
+async fn relay_direct_tcp_fast_path(
+    inbound: TcpStream,
+    context: DirectTcpFastPath<'_>,
+) -> Result<()> {
+    let DirectTcpFastPath {
+        upstream,
+        listener_name,
+        protocol,
+        nodelay,
+        connect_timeout_ms,
+        first_payload,
+        remote_addr,
+        worker_index,
+    } = context;
+
+    let mut outbound = tokio::time::timeout(
+        Duration::from_millis(connect_timeout_ms.max(1)),
+        TcpStream::connect(&upstream),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!("timed out connecting direct tcp upstream {upstream} after {connect_timeout_ms}ms")
+    })?
+    .with_context(|| format!("failed to connect direct tcp upstream {upstream}"))?;
+
+    if nodelay {
+        outbound
+            .set_nodelay(true)
+            .with_context(|| format!("failed setting TCP_NODELAY for upstream {upstream}"))?;
+    }
+    tune_tcp_stream_for_latency(&outbound);
+
+    if !protocol.trim().is_empty() {
+        tracing::debug!(
+            protocol = %protocol,
+            listener = %listener_name,
+            upstream = %upstream,
+            worker = worker_index,
+            %remote_addr,
+            "direct tcp fast path selected"
+        );
+    }
+
+    let first_payload_len = first_payload.len();
+    if !first_payload.is_empty() {
+        outbound
+            .write_all(&first_payload)
+            .await
+            .context("failed to forward peeked tcp payload")?;
+    }
+
+    copy_tcp_bidirectional_adaptive(
+        inbound,
+        outbound,
+        true,
+        tcp_relay_profile(protocol, first_payload_len),
+    )
+    .await
+    .context("direct tcp fast path copy failed")?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpRelayProfile {
+    Latency,
+    Bulk,
+}
+
+fn tcp_relay_profile(protocol: &str, first_payload_len: usize) -> TcpRelayProfile {
+    let protocol = protocol.trim().to_ascii_lowercase();
+    if first_payload_len >= 64 * 1024
+        || protocol.contains("bulk")
+        || protocol.contains("file")
+        || protocol.contains("backup")
+    {
+        TcpRelayProfile::Bulk
+    } else {
+        TcpRelayProfile::Latency
+    }
+}
+
+async fn copy_tcp_bidirectional_latency(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
+    copy_tcp_bidirectional_parallel(left, right, 16 * 1024, 16 * 1024)
+        .await
+        .context("tcp latency relay failed")
+}
+
+fn tcp_splice_fast_path_enabled() -> bool {
+    tcp_splice_supported()
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_splice_supported() -> bool {
+    let level = *RUNTIME_SOCKET_TUNE_LEVEL
+        .get()
+        .unwrap_or(&linux_tune::RuntimeSocketTuneLevel::PortableLinux);
+    !matches!(level, linux_tune::RuntimeSocketTuneLevel::Disabled)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_splice_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+async fn copy_tcp_bidirectional_splice(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
+    let left = Arc::new(left);
+    let right = Arc::new(right);
+
+    let left_to_right = tokio::spawn(splice_tcp_one_direction(left.clone(), right.clone()));
+    let right_to_left = tokio::spawn(splice_tcp_one_direction(right, left));
+
+    let (left_result, right_result) = tokio::join!(left_to_right, right_to_left);
+    let left_bytes = left_result.context("left-to-right tcp splice task failed")??;
+    let right_bytes = right_result.context("right-to-left tcp splice task failed")??;
+    Ok((left_bytes, right_bytes))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn copy_tcp_bidirectional_splice(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
+    copy_tcp_bidirectional_parallel(left, right, 64 * 1024, 64 * 1024).await
+}
+
+#[cfg(target_os = "linux")]
+struct TcpSplicePipe {
+    read_fd: std::os::fd::RawFd,
+    write_fd: std::os::fd::RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl TcpSplicePipe {
+    fn new() -> std::io::Result<Self> {
+        let mut fds = [0; 2];
+        let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let pipe = Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+        };
+        pipe.set_capacity(1 * 1024 * 1024);
+        Ok(pipe)
+    }
+
+    fn set_capacity(&self, bytes: usize) {
+        unsafe {
+            let _ = libc::fcntl(self.write_fd, libc::F_SETPIPE_SZ, bytes as libc::c_int);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TcpSplicePipe {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::close(self.read_fd);
+            let _ = libc::close(self.write_fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_tcp_one_direction(
+    reader: Arc<TcpStream>,
+    writer: Arc<TcpStream>,
+) -> std::io::Result<u64> {
+    let pipe = TcpSplicePipe::new()?;
+    let reader_fd = reader.as_raw_fd();
+    let writer_fd = writer.as_raw_fd();
+    let mut copied = 0_u64;
+
+    loop {
+        let read = reader
+            .async_io(tokio::io::Interest::READABLE, || {
+                splice_fd_to_fd(
+                    reader_fd,
+                    pipe.write_fd,
+                    256 * 1024,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
+                )
+            })
+            .await?;
+
+        if read == 0 {
+            shutdown_fd_write(writer_fd);
+            return Ok(copied);
+        }
+
+        let mut remaining = read;
+        while remaining > 0 {
+            let written = writer
+                .async_io(tokio::io::Interest::WRITABLE, || {
+                    splice_fd_to_fd(
+                        pipe.read_fd,
+                        writer_fd,
+                        remaining,
+                        libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
+                    )
+                })
+                .await?;
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tcp splice wrote zero bytes",
+                ));
+            }
+            remaining -= written;
+            copied = copied.saturating_add(written as u64);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn splice_fd_to_fd(
+    in_fd: std::os::fd::RawFd,
+    out_fd: std::os::fd::RawFd,
+    len: usize,
+    flags: libc::c_uint,
+) -> std::io::Result<usize> {
+    loop {
+        let moved = unsafe {
+            libc::splice(
+                in_fd,
+                std::ptr::null_mut(),
+                out_fd,
+                std::ptr::null_mut(),
+                len,
+                flags,
+            )
+        };
+        if moved >= 0 {
+            return Ok(moved as usize);
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_fd_write(fd: std::os::fd::RawFd) {
+    unsafe {
+        let _ = libc::shutdown(fd, libc::SHUT_WR);
+    }
+}
+
+fn dedicated_stream_runtime() -> &'static tokio::runtime::Runtime {
+    STREAM_RUNTIME.get_or_init(|| {
+        let worker_threads = dedicated_stream_worker_threads();
+        tracing::info!(
+            worker_threads,
+            "starting dedicated stream runtime for TCP listeners"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("proxysss-stream")
+            .enable_all()
+            .build()
+            .expect("failed to start proxysss stream runtime");
+        Box::leak(Box::new(runtime))
+    })
+}
+
+fn dedicated_stream_worker_threads() -> usize {
+    adaptive_stream_runtime_workers()
+}
+
+fn tune_tcp_stream_for_gateway(stream: &TcpStream) {
+    tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Gateway);
+}
+
+fn tune_tcp_stream_for_latency(stream: &TcpStream) {
+    tune_tcp_stream_for_gateway(stream);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpSocketTuneProfile {
+    Gateway,
+}
+
+#[cfg(target_os = "linux")]
+fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) {
+    let level = *RUNTIME_SOCKET_TUNE_LEVEL
+        .get()
+        .unwrap_or(&linux_tune::RuntimeSocketTuneLevel::PortableLinux);
+    if matches!(level, linux_tune::RuntimeSocketTuneLevel::Disabled) {
+        return;
+    }
+
+    let fd = stream.as_raw_fd();
+
+    // TCP_QUICKACK: disable delayed ACK for lower latency round-trips
+    let quickack: libc::c_int = 1;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &quickack as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&quickack) as libc::socklen_t,
+        );
+    }
+
+    // TCP_NODELAY: disable Nagle algorithm for immediate packet dispatch.
+    // Critical for game-long-connection and tcp-stream latency.
+    let nodelay: libc::c_int = 1;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &nodelay as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&nodelay) as libc::socklen_t,
+        );
+    }
+
+    let buf_size: libc::c_int = match (profile, level) {
+        (
+            TcpSocketTuneProfile::Gateway,
+            linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
+            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
+        ) => 8 * 1024 * 1024,
+        (TcpSocketTuneProfile::Gateway, _) => 2 * 1024 * 1024,
+    };
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&buf_size) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&buf_size) as libc::socklen_t,
+        );
+    }
+
+    if matches!(
+        level,
+        linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
+            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme
+    ) {
+        let lowat: libc::c_int = match (profile, level) {
+            (
+                TcpSocketTuneProfile::Gateway,
+                linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
+            ) => 8 * 1024 * 1024,
+            (TcpSocketTuneProfile::Gateway, _) => 4 * 1024 * 1024,
+        };
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                &lowat as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&lowat) as libc::socklen_t,
+            );
+        }
+
+        // TCP_USER_TIMEOUT: fail stalled upstream/downstream sockets promptly
+        // during load spikes instead of letting them occupy gateway resources.
+        let user_timeout_ms: libc::c_int = 30_000;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &user_timeout_ms as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&user_timeout_ms) as libc::socklen_t,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_tcp_stream_for_linux(_stream: &TcpStream, _profile: TcpSocketTuneProfile) {}
+
+/// Enlarge UDP socket buffers so bursty game/KCP datagram floods are absorbed by
+/// the kernel instead of being dropped when a worker is momentarily busy. UDP has
+/// no flow control, so an undersized receive buffer is the dominant cause of
+/// datagram loss (and the throughput cliff) under high-rate large-datagram load.
+#[cfg(target_os = "linux")]
+fn tune_udp_socket_for_gateway(socket: &UdpSocket) {
+    let level = *RUNTIME_SOCKET_TUNE_LEVEL
+        .get()
+        .unwrap_or(&linux_tune::RuntimeSocketTuneLevel::PortableLinux);
+    if matches!(level, linux_tune::RuntimeSocketTuneLevel::Disabled) {
+        return;
+    }
+
+    let fd = socket.as_raw_fd();
+    let buf_size: libc::c_int = match level {
+        linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
+        | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 16 * 1024 * 1024,
+        _ => 4 * 1024 * 1024,
+    };
+
+    // SO_RCVBUF/SO_SNDBUF are clamped by net.core.rmem_max/wmem_max (raised by
+    // `proxysss tune linux`). SO_RCVBUFFORCE/SO_SNDBUFFORCE bypass that ceiling
+    // when the process is privileged (CAP_NET_ADMIN); both are best-effort and
+    // silently ignored when unsupported or unprivileged.
+    for (opt, force) in [
+        (libc::SO_RCVBUF, libc::SO_RCVBUFFORCE),
+        (libc::SO_SNDBUF, libc::SO_SNDBUFFORCE),
+    ] {
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                force,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_udp_socket_for_gateway(_socket: &UdpSocket) {}
+
+#[cfg(target_os = "linux")]
+fn set_tcp_cork(stream: &TcpStream, enabled: bool) {
+    let value: libc::c_int = if enabled { 1 } else { 0 };
+    unsafe {
+        let _ = libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
 }
 
 struct UdpAssociation {
     socket: Arc<UdpSocket>,
     last_seen_epoch: AtomicU64,
+    active: AtomicBool,
+}
+
+struct PendingUdpSessionGuard {
+    sessions: Arc<Mutex<HashSet<SocketAddr>>>,
+    addr: SocketAddr,
+}
+
+impl Drop for PendingUdpSessionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(&self.addr);
+        }
+    }
+}
+
+struct LocalUdpAssociation {
+    association: Arc<UdpAssociation>,
+    last_seen_epoch: u64,
+}
+
+struct UdpAssociationBuildContext<'a> {
+    gateway: &'a Arc<Gateway>,
+    state: &'a Arc<DynamicState>,
+    listener_name: &'a str,
+    listener_socket: &'a Arc<UdpSocket>,
+    associations: &'a Arc<DashMap<SocketAddr, Arc<UdpAssociation>>>,
+    protocol_hint: &'a str,
+    client_addr: SocketAddr,
+    payload: &'a Bytes,
+    request_id: &'a str,
+    session_ttl_secs: u64,
+    max_associations: usize,
 }
 
 pub(crate) struct GatewayHttpResponse {
@@ -124,8 +950,80 @@ pub(crate) struct GatewayHttpResponse {
     upstream: String,
 }
 
-type GatewayBody = UnsyncBoxBody<Bytes, anyhow::Error>;
 type GatewayResponse = Response<GatewayBody>;
+
+enum HyperFastPathResponse {
+    Direct(GatewayResponse),
+    Gateway(GatewayHttpResponse),
+}
+
+enum GatewayBody {
+    Full(Option<Bytes>),
+    Stream(UnsyncBoxBody<Bytes, anyhow::Error>),
+}
+
+impl HyperBody for GatewayBody {
+    type Data = Bytes;
+    type Error = anyhow::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            Self::Full(body) => Poll::Ready(body.take().map(|body| Ok(Frame::data(body)))),
+            Self::Stream(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Full(body) => body.as_ref().map(|body| body.is_empty()).unwrap_or(true),
+            Self::Stream(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Full(Some(body)) => SizeHint::with_exact(body.len() as u64),
+            Self::Full(None) => SizeHint::with_exact(0),
+            Self::Stream(body) => body.size_hint(),
+        }
+    }
+}
+const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
+const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
+const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
+const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
+const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
+const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
+const TCP_LISTEN_BACKLOG: u32 = 262_144;
+
+#[cfg(target_os = "linux")]
+static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
+static STREAM_RUNTIME: OnceLock<&'static tokio::runtime::Runtime> = OnceLock::new();
+
+pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tune::RuntimeTunePlan {
+    let profile = match config.runtime.performance.profile {
+        crate::config::RuntimePerformanceProfile::Edge => TcpTuneProfile::Edge,
+        crate::config::RuntimePerformanceProfile::Bulk => TcpTuneProfile::Bulk,
+        crate::config::RuntimePerformanceProfile::Latency => TcpTuneProfile::Latency,
+    };
+    let plan = linux_tune::build_runtime_tune_plan(
+        config.runtime.performance.enabled,
+        config.runtime.performance.adaptive_system,
+        config.runtime.performance.socket_extreme,
+        profile,
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
+    }
+    plan
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionEncoding {
@@ -176,6 +1074,15 @@ struct CachedHttpEntry {
     upstream: String,
 }
 
+#[derive(Clone)]
+struct CachedStaticFile {
+    len: u64,
+    modified: Option<SystemTime>,
+    body: Bytes,
+    sendfile: Option<Arc<std::fs::File>>,
+    checked_at: Instant,
+}
+
 struct HttpCacheRevalidateRequest<'a> {
     host: &'a str,
     uri: &'a Uri,
@@ -202,12 +1109,26 @@ enum CacheLookup {
 }
 
 #[derive(Clone)]
-struct HttpRouteConfig {
+struct HttpRouteConfig<'a> {
     runtime_scope: Option<String>,
     decision: RouteDecision,
-    compression: ResponseCompressionConfig,
-    cache: ResponseCacheConfig,
-    rate_limit: HttpRateLimitConfig,
+    compression: Cow<'a, ResponseCompressionConfig>,
+    cache: Cow<'a, ResponseCacheConfig>,
+    rate_limit: Cow<'a, HttpRateLimitConfig>,
+    forward_headers: bool,
+}
+
+impl<'a> HttpRouteConfig<'a> {
+    fn to_owned_config(&self) -> HttpRouteConfig<'static> {
+        HttpRouteConfig {
+            runtime_scope: self.runtime_scope.clone(),
+            decision: self.decision.clone(),
+            compression: Cow::Owned(self.compression.as_ref().clone()),
+            cache: Cow::Owned(self.cache.as_ref().clone()),
+            rate_limit: Cow::Owned(self.rate_limit.as_ref().clone()),
+            forward_headers: self.forward_headers,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -251,6 +1172,10 @@ struct GatewayStats {
     ddos_bans_total: AtomicU64,
     critical_task_failures_total: AtomicU64,
     watchdog_heartbeat_total: AtomicU64,
+    /// Set true once startup/reload warm-up (static preload + upstream pre-dial)
+    /// has completed. Listeners bind only after the initial warm-up, so a
+    /// successful connection already implies a warm data plane.
+    warm: AtomicBool,
     process_metrics: Mutex<ProcessMetricsSampler>,
 }
 
@@ -453,7 +1378,9 @@ impl Gateway {
 
         prepare_tls_material(&config)?;
 
-        let dynamic = Arc::new(build_dynamic_state(config.clone()).await?);
+        let dynamic_state = build_dynamic_state(config.clone()).await?;
+        let bootstrap_fast_lane = dynamic_state.fast_lane.clone();
+        let dynamic = Arc::new(dynamic_state);
         let (on_demand_trigger, on_demand_rx) = tokio::sync::mpsc::unbounded_channel();
         let dynamic_blacklist =
             DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist);
@@ -461,6 +1388,7 @@ impl Gateway {
         let gateway = Arc::new(Self {
             config_path,
             bootstrap_config: config,
+            bootstrap_fast_lane,
             dynamic: Arc::new(RwLock::new(dynamic)),
             stats: Arc::new(GatewayStats::default()),
             sticky_affinity: Arc::new(DashMap::new()),
@@ -470,6 +1398,11 @@ impl Gateway {
             stream_rate_limits: Arc::new(DashMap::new()),
             http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
+            raw_http_pools: Arc::new(DashMap::new()),
+            static_route_cache: Arc::new(DashMap::new()),
+            static_file_cache: Arc::new(DashMap::new()),
+            static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
+            static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges,
             acme_tls_alpn_certs,
             on_demand_certs: Arc::new(DashMap::new()),
@@ -482,7 +1415,107 @@ impl Gateway {
         });
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
+        gateway.warm_up(&gateway.bootstrap_config).await;
         Ok(gateway)
+    }
+
+    /// Startup/reload self-optimization: preload hot static files into the
+    /// bounded fast-lane cache and pre-dial upstream keepalive pools so the
+    /// first live request never pays a cold connect. Runs during `new()` before
+    /// any listener binds, so a connectable port already implies a warm data
+    /// plane and a benchmark naturally starts only after warm-up.
+    async fn warm_up(&self, config: &GatewayConfig) {
+        let started = Instant::now();
+        self.preload_static_fast_lane_cache(config).await;
+        let predialed = self.prewarm_upstream_pools(config).await;
+        self.stats.warm.store(true, Ordering::Release);
+        tracing::info!(
+            upstream_predial = predialed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "gateway warm-up complete"
+        );
+    }
+
+    /// Best-effort pre-dial of raw HTTP keepalive pools for reverse-proxy and
+    /// AI-proxy routes so the first request reuses a warm socket instead of
+    /// connecting cold. Bounded work with a short per-attempt timeout.
+    async fn prewarm_upstream_pools(&self, config: &GatewayConfig) -> usize {
+        if !config.runtime.performance.enabled {
+            return 0;
+        }
+        let mut upstreams: Vec<String> = config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .map(|route| route.upstream.clone())
+            .collect();
+        if config.services.ai_proxy.enabled {
+            upstreams.extend(
+                config
+                    .services
+                    .ai_proxy
+                    .routes
+                    .iter()
+                    .map(|route| route.upstream.clone()),
+            );
+        }
+
+        let mut predialed = 0_usize;
+        for upstream in upstreams {
+            let Ok(Some((key, host, port))) = raw_http_pool_parts_from_upstream(&upstream) else {
+                continue;
+            };
+            let pool = self.raw_http_pool_for_parts(key, host, port);
+            for _ in 0..2 {
+                match tokio::time::timeout(Duration::from_millis(250), pool.checkout()).await {
+                    Ok(Ok(stream)) => {
+                        pool.checkin(stream);
+                        predialed = predialed.saturating_add(1);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        predialed
+    }
+
+    async fn preload_static_fast_lane_cache(&self, config: &GatewayConfig) {
+        if !config.runtime.performance.enabled || !plain_static_fast_path_allowed(config) {
+            return;
+        }
+
+        let profile = config.runtime.performance.traffic_profile;
+        let sendfile_threshold = static_sendfile_fast_path_threshold_bytes(config);
+        let mut preloaded = 0_usize;
+        for site in &config.services.static_sites {
+            match preload_static_site_fast_lane_cache(
+                site,
+                profile,
+                sendfile_threshold,
+                &self.static_file_cache,
+                &self.static_file_cache_bytes,
+                &self.static_file_load_locks,
+                &self.static_route_cache,
+            )
+            .await
+            {
+                Ok(count) => preloaded = preloaded.saturating_add(count),
+                Err(error) => tracing::debug!(
+                    ?error,
+                    site = %site.name,
+                    "static fast lane preload skipped for site"
+                ),
+            }
+        }
+
+        if preloaded > 0 {
+            tracing::info!(
+                files = preloaded,
+                traffic_profile = ?profile,
+                "static fast lane cache preloaded"
+            );
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -893,7 +1926,14 @@ impl Gateway {
 
                 let gateway = self.clone();
                 let spawn_key = key.clone();
-                let handle = tokio::spawn(async move { gateway.run_listener_spec(spec).await });
+                let handle = if matches!(spec, ListenerSpec::Tcp(_))
+                    && state.config.runtime.performance.enabled
+                {
+                    dedicated_stream_runtime()
+                        .spawn(async move { gateway.run_listener_spec(spec).await })
+                } else {
+                    tokio::spawn(async move { gateway.run_listener_spec(spec).await })
+                };
                 active.insert(key, handle);
                 tracing::info!(listener = %spawn_key, "listener started");
             }
@@ -936,14 +1976,16 @@ impl Gateway {
 
     async fn run_admin_server(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid admin.bind address")?;
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("failed to bind admin listener {}", bind_addr))?;
+        let listener = bind_tcp_listener(bind_addr, "admin listener").await?;
 
         tracing::info!(bind = %bind_addr, "admin listener ready");
 
         loop {
             let (stream, remote_addr) = listener.accept().await.context("admin accept failed")?;
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on admin connection");
+            }
+            tune_tcp_stream_for_gateway(&stream);
             let gateway = self.clone();
 
             tokio::spawn(async move {
@@ -956,7 +1998,7 @@ impl Gateway {
                     }
                 });
 
-                let result = AutoBuilder::new(TokioExecutor::new())
+                let result = optimized_http_server_builder()
                     .serve_connection_with_upgrades(TokioIo::new(stream), service)
                     .await;
 
@@ -1009,7 +2051,7 @@ impl Gateway {
         if path == "/healthz" {
             return Ok(json_response(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "service": "proxysss", "remote_addr": remote_addr.to_string()}),
+                serde_json::json!({"ok": true, "service": "proxysss", "warm": self.stats.warm.load(Ordering::Relaxed), "remote_addr": remote_addr.to_string()}),
             ));
         }
 
@@ -2240,6 +3282,8 @@ impl Gateway {
             *state = new_state;
         }
         self.load_persisted_manual_upstream_state(&new_config)?;
+        self.prune_raw_http_pools(&new_config);
+        self.warm_up(&new_config).await;
 
         for warning in new_config.warnings() {
             tracing::warn!(warning, "configuration warning");
@@ -2819,20 +3863,65 @@ impl Gateway {
 
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.plain_bind address")?;
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("failed to bind plain http listener {}", bind_addr))?;
+        let worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let mut workers = JoinSet::new();
+        for worker_index in 0..worker_count {
+            let listener = bind_tcp_listener(bind_addr, "plain http listener").await?;
+            tracing::info!(
+                bind = %bind_addr,
+                worker = worker_index,
+                workers = worker_count,
+                "plain http listener ready"
+            );
+            let gateway = self.clone();
+            workers.spawn(async move {
+                gateway
+                    .run_plain_http_accept_loop(listener, bind_addr, worker_index)
+                    .await
+            });
+        }
 
-        tracing::info!(bind = %bind_addr, "plain http listener ready");
+        while let Some(result) = workers.join_next().await {
+            result
+                .context("plain http accept worker task failed")?
+                .context("plain http accept worker stopped")?;
+        }
 
+        Ok(())
+    }
+
+    async fn run_plain_http_accept_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+        _bind_addr: SocketAddr,
+        worker_index: usize,
+    ) -> Result<()> {
         loop {
             let (stream, remote_addr) = listener
                 .accept()
                 .await
                 .context("plain http accept failed")?;
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
+            }
+            tune_tcp_stream_for_gateway(&stream);
             let gateway = self.clone();
 
             tokio::spawn(async move {
+                let mut stream = stream;
+                if gateway.plain_http_data_fast_lane_enabled().await {
+                    match gateway
+                        .try_plain_http_large_static_fast_path(&mut stream, remote_addr)
+                        .await
+                    {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::debug!(?error, %remote_addr, "plain http static fast path skipped");
+                        }
+                    }
+                }
+
                 let service = service_fn(move |request| {
                     let gateway = gateway.clone();
                     async move {
@@ -2842,15 +3931,240 @@ impl Gateway {
                     }
                 });
 
-                let result = AutoBuilder::new(TokioExecutor::new())
+                let result = optimized_http_server_builder()
                     .serve_connection_with_upgrades(TokioIo::new(stream), service)
                     .await;
 
                 if let Err(error) = result {
-                    tracing::warn!(?error, %remote_addr, "plain http connection failed");
+                    tracing::warn!(?error, %remote_addr, worker = worker_index, "plain http connection failed");
                 }
             });
         }
+    }
+
+    async fn try_plain_http_large_static_fast_path(
+        &self,
+        stream: &mut TcpStream,
+        remote_addr: SocketAddr,
+    ) -> Result<bool> {
+        let dynamic_state;
+        let (config, fast_lane) = if self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+        {
+            dynamic_state = self.current_state().await;
+            (&dynamic_state.config, &dynamic_state.fast_lane)
+        } else {
+            (&self.bootstrap_config, &self.bootstrap_fast_lane)
+        };
+        if !fast_lane.plain_http_static_sendfile
+            && !fast_lane.raw_sse_proxy
+            && !fast_lane.raw_reverse_proxy
+            && !fast_lane.raw_websocket_proxy
+        {
+            tracing::debug!(%remote_addr, "plain http static fast path disabled by config");
+            return Ok(false);
+        }
+
+        let mut served_any = false;
+        let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
+        loop {
+            let mut peeked = [0_u8; 4096];
+            let read = peek_http_head(stream, &mut peeked)
+                .await
+                .context("failed peeking plain http request")?;
+            if read == 0 {
+                break;
+            }
+            let Some(path_hint) = peek_static_fast_path_path(&peeked[..read]) else {
+                tracing::debug!(%remote_addr, bytes = read, "plain http static fast path request-line miss");
+                return Ok(served_any);
+            };
+            let static_prefix_hit = config
+                .services
+                .static_sites
+                .iter()
+                .any(|site| static_site_path_matches(site, path_hint));
+            let raw_sse_prefix_hit =
+                fast_lane.raw_sse_proxy && ai_proxy_fast_lane_path_matches(config, path_hint);
+            let raw_reverse_prefix_hit = fast_lane.raw_reverse_proxy
+                && reverse_proxy_fast_lane_path_matches(config, path_hint);
+            let raw_websocket_prefix_hit = fast_lane.raw_websocket_proxy
+                && websocket_fast_lane_path_matches(config, path_hint);
+            if !static_prefix_hit
+                && !raw_sse_prefix_hit
+                && !raw_reverse_prefix_hit
+                && !raw_websocket_prefix_hit
+            {
+                tracing::debug!(%remote_addr, path = %path_hint, "plain http static fast path prefix miss");
+                return Ok(served_any);
+            }
+
+            if !static_prefix_hit
+                && (raw_sse_prefix_hit || raw_reverse_prefix_hit || raw_websocket_prefix_hit)
+            {
+                if raw_websocket_prefix_hit {
+                    let Some(request) = parse_plain_websocket_fast_lane_request(&peeked[..read])
+                    else {
+                        tracing::debug!(%remote_addr, bytes = read, "plain http websocket fast lane parse miss");
+                        return Ok(served_any);
+                    };
+                    if !consume_http_head_len(stream, request.head_len).await? {
+                        return Ok(served_any);
+                    }
+                    if self
+                        .try_serve_plain_raw_websocket_fast_lane(
+                            config,
+                            stream,
+                            &request,
+                            remote_addr,
+                        )
+                        .await?
+                    {
+                        served_any = true;
+                        break;
+                    }
+                    return Ok(served_any);
+                }
+                let Some(request) = parse_plain_fast_lane_request(&peeked[..read]) else {
+                    tracing::debug!(%remote_addr, bytes = read, "plain http raw fast lane parse miss");
+                    return Ok(served_any);
+                };
+                if raw_sse_prefix_hit && plain_raw_sse_fast_lane_matches(config, &request) {
+                    if !consume_http_head_len(stream, request.head_len).await? {
+                        return Ok(served_any);
+                    }
+                    if self
+                        .try_serve_plain_raw_sse_fast_lane(config, stream, &request, remote_addr)
+                        .await?
+                    {
+                        served_any = true;
+                        break;
+                    }
+                    return Ok(served_any);
+                }
+                if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, &request) {
+                    if !consume_http_head_len(stream, request.head_len).await? {
+                        return Ok(served_any);
+                    }
+                    if self
+                        .try_serve_plain_raw_reverse_fast_lane(
+                            config,
+                            stream,
+                            &request,
+                            remote_addr,
+                            &mut raw_reverse_upstream,
+                        )
+                        .await?
+                    {
+                        served_any = true;
+                        if !request.keep_alive {
+                            break;
+                        }
+                        continue;
+                    }
+                    return Ok(served_any);
+                }
+                return Ok(served_any);
+            }
+
+            let Some(request) = parse_static_fast_path_request(&peeked[..read]) else {
+                tracing::debug!(%remote_addr, bytes = read, "plain http static fast path parse miss");
+                return Ok(served_any);
+            };
+            let Some(candidate) = resolve_large_static_fast_path_candidate(
+                config,
+                &request,
+                &self.static_route_cache,
+                &self.static_file_cache,
+                &self.static_file_cache_bytes,
+                &self.static_file_load_locks,
+            )
+            .await?
+            else {
+                tracing::debug!(%remote_addr, path = %request.path, "plain http static fast path candidate miss");
+                return Ok(served_any);
+            };
+
+            if !consume_http_head_len(stream, request.head_len).await? {
+                return Ok(served_any);
+            }
+
+            let connection = if request.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n",
+                candidate.content_type,
+                candidate.len,
+                connection
+            );
+            #[cfg(target_os = "linux")]
+            let cork_sendfile = request.method == "GET"
+                && candidate.len > 0
+                && candidate.cached_body.is_none()
+                && candidate.sendfile.is_some();
+            #[cfg(target_os = "linux")]
+            if cork_sendfile {
+                set_tcp_cork(stream, true);
+            }
+
+            let header_result = stream
+                .write_all(header.as_bytes())
+                .await
+                .context("failed writing plain http fast path response head");
+
+            let send_result =
+                if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
+                    if let Some(body) = candidate.cached_body.as_ref() {
+                        stream
+                            .write_all(body)
+                            .await
+                            .context("failed writing cached static fast path body")
+                    } else {
+                        send_static_file_fast(
+                            stream,
+                            &candidate.path,
+                            candidate.len,
+                            candidate.sendfile.clone(),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                } else {
+                    Ok(())
+                };
+            #[cfg(target_os = "linux")]
+            if cork_sendfile {
+                set_tcp_cork(stream, false);
+            }
+            header_result?;
+            send_result?;
+
+            if config.logging.access_log {
+                tracing::info!(
+                    target: "access",
+                    method = %request.method,
+                    path = %request.path,
+                    status = 200,
+                    upstream = "proxysss://static-sendfile",
+                    remote_addr = %remote_addr,
+                    "access"
+                );
+            }
+
+            served_any = true;
+            if !request.keep_alive {
+                break;
+            }
+        }
+
+        if let Some(upstream) = raw_reverse_upstream.take() {
+            upstream.pool.checkin(upstream.stream);
+        }
+        let _ = stream.shutdown().await;
+        Ok(served_any)
     }
 
     async fn run_tls_http(self: Arc<Self>, bind: String) -> Result<()> {
@@ -2863,17 +4177,49 @@ impl Gateway {
             self.on_demand_trigger.clone(),
             vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
         )?));
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("failed to bind tls http listener {}", bind_addr))?;
+        let worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let mut workers = JoinSet::new();
+        for worker_index in 0..worker_count {
+            let listener = bind_tcp_listener(bind_addr, "tls http listener").await?;
+            tracing::info!(
+                bind = %bind_addr,
+                worker = worker_index,
+                workers = worker_count,
+                "tls http listener ready"
+            );
+            let gateway = self.clone();
+            let acceptor = tls_acceptor.clone();
+            workers.spawn(async move {
+                gateway
+                    .run_tls_http_accept_loop(listener, acceptor, worker_index)
+                    .await
+            });
+        }
 
-        tracing::info!(bind = %bind_addr, "tls http listener ready");
+        while let Some(result) = workers.join_next().await {
+            result
+                .context("tls http accept worker task failed")?
+                .context("tls http accept worker stopped")?;
+        }
 
+        Ok(())
+    }
+
+    async fn run_tls_http_accept_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls_acceptor: TlsAcceptor,
+        worker_index: usize,
+    ) -> Result<()> {
         loop {
             let (stream, remote_addr) =
                 listener.accept().await.context("tls http accept failed")?;
-            let acceptor = tls_acceptor.clone();
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on tls http connection");
+            }
+            tune_tcp_stream_for_gateway(&stream);
             let gateway = self.clone();
+            let acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(stream).await {
@@ -2893,12 +4239,12 @@ impl Gateway {
                     }
                 });
 
-                let result = AutoBuilder::new(TokioExecutor::new())
+                let result = optimized_http_server_builder()
                     .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
                     .await;
 
                 if let Err(error) = result {
-                    tracing::warn!(?error, %remote_addr, "tls http connection failed");
+                    tracing::warn!(?error, %remote_addr, worker = worker_index, "tls http connection failed");
                 }
             });
         }
@@ -2989,7 +4335,7 @@ impl Gateway {
                                 }
                             }
 
-                            let response = match gateway
+                            let mut response = match gateway
                                 .dispatch_http(
                                     parts.method,
                                     parts.uri,
@@ -3031,7 +4377,28 @@ impl Gateway {
                                 continue;
                             }
 
-                            if !response.body.is_empty() {
+                            if let Some(mut body) = response.stream_body.take() {
+                                while let Some(frame) = body.frame().await {
+                                    match frame {
+                                        Ok(frame) => {
+                                            if let Some(data) = frame.data_ref() {
+                                                if !data.is_empty() {
+                                                    if let Err(error) =
+                                                        stream.send_data(data.clone()).await
+                                                    {
+                                                        tracing::warn!(?error, %remote_addr, "failed sending h3 response stream");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(?error, %remote_addr, "failed reading h3 response stream");
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if !response.body.is_empty() {
                                 if let Err(error) = stream.send_data(response.body).await {
                                     tracing::warn!(?error, %remote_addr, "failed sending h3 response body");
                                     continue;
@@ -3058,12 +4425,56 @@ impl Gateway {
             .bind
             .parse()
             .with_context(|| format!("invalid tcp bind {}", listener_config.bind))?;
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("failed to bind tcp listener {}", bind_addr))?;
+        let state = self.current_state().await;
+        let worker_count = tcp_stream_accept_worker_count(&state.config, &listener_config);
+        let mut workers = JoinSet::new();
+        for worker_index in 0..worker_count {
+            let listener = match bind_tcp_listener(bind_addr, "tcp listener").await {
+                Ok(listener) => listener,
+                Err(error) if worker_index > 0 => {
+                    tracing::warn!(
+                        ?error,
+                        listener = %listener_config.name,
+                        bind = %bind_addr,
+                        worker = worker_index,
+                        started_workers = worker_index,
+                        "tcp reuseport accept worker bind failed; continuing with started workers"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            tracing::info!(
+                listener = %listener_config.name,
+                bind = %bind_addr,
+                worker = worker_index,
+                workers = worker_count,
+                "tcp listener ready"
+            );
+            let gateway = self.clone();
+            let listener_config = listener_config.clone();
+            workers.spawn(async move {
+                gateway
+                    .run_tcp_listener_accept_loop(listener, listener_config, worker_index)
+                    .await
+            });
+        }
 
-        tracing::info!(listener = %listener_config.name, bind = %bind_addr, "tcp listener ready");
+        while let Some(result) = workers.join_next().await {
+            result
+                .context("tcp accept worker task failed")?
+                .context("tcp accept worker stopped")?;
+        }
 
+        Ok(())
+    }
+
+    async fn run_tcp_listener_accept_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+        listener_config: TcpListenerConfig,
+        worker_index: usize,
+    ) -> Result<()> {
         loop {
             let (mut inbound, remote_addr) =
                 listener.accept().await.context("tcp accept failed")?;
@@ -3072,6 +4483,7 @@ impl Gateway {
                     .set_nodelay(true)
                     .with_context(|| format!("failed setting TCP_NODELAY for {remote_addr}"))?;
             }
+            tune_tcp_stream_for_latency(&inbound);
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
             let listener_bind = listener_config.bind.clone();
@@ -3079,15 +4491,12 @@ impl Gateway {
             let listener_protocol = listener_config.protocol.clone();
             let listener_nodelay = listener_config.nodelay;
             let listener_connect_timeout_ms = listener_config.connect_timeout_ms;
-            let stream_rate_limit = self
-                .current_state()
-                .await
-                .config
-                .services
-                .rate_limit
-                .stream
-                .clone();
-            if !apply_stream_rate_limit(&self.stream_rate_limits, &stream_rate_limit, remote_addr) {
+            let accept_state = self.current_state().await;
+            if !apply_stream_rate_limit(
+                &self.stream_rate_limits,
+                &accept_state.config.services.rate_limit.stream,
+                remote_addr,
+            ) {
                 tracing::info!(
                     %remote_addr,
                     listener = %listener_name,
@@ -3098,8 +4507,7 @@ impl Gateway {
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let block_config = self.current_state().await.config.clone();
-            if self.is_stream_connection_blocked(&block_config, remote_addr) {
+            if self.is_stream_connection_blocked(&accept_state.config, remote_addr) {
                 tracing::info!(%remote_addr, listener = %listener_name, "tcp connection blocked by security policy");
                 self.stats
                     .blocked_requests_total
@@ -3131,10 +4539,35 @@ impl Gateway {
                         return Ok(());
                     }
 
+                    if state.script.is_none() {
+                        if let Some(upstream) =
+                            direct_tcp_listener_upstream(&state.config, &listener_name)
+                        {
+                            relay_direct_tcp_fast_path(
+                                inbound,
+                                DirectTcpFastPath {
+                                    upstream,
+                                    listener_name: &listener_name,
+                                    protocol: &listener_protocol,
+                                    nodelay: listener_nodelay,
+                                    connect_timeout_ms: listener_connect_timeout_ms,
+                                    first_payload: BytesMut::new(),
+                                    remote_addr,
+                                    worker_index,
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+
+                    let needs_first_payload = listener_name.starts_with("stream|")
+                        || state.config.affinity.enabled
+                        || state.script.is_some();
                     let stream_cfg = state.config.affinity.stream.clone();
                     let mut first_payload = BytesMut::new();
 
-                    if stream_cfg.peek_bytes > 0 {
+                    if needs_first_payload && stream_cfg.peek_bytes > 0 {
                         let mut buffer = vec![0_u8; stream_cfg.peek_bytes];
                         let read_result = tokio::time::timeout(
                             Duration::from_millis(stream_cfg.peek_timeout_ms.max(1)),
@@ -3149,7 +4582,11 @@ impl Gateway {
                         }
                     }
 
-                    let player_id = extract_stream_player_id(&first_payload, &stream_cfg);
+                    let player_id = if state.config.affinity.enabled {
+                        extract_stream_player_id(&first_payload, &stream_cfg)
+                    } else {
+                        None
+                    };
                     let preview = if first_payload.is_empty() {
                         None
                     } else {
@@ -3242,13 +4679,41 @@ impl Gateway {
                         ));
                     };
 
+                    if state.script.is_none() && listener_name.starts_with("stream|") {
+                        if let Some(upstream) = direct_tcp_route_upstream(&state.config, &route) {
+                            relay_direct_tcp_fast_path(
+                                inbound,
+                                DirectTcpFastPath {
+                                    upstream,
+                                    listener_name: &listener_name,
+                                    protocol: &listener_protocol,
+                                    nodelay: listener_nodelay,
+                                    connect_timeout_ms: listener_connect_timeout_ms,
+                                    first_payload,
+                                    remote_addr,
+                                    worker_index,
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+
+                    let remote_addr_for_affinity = if player_id.is_none()
+                        && state.config.affinity.enabled
+                        && state.config.affinity.fallback_to_remote_addr
+                    {
+                        Some(remote_addr.to_string())
+                    } else {
+                        None
+                    };
                     let upstream_plan = gateway.select_upstream_plan(
                         &state.config,
                         &route,
                         "tcp",
                         Some(&listener_name),
                         player_id.as_deref(),
-                        Some(&remote_addr.to_string()),
+                        remote_addr_for_affinity.as_deref(),
                     );
                     let max_attempts = if state.config.load_balance.retries.enabled {
                         (state.config.load_balance.retries.max_retries as usize)
@@ -3258,12 +4723,25 @@ impl Gateway {
                         1
                     };
 
-                    let mut selected: Option<(TcpStream, UpstreamLease, String)> = None;
+                    let mut selected: Option<(TcpStream, Option<UpstreamLease>, String)> = None;
                     let mut last_error: Option<anyhow::Error> = None;
 
                     for upstream in upstream_plan.iter().take(max_attempts) {
-                        let lease =
-                            gateway.acquire_upstream_lease("tcp", Some(&listener_name), upstream);
+                        let track_runtime = gateway.should_track_upstream_runtime(
+                            &state.config,
+                            "tcp",
+                            Some(&listener_name),
+                            upstream,
+                        );
+                        let lease = if track_runtime {
+                            Some(gateway.acquire_upstream_lease(
+                                "tcp",
+                                Some(&listener_name),
+                                upstream,
+                            ))
+                        } else {
+                            None
+                        };
                         match tokio::time::timeout(
                             Duration::from_millis(listener_connect_timeout_ms.max(1)),
                             TcpStream::connect(upstream),
@@ -3276,6 +4754,7 @@ impl Gateway {
                                         format!("failed setting TCP_NODELAY for upstream {upstream}")
                                     })?;
                                 }
+                                tune_tcp_stream_for_latency(&stream);
                                 if !listener_protocol.trim().is_empty() {
                                     tracing::debug!(
                                         protocol = %listener_protocol,
@@ -3285,28 +4764,38 @@ impl Gateway {
                                         "tcp protocol hint selected"
                                     );
                                 }
-                                gateway.on_upstream_success("tcp", Some(&listener_name), upstream);
+                                if track_runtime {
+                                    gateway.on_upstream_success(
+                                        "tcp",
+                                        Some(&listener_name),
+                                        upstream,
+                                    );
+                                }
                                 selected = Some((stream, lease, upstream.clone()));
                                 break;
                             }
                             Ok(Err(error)) => {
-                                gateway.on_upstream_failure(
-                                    &state.config,
-                                    "tcp",
-                                    Some(&listener_name),
-                                    upstream,
-                                );
+                                if track_runtime {
+                                    gateway.on_upstream_failure(
+                                        &state.config,
+                                        "tcp",
+                                        Some(&listener_name),
+                                        upstream,
+                                    );
+                                }
                                 last_error = Some(anyhow!(
                                     "failed to connect tcp upstream {upstream}: {error}"
                                 ));
                             }
                             Err(_) => {
-                                gateway.on_upstream_failure(
-                                    &state.config,
-                                    "tcp",
-                                    Some(&listener_name),
-                                    upstream,
-                                );
+                                if track_runtime {
+                                    gateway.on_upstream_failure(
+                                        &state.config,
+                                        "tcp",
+                                        Some(&listener_name),
+                                        upstream,
+                                    );
+                                }
                                 last_error = Some(anyhow!(
                                     "timed out connecting tcp upstream {upstream} after {listener_connect_timeout_ms}ms"
                                 ));
@@ -3325,17 +4814,29 @@ impl Gateway {
                             .context("failed to forward peeked tcp payload")?;
                     }
 
-                    copy_bidirectional(&mut inbound, &mut outbound)
-                        .await
-                        .context("tcp proxy copy failed")?;
+                    copy_tcp_bidirectional_adaptive(
+                        inbound,
+                        outbound,
+                        state.config.runtime.performance.enabled,
+                        tcp_relay_profile(&listener_protocol, first_payload.len()),
+                    )
+                    .await
+                    .context("tcp proxy copy failed")?;
 
-                    gateway.on_upstream_success("tcp", Some(&listener_name), &upstream);
+                    if gateway.should_track_upstream_runtime(
+                        &state.config,
+                        "tcp",
+                        Some(&listener_name),
+                        &upstream,
+                    ) {
+                        gateway.on_upstream_success("tcp", Some(&listener_name), &upstream);
+                    }
 
                     Ok::<_, anyhow::Error>(())
                 }
                 .await
                 {
-                    tracing::warn!(?error, request_id, listener = %listener_name, %remote_addr, "tcp session failed");
+                    tracing::warn!(?error, request_id, listener = %listener_name, worker = worker_index, %remote_addr, "tcp session failed");
                 }
 
                 gateway
@@ -3513,213 +5014,236 @@ impl Gateway {
             .bind
             .parse()
             .with_context(|| format!("invalid udp bind {}", listener_config.bind))?;
-        let listener_socket = Arc::new(
-            UdpSocket::bind(bind_addr)
-                .await
-                .with_context(|| format!("failed to bind udp listener {}", bind_addr))?,
-        );
         let associations = Arc::new(DashMap::<SocketAddr, Arc<UdpAssociation>>::new());
+        let pending_sessions = Arc::new(Mutex::new(HashSet::new()));
+        let state = self.current_state().await;
+        let worker_count = udp_listener_worker_count(&state.config);
+        let mut workers = JoinSet::new();
+        for worker_index in 0..worker_count {
+            let listener_socket = match bind_udp_listener_socket(bind_addr, "udp listener").await {
+                Ok(socket) => Arc::new(socket),
+                Err(error) if worker_index > 0 => {
+                    tracing::warn!(
+                        ?error,
+                        listener = %listener_config.name,
+                        bind = %bind_addr,
+                        worker = worker_index,
+                        started_workers = worker_index,
+                        "udp reuseport worker bind failed; continuing with started workers"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            tracing::info!(
+                listener = %listener_config.name,
+                bind = %bind_addr,
+                worker = worker_index,
+                workers = worker_count,
+                "udp listener ready"
+            );
+
+            let gateway = self.clone();
+            let listener_config = listener_config.clone();
+            let associations = associations.clone();
+            let pending_sessions = pending_sessions.clone();
+            workers.spawn(async move {
+                gateway
+                    .run_udp_listener_recv_loop(
+                        listener_socket,
+                        listener_config,
+                        associations,
+                        worker_index,
+                        pending_sessions,
+                    )
+                    .await
+            });
+        }
+
+        while let Some(result) = workers.join_next().await {
+            result
+                .context("udp listener worker task failed")?
+                .context("udp listener worker stopped")?;
+        }
+
+        Ok(())
+    }
+
+    async fn run_udp_listener_recv_loop(
+        self: Arc<Self>,
+        listener_socket: Arc<UdpSocket>,
+        listener_config: UdpListenerConfig,
+        associations: Arc<DashMap<SocketAddr, Arc<UdpAssociation>>>,
+        worker_index: usize,
+        pending_sessions: Arc<Mutex<HashSet<SocketAddr>>>,
+    ) -> Result<()> {
         let session_ttl_secs = listener_config.session_ttl_secs.max(1);
         let max_associations = listener_config.max_associations;
         let protocol_hint = listener_config.protocol.clone();
+        let mut local_associations = HashMap::<SocketAddr, LocalUdpAssociation>::new();
+        let mut pending_udp_packets = 0_u64;
+        let mut pending_udp_bytes = 0_u64;
+        let mut cached_now_secs = now_unix_secs();
+        let mut cached_now_refreshed = Instant::now();
 
-        tracing::info!(listener = %listener_config.name, bind = %bind_addr, "udp listener ready");
-
+        let mut buffer = vec![0_u8; 65_536];
         loop {
-            let mut buffer = vec![0_u8; 65_536];
             let (received, client_addr) = listener_socket
                 .recv_from(&mut buffer)
                 .await
                 .context("udp recv failed")?;
-            self.stats.udp_packets_total.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .udp_bytes_total
-                .fetch_add(received as u64, Ordering::Relaxed);
+            pending_udp_packets = pending_udp_packets.saturating_add(1);
+            pending_udp_bytes = pending_udp_bytes.saturating_add(received as u64);
+            if pending_udp_packets >= 64 {
+                flush_udp_stats(
+                    &self.stats,
+                    &mut pending_udp_packets,
+                    &mut pending_udp_bytes,
+                );
+            }
 
-            let payload = buffer[..received].to_vec();
+            if cached_now_refreshed.elapsed() >= Duration::from_secs(1) {
+                cached_now_secs = now_unix_secs();
+                cached_now_refreshed = Instant::now();
+            }
+            let now = cached_now_secs;
+            let mut existing_association = None;
+            let mut remove_local_association = false;
+            if let Some(local) = local_associations.get_mut(&client_addr) {
+                if local.association.active.load(Ordering::Relaxed)
+                    && now.saturating_sub(local.last_seen_epoch) <= session_ttl_secs
+                {
+                    if local.last_seen_epoch != now {
+                        local.last_seen_epoch = now;
+                        local
+                            .association
+                            .last_seen_epoch
+                            .store(now, Ordering::Relaxed);
+                    }
+                    existing_association = Some(local.association.clone());
+                } else {
+                    local.association.active.store(false, Ordering::Relaxed);
+                    remove_local_association = true;
+                }
+            }
+            if remove_local_association {
+                local_associations.remove(&client_addr);
+                associations.remove(&client_addr);
+            }
+            if existing_association.is_none() {
+                if let Some(existing) = associations.get(&client_addr) {
+                    let association = existing.clone();
+                    drop(existing);
+                    if udp_association_is_live(&association, session_ttl_secs, now) {
+                        association.last_seen_epoch.store(now, Ordering::Relaxed);
+                        local_associations.insert(
+                            client_addr,
+                            LocalUdpAssociation {
+                                association: association.clone(),
+                                last_seen_epoch: now,
+                            },
+                        );
+                        existing_association = Some(association);
+                    } else {
+                        association.active.store(false, Ordering::Relaxed);
+                        associations.remove(&client_addr);
+                    }
+                }
+            }
+
+            if let Some(existing) = existing_association {
+                let upstream_socket = existing.socket.clone();
+                if let Err(error) = send_udp_connected(&upstream_socket, &buffer[..received]).await
+                {
+                    tracing::warn!(
+                        ?error,
+                        %client_addr,
+                        listener = %listener_config.name,
+                        worker = worker_index,
+                        "failed forwarding udp payload to existing upstream association"
+                    );
+                    existing.active.store(false, Ordering::Relaxed);
+                    local_associations.remove(&client_addr);
+                    associations.remove(&client_addr);
+                }
+                continue;
+            }
+
+            let payload = Bytes::copy_from_slice(&buffer[..received]);
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
             let listener_socket = listener_socket.clone();
             let associations = associations.clone();
             let protocol_hint = protocol_hint.clone();
+            let should_spawn = {
+                let mut pending = pending_sessions
+                    .lock()
+                    .expect("udp pending session lock poisoned");
+                if pending.contains(&client_addr) {
+                    false
+                } else {
+                    pending.insert(client_addr);
+                    true
+                }
+            };
+            if !should_spawn {
+                continue;
+            }
 
+            let pending_sessions = pending_sessions.clone();
             tokio::spawn(async move {
+                let _pending_guard = PendingUdpSessionGuard {
+                    sessions: pending_sessions,
+                    addr: client_addr,
+                };
                 let request_id = Uuid::new_v4().to_string();
 
                 if let Err(error) = async {
                     let state = gateway.current_state().await;
 
                     let upstream_socket = if let Some(existing) = associations.get(&client_addr) {
-                        existing
-                            .last_seen_epoch
-                            .store(now_unix_secs(), Ordering::Relaxed);
-                        existing.socket.clone()
+                        let association = existing.clone();
+                        drop(existing);
+                        let now = now_unix_secs();
+                        if udp_association_is_live(&association, session_ttl_secs, now) {
+                            association.last_seen_epoch.store(now, Ordering::Relaxed);
+                            association.socket.clone()
+                        } else {
+                            association.active.store(false, Ordering::Relaxed);
+                            associations.remove(&client_addr);
+                            Self::create_udp_upstream_association(UdpAssociationBuildContext {
+                                gateway: &gateway,
+                                state: &state,
+                                listener_name: &listener_name,
+                                listener_socket: &listener_socket,
+                                associations: &associations,
+                                protocol_hint: &protocol_hint,
+                                client_addr,
+                                payload: &payload,
+                                request_id: &request_id,
+                                session_ttl_secs,
+                                max_associations,
+                            })
+                            .await?
+                        }
                     } else {
-                        prune_udp_associations(&associations, session_ttl_secs, max_associations);
-                        if max_associations > 0 && associations.len() >= max_associations {
-                            gateway
-                                .stats
-                                .blocked_requests_total
-                                .fetch_add(1, Ordering::Relaxed);
-                            return Err(anyhow!(
-                                "udp listener {} reached max_associations {}",
-                                listener_name,
-                                max_associations
-                            ));
-                        }
-                        let player_id = extract_stream_player_id(&payload, &state.config.affinity.stream);
-                        let route = if let Some(route) = configured_udp_listener_route(
-                            &state.config,
-                            &listener_name,
-                            player_id.clone(),
-                        ) {
-                            route
-                        } else if let Some(script) = &state.script {
-                            script
-                                .route_udp(StreamContext {
-                                    request_id: request_id.clone(),
-                                    listener: listener_name.clone(),
-                                    protocol: "udp".to_string(),
-                                    remote_addr: client_addr.to_string(),
-                                    player_id: player_id.clone(),
-                                    first_packet_preview: Some(first_packet_preview(&payload)),
-                                    payload_len: payload.len(),
-                                })
-                                .await
-                                .inspect_err(|_| {
-                                    gateway.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                                })?
-                        } else {
-                            return Err(anyhow!(
-                                "udp listener {} has no configured upstream and script runtime is disabled",
-                                listener_name
-                            ));
-                        };
-
-                        let upstream_plan = gateway.select_upstream_plan(
-                            &state.config,
-                            &route,
-                            "udp",
-                            Some(&listener_name),
-                            player_id.as_deref(),
-                            Some(&client_addr.to_string()),
-                        );
-                        let max_attempts = if state.config.load_balance.retries.enabled {
-                            (state.config.load_balance.retries.max_retries as usize)
-                                .saturating_add(1)
-                                .min(upstream_plan.len().max(1))
-                        } else {
-                            1
-                        };
-
-                        let mut selected: Option<(Arc<UdpSocket>, UpstreamLease)> = None;
-                        let mut last_error: Option<anyhow::Error> = None;
-
-                        for upstream in upstream_plan.iter().take(max_attempts) {
-                            let upstream_addr: SocketAddr = match upstream.parse() {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    gateway.on_upstream_failure(&state.config, "udp", Some(&listener_name), upstream);
-                                    last_error = Some(anyhow!("invalid udp upstream {upstream}: {error}"));
-                                    continue;
-                                }
-                            };
-
-                            let bind_any = if upstream_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-                            let socket = match UdpSocket::bind(bind_any).await {
-                                Ok(value) => Arc::new(value),
-                                Err(error) => {
-                                    gateway.on_upstream_failure(&state.config, "udp", Some(&listener_name), upstream);
-                                    last_error = Some(anyhow!("failed to bind udp upstream socket: {error}"));
-                                    continue;
-                                }
-                            };
-
-                            match socket.connect(upstream_addr).await {
-                                Ok(()) => {
-                                    gateway.on_upstream_success("udp", Some(&listener_name), upstream);
-                                    let lease = gateway.acquire_upstream_lease("udp", Some(&listener_name), upstream);
-                                    selected = Some((socket, lease));
-                                    break;
-                                }
-                                Err(error) => {
-                                    gateway.on_upstream_failure(&state.config, "udp", Some(&listener_name), upstream);
-                                    last_error = Some(anyhow!("failed to connect udp upstream {upstream}: {error}"));
-                                }
-                            }
-                        }
-
-                        let (socket, lease) = selected
-                            .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("failed to connect any udp upstream")))?;
-
-                        if !protocol_hint.trim().is_empty() {
-                            tracing::debug!(
-                                protocol = %protocol_hint,
-                                listener = %listener_name,
-                                %client_addr,
-                                "udp protocol hint selected"
-                            );
-                        }
-                        let read_socket = socket.clone();
-                        let send_socket = listener_socket.clone();
-                        let association = Arc::new(UdpAssociation {
-                            socket: socket.clone(),
-                            last_seen_epoch: AtomicU64::new(now_unix_secs()),
-                        });
-                        associations.insert(client_addr, association);
-                        let associations_for_reader = associations.clone();
-
-                        tokio::spawn(async move {
-                            let _lease = lease;
-                            let mut response = vec![0_u8; 65_536];
-                            let check_interval = Duration::from_secs(session_ttl_secs.clamp(1, 30));
-                            loop {
-                                match tokio::time::timeout(
-                                    check_interval,
-                                    read_socket.recv(&mut response),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(size)) => {
-                                        if let Err(error) = send_socket.send_to(&response[..size], client_addr).await {
-                                            tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
-                                            associations_for_reader.remove(&client_addr);
-                                            break;
-                                        }
-                                    }
-                                    Ok(Err(error)) => {
-                                        tracing::warn!(?error, %client_addr, "udp upstream association closed");
-                                        associations_for_reader.remove(&client_addr);
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        let expired = associations_for_reader
-                                            .get(&client_addr)
-                                            .map(|entry| {
-                                                now_unix_secs().saturating_sub(
-                                                    entry.last_seen_epoch.load(Ordering::Relaxed),
-                                                ) > session_ttl_secs
-                                            })
-                                            .unwrap_or(true);
-                                        if expired {
-                                            associations_for_reader.remove(&client_addr);
-                                            tracing::debug!(
-                                                %client_addr,
-                                                ttl_secs = session_ttl_secs,
-                                                "udp upstream association expired"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                        socket
+                        Self::create_udp_upstream_association(UdpAssociationBuildContext {
+                            gateway: &gateway,
+                            state: &state,
+                            listener_name: &listener_name,
+                            listener_socket: &listener_socket,
+                            associations: &associations,
+                            protocol_hint: &protocol_hint,
+                            client_addr,
+                            payload: &payload,
+                            request_id: &request_id,
+                            session_ttl_secs,
+                            max_associations,
+                        })
+                        .await?
                     };
 
-                    upstream_socket
-                        .send(&payload)
+                    send_udp_connected(&upstream_socket, &payload)
                         .await
                         .context("failed forwarding udp payload to upstream")?;
 
@@ -3727,10 +5251,231 @@ impl Gateway {
                 }
                 .await
                 {
-                    tracing::warn!(?error, request_id, listener = %listener_name, %client_addr, "udp session failed");
+                    tracing::warn!(?error, request_id, listener = %listener_name, worker = worker_index, %client_addr, "udp session failed");
                 }
             });
         }
+    }
+
+    async fn create_udp_upstream_association(
+        ctx: UdpAssociationBuildContext<'_>,
+    ) -> Result<Arc<UdpSocket>> {
+        let UdpAssociationBuildContext {
+            gateway,
+            state,
+            listener_name,
+            listener_socket,
+            associations,
+            protocol_hint,
+            client_addr,
+            payload,
+            request_id,
+            session_ttl_secs,
+            max_associations,
+        } = ctx;
+
+        prune_udp_associations(associations, session_ttl_secs, max_associations);
+        if max_associations > 0 && associations.len() >= max_associations {
+            gateway
+                .stats
+                .blocked_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(anyhow!(
+                "udp listener {} reached max_associations {}",
+                listener_name,
+                max_associations
+            ));
+        }
+        let player_id = extract_stream_player_id(payload, &state.config.affinity.stream);
+        let route = if let Some(route) =
+            configured_udp_listener_route(&state.config, listener_name, player_id.clone())
+        {
+            route
+        } else if let Some(script) = &state.script {
+            script
+                .route_udp(StreamContext {
+                    request_id: request_id.to_string(),
+                    listener: listener_name.to_string(),
+                    protocol: "udp".to_string(),
+                    remote_addr: client_addr.to_string(),
+                    player_id: player_id.clone(),
+                    first_packet_preview: Some(first_packet_preview(payload)),
+                    payload_len: payload.len(),
+                })
+                .await
+                .inspect_err(|_| {
+                    gateway
+                        .stats
+                        .script_fail_total
+                        .fetch_add(1, Ordering::Relaxed);
+                })?
+        } else {
+            return Err(anyhow!(
+                "udp listener {} has no configured upstream and script runtime is disabled",
+                listener_name
+            ));
+        };
+
+        let remote_addr_for_affinity = if player_id.is_none()
+            && state.config.affinity.enabled
+            && state.config.affinity.fallback_to_remote_addr
+        {
+            Some(client_addr.to_string())
+        } else {
+            None
+        };
+        let upstream_plan = gateway.select_upstream_plan(
+            &state.config,
+            &route,
+            "udp",
+            Some(listener_name),
+            player_id.as_deref(),
+            remote_addr_for_affinity.as_deref(),
+        );
+        let max_attempts = if state.config.load_balance.retries.enabled {
+            (state.config.load_balance.retries.max_retries as usize)
+                .saturating_add(1)
+                .min(upstream_plan.len().max(1))
+        } else {
+            1
+        };
+
+        let mut selected: Option<(Arc<UdpSocket>, UpstreamLease)> = None;
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for upstream in upstream_plan.iter().take(max_attempts) {
+            let upstream_addr: SocketAddr = match upstream.parse() {
+                Ok(value) => value,
+                Err(error) => {
+                    gateway.on_upstream_failure(
+                        &state.config,
+                        "udp",
+                        Some(listener_name),
+                        upstream,
+                    );
+                    last_error = Some(anyhow!("invalid udp upstream {upstream}: {error}"));
+                    continue;
+                }
+            };
+
+            let bind_any = if upstream_addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let socket = match UdpSocket::bind(bind_any).await {
+                Ok(value) => Arc::new(value),
+                Err(error) => {
+                    gateway.on_upstream_failure(
+                        &state.config,
+                        "udp",
+                        Some(listener_name),
+                        upstream,
+                    );
+                    last_error = Some(anyhow!("failed to bind udp upstream socket: {error}"));
+                    continue;
+                }
+            };
+
+            match socket.connect(upstream_addr).await {
+                Ok(()) => {
+                    gateway.on_upstream_success("udp", Some(listener_name), upstream);
+                    tune_udp_socket_for_gateway(&socket);
+                    let lease =
+                        gateway.acquire_upstream_lease("udp", Some(listener_name), upstream);
+                    selected = Some((socket, lease));
+                    break;
+                }
+                Err(error) => {
+                    gateway.on_upstream_failure(
+                        &state.config,
+                        "udp",
+                        Some(listener_name),
+                        upstream,
+                    );
+                    last_error = Some(anyhow!(
+                        "failed to connect udp upstream {upstream}: {error}"
+                    ));
+                }
+            }
+        }
+
+        let (socket, lease) = selected.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("failed to connect any udp upstream"))
+        })?;
+
+        if !protocol_hint.trim().is_empty() {
+            tracing::debug!(
+                protocol = %protocol_hint,
+                listener = %listener_name,
+                %client_addr,
+                "udp protocol hint selected"
+            );
+        }
+        let read_socket = socket.clone();
+        let send_socket = listener_socket.clone();
+        let association = Arc::new(UdpAssociation {
+            socket: socket.clone(),
+            last_seen_epoch: AtomicU64::new(now_unix_secs()),
+            active: AtomicBool::new(true),
+        });
+        associations.insert(client_addr, association.clone());
+        let associations_for_reader = associations.clone();
+        let association_for_reader = association.clone();
+
+        tokio::spawn(async move {
+            let _lease = lease;
+            let mut response = udp_buffer_pool().acquire();
+            let check_interval = Duration::from_secs(session_ttl_secs.clamp(1, 30));
+            loop {
+                match tokio::time::timeout(check_interval, read_socket.recv(&mut response)).await {
+                    Ok(Ok(size)) => {
+                        if let Err(error) =
+                            send_udp_to(&send_socket, &response[..size], client_addr).await
+                        {
+                            tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
+                            association_for_reader
+                                .active
+                                .store(false, Ordering::Relaxed);
+                            associations_for_reader.remove(&client_addr);
+                            break;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(?error, %client_addr, "udp upstream association closed");
+                        association_for_reader
+                            .active
+                            .store(false, Ordering::Relaxed);
+                        associations_for_reader.remove(&client_addr);
+                        break;
+                    }
+                    Err(_) => {
+                        let expired = associations_for_reader
+                            .get(&client_addr)
+                            .map(|entry| {
+                                now_unix_secs()
+                                    .saturating_sub(entry.last_seen_epoch.load(Ordering::Relaxed))
+                                    > session_ttl_secs
+                            })
+                            .unwrap_or(true);
+                        if expired {
+                            association_for_reader
+                                .active
+                                .store(false, Ordering::Relaxed);
+                            associations_for_reader.remove(&client_addr);
+                            tracing::debug!(
+                                %client_addr,
+                                ttl_secs = session_ttl_secs,
+                                "udp upstream association expired"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(socket)
     }
 
     async fn handle_hyper_request(
@@ -3742,14 +5487,62 @@ impl Gateway {
         self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
 
         let started = Instant::now();
-        let on_upgrade = websocket_upgrade_requested(request.headers())
-            .then(|| hyper::upgrade::on(&mut request));
-        let version = version_label(request.version());
+        match self
+            .try_http_static_success_fast_path(&request, scheme)
+            .await
+        {
+            Ok(Some(response)) => return Ok(response.into_hyper()),
+            Ok(None) => {}
+            Err(error) => {
+                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(?error, %remote_addr, scheme, "http static fast path failed");
+                return Ok(
+                    GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
+                        .into_hyper(),
+                );
+            }
+        }
+
         let method = request.method().clone();
         let uri = request.uri().clone();
+        let version = version_label(request.version());
+        match self
+            .try_hyper_simple_http_proxy_fast_path(
+                &method,
+                &uri,
+                request.headers(),
+                remote_addr,
+                scheme,
+                version,
+            )
+            .await
+        {
+            Ok(Some(HyperFastPathResponse::Direct(response))) => {
+                return Ok(response);
+            }
+            Ok(Some(HyperFastPathResponse::Gateway(response))) => {
+                let response = self
+                    .finish_hyper_http_response(&request, response, remote_addr, started)
+                    .await;
+                return Ok(response.into_hyper());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(?error, %remote_addr, scheme, "http proxy fast path failed");
+                return Ok(
+                    GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
+                        .into_hyper(),
+                );
+            }
+        }
+
+        let on_upgrade = websocket_upgrade_requested(request.headers())
+            .then(|| hyper::upgrade::on(&mut request));
         let headers = request.headers().clone();
-        let body = match request.body_mut().collect().await {
-            Ok(collected) => collected.to_bytes(),
+        let body = match collect_request_body_if_needed(&method, &headers, request.body_mut()).await
+        {
+            Ok(body) => body,
             Err(error) => {
                 self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(?error, %remote_addr, "failed collecting request body");
@@ -3765,7 +5558,7 @@ impl Gateway {
             .dispatch_http(
                 method,
                 uri,
-                headers.clone(),
+                headers,
                 body,
                 remote_addr,
                 scheme,
@@ -3782,46 +5575,233 @@ impl Gateway {
             }
         };
 
+        let response = self
+            .finish_hyper_http_response(&request, response, remote_addr, started)
+            .await;
+        Ok(response.into_hyper())
+    }
+
+    async fn finish_hyper_http_response(
+        &self,
+        request: &Request<Incoming>,
+        response: GatewayHttpResponse,
+        remote_addr: SocketAddr,
+        started: Instant,
+    ) -> GatewayHttpResponse {
         let elapsed = started.elapsed();
         if response.status.is_server_error() {
             self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
         }
 
-        let state = self.current_state().await;
-        let response = decorate_error_response(&state.config, &headers, response);
-        if state.config.logging.access_log {
-            let request_id = Uuid::new_v4().to_string();
-            if should_sample(state.config.logging.access_sample_rate, &request_id) {
-                let slow = elapsed.as_millis() as u64 >= state.config.logging.slow_request_ms;
-                if slow {
-                    tracing::warn!(
-                        target: "access",
-                        request_id,
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                        status = %response.status.as_u16(),
-                        latency_ms = elapsed.as_millis() as u64,
-                        upstream = %response.upstream,
-                        remote_addr = %remote_addr,
-                        "slow access"
-                    );
-                } else {
-                    tracing::info!(
-                        target: "access",
-                        request_id,
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                        status = %response.status.as_u16(),
-                        latency_ms = elapsed.as_millis() as u64,
-                        upstream = %response.upstream,
-                        remote_addr = %remote_addr,
-                        "access"
-                    );
-                }
-            }
+        let mut response = response;
+        if response.status.is_client_error() || response.status.is_server_error() {
+            let state = self.current_state().await;
+            response = decorate_error_response(&state.config, request.headers(), response);
+            write_access_log_if_enabled(&state.config, request, &response, remote_addr, elapsed);
+        } else if self.bootstrap_config.logging.access_log
+            || self.bootstrap_config.runtime.hot_reload.enabled
+        {
+            let state = self.current_state().await;
+            write_access_log_if_enabled(&state.config, request, &response, remote_addr, elapsed);
         }
 
-        Ok(response.into_hyper())
+        response
+    }
+
+    async fn try_hyper_simple_http_proxy_fast_path(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        version: &str,
+    ) -> Result<Option<HyperFastPathResponse>> {
+        if !request_body_declared_empty(method, headers)
+            || method.as_str() == "PURGE"
+            || websocket_upgrade_requested(headers)
+        {
+            return Ok(None);
+        }
+
+        let state = self.current_state().await;
+        if !state.fast_lane.simple_http_proxy {
+            return Ok(None);
+        }
+
+        if !security::request_uri_is_safe(uri) {
+            return Ok(Some(HyperFastPathResponse::Gateway(
+                GatewayHttpResponse::bytes(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"invalid request path"),
+                    "proxysss://security",
+                ),
+            )));
+        }
+
+        if let Some(status) =
+            security::reject_ambiguous_http1_request(headers, &state.config.security)
+        {
+            return Ok(Some(HyperFastPathResponse::Gateway(
+                GatewayHttpResponse::bytes(
+                    status,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"ambiguous http/1 request"),
+                    "proxysss://security",
+                ),
+            )));
+        }
+
+        let host = request_host(headers, uri);
+        let empty_body = Bytes::new();
+
+        if let Some(route) = state
+            .config
+            .services
+            .ai_proxy
+            .enabled
+            .then_some(&state.config.services.ai_proxy.routes)
+            .into_iter()
+            .flatten()
+            .filter(|route| crate::ai_proxy::route_matches(route, &host, uri.path()))
+            .max_by_key(|route| route.path_prefix.len())
+        {
+            if !ai_proxy_route_fast_path_eligible(route) {
+                return Ok(None);
+            }
+
+            let rewrite_path = ai_proxy_rewrite_path(route, uri);
+            if state.fast_lane.raw_sse_proxy && request_accepts_sse(headers) {
+                return self
+                    .dispatch_raw_sse_upstream_http(
+                        &state.config,
+                        method,
+                        uri,
+                        headers,
+                        &empty_body,
+                        remote_addr,
+                        scheme,
+                        &host,
+                        &route.upstream,
+                        rewrite_path.as_deref(),
+                    )
+                    .await
+                    .map(|response| Some(HyperFastPathResponse::Gateway(response)));
+            }
+
+            return self
+                .dispatch_simple_upstream_http(
+                    &state,
+                    method,
+                    uri,
+                    headers,
+                    &empty_body,
+                    remote_addr,
+                    scheme,
+                    version,
+                    &host,
+                    &route.upstream,
+                    rewrite_path.as_deref(),
+                )
+                .await
+                .map(|response| Some(HyperFastPathResponse::Gateway(response)));
+        }
+
+        if let Some(route) = state
+            .config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .filter(|route| reverse_proxy_route_matches(route, &host, uri.path()))
+            .max_by_key(|route| route.path_prefix.len())
+        {
+            if !reverse_proxy_route_fast_path_eligible(route) {
+                return Ok(None);
+            }
+
+            let rewrite_path = reverse_proxy_rewrite_path(route, uri);
+            return self
+                .dispatch_simple_upstream_http_fast_response(
+                    &state,
+                    method,
+                    uri,
+                    headers,
+                    &empty_body,
+                    remote_addr,
+                    scheme,
+                    version,
+                    &host,
+                    &route.upstream,
+                    rewrite_path.as_deref(),
+                )
+                .await
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    async fn try_http_static_success_fast_path(
+        &self,
+        request: &Request<Incoming>,
+        scheme: &'static str,
+    ) -> Result<Option<GatewayHttpResponse>> {
+        let method = request.method();
+        if method != Method::GET && method != Method::HEAD {
+            return Ok(None);
+        }
+        if !request_body_declared_empty(method, request.headers()) {
+            return Ok(None);
+        }
+        if websocket_upgrade_requested(request.headers()) {
+            return Ok(None);
+        }
+
+        let dynamic_state;
+        let config = if self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+        {
+            dynamic_state = self.current_state().await;
+            &dynamic_state.config
+        } else {
+            &self.bootstrap_config
+        };
+        if !http_static_success_fast_path_allowed(config, scheme, request.uri()) {
+            return Ok(None);
+        }
+        if !security::request_uri_is_safe(request.uri()) {
+            return Ok(None);
+        }
+        if security::reject_ambiguous_http1_request(request.headers(), &config.security).is_some() {
+            return Ok(None);
+        }
+
+        let Some(site) = config
+            .services
+            .static_sites
+            .iter()
+            .find(|site| static_site_path_matches(site, request.uri().path()))
+        else {
+            return Ok(None);
+        };
+
+        let response = dispatch_static_site(
+            site,
+            method,
+            request.uri(),
+            &self.static_file_cache,
+            &self.static_file_cache_bytes,
+            &self.static_file_load_locks,
+        )
+        .await?;
+
+        if response.status.is_success() {
+            Ok(Some(response))
+        } else {
+            Ok(None)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3858,18 +5838,14 @@ impl Gateway {
             ));
         }
 
-        let host = headers
-            .get(HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_string())
-            .or_else(|| {
-                uri.authority()
-                    .map(|authority| authority.as_str().to_string())
-            })
-            .unwrap_or_else(|| "localhost".to_string());
+        let host = request_host(&headers, &uri).into_owned();
 
-        let player_id = extract_http_player_id(&uri, &headers, &state.config.affinity.http);
-        let request_id = Uuid::new_v4().to_string();
+        let script_route_available = state.script.is_some();
+        let player_id = if state.config.affinity.enabled || script_route_available {
+            extract_http_player_id(&uri, &headers, &state.config.affinity.http)
+        } else {
+            None
+        };
 
         if let Some(token) = uri.path().strip_prefix("/.well-known/acme-challenge/") {
             if let Some(value) = self.acme_http_challenges.get(token) {
@@ -3979,7 +5955,7 @@ impl Gateway {
                 remote_addr,
             ) {
                 Ok(lease) => lease,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             };
             let response = crate::filecloud::dispatch_filecloud(
                 &state.config.services.filecloud,
@@ -4007,7 +5983,7 @@ impl Gateway {
                 remote_addr,
             ) {
                 Ok(lease) => lease,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             };
             let response =
                 dispatch_webdav(&state.config.services.webdav, &method, &uri, &headers, body)
@@ -4033,9 +6009,17 @@ impl Gateway {
                 remote_addr,
             ) {
                 Ok(lease) => lease,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             };
-            let response = dispatch_static_site(site, &method, &uri).await?;
+            let response = dispatch_static_site(
+                site,
+                &method,
+                &uri,
+                &self.static_file_cache,
+                &self.static_file_cache_bytes,
+                &self.static_file_load_locks,
+            )
+            .await?;
             return finalize_http_response(
                 &headers,
                 &state.config.services.response_policy.compression,
@@ -4043,9 +6027,27 @@ impl Gateway {
             );
         }
 
+        if let Some(response) = self
+            .try_simple_http_proxy_fast_path(
+                &state,
+                &method,
+                &uri,
+                &headers,
+                &body,
+                remote_addr,
+                scheme,
+                version,
+                &host,
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+
         let route = if let Some(route) = configured_http_route(&state.config, &host, &uri) {
             route
         } else if let Some(script) = &state.script {
+            let request_id = Uuid::new_v4().to_string();
             HttpRouteConfig {
                 runtime_scope: Some("script".to_string()),
                 decision: script
@@ -4066,17 +6068,19 @@ impl Gateway {
                     .inspect_err(|_| {
                         self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
                     })?,
-                compression: state.config.services.response_policy.compression.clone(),
-                cache: state.config.services.response_policy.cache.clone(),
-                rate_limit: state.config.services.rate_limit.http.clone(),
+                compression: Cow::Borrowed(&state.config.services.response_policy.compression),
+                cache: Cow::Borrowed(&state.config.services.response_policy.cache),
+                rate_limit: Cow::Borrowed(&state.config.services.rate_limit.http),
+                forward_headers: true,
             }
         } else if let Some(route) = builtin_http_route(uri.path()) {
             HttpRouteConfig {
                 runtime_scope: Some("builtin".to_string()),
                 decision: route,
-                compression: state.config.services.response_policy.compression.clone(),
-                cache: state.config.services.response_policy.cache.clone(),
-                rate_limit: state.config.services.rate_limit.http.clone(),
+                compression: Cow::Borrowed(&state.config.services.response_policy.compression),
+                cache: Cow::Borrowed(&state.config.services.response_policy.cache),
+                rate_limit: Cow::Borrowed(&state.config.services.rate_limit.http),
+                forward_headers: true,
             }
         } else {
             return Ok(GatewayHttpResponse::error(
@@ -4088,7 +6092,7 @@ impl Gateway {
         let _rate_limit_lease =
             match self.apply_http_rate_limit(&route.rate_limit, &host, &headers, remote_addr) {
                 Ok(lease) => lease,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             };
 
         if route.decision.upstream.starts_with("proxysss://") {
@@ -4110,6 +6114,7 @@ impl Gateway {
                     scheme,
                     &host,
                     &route.decision,
+                    route.forward_headers,
                     on_upgrade,
                 )
                 .await;
@@ -4128,7 +6133,7 @@ impl Gateway {
                 }
                 Some(CacheLookup::Stale(mut response)) => {
                     let gateway = self.clone();
-                    let route_for_refresh = route.clone();
+                    let route_for_refresh = route.to_owned_config();
                     let cache_key_owned = cache_key.to_string();
                     let host_owned = host.to_string();
                     let uri_owned = uri.clone();
@@ -4165,17 +6170,26 @@ impl Gateway {
             }
         }
 
+        let affinity_key = route
+            .decision
+            .affinity_key
+            .as_deref()
+            .or(player_id.as_deref());
+        let remote_addr_for_affinity = if affinity_key.is_none()
+            && state.config.affinity.enabled
+            && state.config.affinity.fallback_to_remote_addr
+        {
+            Some(remote_addr.to_string())
+        } else {
+            None
+        };
         let upstream_plan = self.select_upstream_plan(
             &state.config,
             &route.decision,
             "http",
             route.runtime_scope.as_deref(),
-            route
-                .decision
-                .affinity_key
-                .as_deref()
-                .or(player_id.as_deref()),
-            Some(&remote_addr.to_string()),
+            affinity_key,
+            remote_addr_for_affinity.as_deref(),
         );
         let max_attempts = if state.config.load_balance.retries.enabled {
             (state.config.load_balance.retries.max_retries as usize)
@@ -4188,18 +6202,34 @@ impl Gateway {
         let mut last_error: Option<anyhow::Error> = None;
 
         for (attempt, upstream) in upstream_plan.iter().take(max_attempts).enumerate() {
-            let upstream_url = build_upstream_url(upstream, &route.decision, &uri)?;
-            let upstream_headers =
-                build_upstream_headers(&headers, &route.decision, &host, remote_addr, scheme)?;
-            let _lease =
-                self.acquire_upstream_lease("http", route.runtime_scope.as_deref(), upstream);
+            let upstream_target = build_upstream_http_target(upstream, &route.decision, &uri)?;
+            let upstream_headers = build_upstream_headers(
+                &headers,
+                &route.decision,
+                &host,
+                remote_addr,
+                scheme,
+                route.forward_headers,
+            )?;
+            let track_runtime = self.should_track_upstream_runtime(
+                &state.config,
+                "http",
+                route.runtime_scope.as_deref(),
+                upstream,
+            );
+            let _lease = if track_runtime {
+                Some(self.acquire_upstream_lease("http", route.runtime_scope.as_deref(), upstream))
+            } else {
+                None
+            };
 
             let send_result = state
-                .http_client
-                .request(method.clone(), upstream_url)
-                .headers(upstream_headers)
-                .body(body.clone())
-                .send()
+                .dispatch_upstream_http(
+                    method.clone(),
+                    upstream_target,
+                    upstream_headers,
+                    body.clone(),
+                )
                 .await;
 
             let upstream_response = match send_result {
@@ -4217,12 +6247,21 @@ impl Gateway {
             };
 
             let status = upstream_response.status();
-            let response_headers = upstream_response
-                .headers()
-                .iter()
-                .filter(|(name, _)| !is_hop_header(name.as_str()))
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<Vec<_>>();
+            let stream_upstream_body = should_stream_upstream_body(
+                status,
+                &upstream_response.headers,
+                version,
+                cache_key.as_deref(),
+                &route.compression,
+            );
+            let mut response_headers = Vec::with_capacity(upstream_response.headers.len());
+            response_headers.extend(
+                upstream_response
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| !is_hop_header(name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
             if status.is_server_error() && attempt + 1 < max_attempts {
                 self.on_upstream_failure(
                     &state.config,
@@ -4237,14 +6276,12 @@ impl Gateway {
                 continue;
             }
 
-            self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
-            let is_sse = response_headers
-                .iter()
-                .find(|(name, _)| name == CONTENT_TYPE)
-                .and_then(|(_, value)| value.to_str().ok())
-                .map(|value| value.starts_with("text/event-stream"))
-                .unwrap_or(false);
-            let (body, stream_body) = if version == "HTTP/3" || cache_key.is_some() || !is_sse {
+            if track_runtime {
+                self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
+            }
+            let (body, stream_body) = if stream_upstream_body {
+                (Bytes::new(), Some(upstream_response.into_stream_body()))
+            } else {
                 let response_body = match upstream_response.bytes().await {
                     Ok(body_bytes) => body_bytes,
                     Err(error) => {
@@ -4260,11 +6297,6 @@ impl Gateway {
                     }
                 };
                 (response_body, None)
-            } else {
-                (
-                    Bytes::new(),
-                    Some(streaming_body(upstream_response.bytes_stream())),
-                )
             };
             let response = GatewayHttpResponse {
                 status,
@@ -4297,6 +6329,669 @@ impl Gateway {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn try_simple_http_proxy_fast_path(
+        &self,
+        state: &Arc<DynamicState>,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        version: &str,
+        host: &str,
+    ) -> Result<Option<GatewayHttpResponse>> {
+        let config = &state.config;
+        if !state.fast_lane.simple_http_proxy
+            || method.as_str() == "PURGE"
+            || websocket_upgrade_requested(headers)
+        {
+            return Ok(None);
+        }
+
+        if let Some(route) = config
+            .services
+            .ai_proxy
+            .enabled
+            .then_some(&config.services.ai_proxy.routes)
+            .into_iter()
+            .flatten()
+            .filter(|route| crate::ai_proxy::route_matches(route, host, uri.path()))
+            .max_by_key(|route| route.path_prefix.len())
+        {
+            if ai_proxy_route_fast_path_eligible(route) {
+                let rewrite_path = ai_proxy_rewrite_path(route, uri);
+                if state.fast_lane.raw_sse_proxy && request_accepts_sse(headers) {
+                    return self
+                        .dispatch_raw_sse_upstream_http(
+                            &state.config,
+                            method,
+                            uri,
+                            headers,
+                            body,
+                            remote_addr,
+                            scheme,
+                            host,
+                            &route.upstream,
+                            rewrite_path.as_deref(),
+                        )
+                        .await
+                        .map(Some);
+                }
+                return self
+                    .dispatch_simple_upstream_http(
+                        state,
+                        method,
+                        uri,
+                        headers,
+                        body,
+                        remote_addr,
+                        scheme,
+                        version,
+                        host,
+                        &route.upstream,
+                        rewrite_path.as_deref(),
+                    )
+                    .await
+                    .map(Some);
+            }
+            return Ok(None);
+        }
+
+        if let Some(route) = config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .filter(|route| reverse_proxy_route_matches(route, host, uri.path()))
+            .max_by_key(|route| route.path_prefix.len())
+        {
+            if reverse_proxy_route_fast_path_eligible(route) {
+                let rewrite_path = reverse_proxy_rewrite_path(route, uri);
+                return self
+                    .dispatch_simple_upstream_http(
+                        state,
+                        method,
+                        uri,
+                        headers,
+                        body,
+                        remote_addr,
+                        scheme,
+                        version,
+                        host,
+                        &route.upstream,
+                        rewrite_path.as_deref(),
+                    )
+                    .await
+                    .map(Some);
+            }
+        }
+
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_simple_upstream_http(
+        &self,
+        state: &DynamicState,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        version: &str,
+        host: &str,
+        upstream: &str,
+        rewrite_path: Option<&str>,
+    ) -> Result<GatewayHttpResponse> {
+        let upstream_target = build_upstream_http_target_with_rewrite(upstream, rewrite_path, uri)?;
+        let upstream_headers =
+            build_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+        let upstream_response = state
+            .dispatch_upstream_http(
+                method.clone(),
+                upstream_target,
+                upstream_headers,
+                body.clone(),
+            )
+            .await?;
+
+        let status = upstream_response.status();
+        let stream_upstream_body = should_stream_upstream_body(
+            status,
+            &upstream_response.headers,
+            version,
+            None,
+            &state.config.services.response_policy.compression,
+        );
+        let response_headers = upstream_response
+            .headers
+            .iter()
+            .filter(|(name, _)| !is_hop_header(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let (body, stream_body) = if stream_upstream_body {
+            (Bytes::new(), Some(upstream_response.into_stream_body()))
+        } else {
+            (upstream_response.bytes().await?, None)
+        };
+
+        let response = GatewayHttpResponse {
+            status,
+            headers: response_headers,
+            body,
+            stream_body,
+            upstream: upstream.to_string(),
+        };
+        finalize_http_response(
+            headers,
+            &state.config.services.response_policy.compression,
+            response,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_simple_upstream_http_fast_response(
+        &self,
+        state: &DynamicState,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        version: &str,
+        host: &str,
+        upstream: &str,
+        rewrite_path: Option<&str>,
+    ) -> Result<HyperFastPathResponse> {
+        let upstream_target = build_upstream_http_target_with_rewrite(upstream, rewrite_path, uri)?;
+        let UpstreamHttpTarget::Hyper(upstream_uri) = upstream_target else {
+            return self
+                .dispatch_simple_upstream_http(
+                    state,
+                    method,
+                    uri,
+                    headers,
+                    body,
+                    remote_addr,
+                    scheme,
+                    version,
+                    host,
+                    upstream,
+                    rewrite_path,
+                )
+                .await
+                .map(HyperFastPathResponse::Gateway);
+        };
+
+        let upstream_headers =
+            build_empty_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+        let mut upstream_request = Request::builder()
+            .method(method.clone())
+            .uri(upstream_uri)
+            .body(Full::new(body.clone()))
+            .context("failed building upstream request")?;
+        *upstream_request.headers_mut() = upstream_headers;
+
+        let upstream_response = state
+            .http_fast_client
+            .request(upstream_request)
+            .await
+            .context("upstream request failed")?;
+        let (mut parts, upstream_body) = upstream_response.into_parts();
+        remove_hop_headers_from_map(&mut parts.headers);
+
+        let status = parts.status;
+        let stream_upstream_body = should_stream_upstream_body(
+            status,
+            &parts.headers,
+            version,
+            None,
+            &state.config.services.response_policy.compression,
+        );
+
+        if self.simple_hyper_response_can_return_direct(status, &parts.headers) {
+            let response_body = if stream_upstream_body {
+                GatewayBody::Stream(
+                    upstream_body
+                        .map_err(|error| anyhow!("upstream response stream failed: {error}"))
+                        .boxed_unsync(),
+                )
+            } else {
+                let body_bytes = upstream_body
+                    .collect()
+                    .await
+                    .map(|collected| collected.to_bytes())
+                    .context("failed reading upstream response body")?;
+                full_body(body_bytes)
+            };
+            return Ok(HyperFastPathResponse::Direct(Response::from_parts(
+                parts,
+                response_body,
+            )));
+        }
+
+        let response_headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let (body, stream_body) = if stream_upstream_body {
+            (
+                Bytes::new(),
+                Some(GatewayBody::Stream(
+                    upstream_body
+                        .map_err(|error| anyhow!("upstream response stream failed: {error}"))
+                        .boxed_unsync(),
+                )),
+            )
+        } else {
+            let body_bytes = upstream_body
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .context("failed reading upstream response body")?;
+            (body_bytes, None)
+        };
+
+        let response = GatewayHttpResponse {
+            status,
+            headers: response_headers,
+            body,
+            stream_body,
+            upstream: upstream.to_string(),
+        };
+        finalize_http_response(
+            headers,
+            &state.config.services.response_policy.compression,
+            response,
+        )
+        .map(HyperFastPathResponse::Gateway)
+    }
+
+    fn simple_hyper_response_can_return_direct(
+        &self,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> bool {
+        status.is_success()
+            && !self.bootstrap_config.logging.access_log
+            && !self.bootstrap_config.runtime.hot_reload.enabled
+            && !upstream_response_is_sse(headers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_raw_sse_upstream_http(
+        &self,
+        config: &GatewayConfig,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        host: &str,
+        upstream: &str,
+        rewrite_path: Option<&str>,
+    ) -> Result<GatewayHttpResponse> {
+        let upstream_url = build_upstream_url_with_rewrite(upstream, rewrite_path, uri)?;
+        let mut upstream_headers =
+            build_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+        upstream_headers.insert(CONNECTION, HeaderValue::from_static("close"));
+        if !body.is_empty() && !upstream_headers.contains_key(CONTENT_LENGTH) {
+            upstream_headers.insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            );
+        }
+
+        let mut upstream_io =
+            connect_upgrade_upstream(&upstream_url, config.http.allow_insecure_upstreams)
+                .await
+                .with_context(|| format!("failed connecting raw SSE upstream {upstream_url}"))?;
+        let request_bytes = serialize_http_request(method, &upstream_url, &upstream_headers, body)?;
+        upstream_io
+            .write_all(&request_bytes)
+            .await
+            .with_context(|| format!("failed sending raw SSE request to {upstream_url}"))?;
+
+        let (status, response_headers, leftover) = read_http_response_head(&mut upstream_io)
+            .await
+            .with_context(|| format!("failed reading raw SSE response from {upstream_url}"))?;
+        let response_headers = response_headers
+            .into_iter()
+            .filter(|(name, _)| !is_hop_header(name.as_str()))
+            .collect::<Vec<_>>();
+        let response = GatewayHttpResponse {
+            status,
+            headers: response_headers,
+            body: Bytes::new(),
+            stream_body: Some(raw_sse_streaming_body(upstream_io, leftover)),
+            upstream: upstream_url.to_string(),
+        };
+        finalize_http_response(
+            headers,
+            &config.services.response_policy.compression,
+            response,
+        )
+    }
+
+    async fn try_serve_plain_raw_sse_fast_lane(
+        &self,
+        config: &GatewayConfig,
+        downstream: &mut TcpStream,
+        request: &PlainFastLaneRequest,
+        _remote_addr: SocketAddr,
+    ) -> Result<bool> {
+        if !request.accepts_sse {
+            return Ok(false);
+        }
+        let host = request.host.as_deref().unwrap_or("localhost");
+        let Some(route) = config
+            .services
+            .ai_proxy
+            .enabled
+            .then_some(&config.services.ai_proxy.routes)
+            .into_iter()
+            .flatten()
+            .filter(|route| crate::ai_proxy::route_matches(route, host, &request.path))
+            .max_by_key(|route| route.path_prefix.len())
+        else {
+            return Ok(false);
+        };
+        if !ai_proxy_route_fast_path_eligible(route) {
+            return Ok(false);
+        }
+
+        let rewrite_path = ai_proxy_raw_rewrite_path(route, &request.target, &request.path);
+        let Some((_, upstream_host, upstream_port)) =
+            raw_http_pool_parts_from_upstream(&route.upstream)?
+        else {
+            return Ok(false);
+        };
+        let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
+        let mut upstream_io = TcpStream::connect((upstream_host.as_str(), upstream_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed connecting plain raw SSE upstream {}",
+                    route.upstream
+                )
+            })?;
+        let _ = upstream_io.set_nodelay(true);
+        tune_tcp_stream_for_gateway(&upstream_io);
+        let request_bytes = serialize_raw_fast_lane_request(
+            request,
+            path_and_query,
+            host,
+            None,
+            route.forward_headers,
+        );
+        upstream_io
+            .write_all(&request_bytes)
+            .await
+            .with_context(|| {
+                format!("failed sending plain raw SSE request to {}", route.upstream)
+            })?;
+
+        let response_head = read_raw_fast_http_response_head(&mut upstream_io, true)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading plain raw SSE response from {}",
+                    route.upstream
+                )
+            })?;
+        let response_head_bytes = build_raw_http_response_head_bytes(
+            response_head.status,
+            &response_head.headers,
+            false,
+            false,
+        );
+        downstream
+            .write_all(&response_head_bytes)
+            .await
+            .context("failed writing raw SSE response head")?;
+        relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
+            .await
+            .context("plain raw SSE stream relay failed")?;
+        Ok(true)
+    }
+
+    async fn try_serve_plain_raw_reverse_fast_lane(
+        &self,
+        config: &GatewayConfig,
+        downstream: &mut TcpStream,
+        request: &PlainFastLaneRequest,
+        _remote_addr: SocketAddr,
+        lane_upstream: &mut Option<RawReverseLaneUpstream>,
+    ) -> Result<bool> {
+        let host = request.host.as_deref().unwrap_or("localhost");
+        let Some(route) = config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .filter(|route| reverse_proxy_route_matches(route, host, &request.path))
+            .max_by_key(|route| route.path_prefix.len())
+        else {
+            return Ok(false);
+        };
+        if !reverse_proxy_route_fast_path_eligible(route) {
+            return Ok(false);
+        }
+
+        let Some((pool_key, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
+            return Ok(false);
+        };
+        let path_and_query =
+            reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
+        let mut upstream_io = if lane_upstream
+            .as_ref()
+            .map(|upstream| upstream.key == pool_key)
+            .unwrap_or(false)
+        {
+            lane_upstream
+                .take()
+                .map(|upstream| upstream.stream)
+                .expect("checked lane upstream exists")
+        } else {
+            if let Some(previous) = lane_upstream.take() {
+                previous.pool.checkin(previous.stream);
+            }
+            pool.checkout().await.with_context(|| {
+                format!(
+                    "failed checking out plain raw reverse upstream {}",
+                    route.upstream
+                )
+            })?
+        };
+        let request_bytes = serialize_raw_fast_lane_request(
+            request,
+            path_and_query.as_ref(),
+            host,
+            None,
+            route.forward_headers,
+        );
+        upstream_io
+            .write_all(&request_bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed sending plain raw reverse request to {}",
+                    route.upstream
+                )
+            })?;
+
+        let response_head = read_raw_fast_http_response_head(&mut upstream_io, false)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading plain raw reverse response from {}",
+                    route.upstream
+                )
+            })?;
+        let upstream_keep_alive = !response_head.connection_close;
+        let content_length = response_head.content_length;
+        let transfer_chunked = response_head.transfer_chunked;
+        let response_head_bytes = response_head.raw_head.clone();
+        if request.method == Method::HEAD || status_has_no_body(response_head.status) {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw HTTP response head")?;
+            if upstream_keep_alive {
+                *lane_upstream = Some(RawReverseLaneUpstream {
+                    key: pool_key,
+                    pool,
+                    stream: upstream_io,
+                });
+            }
+        } else if let Some(len) = content_length {
+            let reusable = if let Some(leftover) = response_head.leftover {
+                let leftover_len = leftover.len() as u64;
+                if leftover_len >= len {
+                    let mut response_bytes =
+                        Vec::with_capacity(response_head_bytes.len() + len as usize);
+                    response_bytes.extend_from_slice(&response_head_bytes);
+                    response_bytes.extend_from_slice(&leftover[..len as usize]);
+                    downstream
+                        .write_all(&response_bytes)
+                        .await
+                        .context("failed writing raw HTTP response head/body")?;
+                    leftover_len == len
+                } else {
+                    downstream
+                        .write_all(&response_head_bytes)
+                        .await
+                        .context("failed writing raw HTTP response head")?;
+                    relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
+                }
+            } else {
+                downstream
+                    .write_all(&response_head_bytes)
+                    .await
+                    .context("failed writing raw HTTP response head")?;
+                relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
+            };
+            if reusable && upstream_keep_alive {
+                *lane_upstream = Some(RawReverseLaneUpstream {
+                    key: pool_key,
+                    pool,
+                    stream: upstream_io,
+                });
+            }
+        } else if transfer_chunked {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw HTTP response head")?;
+            let reusable = relay_passthrough_chunked_http_body(
+                &mut upstream_io,
+                downstream,
+                response_head.leftover,
+            )
+            .await?;
+            if reusable && upstream_keep_alive {
+                *lane_upstream = Some(RawReverseLaneUpstream {
+                    key: pool_key,
+                    pool,
+                    stream: upstream_io,
+                });
+            }
+        } else {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw HTTP response head")?;
+            relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover).await?;
+        }
+        Ok(true)
+    }
+
+    async fn try_serve_plain_raw_websocket_fast_lane(
+        &self,
+        config: &GatewayConfig,
+        downstream: &mut TcpStream,
+        request: &PlainWebSocketFastLaneRequest,
+        _remote_addr: SocketAddr,
+    ) -> Result<bool> {
+        let host = request.host.as_deref().unwrap_or("localhost");
+        let Some(route) = config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .filter(|route| websocket_route_fast_path_eligible(route))
+            .filter(|route| reverse_proxy_route_matches(route, host, &request.path))
+            .max_by_key(|route| route.path_prefix.len())
+        else {
+            return Ok(false);
+        };
+        let Some((_, upstream_host, upstream_port)) =
+            raw_websocket_pool_parts_from_upstream(&route.upstream)?
+        else {
+            return Ok(false);
+        };
+        let path_and_query =
+            reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
+        let mut upstream_io = TcpStream::connect((upstream_host.as_str(), upstream_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed connecting plain raw websocket upstream {}",
+                    route.upstream
+                )
+            })?;
+        let _ = upstream_io.set_nodelay(true);
+        tune_tcp_stream_for_gateway(&upstream_io);
+
+        let request_bytes =
+            serialize_raw_websocket_fast_lane_request(request, path_and_query.as_ref(), host);
+        upstream_io
+            .write_all(&request_bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed sending plain raw websocket handshake to {}",
+                    route.upstream
+                )
+            })?;
+
+        let response_head = read_raw_fast_http_response_head(&mut upstream_io, false)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading plain raw websocket response from {}",
+                    route.upstream
+                )
+            })?;
+        downstream
+            .write_all(&response_head.raw_head)
+            .await
+            .context("failed writing raw websocket response head")?;
+        if let Some(leftover) = response_head.leftover {
+            if !leftover.is_empty() {
+                downstream
+                    .write_all(&leftover)
+                    .await
+                    .context("failed writing raw websocket upstream prelude")?;
+            }
+        }
+        if response_head.status != StatusCode::SWITCHING_PROTOCOLS {
+            return Ok(true);
+        }
+
+        copy_bidirectional(downstream, &mut upstream_io)
+            .await
+            .context("raw websocket tunnel relay failed")?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_websocket(
         &self,
         method: Method,
@@ -4307,6 +7002,7 @@ impl Gateway {
         scheme: &str,
         host: &str,
         route: &RouteDecision,
+        forward_headers: bool,
         on_upgrade: OnUpgrade,
     ) -> Result<GatewayHttpResponse> {
         let state = self.current_state().await;
@@ -4319,6 +7015,7 @@ impl Gateway {
             remote_addr,
             scheme,
             host,
+            forward_headers,
         )?;
         let upstream = upstream_url.to_string();
         let mut upstream_io =
@@ -4385,6 +7082,56 @@ impl Gateway {
 
     async fn current_state(&self) -> Arc<DynamicState> {
         self.dynamic.read().await.clone()
+    }
+
+    async fn plain_http_data_fast_lane_enabled(&self) -> bool {
+        if self.bootstrap_config.runtime.hot_reload.enabled || self.bootstrap_config.admin.enabled {
+            let fast_lane = self.current_state().await.fast_lane.clone();
+            fast_lane.plain_http_static_sendfile
+                || fast_lane.raw_sse_proxy
+                || fast_lane.raw_reverse_proxy
+                || fast_lane.raw_websocket_proxy
+        } else {
+            self.bootstrap_fast_lane.plain_http_static_sendfile
+                || self.bootstrap_fast_lane.raw_sse_proxy
+                || self.bootstrap_fast_lane.raw_reverse_proxy
+                || self.bootstrap_fast_lane.raw_websocket_proxy
+        }
+    }
+
+    fn raw_http_pool_for_upstream(
+        &self,
+        upstream: &str,
+    ) -> Result<Option<(String, Arc<RawHttpUpstreamPool>)>> {
+        let Some((key, host, port)) = raw_http_pool_parts_from_upstream(upstream)? else {
+            return Ok(None);
+        };
+        let pool = self.raw_http_pool_for_parts(key.clone(), host, port);
+        Ok(Some((key, pool)))
+    }
+
+    fn raw_http_pool_for_parts(
+        &self,
+        key: String,
+        host: String,
+        port: u16,
+    ) -> Arc<RawHttpUpstreamPool> {
+        if let Some(pool) = self.raw_http_pools.get(&key) {
+            return pool.clone();
+        }
+
+        let pool = Arc::new(RawHttpUpstreamPool::new(host, port));
+        self.raw_http_pools.insert(key.clone(), pool.clone());
+        self.raw_http_pools
+            .get(&key)
+            .map(|entry| entry.clone())
+            .unwrap_or(pool)
+    }
+
+    fn prune_raw_http_pools(&self, config: &GatewayConfig) {
+        let active_keys = raw_http_pool_keys_for_config(config);
+        self.raw_http_pools
+            .retain(|key, _| active_keys.contains(key.as_str()));
     }
 
     fn lookup_cached_http_response(
@@ -4490,18 +7237,24 @@ impl Gateway {
 
     async fn revalidate_cached_http_response(
         &self,
-        route: &HttpRouteConfig,
+        route: &HttpRouteConfig<'_>,
         cache_key: &str,
         request: &HttpCacheRevalidateRequest<'_>,
     ) -> Result<()> {
         let state = self.current_state().await;
+        let remote_addr_for_affinity =
+            if state.config.affinity.enabled && state.config.affinity.fallback_to_remote_addr {
+                Some(request.remote_addr.to_string())
+            } else {
+                None
+            };
         let upstream_plan = self.select_upstream_plan(
             &state.config,
             &route.decision,
             "http",
             route.runtime_scope.as_deref(),
             route.decision.affinity_key.as_deref(),
-            Some(&request.remote_addr.to_string()),
+            remote_addr_for_affinity.as_deref(),
         );
         let upstream = upstream_plan
             .first()
@@ -4514,6 +7267,7 @@ impl Gateway {
             request.host,
             request.remote_addr,
             request.scheme,
+            route.forward_headers,
         )?;
         let response = state
             .http_client
@@ -4728,7 +7482,7 @@ impl Gateway {
         host: &str,
         headers: &HeaderMap,
         remote_addr: SocketAddr,
-    ) -> std::result::Result<Option<HttpRateLimitLease>, GatewayHttpResponse> {
+    ) -> std::result::Result<Option<HttpRateLimitLease>, Box<GatewayHttpResponse>> {
         if !config.enabled {
             return Ok(None);
         }
@@ -4739,7 +7493,10 @@ impl Gateway {
         if let Some(retry_after) =
             apply_http_rate_limit_to_store(&self.http_rate_limits, config, key.clone())
         {
-            return Err(rate_limit_rejection_response(config, &retry_after));
+            return Err(Box::new(rate_limit_rejection_response(
+                config,
+                &retry_after,
+            )));
         }
 
         if config.max_connections == 0 {
@@ -4748,7 +7505,7 @@ impl Gateway {
 
         let mut entry = self.http_connection_limits.entry(key.clone()).or_insert(0);
         if *entry >= config.max_connections {
-            return Err(rate_limit_rejection_response(config, "1"));
+            return Err(Box::new(rate_limit_rejection_response(config, "1")));
         }
         *entry = entry.saturating_add(1);
         drop(entry);
@@ -4786,6 +7543,13 @@ impl Gateway {
         let raw_candidates = normalize_candidates(route);
         if raw_candidates.is_empty() {
             return vec![route.upstream.clone()];
+        }
+
+        if raw_candidates.len() == 1
+            && !config.load_balance.active_health.enabled
+            && !config.load_balance.passive_health.enabled
+        {
+            return raw_candidates;
         }
 
         let candidates = self.filter_healthy_candidates(config, protocol, listener, raw_candidates);
@@ -5035,6 +7799,16 @@ impl Gateway {
         if !entry.manually_disabled {
             entry.quarantined_until = None;
         }
+    }
+
+    fn should_track_upstream_runtime(
+        &self,
+        config: &GatewayConfig,
+        _protocol: &str,
+        _listener: Option<&str>,
+        _upstream: &str,
+    ) -> bool {
+        config.load_balance.active_health.enabled || config.load_balance.passive_health.enabled
     }
 
     fn on_upstream_failure(
@@ -5982,9 +8756,768 @@ impl GatewayHttpResponse {
 }
 
 fn full_body(body: Bytes) -> GatewayBody {
-    Full::new(body)
-        .map_err(|never| match never {})
-        .boxed_unsync()
+    GatewayBody::Full(Some(body))
+}
+
+fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
+    let mut builder = AutoBuilder::new(TokioExecutor::new());
+    builder.http1().writev(true).max_buf_size(1024 * 1024);
+    builder
+        .http2()
+        .adaptive_window(true)
+        .max_send_buf_size(1024 * 1024);
+    builder
+}
+
+struct StaticFastPathRequest {
+    method: &'static str,
+    target: String,
+    path: String,
+    host: Option<String>,
+    keep_alive: bool,
+    head_len: usize,
+}
+
+struct StaticFastPathCandidate {
+    path: PathBuf,
+    len: u64,
+    content_type: &'static str,
+    cached_body: Option<Bytes>,
+    sendfile: Option<Arc<std::fs::File>>,
+}
+
+struct PlainFastLaneRequest {
+    method: Method,
+    target: String,
+    path: String,
+    forward_header_bytes: Vec<u8>,
+    accepts_sse: bool,
+    host: Option<String>,
+    keep_alive: bool,
+    head_len: usize,
+}
+
+struct PlainWebSocketFastLaneRequest {
+    target: String,
+    path: String,
+    header_bytes: Vec<u8>,
+    host: Option<String>,
+    head_len: usize,
+}
+
+struct RawReverseLaneUpstream {
+    key: String,
+    pool: Arc<RawHttpUpstreamPool>,
+    stream: TcpStream,
+}
+
+fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
+    !config.logging.access_log
+        && !config.security.ddos.enabled
+        && !config.security.dynamic_blacklist.enabled
+        && !config.services.access_control.http.enabled
+        && !config.services.rate_limit.http.enabled
+        && !config.services.response_policy.compression.enabled
+        && !config.services.static_sites.is_empty()
+}
+
+fn static_sendfile_fast_path_threshold_bytes(config: &GatewayConfig) -> u64 {
+    match config.runtime.performance.traffic_profile {
+        RuntimePerformanceTrafficProfile::Bulk => 0,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => {
+            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
+        }
+    }
+}
+
+fn peek_static_fast_path_path(buffer: &[u8]) -> Option<&str> {
+    let head = std::str::from_utf8(buffer).ok()?;
+    let line_end = head.find("\r\n")?;
+    let mut parts = head[..line_end].split_whitespace();
+    match parts.next()? {
+        "GET" | "HEAD" => {}
+        _ => return None,
+    }
+    let target = parts.next()?;
+    if !target.starts_with('/') || target.starts_with("//") {
+        return None;
+    }
+    Some(
+        target
+            .split_once('?')
+            .map(|(path, _)| path)
+            .unwrap_or(target),
+    )
+}
+
+fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest> {
+    let head = std::str::from_utf8(buffer).ok()?;
+    let head_end = head.find("\r\n\r\n")?;
+    let mut lines = head[..head_end].split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = match request_parts.next()? {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        _ => return None,
+    };
+    let target = request_parts.next()?;
+    let version = request_parts.next()?;
+    if request_parts.next().is_some() || (version != "HTTP/1.1" && version != "HTTP/1.0") {
+        return None;
+    }
+    if !target.starts_with('/') || target.starts_with("//") {
+        return None;
+    }
+
+    let path = target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    let mut host = None;
+    let mut connection_close = false;
+    let mut connection_keep_alive = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("range")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("upgrade")
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length")
+            && value.trim().parse::<u64>().ok().unwrap_or(1) != 0
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("host") {
+            host = Some(value.trim().to_string());
+        }
+        if name.eq_ignore_ascii_case("connection") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.eq_ignore_ascii_case("close") {
+                    connection_close = true;
+                } else if token.eq_ignore_ascii_case("keep-alive") {
+                    connection_keep_alive = true;
+                }
+            }
+        }
+    }
+    let keep_alive = if version == "HTTP/1.1" {
+        !connection_close
+    } else {
+        connection_keep_alive && !connection_close
+    };
+
+    Some(StaticFastPathRequest {
+        method,
+        target: target.to_string(),
+        path: path.to_string(),
+        host,
+        keep_alive,
+        head_len: head_end + 4,
+    })
+}
+
+fn parse_plain_fast_lane_request(buffer: &[u8]) -> Option<PlainFastLaneRequest> {
+    let head = std::str::from_utf8(buffer).ok()?;
+    let head_end = head.find("\r\n\r\n")?;
+    let mut lines = head[..head_end].split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = Method::from_bytes(request_parts.next()?.as_bytes()).ok()?;
+    if method != Method::GET && method != Method::HEAD {
+        return None;
+    }
+    let target = request_parts.next()?;
+    let version = request_parts.next()?;
+    if request_parts.next().is_some() || (version != "HTTP/1.1" && version != "HTTP/1.0") {
+        return None;
+    }
+    if !target.starts_with('/') || target.starts_with("//") {
+        return None;
+    }
+
+    let path = target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    let mut forward_header_bytes = Vec::with_capacity(head_end.min(1024));
+    let mut accepts_sse = false;
+    let mut host = None;
+    let mut connection_close = false;
+    let mut connection_keep_alive = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("upgrade")
+            || (name.eq_ignore_ascii_case("content-length")
+                && value.parse::<u64>().ok().unwrap_or(1) != 0)
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("host") {
+            host = Some(value.to_string());
+        }
+        if name.eq_ignore_ascii_case("accept") && header_value_accepts_sse(value) {
+            accepts_sse = true;
+        }
+        if name.eq_ignore_ascii_case("connection") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.eq_ignore_ascii_case("close") {
+                    connection_close = true;
+                } else if token.eq_ignore_ascii_case("keep-alive") {
+                    connection_keep_alive = true;
+                }
+            }
+        }
+        if !is_hop_header(name)
+            && !name.eq_ignore_ascii_case("host")
+            && !name.eq_ignore_ascii_case("content-length")
+        {
+            forward_header_bytes.extend_from_slice(name.as_bytes());
+            forward_header_bytes.extend_from_slice(b": ");
+            forward_header_bytes.extend_from_slice(value.as_bytes());
+            forward_header_bytes.extend_from_slice(b"\r\n");
+        }
+    }
+    let keep_alive = if version == "HTTP/1.1" {
+        !connection_close
+    } else {
+        connection_keep_alive && !connection_close
+    };
+
+    Some(PlainFastLaneRequest {
+        method,
+        target: target.to_string(),
+        path: path.to_string(),
+        forward_header_bytes,
+        accepts_sse,
+        host,
+        keep_alive,
+        head_len: head_end + 4,
+    })
+}
+
+fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSocketFastLaneRequest> {
+    let head = std::str::from_utf8(buffer).ok()?;
+    let head_end = head.find("\r\n\r\n")?;
+    let mut lines = head[..head_end].split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_whitespace();
+    if request_parts.next()? != "GET" {
+        return None;
+    }
+    let target = request_parts.next()?;
+    let version = request_parts.next()?;
+    if request_parts.next().is_some() || version != "HTTP/1.1" {
+        return None;
+    }
+    if !target.starts_with('/') || target.starts_with("//") {
+        return None;
+    }
+
+    let path = target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    let mut header_bytes = Vec::with_capacity(head_end.min(1536));
+    let mut host = None;
+    let mut upgrade_websocket = false;
+    let mut connection_upgrade = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || (name.eq_ignore_ascii_case("content-length")
+                && value.parse::<u64>().ok().unwrap_or(1) != 0)
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("host") {
+            host = Some(value.to_string());
+            continue;
+        }
+        if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
+            upgrade_websocket = true;
+        }
+        if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            connection_upgrade = true;
+        }
+        if !name.eq_ignore_ascii_case("proxy-connection")
+            && !name.eq_ignore_ascii_case("content-length")
+        {
+            header_bytes.extend_from_slice(name.as_bytes());
+            header_bytes.extend_from_slice(b": ");
+            header_bytes.extend_from_slice(value.as_bytes());
+            header_bytes.extend_from_slice(b"\r\n");
+        }
+    }
+    if !upgrade_websocket || !connection_upgrade {
+        return None;
+    }
+
+    Some(PlainWebSocketFastLaneRequest {
+        target: target.to_string(),
+        path: path.to_string(),
+        header_bytes,
+        host,
+        head_len: head_end + 4,
+    })
+}
+
+fn http_head_complete(buffer: &[u8]) -> bool {
+    memmem::find(buffer, b"\r\n\r\n").is_some()
+}
+
+async fn peek_http_head(stream: &TcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut last_read = 0;
+    for _ in 0..16 {
+        let read = stream.peek(buffer).await?;
+        last_read = read;
+        if read == 0 || read == buffer.len() || http_head_complete(&buffer[..read]) {
+            return Ok(read);
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(last_read)
+}
+
+async fn consume_http_head_len(stream: &mut TcpStream, mut remaining: usize) -> Result<bool> {
+    let mut buffer = [0_u8; 1024];
+    while remaining > 0 {
+        let read_target = remaining.min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..read_target])
+            .await
+            .context("failed reading plain http fast lane request")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        remaining -= read;
+    }
+    Ok(true)
+}
+
+async fn resolve_large_static_fast_path_candidate(
+    config: &GatewayConfig,
+    request: &StaticFastPathRequest,
+    static_route_cache: &DashMap<String, PathBuf>,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
+) -> Result<Option<StaticFastPathCandidate>> {
+    let mut matched_site = None;
+    let route_cached_target = static_route_cache
+        .get(&request.path)
+        .map(|target| target.clone());
+    if route_cached_target.is_none() || http_to_https_redirect_can_apply(config) {
+        let uri = request
+            .target
+            .parse::<Uri>()
+            .context("invalid fast path request target")?;
+        if !security::request_uri_is_safe(&uri) {
+            return Ok(None);
+        }
+        if let Some(host) = request.host.as_deref() {
+            if should_redirect_http_to_https(config, host, &uri) {
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut target = if let Some(target) = route_cached_target {
+        target.clone()
+    } else {
+        let Some(site) = config
+            .services
+            .static_sites
+            .iter()
+            .find(|site| static_site_path_matches(site, &request.path))
+        else {
+            return Ok(None);
+        };
+        let Some(target) = static_site_filesystem_path(site, &request.path)? else {
+            return Ok(None);
+        };
+        matched_site = Some(site);
+        target
+    };
+    let sendfile_threshold = static_sendfile_fast_path_threshold_bytes(config);
+    if let Some(candidate) = fresh_cached_static_file_candidate(
+        &target,
+        request.method,
+        static_file_cache,
+        sendfile_threshold,
+    ) {
+        return Ok(Some(candidate));
+    }
+
+    let metadata = match tokio::fs::metadata(&target).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed reading fast path static metadata"),
+    };
+    let metadata = if metadata.is_dir() {
+        let Some(site) = matched_site else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for index in &site.index_files {
+            let candidate = target.join(index);
+            if tokio::fs::metadata(&candidate)
+                .await
+                .map(|item| item.is_file())
+                .unwrap_or(false)
+            {
+                found = Some(candidate);
+                break;
+            }
+        }
+        let Some(index) = found else {
+            return Ok(None);
+        };
+        target = index;
+        tokio::fs::metadata(&target)
+            .await
+            .context("failed reading fast path static index metadata")?
+    } else {
+        metadata
+    };
+
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let use_sendfile = cfg!(target_os = "linux")
+        && request.method == "GET"
+        && metadata.len() >= sendfile_threshold;
+    let cached_body = if request.method == "GET"
+        && !use_sendfile
+        && metadata.len() < STATIC_STREAM_THRESHOLD_BYTES
+    {
+        Some(
+            cached_static_file_body(
+                &target,
+                &metadata,
+                static_file_cache,
+                static_file_cache_bytes,
+                static_file_load_locks,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let sendfile = if use_sendfile {
+        Some(cached_static_sendfile(
+            &target,
+            &metadata,
+            static_file_cache,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(Some(StaticFastPathCandidate {
+        content_type: static_content_type(&target),
+        len: metadata.len(),
+        path: target,
+        cached_body,
+        sendfile,
+    }))
+}
+
+async fn send_static_file_fast(
+    stream: &mut TcpStream,
+    path: &Path,
+    _len: u64,
+    sendfile: Option<Arc<std::fs::File>>,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = sendfile;
+
+    #[cfg(target_os = "linux")]
+    {
+        let path = path.to_path_buf();
+        let file = match sendfile {
+            Some(file) => file,
+            None => Arc::new(
+                std::fs::File::open(&path).context("failed opening static file for sendfile")?,
+            ),
+        };
+        sendfile_all_async(stream, file.as_raw_fd(), _len)
+            .await
+            .context("sendfile static response failed")?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .context("failed opening static file for fast copy")?;
+        tokio::io::copy(&mut file, stream)
+            .await
+            .context("failed copying static fast path file")?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn sendfile_all_async(
+    stream: &TcpStream,
+    in_fd: std::os::fd::RawFd,
+    len: u64,
+) -> std::io::Result<u64> {
+    let out_fd = stream.as_raw_fd();
+    let mut offset: libc::off_t = 0;
+    let mut sent = 0_u64;
+
+    while sent < len {
+        let remaining = len - sent;
+        let count = remaining.min(16 * 1024 * 1024) as usize;
+        let written = stream
+            .async_io(tokio::io::Interest::WRITABLE, || loop {
+                let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
+                if written >= 0 {
+                    return Ok(written as usize);
+                }
+
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            })
+            .await?;
+        if written == 0 {
+            break;
+        }
+        sent = sent.saturating_add(written as u64);
+    }
+
+    Ok(sent)
+}
+
+async fn bind_tcp_listener(bind_addr: SocketAddr, label: &str) -> Result<TcpListener> {
+    let socket = if bind_addr.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }
+    .with_context(|| format!("failed creating socket for {label} {bind_addr}"))?;
+
+    socket
+        .set_reuseaddr(true)
+        .with_context(|| format!("failed setting SO_REUSEADDR for {label} {bind_addr}"))?;
+
+    // SO_REUSEPORT: kernel-level load balancing across multiple accept loops
+    // on multi-core systems.  Critical for TCP stream / game-long-connection perf.
+    #[cfg(target_os = "linux")]
+    {
+        let fd = socket.as_raw_fd();
+        let enable: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &enable as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::warn!(label = %label, bind = %bind_addr, "SO_REUSEPORT failed (non-fatal)");
+        }
+    }
+
+    socket
+        .bind(bind_addr)
+        .with_context(|| format!("failed to bind {label} {bind_addr}"))?;
+    let listener = socket
+        .listen(TCP_LISTEN_BACKLOG)
+        .with_context(|| format!("failed to listen on {label} {bind_addr}"))?;
+
+    // TCP_FASTOPEN on the listener: reduces handshake RTT for repeat clients
+    #[cfg(target_os = "linux")]
+    {
+        let fd = listener.as_raw_fd();
+        let tfo_queue: libc::c_int = 5;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &tfo_queue as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tfo_queue) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::debug!(label = %label, "TCP_FASTOPEN on listener failed (non-fatal)");
+        }
+    }
+
+    Ok(listener)
+}
+
+async fn bind_udp_listener_socket(bind_addr: SocketAddr, label: &str) -> Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(bind_addr),
+        Type::DGRAM,
+        Some(SocketProtocol::UDP),
+    )
+    .with_context(|| format!("failed creating udp socket for {label} {bind_addr}"))?;
+
+    socket
+        .set_reuse_address(true)
+        .with_context(|| format!("failed setting SO_REUSEADDR for {label} {bind_addr}"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(error) = socket.set_reuse_port(true) {
+            tracing::warn!(?error, label = %label, bind = %bind_addr, "SO_REUSEPORT failed for udp listener (non-fatal)");
+        }
+    }
+
+    socket
+        .bind(&bind_addr.into())
+        .with_context(|| format!("failed to bind {label} {bind_addr}"))?;
+    socket.set_nonblocking(true).with_context(|| {
+        format!("failed setting udp listener nonblocking for {label} {bind_addr}")
+    })?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+        .with_context(|| format!("failed creating tokio udp socket for {label} {bind_addr}"))
+        .inspect(tune_udp_socket_for_gateway)
+}
+
+fn plain_http_accept_worker_count(config: &GatewayConfig) -> usize {
+    if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
+        return 1;
+    }
+    adaptive_data_plane_workers(1)
+}
+
+fn udp_listener_worker_count(config: &GatewayConfig) -> usize {
+    udp_listener_worker_count_for(config, adaptive_data_plane_workers(1))
+}
+
+fn udp_listener_worker_count_for(config: &GatewayConfig, available_parallelism: usize) -> usize {
+    if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
+        return 1;
+    }
+    available_parallelism.max(1)
+}
+
+fn tcp_stream_accept_worker_count(config: &GatewayConfig, listener: &TcpListenerConfig) -> usize {
+    tcp_stream_accept_worker_count_for(
+        config,
+        listener,
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+fn tcp_stream_accept_worker_count_for(
+    config: &GatewayConfig,
+    listener: &TcpListenerConfig,
+    available_parallelism: usize,
+) -> usize {
+    if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
+        return 1;
+    }
+    if listener.name == "ftp" && config.services.ftp.native_control {
+        return 1;
+    }
+    adaptive_stream_runtime_workers_for(available_parallelism)
+}
+
+fn adaptive_data_plane_workers(min_workers: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(min_workers.max(1))
+        .max(min_workers.max(1))
+}
+
+fn adaptive_stream_runtime_workers() -> usize {
+    adaptive_stream_runtime_workers_for(adaptive_data_plane_workers(1))
+}
+
+fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
+    let cores = cores.max(1);
+    if cores <= 4 {
+        1
+    } else {
+        cores.div_ceil(2)
+    }
+}
+
+fn direct_tcp_listener_upstream(config: &GatewayConfig, listener_name: &str) -> Option<String> {
+    if !direct_tcp_fast_path_allowed(config) || listener_name.starts_with("stream|") {
+        return None;
+    }
+    if listener_name == "ftp" && config.services.ftp.native_control {
+        return None;
+    }
+    let listener = config
+        .tcp
+        .listeners
+        .iter()
+        .find(|listener| listener.name == listener_name)?;
+    if !listener.upstream_weights.is_empty() {
+        return None;
+    }
+    single_direct_tcp_upstream(&listener.upstream, &listener.upstreams)
+}
+
+fn direct_tcp_route_upstream(config: &GatewayConfig, route: &RouteDecision) -> Option<String> {
+    if !direct_tcp_fast_path_allowed(config) || !route.upstream_weights.is_empty() {
+        return None;
+    }
+    if !route.set_headers.is_empty()
+        || !route.strip_headers.is_empty()
+        || route.rewrite_path.is_some()
+        || route.status.is_some()
+        || route.content_type.is_some()
+    {
+        return None;
+    }
+    single_direct_tcp_upstream(&route.upstream, &route.upstreams)
+}
+
+fn direct_tcp_fast_path_allowed(config: &GatewayConfig) -> bool {
+    config.runtime.performance.enabled
+        && !config.affinity.enabled
+        && !config.load_balance.active_health.enabled
+        && !config.load_balance.passive_health.enabled
+}
+
+fn single_direct_tcp_upstream(upstream: &str, upstreams: &[String]) -> Option<String> {
+    let mut selected: Option<&str> = None;
+    for candidate in std::iter::once(upstream)
+        .chain(upstreams.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        match selected {
+            Some(existing) if existing != candidate => return None,
+            Some(_) => {}
+            None => selected = Some(candidate),
+        }
+    }
+    selected.map(str::to_string)
 }
 
 fn streaming_body<S>(stream: S) -> GatewayBody
@@ -5994,7 +9527,73 @@ where
     let stream = stream
         .map_ok(Frame::data)
         .map_err(|error| anyhow!("upstream response stream failed: {error}"));
-    StreamBody::new(stream).boxed_unsync()
+    GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
+}
+
+fn file_streaming_body(file: tokio::fs::File) -> GatewayBody {
+    // 1MB buffer: large static files (game hot-update, CDN assets) benefit from
+    // fewer read syscalls and better kernel readahead alignment on Linux.
+    let stream = ReaderStream::with_capacity(file, 1024 * 1024)
+        .map_ok(Frame::data)
+        .map_err(|error| anyhow!("static file stream failed: {error}"));
+    GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
+}
+
+struct RawSseStreamState {
+    upstream: BoxedProxyIo,
+    leftover: Option<Bytes>,
+    pending: BytesMut,
+    buffer: [u8; 4096],
+    done: bool,
+}
+
+fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> GatewayBody {
+    let state = RawSseStreamState {
+        upstream,
+        leftover,
+        pending: BytesMut::with_capacity(4096),
+        buffer: [0_u8; 4096],
+        done: false,
+    };
+    let stream = futures::stream::try_unfold(state, |mut state| async move {
+        if state.done {
+            return Ok::<_, anyhow::Error>(None);
+        }
+
+        loop {
+            if let Some(end) = find_sse_event_end(&state.pending) {
+                let event = state.pending.split_to(end).freeze();
+                state.done = event
+                    .windows(b"data: [DONE]".len())
+                    .any(|window| window == b"data: [DONE]");
+                return Ok(Some((event, state)));
+            }
+
+            if let Some(leftover) = state.leftover.take() {
+                if !leftover.is_empty() {
+                    state.pending.extend_from_slice(&leftover);
+                    continue;
+                }
+            }
+
+            let read = state
+                .upstream
+                .read(&mut state.buffer)
+                .await
+                .context("raw SSE upstream stream read failed")?;
+            if read == 0 {
+                if state.pending.is_empty() {
+                    return Ok(None);
+                }
+                let bytes = state.pending.split().freeze();
+                state.done = true;
+                return Ok(Some((bytes, state)));
+            }
+            state.pending.extend_from_slice(&state.buffer[..read]);
+        }
+    })
+    .map_ok(Frame::data);
+    GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
 }
 
 impl GatewayStats {
@@ -6504,14 +10103,28 @@ fn html_escape(value: &str) -> String {
 }
 
 async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
+    let mut http_connector = HttpConnector::new();
+    http_connector.set_nodelay(true);
+    http_connector.set_keepalive(Some(Duration::from_secs(90)));
+    http_connector.enforce_http(true);
+    let http_fast_client = HyperClient::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4096)
+        .build(http_connector);
+
     let client = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(config.http.allow_insecure_upstreams)
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(4096)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(Some(Duration::from_secs(15)))
         .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
-        .pool_max_idle_per_host(1024)
         .timeout(Duration::from_millis(config.http.request_timeout_ms.max(1)))
         .build()
         .context("failed to build upstream http client")?;
@@ -6537,8 +10150,10 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
     }
 
     Ok(DynamicState {
+        fast_lane: FastLaneState::compile(&config),
         config,
         http_client: client,
+        http_fast_client,
         script,
     })
 }
@@ -7288,6 +10903,14 @@ fn run_command_checked(mut command: Command, description: &str) -> Result<()> {
 }
 
 fn build_upstream_url(base_upstream: &str, route: &RouteDecision, uri: &Uri) -> Result<Url> {
+    build_upstream_url_with_rewrite(base_upstream, route.rewrite_path.as_deref(), uri)
+}
+
+fn build_upstream_url_with_rewrite(
+    base_upstream: &str,
+    rewrite_path: Option<&str>,
+    uri: &Uri,
+) -> Result<Url> {
     let upstream = if base_upstream.starts_with("http://")
         || base_upstream.starts_with("https://")
         || base_upstream.starts_with("ws://")
@@ -7300,7 +10923,7 @@ fn build_upstream_url(base_upstream: &str, route: &RouteDecision, uri: &Uri) -> 
     let mut url =
         Url::parse(&upstream).with_context(|| format!("invalid upstream url {}", base_upstream))?;
 
-    let rewritten = route.rewrite_path.clone().unwrap_or_else(|| {
+    let rewritten = rewrite_path.map(str::to_string).unwrap_or_else(|| {
         uri.path_and_query()
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| uri.path().to_string())
@@ -7316,14 +10939,93 @@ fn build_upstream_url(base_upstream: &str, route: &RouteDecision, uri: &Uri) -> 
     Ok(url)
 }
 
+fn build_upstream_http_target(
+    base_upstream: &str,
+    route: &RouteDecision,
+    uri: &Uri,
+) -> Result<UpstreamHttpTarget> {
+    build_upstream_http_target_with_rewrite(base_upstream, route.rewrite_path.as_deref(), uri)
+}
+
+fn build_upstream_http_target_with_rewrite(
+    base_upstream: &str,
+    rewrite_path: Option<&str>,
+    uri: &Uri,
+) -> Result<UpstreamHttpTarget> {
+    if let Some(authority) = http_upstream_authority(base_upstream) {
+        let path_and_query = upstream_path_and_query(rewrite_path, uri);
+        let mut target =
+            String::with_capacity("http://".len() + authority.len() + path_and_query.len());
+        target.push_str("http://");
+        target.push_str(authority);
+        target.push_str(&path_and_query);
+        let upstream_uri: Uri = target
+            .parse()
+            .with_context(|| format!("invalid upstream uri {}", base_upstream))?;
+        return Ok(UpstreamHttpTarget::Hyper(upstream_uri));
+    }
+
+    build_upstream_url_with_rewrite(base_upstream, rewrite_path, uri)
+        .map(UpstreamHttpTarget::Reqwest)
+}
+
+fn http_upstream_authority(base_upstream: &str) -> Option<&str> {
+    let value = base_upstream.trim();
+    if value.starts_with("https://")
+        || value.starts_with("ws://")
+        || value.starts_with("wss://")
+        || (!value.starts_with("http://") && value.contains("://"))
+    {
+        return None;
+    }
+
+    let authority = value
+        .strip_prefix("http://")
+        .unwrap_or(value)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return None;
+    }
+
+    Some(authority)
+}
+
+fn upstream_path_and_query(rewrite_path: Option<&str>, uri: &Uri) -> String {
+    let rewritten = rewrite_path.unwrap_or_else(|| {
+        uri.path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or_else(|| uri.path())
+    });
+    match rewritten.split_once('?') {
+        Some((path, query)) => format!("{}?{}", upstream_path(path), query),
+        None => match uri.query() {
+            Some(query) => format!("{}?{}", upstream_path(rewritten), query),
+            None => upstream_path(rewritten),
+        },
+    }
+}
+
+fn upstream_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
 fn build_upstream_headers(
     original: &HeaderMap,
     route: &RouteDecision,
     host: &str,
     remote_addr: SocketAddr,
     scheme: &str,
+    forward_headers: bool,
 ) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
+    let forwarding_capacity = if forward_headers { 6 } else { 1 };
+    let mut headers =
+        HeaderMap::with_capacity(original.len() + route.set_headers.len() + forwarding_capacity);
 
     for (name, value) in original {
         if is_hop_header(name.as_str()) || name == HOST {
@@ -7350,7 +11052,65 @@ fn build_upstream_headers(
         HOST,
         HeaderValue::from_str(host).context("invalid host header")?,
     );
-    apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+    if forward_headers {
+        apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+    }
+
+    Ok(headers)
+}
+
+fn build_simple_upstream_headers(
+    original: &HeaderMap,
+    host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+    forward_headers: bool,
+) -> Result<HeaderMap> {
+    let forwarding_capacity = if forward_headers { 6 } else { 1 };
+    let mut headers = HeaderMap::with_capacity(original.len() + forwarding_capacity);
+
+    for (name, value) in original {
+        if is_hop_header(name.as_str()) || name == HOST {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(host).context("invalid host header")?,
+    );
+    if forward_headers {
+        apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+    }
+
+    Ok(headers)
+}
+
+fn build_empty_simple_upstream_headers(
+    original: &HeaderMap,
+    host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+    forward_headers: bool,
+) -> Result<HeaderMap> {
+    let forwarding_capacity = if forward_headers { 6 } else { 1 };
+    let mut headers = HeaderMap::with_capacity(original.len() + forwarding_capacity);
+
+    for (name, value) in original {
+        if is_hop_header(name.as_str()) || name == HOST || name == CONTENT_LENGTH {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(host).context("invalid host header")?,
+    );
+    if forward_headers {
+        apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+    }
 
     Ok(headers)
 }
@@ -7400,7 +11160,7 @@ fn finalize_http_response(
 }
 
 fn apply_streaming_response_headers(response: &mut GatewayHttpResponse) -> Result<()> {
-    if response.stream_body.is_none() && !response_content_type_is(response, "text/event-stream") {
+    if !response_content_type_is(response, "text/event-stream") {
         return Ok(());
     }
 
@@ -8013,7 +11773,8 @@ async fn bind_ftp_passive_listener(
     };
 
     for port in start..=end {
-        match TcpListener::bind(SocketAddr::new(candidate_ip, port)).await {
+        let candidate_addr = SocketAddr::new(candidate_ip, port);
+        match bind_tcp_listener(candidate_addr, "ftp data listener").await {
             Ok(listener) => return Ok(Some((listener, port))),
             Err(_) => continue,
         }
@@ -8298,13 +12059,12 @@ fn extract_http_player_id(
     cfg: &HttpAffinityConfig,
 ) -> Option<String> {
     if let Some(query) = uri.query() {
-        let target_keys: HashSet<String> = cfg
-            .query_keys
-            .iter()
-            .map(|key| key.to_ascii_lowercase())
-            .collect();
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if target_keys.contains(&key.to_ascii_lowercase()) {
+            if cfg
+                .query_keys
+                .iter()
+                .any(|target| target.eq_ignore_ascii_case(key.as_ref()))
+            {
                 let value = value.trim();
                 if !value.is_empty() {
                     return Some(value.to_string());
@@ -8325,15 +12085,14 @@ fn extract_http_player_id(
     }
 
     if let Some(cookie) = headers.get(COOKIE).and_then(|value| value.to_str().ok()) {
-        let target_keys: HashSet<String> = cfg
-            .cookie_keys
-            .iter()
-            .map(|key| key.to_ascii_lowercase())
-            .collect();
         for chunk in cookie.split(';') {
             let trimmed = chunk.trim();
             if let Some((name, value)) = trimmed.split_once('=') {
-                if target_keys.contains(&name.trim().to_ascii_lowercase()) {
+                if cfg
+                    .cookie_keys
+                    .iter()
+                    .any(|target| target.eq_ignore_ascii_case(name.trim()))
+                {
                     let value = value.trim();
                     if !value.is_empty() {
                         return Some(value.to_string());
@@ -8569,6 +12328,69 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, now: u64) -> bool {
+    association.active.load(Ordering::Relaxed)
+        && now.saturating_sub(association.last_seen_epoch.load(Ordering::Relaxed))
+            <= session_ttl_secs
+}
+
+fn flush_udp_stats(stats: &GatewayStats, packets: &mut u64, bytes: &mut u64) {
+    if *packets > 0 {
+        stats
+            .udp_packets_total
+            .fetch_add(*packets, Ordering::Relaxed);
+        *packets = 0;
+    }
+    if *bytes > 0 {
+        stats.udp_bytes_total.fetch_add(*bytes, Ordering::Relaxed);
+        *bytes = 0;
+    }
+}
+
+async fn send_udp_connected(socket: &UdpSocket, payload: &[u8]) -> std::io::Result<()> {
+    match socket.try_send(payload) {
+        Ok(written) if written == payload.len() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "udp connected send wrote a partial datagram",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            let written = socket.send(payload).await?;
+            if written == payload.len() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "udp connected send wrote a partial datagram",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_udp_to(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> std::io::Result<()> {
+    match socket.try_send_to(payload, addr) {
+        Ok(written) if written == payload.len() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "udp send_to wrote a partial datagram",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            let written = socket.send_to(payload, addr).await?;
+            if written == payload.len() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "udp send_to wrote a partial datagram",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn prune_udp_associations(
     associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
     session_ttl_secs: u64,
@@ -8576,7 +12398,11 @@ fn prune_udp_associations(
 ) {
     let now = now_unix_secs();
     associations.retain(|_, association| {
-        now.saturating_sub(association.last_seen_epoch.load(Ordering::Relaxed)) <= session_ttl_secs
+        let keep = udp_association_is_live(association, session_ttl_secs, now);
+        if !keep {
+            association.active.store(false, Ordering::Relaxed);
+        }
+        keep
     });
 
     if max_associations == 0 || associations.len() < max_associations {
@@ -8595,7 +12421,9 @@ fn prune_udp_associations(
             .max(1),
     );
     for (addr, _) in oldest.into_iter().take(remove_count) {
-        associations.remove(&addr);
+        if let Some((_, association)) = associations.remove(&addr) {
+            association.active.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -9876,6 +13704,471 @@ fn is_hop_header(name: &str) -> bool {
     )
 }
 
+fn remove_hop_headers_from_map(headers: &mut HeaderMap) {
+    headers.remove(CONNECTION);
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(HeaderName::from_static("proxy-authenticate"));
+    headers.remove(HeaderName::from_static("proxy-authorization"));
+    headers.remove(HeaderName::from_static("te"));
+    headers.remove(HeaderName::from_static("trailers"));
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(HeaderName::from_static("upgrade"));
+    headers.remove(HeaderName::from_static("proxy-connection"));
+}
+
+fn should_stream_upstream_body(
+    status: StatusCode,
+    headers: &HeaderMap,
+    version: &str,
+    cache_key: Option<&str>,
+    compression: &ResponseCompressionConfig,
+) -> bool {
+    if !status.is_success() || version == "HTTP/3" || cache_key.is_some() || compression.enabled {
+        return false;
+    }
+
+    if upstream_response_is_sse(headers) {
+        return true;
+    }
+
+    match upstream_content_length(headers) {
+        Some(len) => len >= UPSTREAM_STREAM_THRESHOLD_BYTES,
+        None => true,
+    }
+}
+
+fn request_accepts_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT)
+        .iter()
+        .any(|value| value.to_str().ok().is_some_and(header_value_accepts_sse))
+}
+
+fn header_value_accepts_sse(raw: &str) -> bool {
+    raw.split(',').any(|item| {
+        item.split(';')
+            .next()
+            .map(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+            .unwrap_or(false)
+    })
+}
+
+fn ai_proxy_fast_lane_path_matches(config: &GatewayConfig, path: &str) -> bool {
+    config.services.ai_proxy.enabled
+        && config.services.ai_proxy.routes.iter().any(|route| {
+            ai_proxy_route_fast_path_eligible(route)
+                && raw_http_pool_key_from_upstream(&route.upstream).is_some()
+                && route_prefix_matches(&route.path_prefix, path)
+        })
+}
+
+#[allow(dead_code)]
+fn reverse_proxy_fast_lane_path_matches(config: &GatewayConfig, path: &str) -> bool {
+    config.services.reverse_proxy.routes.iter().any(|route| {
+        reverse_proxy_route_fast_path_eligible(route)
+            && raw_http_pool_key_from_upstream(&route.upstream).is_some()
+            && route_prefix_matches(&route.path_prefix, path)
+    })
+}
+
+fn websocket_fast_lane_path_matches(config: &GatewayConfig, path: &str) -> bool {
+    config.services.reverse_proxy.routes.iter().any(|route| {
+        websocket_route_fast_path_eligible(route)
+            && raw_websocket_pool_key_from_upstream(&route.upstream).is_some()
+            && route_prefix_matches(&route.path_prefix, path)
+    })
+}
+
+fn plain_raw_sse_fast_lane_matches(config: &GatewayConfig, request: &PlainFastLaneRequest) -> bool {
+    if !request.accepts_sse {
+        return false;
+    }
+    let host = request.host.as_deref().unwrap_or("localhost");
+    config.services.ai_proxy.enabled
+        && config.services.ai_proxy.routes.iter().any(|route| {
+            ai_proxy_route_fast_path_eligible(route)
+                && raw_http_pool_key_from_upstream(&route.upstream).is_some()
+                && crate::ai_proxy::route_matches(route, host, &request.path)
+        })
+}
+
+#[allow(dead_code)]
+fn plain_raw_reverse_fast_lane_matches(
+    config: &GatewayConfig,
+    request: &PlainFastLaneRequest,
+) -> bool {
+    if request.accepts_sse {
+        return false;
+    }
+    let host = request.host.as_deref().unwrap_or("localhost");
+    config.services.reverse_proxy.routes.iter().any(|route| {
+        reverse_proxy_route_fast_path_eligible(route)
+            && raw_http_pool_key_from_upstream(&route.upstream).is_some()
+            && reverse_proxy_route_matches(route, host, &request.path)
+    })
+}
+
+fn http_static_success_fast_path_allowed(config: &GatewayConfig, scheme: &str, uri: &Uri) -> bool {
+    if config.logging.access_log
+        || config.security.ddos.enabled
+        || config.security.dynamic_blacklist.enabled
+        || config.services.access_control.http.enabled
+        || config.services.rate_limit.http.enabled
+        || config.services.response_policy.compression.enabled
+        || config.services.filecloud.enabled
+        || config.services.webdav.enabled
+        || config.services.static_sites.is_empty()
+    {
+        return false;
+    }
+
+    if monitoring_path_matches(&config.monitoring, uri.path()) {
+        return false;
+    }
+
+    if scheme == "http" && http_to_https_redirect_can_apply(config) {
+        return false;
+    }
+
+    true
+}
+
+fn http_to_https_redirect_can_apply(config: &GatewayConfig) -> bool {
+    if config.http.tls_bind.trim().is_empty() {
+        return false;
+    }
+
+    matches!(
+        config.http.tls.mode,
+        TlsMode::AcmeManaged | TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
+    ) || !config.http.tls.certificates.is_empty()
+        || config
+            .services
+            .domain_routes
+            .iter()
+            .any(|route| route.ssl.effective_mode() != DomainTlsMode::Disabled)
+}
+
+fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
+    !config.services.response_policy.compression.enabled
+        && !config.services.response_policy.cache.enabled
+        && !config.services.rate_limit.http.enabled
+        && !config.load_balance.retries.enabled
+        && !config.load_balance.active_health.enabled
+        && !config.load_balance.passive_health.enabled
+        && !config.affinity.enabled
+}
+
+fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Cow<'a, str> {
+    if let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) {
+        return Cow::Borrowed(host);
+    }
+
+    if let Some(authority) = uri.authority() {
+        return Cow::Borrowed(authority.as_str());
+    }
+
+    Cow::Borrowed("localhost")
+}
+
+fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
+    route.upstreams.is_empty()
+        && route.upstream_weights.is_empty()
+        && route.set_headers.is_empty()
+        && route.strip_headers.is_empty()
+        && !route.forward_headers
+        && !route.compression.enabled
+        && !route.cache.enabled
+        && !route.rate_limit.enabled
+}
+
+fn websocket_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
+    reverse_proxy_route_fast_path_eligible(route)
+        && raw_websocket_pool_key_from_upstream(&route.upstream).is_some()
+}
+
+fn ai_proxy_route_fast_path_eligible(route: &crate::ai_proxy::AiProxyRouteConfig) -> bool {
+    route.add_headers.is_empty()
+        && route.strip_headers.is_empty()
+        && !route.forward_headers
+        && !route.emit_metadata_headers
+}
+
+fn reverse_proxy_rewrite_path(route: &ReverseProxyRouteConfig, uri: &Uri) -> Option<String> {
+    route
+        .strip_prefix
+        .then(|| rewrite_path_with_prefix(&route.path_prefix, None, uri))
+}
+
+fn reverse_proxy_raw_path_and_query<'a>(
+    route: &ReverseProxyRouteConfig,
+    target: &'a str,
+    path: &'a str,
+) -> Cow<'a, str> {
+    if !route.strip_prefix {
+        return Cow::Borrowed(target);
+    }
+
+    let suffix = route_prefix_suffix(&route.path_prefix, path).unwrap_or(path);
+    let rewritten_path = if suffix.is_empty() {
+        Cow::Borrowed("/")
+    } else if suffix.starts_with('/') {
+        Cow::Borrowed(suffix)
+    } else {
+        Cow::Owned(format!("/{suffix}"))
+    };
+
+    match target.split_once('?').map(|(_, query)| query) {
+        Some(query) => Cow::Owned(format!("{}?{query}", rewritten_path.as_ref())),
+        None => rewritten_path,
+    }
+}
+
+fn ai_proxy_rewrite_path(route: &crate::ai_proxy::AiProxyRouteConfig, uri: &Uri) -> Option<String> {
+    let rewrite_base = route.rewrite_base_path.trim();
+    if rewrite_base.is_empty() {
+        None
+    } else {
+        Some(rewrite_path_with_prefix(
+            &route.path_prefix,
+            Some(rewrite_base),
+            uri,
+        ))
+    }
+}
+
+fn ai_proxy_raw_rewrite_path(
+    route: &crate::ai_proxy::AiProxyRouteConfig,
+    target: &str,
+    path: &str,
+) -> Option<String> {
+    let rewrite_base = route.rewrite_base_path.trim();
+    if rewrite_base.is_empty()
+        || rewrite_base.trim_end_matches('/') == route.path_prefix.trim_end_matches('/')
+    {
+        None
+    } else {
+        Some(rewrite_path_with_prefix_parts(
+            &route.path_prefix,
+            Some(rewrite_base),
+            target,
+            path,
+        ))
+    }
+}
+
+fn rewrite_path_with_prefix(prefix: &str, base: Option<&str>, uri: &Uri) -> String {
+    rewrite_path_with_prefix_parts(
+        prefix,
+        base,
+        uri.path_and_query()
+            .map(|path_and_query| path_and_query.as_str())
+            .unwrap_or(uri.path()),
+        uri.path(),
+    )
+}
+
+fn rewrite_path_with_prefix_parts(
+    prefix: &str,
+    base: Option<&str>,
+    target: &str,
+    path: &str,
+) -> String {
+    let suffix = route_prefix_suffix(prefix, path).unwrap_or(path);
+    let path = if let Some(base) = base {
+        let suffix = if suffix.is_empty() {
+            "/"
+        } else if suffix.starts_with('/') {
+            suffix
+        } else {
+            path
+        };
+        format!("{}{}", base.trim_end_matches('/'), suffix)
+    } else if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('/') {
+        suffix.to_string()
+    } else {
+        format!("/{suffix}")
+    };
+
+    match target.split_once('?').map(|(_, query)| query) {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    }
+}
+
+fn upstream_response_is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("text/event-stream"))
+        .unwrap_or(false)
+}
+
+fn upstream_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn status_has_no_body(status: StatusCode) -> bool {
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
+fn raw_http_pool_keys_for_config(config: &GatewayConfig) -> HashSet<String> {
+    config
+        .services
+        .reverse_proxy
+        .routes
+        .iter()
+        .filter(|route| reverse_proxy_route_fast_path_eligible(route))
+        .filter_map(|route| raw_http_pool_key_from_upstream(&route.upstream))
+        .collect()
+}
+
+fn raw_http_pool_key_from_upstream(upstream: &str) -> Option<String> {
+    raw_http_pool_parts_from_upstream(upstream)
+        .ok()
+        .flatten()
+        .map(|(key, _, _)| key)
+}
+
+fn raw_websocket_pool_key_from_upstream(upstream: &str) -> Option<String> {
+    raw_websocket_pool_parts_from_upstream(upstream)
+        .ok()
+        .flatten()
+        .map(|(key, _, _)| key)
+}
+
+fn raw_websocket_pool_parts_from_upstream(upstream: &str) -> Result<Option<(String, String, u16)>> {
+    let Some(authority) = upstream.strip_prefix("ws://") else {
+        return Ok(None);
+    };
+    if let Some(parts) = raw_http_pool_parts_from_authority(authority)? {
+        return Ok(Some(parts));
+    }
+    let url = Url::parse(upstream).context("invalid raw websocket upstream url")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("raw websocket upstream URL missing host"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+    Ok(Some((format!("{host}:{port}"), host, port)))
+}
+
+fn raw_http_pool_parts_from_upstream(upstream: &str) -> Result<Option<(String, String, u16)>> {
+    let Some(authority) = upstream.strip_prefix("http://").or(Some(upstream)) else {
+        return Ok(None);
+    };
+    if upstream.contains("://") && !upstream.starts_with("http://") {
+        return Ok(None);
+    }
+    if let Some(parts) = raw_http_pool_parts_from_authority(authority)? {
+        return Ok(Some(parts));
+    }
+
+    let url = if upstream.starts_with("http://") {
+        Url::parse(upstream).context("invalid raw HTTP upstream url")?
+    } else {
+        Url::parse(&format!("http://{upstream}")).context("invalid raw HTTP upstream url")?
+    };
+    raw_http_pool_key(&url)
+}
+
+fn raw_http_pool_parts_from_authority(authority: &str) -> Result<Option<(String, String, u16)>> {
+    if authority.is_empty()
+        || authority
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b'[' | b']'))
+    {
+        return Ok(None);
+    }
+    let colon_count = authority
+        .as_bytes()
+        .iter()
+        .filter(|&&byte| byte == b':')
+        .count();
+    if colon_count > 1 {
+        return Ok(None);
+    }
+
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .with_context(|| format!("invalid raw HTTP upstream port in {authority}"))?;
+            (host, port)
+        }
+        None => (authority, 80),
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let host = host.to_string();
+    Ok(Some((format!("{host}:{port}"), host, port)))
+}
+
+fn raw_http_pool_key(url: &Url) -> Result<Option<(String, String, u16)>> {
+    if url.scheme() != "http" {
+        return Ok(None);
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("raw HTTP upstream URL missing host"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+    Ok(Some((format!("{host}:{port}"), host, port)))
+}
+
+fn write_access_log_if_enabled(
+    config: &GatewayConfig,
+    request: &Request<Incoming>,
+    response: &GatewayHttpResponse,
+    remote_addr: SocketAddr,
+    elapsed: Duration,
+) {
+    if !config.logging.access_log {
+        return;
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    if !should_sample(config.logging.access_sample_rate, &request_id) {
+        return;
+    }
+
+    let slow = elapsed.as_millis() as u64 >= config.logging.slow_request_ms;
+    if slow {
+        tracing::warn!(
+            target: "access",
+            request_id,
+            method = %request.method(),
+            path = %request.uri().path(),
+            status = %response.status.as_u16(),
+            latency_ms = elapsed.as_millis() as u64,
+            upstream = %response.upstream,
+            remote_addr = %remote_addr,
+            "slow access"
+        );
+    } else {
+        tracing::info!(
+            target: "access",
+            request_id,
+            method = %request.method(),
+            path = %request.uri().path(),
+            status = %response.status.as_u16(),
+            latency_ms = elapsed.as_millis() as u64,
+            upstream = %response.upstream,
+            remote_addr = %remote_addr,
+            "access"
+        );
+    }
+}
+
 fn websocket_upgrade_requested(headers: &HeaderMap) -> bool {
     let upgrade = headers
         .get("upgrade")
@@ -10193,17 +14486,21 @@ pub(crate) fn default_script_env(config: &GatewayConfig) -> BTreeMap<String, Str
     env
 }
 
-fn configured_http_route(config: &GatewayConfig, host: &str, uri: &Uri) -> Option<HttpRouteConfig> {
+fn configured_http_route<'a>(
+    config: &'a GatewayConfig,
+    host: &str,
+    uri: &Uri,
+) -> Option<HttpRouteConfig<'a>> {
     configured_ai_proxy_route(config, host, uri)
         .or_else(|| configured_domain_route(config, host, uri))
         .or_else(|| configured_reverse_proxy_route(config, host, uri))
 }
 
-fn configured_ai_proxy_route(
-    config: &GatewayConfig,
+fn configured_ai_proxy_route<'a>(
+    config: &'a GatewayConfig,
     host: &str,
     uri: &Uri,
-) -> Option<HttpRouteConfig> {
+) -> Option<HttpRouteConfig<'a>> {
     if !config.services.ai_proxy.enabled {
         return None;
     }
@@ -10221,20 +14518,29 @@ fn configured_ai_proxy_route(
             uri,
             &config.services.ai_proxy.header_prefix,
         ),
-        compression: config.services.response_policy.compression.clone(),
-        cache: ResponseCacheConfig {
-            enabled: false,
-            ..Default::default()
-        },
-        rate_limit: config.services.rate_limit.http.clone(),
+        compression: Cow::Borrowed(&config.services.response_policy.compression),
+        cache: disabled_ai_cache_policy(&config.services.response_policy.cache),
+        rate_limit: Cow::Borrowed(&config.services.rate_limit.http),
+        forward_headers: route.forward_headers,
     })
 }
 
-fn configured_domain_route(
-    config: &GatewayConfig,
+fn disabled_ai_cache_policy(base: &ResponseCacheConfig) -> Cow<'_, ResponseCacheConfig> {
+    if base.enabled {
+        Cow::Owned(ResponseCacheConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    } else {
+        Cow::Borrowed(base)
+    }
+}
+
+fn configured_domain_route<'a>(
+    config: &'a GatewayConfig,
     host: &str,
     uri: &Uri,
-) -> Option<HttpRouteConfig> {
+) -> Option<HttpRouteConfig<'a>> {
     config
         .services
         .domain_routes
@@ -10244,11 +14550,11 @@ fn configured_domain_route(
         .map(|route| domain_route_config(config, route, uri))
 }
 
-fn configured_reverse_proxy_route(
-    config: &GatewayConfig,
+fn configured_reverse_proxy_route<'a>(
+    config: &'a GatewayConfig,
     host: &str,
     uri: &Uri,
-) -> Option<HttpRouteConfig> {
+) -> Option<HttpRouteConfig<'a>> {
     config
         .services
         .reverse_proxy
@@ -10268,6 +14574,7 @@ fn configured_reverse_proxy_route(
                 &config.services.rate_limit.http,
                 &route.rate_limit,
             ),
+            forward_headers: route.forward_headers,
         })
 }
 
@@ -10285,11 +14592,41 @@ fn reverse_proxy_route_matches(route: &ReverseProxyRouteConfig, host: &str, path
 }
 
 fn reverse_proxy_path_matches(prefix: &str, path: &str) -> bool {
-    let prefix = normalize_route_prefix(prefix);
-    if prefix == "/" {
+    route_prefix_matches(prefix, path)
+}
+
+fn route_prefix_matches(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim().trim_end_matches('/');
+    if prefix.is_empty() {
         return path.starts_with('/');
     }
-    path == prefix || path.starts_with(&format!("{prefix}/"))
+
+    let suffix = if prefix.starts_with('/') {
+        path.strip_prefix(prefix)
+    } else {
+        path.strip_prefix('/')
+            .and_then(|path_without_slash| path_without_slash.strip_prefix(prefix))
+    };
+
+    match suffix {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+fn route_prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    let prefix = prefix.trim().trim_end_matches('/');
+    if prefix.is_empty() {
+        return Some(path);
+    }
+
+    if prefix.starts_with('/') {
+        path.strip_prefix(prefix)
+    } else {
+        path.strip_prefix('/')
+            .and_then(|path_without_slash| path_without_slash.strip_prefix(prefix))
+    }
 }
 
 fn host_matches(pattern: &str, host: &str) -> bool {
@@ -10356,8 +14693,7 @@ fn should_redirect_http_to_https(config: &GatewayConfig, host: &str, uri: &Uri) 
 
 fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> RouteDecision {
     let rewrite_path = route.strip_prefix.then(|| {
-        let prefix = normalize_route_prefix(&route.path_prefix);
-        let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
+        let suffix = route_prefix_suffix(&route.path_prefix, uri.path()).unwrap_or(uri.path());
         let path = if suffix.is_empty() {
             "/".to_string()
         } else if suffix.starts_with('/') {
@@ -10384,11 +14720,11 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
     }
 }
 
-fn domain_route_config(
-    config: &GatewayConfig,
-    route: &DomainRouteConfig,
+fn domain_route_config<'a>(
+    config: &'a GatewayConfig,
+    route: &'a DomainRouteConfig,
     uri: &Uri,
-) -> HttpRouteConfig {
+) -> HttpRouteConfig<'a> {
     HttpRouteConfig {
         runtime_scope: Some(route.name.clone()),
         decision: RouteDecision {
@@ -10397,8 +14733,8 @@ fn domain_route_config(
             upstream_weights: route.upstream_weights.clone(),
             affinity_key: None,
             rewrite_path: route.strip_prefix.then(|| {
-                let prefix = normalize_route_prefix(&route.path_prefix);
-                let suffix = uri.path().strip_prefix(&prefix).unwrap_or(uri.path());
+                let suffix =
+                    route_prefix_suffix(&route.path_prefix, uri.path()).unwrap_or(uri.path());
                 let path = if suffix.is_empty() {
                     "/".to_string()
                 } else if suffix.starts_with('/') {
@@ -10422,6 +14758,7 @@ fn domain_route_config(
         ),
         cache: merge_cache_policy(&config.services.response_policy.cache, &route.cache),
         rate_limit: merge_rate_limit_policy(&config.services.rate_limit.http, &route.rate_limit),
+        forward_headers: route.forward_headers,
     }
 }
 
@@ -10476,47 +14813,36 @@ fn resolve_global_active_health_config(base: &ActiveHealthConfig) -> ResolvedAct
     }
 }
 
-fn merge_compression_policy(
-    base: &ResponseCompressionConfig,
-    override_policy: &ResponseCompressionConfig,
-) -> ResponseCompressionConfig {
+fn merge_compression_policy<'a>(
+    base: &'a ResponseCompressionConfig,
+    override_policy: &'a ResponseCompressionConfig,
+) -> Cow<'a, ResponseCompressionConfig> {
     if override_policy.enabled {
-        override_policy.clone()
+        Cow::Borrowed(override_policy)
     } else {
-        base.clone()
+        Cow::Borrowed(base)
     }
 }
 
-fn merge_cache_policy(
-    base: &ResponseCacheConfig,
-    override_policy: &ResponseCacheConfig,
-) -> ResponseCacheConfig {
+fn merge_cache_policy<'a>(
+    base: &'a ResponseCacheConfig,
+    override_policy: &'a ResponseCacheConfig,
+) -> Cow<'a, ResponseCacheConfig> {
     if override_policy.enabled {
-        override_policy.clone()
+        Cow::Borrowed(override_policy)
     } else {
-        base.clone()
+        Cow::Borrowed(base)
     }
 }
 
-fn merge_rate_limit_policy(
-    base: &HttpRateLimitConfig,
-    override_policy: &HttpRateLimitConfig,
-) -> HttpRateLimitConfig {
+fn merge_rate_limit_policy<'a>(
+    base: &'a HttpRateLimitConfig,
+    override_policy: &'a HttpRateLimitConfig,
+) -> Cow<'a, HttpRateLimitConfig> {
     if override_policy.enabled {
-        override_policy.clone()
+        Cow::Borrowed(override_policy)
     } else {
-        base.clone()
-    }
-}
-
-fn normalize_route_prefix(prefix: &str) -> String {
-    let trimmed = prefix.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
+        Cow::Borrowed(base)
     }
 }
 
@@ -10524,6 +14850,9 @@ async fn dispatch_static_site(
     site: &StaticSiteConfig,
     method: &Method,
     uri: &Uri,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
 ) -> Result<GatewayHttpResponse> {
     if method != Method::GET && method != Method::HEAD {
         return Ok(GatewayHttpResponse::bytes(
@@ -10540,6 +14869,10 @@ async fn dispatch_static_site(
             "static path not found",
         ));
     };
+
+    if let Some(response) = fresh_cached_static_file_response(&target, method, static_file_cache) {
+        return Ok(response);
+    }
 
     let metadata = match tokio::fs::metadata(&target).await {
         Ok(value) => value,
@@ -10583,13 +14916,24 @@ async fn dispatch_static_site(
         metadata
     };
 
-    let body = if method == Method::HEAD {
-        Bytes::new()
+    let (body, stream_body) = if method == Method::HEAD {
+        (Bytes::new(), None)
+    } else if metadata.len() >= STATIC_STREAM_THRESHOLD_BYTES {
+        let file = tokio::fs::File::open(&target)
+            .await
+            .context("failed opening static file")?;
+        (Bytes::new(), Some(file_streaming_body(file)))
     } else {
-        Bytes::from(
-            tokio::fs::read(&target)
-                .await
-                .context("failed reading static file")?,
+        (
+            cached_static_file_body(
+                &target,
+                &metadata,
+                static_file_cache,
+                static_file_cache_bytes,
+                static_file_load_locks,
+            )
+            .await?,
+            None,
         )
     };
     let mut response = GatewayHttpResponse::bytes(
@@ -10598,12 +14942,333 @@ async fn dispatch_static_site(
         body,
         "proxysss://static",
     );
+    response.stream_body = stream_body;
     response.headers.push((
         http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&metadata.len().to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     ));
     Ok(response)
+}
+
+async fn cached_static_file_body(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
+) -> Result<Bytes> {
+    let key = target.to_string_lossy().to_string();
+    let modified = metadata.modified().ok();
+    if let Some(body) = fresh_static_cache_body(&key, metadata, modified, static_file_cache) {
+        return Ok(body);
+    }
+    evict_stale_static_cache_entry(
+        &key,
+        metadata,
+        modified,
+        static_file_cache,
+        static_file_cache_bytes,
+    );
+
+    let load_lock = if metadata.len() <= STATIC_STREAM_THRESHOLD_BYTES {
+        Some(
+            static_file_load_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let guard = match &load_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    if load_lock.is_some() {
+        if let Some(body) = fresh_static_cache_body(&key, metadata, modified, static_file_cache) {
+            drop(guard);
+            static_file_load_locks.remove(&key);
+            return Ok(body);
+        }
+        evict_stale_static_cache_entry(
+            &key,
+            metadata,
+            modified,
+            static_file_cache,
+            static_file_cache_bytes,
+        );
+    }
+
+    let body = if metadata.len() >= STATIC_MMAP_THRESHOLD_BYTES {
+        let target = target.to_path_buf();
+        tokio::task::spawn_blocking(move || mmap_static_file_bytes(&target))
+            .await
+            .context("static mmap task failed")??
+    } else {
+        Bytes::from(
+            tokio::fs::read(target)
+                .await
+                .context("failed reading static file")?,
+        )
+    };
+    let body_len = body.len() as u64;
+    if body_len <= STATIC_STREAM_THRESHOLD_BYTES
+        && static_file_cache.len() < STATIC_FILE_CACHE_MAX_ENTRIES
+    {
+        let current = static_file_cache_bytes.load(Ordering::Relaxed);
+        if current.saturating_add(body_len) <= STATIC_FILE_CACHE_MAX_BYTES {
+            let sendfile = static_file_cache
+                .get(&key)
+                .and_then(|entry| entry.sendfile.clone());
+            static_file_cache.insert(
+                key.clone(),
+                CachedStaticFile {
+                    len: metadata.len(),
+                    modified,
+                    body: body.clone(),
+                    sendfile,
+                    checked_at: Instant::now(),
+                },
+            );
+            static_file_cache_bytes.fetch_add(body_len, Ordering::Relaxed);
+        }
+    }
+    drop(guard);
+    if load_lock.is_some() {
+        static_file_load_locks.remove(&key);
+    }
+    Ok(body)
+}
+
+fn mmap_static_file_bytes(target: &Path) -> Result<Bytes> {
+    let file = std::fs::File::open(target)
+        .with_context(|| format!("failed opening static file for mmap {}", target.display()))?;
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .map(&file)
+            .with_context(|| format!("failed mmap static file {}", target.display()))?
+    };
+    Ok(Bytes::from_owner(mmap))
+}
+
+fn fresh_static_cache_body(
+    key: &str,
+    metadata: &std::fs::Metadata,
+    modified: Option<SystemTime>,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> Option<Bytes> {
+    let mut entry = static_file_cache.get_mut(key)?;
+    if entry.len == metadata.len()
+        && entry.modified == modified
+        && entry.body.len() as u64 == entry.len
+    {
+        entry.checked_at = Instant::now();
+        return Some(entry.body.clone());
+    }
+    None
+}
+
+fn evict_stale_static_cache_entry(
+    key: &str,
+    metadata: &std::fs::Metadata,
+    modified: Option<SystemTime>,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+) {
+    let old_len = match static_file_cache.get(key) {
+        Some(entry) if entry.len != metadata.len() || entry.modified != modified => {
+            entry.body.len() as u64
+        }
+        _ => return,
+    };
+    static_file_cache.remove(key);
+    static_file_cache_bytes.fetch_sub(old_len, Ordering::Relaxed);
+}
+
+fn fresh_cached_static_file_response(
+    target: &Path,
+    method: &Method,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> Option<GatewayHttpResponse> {
+    if method != Method::GET {
+        return None;
+    }
+    let key = target.to_string_lossy().to_string();
+    let entry = static_file_cache.get(&key)?;
+    if entry.body.len() as u64 != entry.len {
+        return None;
+    }
+    if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS) {
+        return None;
+    }
+
+    let mut response = GatewayHttpResponse::bytes(
+        StatusCode::OK,
+        static_content_type(target),
+        entry.body.clone(),
+        "proxysss://static-cache",
+    );
+    response.headers.push((
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&entry.len.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    ));
+    Some(response)
+}
+
+fn fresh_cached_static_file_candidate(
+    target: &Path,
+    method: &str,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    sendfile_threshold: u64,
+) -> Option<StaticFastPathCandidate> {
+    if method != "GET" {
+        return None;
+    }
+    let key = target.to_string_lossy().to_string();
+    let entry = static_file_cache.get(&key)?;
+    if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS) {
+        return None;
+    }
+
+    let sendfile = if cfg!(target_os = "linux") && entry.len >= sendfile_threshold {
+        Some(entry.sendfile.as_ref()?.clone())
+    } else {
+        None
+    };
+    let cached_body = if sendfile.is_none() {
+        if entry.body.len() as u64 != entry.len {
+            return None;
+        }
+        Some(entry.body.clone())
+    } else {
+        None
+    };
+
+    Some(StaticFastPathCandidate {
+        path: target.to_path_buf(),
+        len: entry.len,
+        content_type: static_content_type(target),
+        cached_body,
+        sendfile,
+    })
+}
+
+fn cached_static_sendfile(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> Result<Arc<std::fs::File>> {
+    let key = target.to_string_lossy().to_string();
+    let modified = metadata.modified().ok();
+    if let Some(mut entry) = static_file_cache.get_mut(&key) {
+        if entry.len == metadata.len() && entry.modified == modified {
+            entry.checked_at = Instant::now();
+            if let Some(file) = &entry.sendfile {
+                return Ok(file.clone());
+            }
+            let file = Arc::new(std::fs::File::open(target).with_context(|| {
+                format!(
+                    "failed opening static file for sendfile {}",
+                    target.display()
+                )
+            })?);
+            entry.sendfile = Some(file.clone());
+            return Ok(file);
+        }
+    }
+
+    let file = Arc::new(std::fs::File::open(target).with_context(|| {
+        format!(
+            "failed opening static file for sendfile {}",
+            target.display()
+        )
+    })?);
+    if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
+        return Ok(file);
+    }
+    static_file_cache.insert(
+        key,
+        CachedStaticFile {
+            len: metadata.len(),
+            modified,
+            body: Bytes::new(),
+            sendfile: Some(file.clone()),
+            checked_at: Instant::now(),
+        },
+    );
+    Ok(file)
+}
+
+async fn preload_static_site_fast_lane_cache(
+    site: &StaticSiteConfig,
+    traffic_profile: RuntimePerformanceTrafficProfile,
+    sendfile_threshold: u64,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
+    static_route_cache: &DashMap<String, PathBuf>,
+) -> Result<usize> {
+    let mut candidates = HashMap::<String, PathBuf>::new();
+    let prefix = normalize_webdav_prefix(&site.path_prefix);
+    for index in &site.index_files {
+        let path = site.root.join(index);
+        candidates.insert(format!("{}/{}", prefix.trim_end_matches('/'), index), path);
+    }
+
+    if let Ok(entries) = fs::read_dir(&site.root) {
+        for entry in entries.flatten().take(STATIC_PRELOAD_MAX_FILES_PER_SITE) {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    candidates.insert(format!("{}/{}", prefix.trim_end_matches('/'), name), path);
+                }
+            }
+        }
+    }
+
+    let mut preloaded = 0_usize;
+    for (request_path, target) in candidates {
+        let metadata = match tokio::fs::metadata(&target).await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("failed reading static preload metadata"),
+        };
+        static_route_cache.insert(request_path, target.clone());
+
+        let should_cache_body = matches!(
+            traffic_profile,
+            RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
+        ) && metadata.len() <= STATIC_PRELOAD_SMALL_MAX_BYTES;
+        let should_cache_sendfile = cfg!(target_os = "linux")
+            && matches!(
+                traffic_profile,
+                RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+            )
+            && metadata.len() >= sendfile_threshold;
+
+        if should_cache_body {
+            let body = cached_static_file_body(
+                &target,
+                &metadata,
+                static_file_cache,
+                static_file_cache_bytes,
+                static_file_load_locks,
+            )
+            .await?;
+            if !body.is_empty() {
+                preloaded = preloaded.saturating_add(1);
+            }
+        } else if should_cache_sendfile {
+            cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            preloaded = preloaded.saturating_add(1);
+        }
+    }
+
+    Ok(preloaded)
 }
 
 async fn static_autoindex(
@@ -11400,11 +16065,11 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
                 <h2>Built-in Control Plane</h2>
                 <div class="list">
                     <div><strong>Health:</strong> active HTTP/TCP health probes plus passive quarantine and manual drain state.</div>
-                    <div><strong>Reload:</strong> the main YAML config, scripts, plugins, and route-level health policy reload without a full process restart where supported.</div>
+                    <div><strong>Reload:</strong> manual <code>POST /v1/reload</code> is the default high-performance path; optional file watching fingerprints the main YAML config, scripts, plugins, and route-level health policy when enabled.</div>
                     <div><strong>Route automation:</strong> token-authenticated `POST /v1/domain-routes/upsert` can persist new domain routes into the main YAML file and reload them in process.</div>
                     <div><strong>Maintenance:</strong> upstream disable/restore can be persisted on disk through runtime maintenance state.</div>
                     <div><strong>Error Pages:</strong> configurable status-page bodies/files plus polished built-in browser-facing 404/403/5xx pages.</div>
-                    <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>.</div>
+                    <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>, plus Linux SO_REUSEPORT accept fanout for HTTP and TCP streams when performance mode is enabled.</div>
                 </div>
             </section>
 
@@ -11513,7 +16178,7 @@ fn docs_template_acme_dns() -> &'static str {
 }
 
 fn docs_template_health() -> &'static str {
-    "load_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    interval_secs: 10\n    timeout_ms: 2000\n    path: /healthz\n    expected_statuses: [200, 204]\n    failure_threshold: 2\n    success_threshold: 2\n    jitter_percent: 20\n    udp_payload: proxysss-health\n    udp_expect_response: true\n    alert_webhooks:\n      - https://ops.example.com/webhooks/proxysss\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
+    "load_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    interval_secs: 10\n    timeout_ms: 2000\n    path: /healthz\n    expected_statuses: [200, 204]\n    failure_threshold: 2\n    success_threshold: 2\n    jitter_percent: 20\n    udp_payload: proxysss-health\n    udp_expect_response: true\n    alert_webhooks:\n      - https://ops.example.com/webhooks/proxysss\nruntime:\n  performance:\n    enabled: true\n    profile: edge\n    traffic_profile: small\n    adaptive_system: true\n    socket_extreme: true\n    log_on_start: true\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
 }
 
 fn docs_template_error_pages() -> &'static str {
@@ -13425,6 +18090,8 @@ async fn connect_upgrade_upstream(url: &Url, allow_insecure: bool) -> Result<Box
         .port_or_known_default()
         .ok_or_else(|| anyhow!("upstream URL missing port"))?;
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let _ = tcp.set_nodelay(true);
+    tune_tcp_stream_for_gateway(&tcp);
 
     if matches!(url.scheme(), "https" | "wss") {
         let client_config = if allow_insecure {
@@ -13447,9 +18114,12 @@ async fn connect_upgrade_upstream(url: &Url, allow_insecure: bool) -> Result<Box
     }
 }
 
-async fn read_http_response_head(
-    upstream: &mut BoxedProxyIo,
-) -> Result<(StatusCode, Vec<(HeaderName, HeaderValue)>, Option<Bytes>)> {
+async fn read_http_response_head<T>(
+    upstream: &mut T,
+) -> Result<(StatusCode, Vec<(HeaderName, HeaderValue)>, Option<Bytes>)>
+where
+    T: AsyncRead + Unpin + ?Sized,
+{
     let mut buffer = BytesMut::with_capacity(4096);
 
     loop {
@@ -13501,6 +18171,372 @@ fn parse_http_response_head(head: &[u8]) -> Result<(StatusCode, Vec<(HeaderName,
     Ok((status, parsed_headers))
 }
 
+struct RawFastHttpResponseHead {
+    status: StatusCode,
+    raw_head: Bytes,
+    headers: Vec<u8>,
+    content_length: Option<u64>,
+    transfer_chunked: bool,
+    connection_close: bool,
+    leftover: Option<Bytes>,
+}
+
+async fn read_raw_fast_http_response_head(
+    upstream: &mut TcpStream,
+    filter_hop_headers: bool,
+) -> Result<RawFastHttpResponseHead> {
+    let mut buffer = BytesMut::with_capacity(4096);
+
+    loop {
+        if let Some(position) = find_header_end(&buffer) {
+            let head = buffer.split_to(position + 4).freeze();
+            let leftover = if buffer.is_empty() {
+                None
+            } else {
+                Some(buffer.freeze())
+            };
+            return parse_raw_fast_http_response_head(&head, leftover, filter_hop_headers);
+        }
+
+        if buffer.len() > 64 * 1024 {
+            return Err(anyhow!("upstream response headers exceeded 64KiB"));
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = upstream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(anyhow!("upstream closed during handshake"));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_raw_fast_http_response_head(
+    head: &[u8],
+    leftover: Option<Bytes>,
+    filter_hop_headers: bool,
+) -> Result<RawFastHttpResponseHead> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers);
+    let status = response
+        .parse(head)
+        .context("failed parsing upstream raw fast response")?;
+    if !matches!(status, httparse::Status::Complete(_)) {
+        return Err(anyhow!("incomplete upstream raw fast response"));
+    }
+
+    let status = StatusCode::from_u16(
+        response
+            .code
+            .ok_or_else(|| anyhow!("missing upstream status code"))?,
+    )?;
+    let mut content_length = None;
+    let mut transfer_chunked = false;
+    let mut connection_close = false;
+    let mut filtered = if filter_hop_headers {
+        Vec::with_capacity(head.len().min(4096))
+    } else {
+        Vec::new()
+    };
+
+    for header in response.headers.iter() {
+        let name = header.name;
+        let value = header.value;
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_chunked = std::str::from_utf8(value).ok().is_some_and(|raw| {
+                raw.split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
+            });
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_close = std::str::from_utf8(value).ok().is_some_and(|raw| {
+                raw.split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("close"))
+            });
+        }
+
+        if filter_hop_headers {
+            if is_hop_header(name) {
+                continue;
+            }
+            filtered.extend_from_slice(name.as_bytes());
+            filtered.extend_from_slice(b": ");
+            filtered.extend_from_slice(value);
+            filtered.extend_from_slice(b"\r\n");
+        }
+    }
+
+    Ok(RawFastHttpResponseHead {
+        status,
+        raw_head: Bytes::copy_from_slice(head),
+        headers: filtered,
+        content_length,
+        transfer_chunked,
+        connection_close,
+        leftover,
+    })
+}
+
+fn build_raw_http_response_head_bytes(
+    status: StatusCode,
+    headers: &[u8],
+    keep_alive: bool,
+    chunked: bool,
+) -> Vec<u8> {
+    let reason = status.canonical_reason().unwrap_or("");
+    let mut head = Vec::with_capacity(128 + headers.len());
+    head.extend_from_slice(b"HTTP/1.1 ");
+    append_u16_decimal(&mut head, status.as_u16());
+    if !reason.is_empty() {
+        head.push(b' ');
+        head.extend_from_slice(reason.as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
+    head.extend_from_slice(headers);
+    if chunked {
+        head.extend_from_slice(b"transfer-encoding: chunked\r\n");
+    }
+    if !keep_alive {
+        head.extend_from_slice(b"connection: close\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    head
+}
+
+fn append_u16_decimal(out: &mut Vec<u8>, value: u16) {
+    let hundreds = value / 100;
+    let tens = (value / 10) % 10;
+    let ones = value % 10;
+    out.push(b'0' + hundreds as u8);
+    out.push(b'0' + tens as u8);
+    out.push(b'0' + ones as u8);
+}
+
+async fn relay_raw_http_body(
+    upstream: &mut (impl AsyncRead + Unpin + ?Sized),
+    downstream: &mut TcpStream,
+    leftover: Option<Bytes>,
+) -> Result<()> {
+    if let Some(leftover) = leftover {
+        if !leftover.is_empty() {
+            downstream
+                .write_all(&leftover)
+                .await
+                .context("failed writing raw upstream prelude to downstream")?;
+        }
+    }
+
+    let mut buffer = relay_buffer_pool().acquire();
+    loop {
+        let read = upstream
+            .read(&mut buffer)
+            .await
+            .context("failed reading raw upstream body")?;
+        if read == 0 {
+            break;
+        }
+        downstream
+            .write_all(&buffer[..read])
+            .await
+            .context("failed writing raw upstream body")?;
+    }
+    Ok(())
+}
+
+fn find_sse_event_end(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(position) = memchr(b'\n', &bytes[offset..]) {
+        let index = offset + position;
+        if index > 0 && bytes[index - 1] == b'\n' {
+            return Some(index + 1);
+        }
+        if index >= 3 && bytes[index - 3..=index] == *b"\r\n\r\n" {
+            return Some(index + 1);
+        }
+        offset = index + 1;
+    }
+    None
+}
+
+async fn relay_passthrough_chunked_http_body(
+    upstream: &mut (impl AsyncRead + Unpin + ?Sized),
+    downstream: &mut TcpStream,
+    leftover: Option<Bytes>,
+) -> Result<bool> {
+    let mut scanner = ChunkedBodyScanner::default();
+    if let Some(leftover) = leftover {
+        if !leftover.is_empty() {
+            downstream
+                .write_all(&leftover)
+                .await
+                .context("failed writing chunked upstream prelude")?;
+            if scanner.observe(&leftover)? {
+                return Ok(true);
+            }
+        }
+    }
+
+    let mut buffer = vec![0_u8; 16 * 1024];
+    loop {
+        let read = upstream
+            .read(&mut buffer)
+            .await
+            .context("failed reading chunked raw upstream body")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        downstream
+            .write_all(&buffer[..read])
+            .await
+            .context("failed writing chunked raw upstream body")?;
+        if scanner.observe(&buffer[..read])? {
+            return Ok(true);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChunkedBodyScanner {
+    state: ChunkedScanState,
+}
+
+enum ChunkedScanState {
+    SizeLine(Vec<u8>),
+    Body(u64),
+    BodyCrLf(usize),
+    Trailer(Vec<u8>),
+    Done,
+}
+
+impl Default for ChunkedScanState {
+    fn default() -> Self {
+        Self::SizeLine(Vec::with_capacity(32))
+    }
+}
+
+impl ChunkedBodyScanner {
+    fn observe(&mut self, mut bytes: &[u8]) -> Result<bool> {
+        while !bytes.is_empty() {
+            match &mut self.state {
+                ChunkedScanState::SizeLine(line) => {
+                    let Some(pos) = bytes.iter().position(|byte| *byte == b'\n') else {
+                        line.extend_from_slice(bytes);
+                        if line.len() > 16 * 1024 {
+                            return Err(anyhow!("chunk size line exceeded 16KiB"));
+                        }
+                        return Ok(false);
+                    };
+                    line.extend_from_slice(&bytes[..=pos]);
+                    bytes = &bytes[pos + 1..];
+                    if !line.ends_with(b"\r\n") {
+                        return Err(anyhow!("invalid chunk size line"));
+                    }
+                    let size = parse_chunk_size_line(line)?;
+                    line.clear();
+                    self.state = if size == 0 {
+                        ChunkedScanState::Trailer(Vec::with_capacity(64))
+                    } else {
+                        ChunkedScanState::Body(size)
+                    };
+                }
+                ChunkedScanState::Body(remaining) => {
+                    let consumed = (*remaining).min(bytes.len() as u64) as usize;
+                    *remaining -= consumed as u64;
+                    bytes = &bytes[consumed..];
+                    if *remaining == 0 {
+                        self.state = ChunkedScanState::BodyCrLf(0);
+                    }
+                }
+                ChunkedScanState::BodyCrLf(seen) => {
+                    let expected = [b'\r', b'\n'];
+                    while *seen < 2 && !bytes.is_empty() {
+                        if bytes[0] != expected[*seen] {
+                            return Err(anyhow!("invalid chunk body terminator"));
+                        }
+                        *seen += 1;
+                        bytes = &bytes[1..];
+                    }
+                    if *seen == 2 {
+                        self.state = ChunkedScanState::SizeLine(Vec::with_capacity(32));
+                    }
+                }
+                ChunkedScanState::Trailer(trailer) => {
+                    trailer.extend_from_slice(bytes);
+                    if trailer.len() > 64 * 1024 {
+                        return Err(anyhow!("chunk trailer exceeded 64KiB"));
+                    }
+                    if trailer.starts_with(b"\r\n") || find_header_end(trailer).is_some() {
+                        self.state = ChunkedScanState::Done;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                ChunkedScanState::Done => return Ok(true),
+            }
+        }
+
+        Ok(matches!(self.state, ChunkedScanState::Done))
+    }
+}
+
+fn parse_chunk_size_line(line: &[u8]) -> Result<u64> {
+    let line = std::str::from_utf8(line)
+        .context("chunk size line is not utf-8")?
+        .trim_end_matches("\r\n");
+    let size_hex = line
+        .split_once(';')
+        .map(|(size, _)| size)
+        .unwrap_or(line)
+        .trim();
+    u64::from_str_radix(size_hex, 16).context("invalid chunk size")
+}
+
+async fn relay_fixed_http_body(
+    upstream: &mut (impl AsyncRead + Unpin + ?Sized),
+    downstream: &mut TcpStream,
+    leftover: Option<Bytes>,
+    len: u64,
+) -> Result<bool> {
+    let mut remaining = len;
+    if let Some(leftover) = leftover {
+        if !leftover.is_empty() {
+            let to_write = remaining.min(leftover.len() as u64) as usize;
+            if to_write > 0 {
+                downstream
+                    .write_all(&leftover[..to_write])
+                    .await
+                    .context("failed writing fixed raw upstream prelude")?;
+                remaining -= to_write as u64;
+            }
+            if to_write < leftover.len() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let mut buffer = vec![0_u8; 16 * 1024];
+    while remaining > 0 {
+        let read_target = remaining.min(buffer.len() as u64) as usize;
+        let read = upstream
+            .read(&mut buffer[..read_target])
+            .await
+            .context("failed reading fixed raw upstream body")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        downstream
+            .write_all(&buffer[..read])
+            .await
+            .context("failed writing fixed raw upstream body")?;
+        remaining -= read as u64;
+    }
+
+    Ok(true)
+}
+
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -13512,8 +18548,11 @@ fn build_websocket_upstream_headers(
     remote_addr: SocketAddr,
     scheme: &str,
     original_host: &str,
+    forward_headers: bool,
 ) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
+    let forwarding_capacity = if forward_headers { 6 } else { 1 };
+    let mut headers =
+        HeaderMap::with_capacity(original.len() + route.set_headers.len() + forwarding_capacity);
 
     for (name, value) in original {
         if name == HOST || name.as_str().eq_ignore_ascii_case("proxy-connection") {
@@ -13540,7 +18579,9 @@ fn build_websocket_upstream_headers(
         original_host
     };
     headers.insert(HOST, HeaderValue::from_str(host)?);
-    apply_forwarding_headers(&mut headers, original_host, remote_addr, scheme)?;
+    if forward_headers {
+        apply_forwarding_headers(&mut headers, original_host, remote_addr, scheme)?;
+    }
 
     Ok(headers)
 }
@@ -13567,6 +18608,50 @@ fn serialize_http_request(
     request.extend_from_slice(b"\r\n");
     request.extend_from_slice(body);
     Ok(request)
+}
+
+fn serialize_raw_fast_lane_request(
+    request: &PlainFastLaneRequest,
+    path_and_query: &str,
+    host: &str,
+    connection: Option<&str>,
+    forward_headers: bool,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(128 + request.forward_header_bytes.len());
+    bytes.extend_from_slice(request.method.as_str().as_bytes());
+    bytes.extend_from_slice(b" ");
+    bytes.extend_from_slice(path_and_query.as_bytes());
+    bytes.extend_from_slice(b" HTTP/1.1\r\n");
+    if forward_headers {
+        bytes.extend_from_slice(&request.forward_header_bytes);
+    }
+
+    bytes.extend_from_slice(b"host: ");
+    bytes.extend_from_slice(host.as_bytes());
+    bytes.extend_from_slice(b"\r\n");
+    if let Some(connection) = connection {
+        bytes.extend_from_slice(b"connection: ");
+        bytes.extend_from_slice(connection.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+    }
+    bytes.extend_from_slice(b"\r\n");
+    bytes
+}
+
+fn serialize_raw_websocket_fast_lane_request(
+    request: &PlainWebSocketFastLaneRequest,
+    path_and_query: &str,
+    host: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(128 + request.header_bytes.len());
+    bytes.extend_from_slice(b"GET ");
+    bytes.extend_from_slice(path_and_query.as_bytes());
+    bytes.extend_from_slice(b" HTTP/1.1\r\n");
+    bytes.extend_from_slice(&request.header_bytes);
+    bytes.extend_from_slice(b"host: ");
+    bytes.extend_from_slice(host.as_bytes());
+    bytes.extend_from_slice(b"\r\n\r\n");
+    bytes
 }
 
 fn upstream_host_header(url: &Url) -> Result<String> {
@@ -13879,6 +18964,7 @@ mod tests {
                 strip_prefix: false,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
                 compression: ResponseCompressionConfig::default(),
                 cache: ResponseCacheConfig::default(),
                 rate_limit: HttpRateLimitConfig::default(),
@@ -13907,6 +18993,7 @@ mod tests {
                 strip_prefix: true,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
                 compression: ResponseCompressionConfig::default(),
                 cache: ResponseCacheConfig::default(),
                 rate_limit: HttpRateLimitConfig::default(),
@@ -13936,6 +19023,7 @@ mod tests {
                 strip_prefix: true,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
                 compression: ResponseCompressionConfig::default(),
                 cache: ResponseCacheConfig::default(),
                 rate_limit: HttpRateLimitConfig::default(),
@@ -14061,6 +19149,7 @@ mod tests {
             strip_prefix: true,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
@@ -14092,6 +19181,7 @@ mod tests {
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
+                    forward_headers: true,
                     compression: ResponseCompressionConfig::default(),
                     cache: ResponseCacheConfig::default(),
                     rate_limit: HttpRateLimitConfig::default(),
@@ -14107,6 +19197,7 @@ mod tests {
                     strip_prefix: false,
                     set_headers: BTreeMap::new(),
                     strip_headers: Vec::new(),
+                    forward_headers: true,
                     compression: ResponseCompressionConfig::default(),
                     cache: ResponseCacheConfig::default(),
                     rate_limit: HttpRateLimitConfig::default(),
@@ -14134,6 +19225,7 @@ mod tests {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig {
                 enabled: true,
                 algorithms: crate::config::ResponseCompressionConfig::default().algorithms,
@@ -14174,6 +19266,7 @@ mod tests {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
@@ -14190,6 +19283,7 @@ mod tests {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
@@ -14333,6 +19427,40 @@ mod tests {
     }
 
     #[test]
+    fn finalize_http_response_preserves_length_for_non_sse_streams() {
+        let request_headers = HeaderMap::new();
+        let mut response = GatewayHttpResponse::bytes(
+            StatusCode::OK,
+            "application/octet-stream",
+            Bytes::new(),
+            "proxysss://static",
+        );
+        response.stream_body = Some(full_body(Bytes::from_static(b"chunk")));
+        response.push_header(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let compression = ResponseCompressionConfig {
+            enabled: true,
+            algorithms: vec![CompressionAlgorithm::Gzip],
+            min_length: 1,
+            content_types: vec!["application/".to_string()],
+        };
+
+        let response = finalize_http_response(&request_headers, &compression, response)
+            .expect("finalize response");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == CONTENT_LENGTH && value == "5"));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name == CACHE_CONTROL));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name == CONTENT_ENCODING));
+    }
+
+    #[test]
     fn listener_specs_include_ftp_when_enabled() {
         let mut config = GatewayConfig::default();
         config.services.ftp.enabled = true;
@@ -14343,6 +19471,86 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(keys.iter().any(|key| key.starts_with("tcp:ftp:")));
+    }
+
+    #[test]
+    fn tcp_stream_accept_worker_count_uses_reuseport_on_linux_performance() {
+        let mut config = GatewayConfig::default();
+        config.runtime.performance.enabled = true;
+        let listener = TcpListenerConfig {
+            name: "tcp-echo".to_string(),
+            bind: "127.0.0.1:7000".to_string(),
+            upstream: "127.0.0.1:7001".to_string(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            protocol: "game_tcp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 1_000,
+        };
+
+        let workers = tcp_stream_accept_worker_count_for(&config, &listener, 4);
+        if cfg!(target_os = "linux") {
+            assert_eq!(workers, 1);
+            assert_eq!(
+                tcp_stream_accept_worker_count_for(&config, &listener, 96),
+                48
+            );
+        } else {
+            assert_eq!(workers, 1);
+        }
+
+        config.runtime.performance.enabled = false;
+        assert_eq!(tcp_stream_accept_worker_count_for(&config, &listener, 4), 1);
+    }
+
+    #[test]
+    fn udp_listener_worker_count_uses_reuseport_on_linux_performance() {
+        let mut config = GatewayConfig::default();
+        config.runtime.performance.enabled = true;
+
+        let workers = udp_listener_worker_count_for(&config, 4);
+        if cfg!(target_os = "linux") {
+            assert_eq!(workers, 4);
+            assert_eq!(udp_listener_worker_count_for(&config, 96), 96);
+        } else {
+            assert_eq!(workers, 1);
+        }
+
+        config.runtime.performance.enabled = false;
+        assert_eq!(udp_listener_worker_count_for(&config, 4), 1);
+    }
+
+    #[test]
+    fn direct_tcp_listener_upstream_requires_policy_free_single_upstream() {
+        let mut config = GatewayConfig::default();
+        config.runtime.performance.enabled = true;
+        config.affinity.enabled = false;
+        config.load_balance.active_health.enabled = false;
+        config.load_balance.passive_health.enabled = false;
+        config.tcp.listeners.push(TcpListenerConfig {
+            name: "direct".to_string(),
+            bind: "127.0.0.1:7000".to_string(),
+            upstream: "127.0.0.1:7001".to_string(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            protocol: "game_tcp".to_string(),
+            nodelay: true,
+            connect_timeout_ms: 1_000,
+        });
+
+        assert_eq!(
+            direct_tcp_listener_upstream(&config, "direct").as_deref(),
+            Some("127.0.0.1:7001")
+        );
+
+        config.tcp.listeners[0]
+            .upstreams
+            .push("127.0.0.1:7002".to_string());
+        assert!(direct_tcp_listener_upstream(&config, "direct").is_none());
+
+        config.tcp.listeners[0].upstreams.clear();
+        config.load_balance.active_health.enabled = true;
+        assert!(direct_tcp_listener_upstream(&config, "direct").is_none());
     }
 
     #[test]
@@ -14395,6 +19603,7 @@ mod tests {
             "api.example.com",
             "203.0.113.20:443".parse().expect("remote addr"),
             "https",
+            true,
         )
         .expect("headers");
 
@@ -14431,6 +19640,38 @@ mod tests {
     }
 
     #[test]
+    fn build_upstream_headers_can_skip_forwarding_chain() {
+        let route = RouteDecision {
+            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
+        };
+        let headers = build_upstream_headers(
+            &HeaderMap::new(),
+            &route,
+            "api.example.com",
+            "203.0.113.20:443".parse().expect("remote addr"),
+            "https",
+            false,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get(HOST).and_then(|value| value.to_str().ok()),
+            Some("api.example.com")
+        );
+        assert!(!headers.contains_key("x-forwarded-for"));
+        assert!(!headers.contains_key("x-real-ip"));
+        assert!(!headers.contains_key("forwarded"));
+    }
+
+    #[test]
     fn snapshot_prometheus_emits_counter_lines() {
         let stats = GatewayStats::default();
         stats.http_requests.store(42, Ordering::Relaxed);
@@ -14455,9 +19696,13 @@ mod tests {
         let gateway = Gateway {
             config_path: PathBuf::from("proxysss.yaml"),
             bootstrap_config: GatewayConfig::default(),
+            bootstrap_fast_lane: FastLaneState::compile(&GatewayConfig::default()),
             dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
                 config: GatewayConfig::default(),
+                fast_lane: FastLaneState::compile(&GatewayConfig::default()),
                 http_client: reqwest::Client::new(),
+                http_fast_client: HyperClient::builder(TokioExecutor::new())
+                    .build(HttpConnector::new()),
                 script: None,
             }))),
             stats: Arc::new(GatewayStats::default()),
@@ -14468,6 +19713,11 @@ mod tests {
             stream_rate_limits: Arc::new(DashMap::new()),
             http_connection_limits: Arc::new(DashMap::new()),
             http_cache: Arc::new(DashMap::new()),
+            raw_http_pools: Arc::new(DashMap::new()),
+            static_route_cache: Arc::new(DashMap::new()),
+            static_file_cache: Arc::new(DashMap::new()),
+            static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
+            static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
             acme_tls_alpn_certs: Arc::new(DashMap::new()),
             on_demand_certs: Arc::new(DashMap::new()),
@@ -14697,6 +19947,17 @@ mod tests {
         assert!(error.to_string().contains("escapes root"));
     }
 
+    async fn dispatch_static_site_for_test(
+        site: &StaticSiteConfig,
+        method: &Method,
+        uri: &Uri,
+    ) -> Result<GatewayHttpResponse> {
+        let cache = DashMap::new();
+        let cache_bytes = AtomicU64::new(0);
+        let load_locks = DashMap::new();
+        dispatch_static_site(site, method, uri, &cache, &cache_bytes, &load_locks).await
+    }
+
     #[tokio::test]
     async fn static_site_serves_index_file() {
         let root = std::env::temp_dir().join(format!("proxysss-static-test-{}", Uuid::new_v4()));
@@ -14715,7 +19976,7 @@ mod tests {
             autoindex: false,
         };
         let uri: Uri = "/assets".parse().expect("valid uri");
-        let response = dispatch_static_site(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
             .await
             .expect("static response");
 
@@ -14746,7 +20007,7 @@ mod tests {
             autoindex: true,
         };
         let uri: Uri = "/test.txt".parse().expect("valid uri");
-        let response = dispatch_static_site(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
             .await
             .expect("static response");
 
@@ -14775,7 +20036,7 @@ mod tests {
             autoindex: true,
         };
         let uri: Uri = "/assets".parse().expect("valid uri");
-        let response = dispatch_static_site(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
             .await
             .expect("static response");
 
@@ -15064,6 +20325,7 @@ mod tests {
                 Arc::new(UdpAssociation {
                     socket: socket.clone(),
                     last_seen_epoch: AtomicU64::new(now.saturating_sub(1_000 + port as u64)),
+                    active: AtomicBool::new(true),
                 }),
             );
         }
@@ -15072,6 +20334,7 @@ mod tests {
             Arc::new(UdpAssociation {
                 socket,
                 last_seen_epoch: AtomicU64::new(now),
+                active: AtomicBool::new(true),
             }),
         );
 

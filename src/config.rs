@@ -670,6 +670,44 @@ pub struct RuntimeConfig {
     pub maintenance_state: MaintenanceStateConfig,
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    #[serde(default)]
+    pub performance: RuntimePerformanceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePerformanceConfig {
+    /// Default-on adaptive OS/runtime tuning. This never writes sysctl files;
+    /// persistent host tuning stays explicit through `proxysss tune linux --apply`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub profile: RuntimePerformanceProfile,
+    #[serde(default)]
+    pub traffic_profile: RuntimePerformanceTrafficProfile,
+    #[serde(default = "default_true")]
+    pub adaptive_system: bool,
+    #[serde(default = "default_true")]
+    pub socket_extreme: bool,
+    #[serde(default = "default_true")]
+    pub log_on_start: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePerformanceProfile {
+    #[default]
+    Edge,
+    Bulk,
+    Latency,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePerformanceTrafficProfile {
+    #[default]
+    Small,
+    Balanced,
+    Bulk,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,7 +724,7 @@ pub struct WatchdogConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotReloadConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_reload_interval_ms")]
     pub interval_ms: u64,
@@ -842,6 +880,8 @@ pub struct ReverseProxyRouteConfig {
     pub set_headers: BTreeMap<String, String>,
     #[serde(default, alias = "remove_headers")]
     pub strip_headers: Vec<String>,
+    #[serde(default = "default_true")]
+    pub forward_headers: bool,
     #[serde(default)]
     pub compression: ResponseCompressionConfig,
     #[serde(default)]
@@ -870,6 +910,8 @@ pub struct DomainRouteConfig {
     pub set_headers: BTreeMap<String, String>,
     #[serde(default, alias = "remove_headers")]
     pub strip_headers: Vec<String>,
+    #[serde(default = "default_true")]
+    pub forward_headers: bool,
     #[serde(default)]
     pub compression: ResponseCompressionConfig,
     #[serde(default)]
@@ -2513,7 +2555,7 @@ impl Default for MonitoringConfig {
 impl Default for HotReloadConfig {
     fn default() -> Self {
         Self {
-            enabled: default_true(),
+            enabled: false,
             interval_ms: default_reload_interval_ms(),
         }
     }
@@ -2535,6 +2577,19 @@ impl Default for WatchdogConfig {
             restart_critical_tasks: default_true(),
             restart_backoff_secs: default_watchdog_restart_backoff_secs(),
             heartbeat_interval_secs: default_watchdog_heartbeat_interval_secs(),
+        }
+    }
+}
+
+impl Default for RuntimePerformanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            profile: RuntimePerformanceProfile::default(),
+            traffic_profile: RuntimePerformanceTrafficProfile::default(),
+            adaptive_system: default_true(),
+            socket_extreme: default_true(),
+            log_on_start: default_true(),
         }
     }
 }
@@ -2594,6 +2649,7 @@ impl Default for ReverseProxyRouteConfig {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
@@ -2614,6 +2670,7 @@ impl Default for DomainRouteConfig {
             strip_prefix: false,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
+            forward_headers: true,
             compression: ResponseCompressionConfig::default(),
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
@@ -3685,6 +3742,31 @@ mod tests {
         assert!(config.runtime.watchdog.restart_critical_tasks);
         assert_eq!(config.runtime.watchdog.restart_backoff_secs, 2);
         assert_eq!(config.runtime.watchdog.heartbeat_interval_secs, 30);
+        assert!(!config.runtime.hot_reload.enabled);
+        assert_eq!(config.runtime.hot_reload.interval_ms, 1500);
+        assert!(config.runtime.performance.enabled);
+        assert!(config.runtime.performance.adaptive_system);
+        assert!(config.runtime.performance.socket_extreme);
+        assert!(config.runtime.performance.log_on_start);
+        assert_eq!(
+            config.runtime.performance.profile,
+            RuntimePerformanceProfile::Edge
+        );
+        assert_eq!(
+            config.runtime.performance.traffic_profile,
+            RuntimePerformanceTrafficProfile::Small
+        );
+    }
+
+    #[test]
+    fn default_yaml_exposes_adaptive_runtime_performance() {
+        let yaml = GatewayConfig::render_default_yaml();
+        assert!(yaml.contains("hot_reload:"));
+        assert!(yaml.contains("enabled: false"));
+        assert!(yaml.contains("performance:"));
+        assert!(yaml.contains("traffic_profile: small"));
+        assert!(yaml.contains("adaptive_system: true"));
+        assert!(yaml.contains("socket_extreme: true"));
     }
 
     #[test]
@@ -4009,6 +4091,7 @@ mod tests {
                 strip_prefix: false,
                 set_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
                 compression: ResponseCompressionConfig::default(),
                 cache: ResponseCacheConfig::default(),
                 rate_limit: HttpRateLimitConfig::default(),
@@ -4038,6 +4121,8 @@ mod tests {
                 rewrite_base_path: "/v1".to_string(),
                 add_headers: BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
+                emit_metadata_headers: true,
             });
 
         let error = config

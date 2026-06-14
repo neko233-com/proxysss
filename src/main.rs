@@ -12,6 +12,10 @@ mod security;
 mod stream_routes;
 mod ts_transpile;
 
+#[cfg(all(unix, not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(test)]
 mod verify;
 
@@ -314,7 +318,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "hot reload",
-        "the main YAML config, the main script, and auto-loaded plugins are fingerprinted",
+        "manual /v1/reload is default; optional watcher fingerprints the main YAML, scripts, and auto-loaded plugins",
     ),
     (
         "forwarded headers",
@@ -395,6 +399,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     (
         "tcp tuning assistant",
         "proxysss tune tcp launches an interactive Linux-oriented sysctl tuning flow based on workload and hardware",
+    ),
+    (
+        "adaptive runtime performance",
+        "runtime.performance is enabled by default; traffic_profile defaults to small for low-latency small-file/SSE/WebSocket/TCP/UDP feedback, Linux hosts get startup-logged socket tuning, CPU-adaptive HTTP/TCP SO_REUSEPORT accept fanout, direct single-upstream TCP fast paths, raw WebSocket fast lanes for no-policy ws:// routes, lock-free raw HTTP keepalive pooling, static fast-lane preload after config load, and Ubuntu 24.x extreme socket policy with safe fallback on older/unknown distros",
     ),
     (
         "admin api/console",
@@ -499,7 +507,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "hot reload",
         status: ParityStatus::Supported,
-        evidence: "reload fingerprint covers the main YAML config, the main script, and auto-loaded plugins",
+        evidence: "manual /v1/reload and admin writes reload in process; optional watcher fingerprints the main YAML config, scripts, and auto-loaded plugins",
         next_gap: "",
     },
     NginxParityItem {
@@ -577,7 +585,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     CaddyFeatureItem {
         capability: "admin API and hot reload",
         status: ParityStatus::Supported,
-        evidence: "admin API on 127.0.0.1:7777 plus config/script/plugin hot reload fingerprinting",
+        evidence: "admin API on 127.0.0.1:7777 persists mutations and reloads in process; background file watching is opt-in",
         next_gap: "",
     },
     CaddyFeatureItem {
@@ -637,7 +645,12 @@ async fn main() -> Result<()> {
             let gateway_config = GatewayConfig::load(&config_path)?;
 
             init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
+            let runtime_tune_plan = gateway::configure_runtime_performance(&gateway_config);
             emit_startup_banner(&config_path, &gateway_config);
+            emit_runtime_tune_plan(
+                &runtime_tune_plan,
+                gateway_config.runtime.performance.log_on_start,
+            );
             for warning in gateway_config.warnings() {
                 tracing::warn!(warning, "configuration warning");
             }
@@ -1084,6 +1097,7 @@ fn run_interactive_tcp_tune() -> Result<()> {
         cpu_cores: prompt_u32("CPU cores", 8)?,
         nic_gbps: prompt_u32("NIC speed (Gbps)", 10)?,
         max_connections: prompt_u32("Peak concurrent connections", 20000)?,
+        ..Default::default()
     };
 
     let profile_name = match survey.profile {
@@ -1268,6 +1282,18 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.runtime.watchdog.restart_critical_tasks,
         config.runtime.watchdog.restart_backoff_secs,
         config.runtime.watchdog.heartbeat_interval_secs
+    );
+    let runtime_tune_plan = gateway::configure_runtime_performance(config);
+    println!(
+        "performance       : enabled={}, adaptive_system={}, socket_extreme={}, profile={:?}, traffic_profile={:?}, os={}, distro={:?}, socket_level={:?}",
+        config.runtime.performance.enabled,
+        config.runtime.performance.adaptive_system,
+        config.runtime.performance.socket_extreme,
+        config.runtime.performance.profile,
+        config.runtime.performance.traffic_profile,
+        runtime_tune_plan.os,
+        runtime_tune_plan.distro,
+        runtime_tune_plan.socket_level
     );
     println!(
         "error pages       : enabled={}, show_details={}, custom_pages={}",
@@ -1542,6 +1568,9 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
         config.runtime.hot_reload.interval_ms
     ));
     output.push_str("[hot_reload]\n");
+    output.push_str("manual reload through POST /v1/reload is available when admin is enabled\n");
+    output.push_str("admin write APIs persist YAML and reload eligible changes immediately\n");
+    output.push_str("background file watching is opt-in with runtime.hot_reload.enabled=true\n");
     output.push_str("configuration values except listener identity\n");
     output.push_str("the main proxysss.yaml file\n");
     output.push_str("main extension script from script.entry\n");
@@ -1611,7 +1640,7 @@ fn config_template_name(kind: ConfigTemplateKind) -> &'static str {
 fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
     match kind {
         ConfigTemplateKind::Full => {
-            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  error_pages:\n    enabled: true\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>proxysss could not match this route.</p></body></html>\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    path: /healthz\n    failure_threshold: 2\n    success_threshold: 2\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      active_health:\n        path: /healthz\n"
+            "config_version: 1\nhttp:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\n  error_pages:\n    enabled: true\n    pages:\n      - status: 404\n        content_type: text/html; charset=utf-8\n        body: |\n          <html><body><h1>{{status}} {{reason}}</h1><p>proxysss could not match this route.</p></body></html>\n  tls:\n    auto_https:\n      enabled: true\n      email: admin@example.com\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    path: /healthz\n    failure_threshold: 2\n    success_threshold: 2\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  performance:\n    enabled: true\n    profile: edge\n    traffic_profile: small\n    adaptive_system: true\n    socket_extreme: true\n    log_on_start: true\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n  maintenance_state:\n    enabled: true\n    path: ./runtime/maintenance-state.json\nservices:\n  domain_routes:\n    - name: app\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n      cache:\n        enabled: true\n        ttl_secs: 30\n      active_health:\n        path: /healthz\n"
         }
         ConfigTemplateKind::Http => {
             "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  h3_bind: 0.0.0.0:443\nservices:\n  domain_routes:\n    - name: api\n      domains: [api.example.com]\n      path_prefix: /api\n      upstream: http://127.0.0.1:8080\n      upstreams:\n        - http://127.0.0.1:8080\n        - http://127.0.0.1:8081\n      strip_prefix: true\n      ssl:\n        type: auto\n      active_health:\n        path: /readyz\n        failure_threshold: 2\n        success_threshold: 2\n"
@@ -1632,7 +1661,7 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
             "script:\n  enabled: true\n  entry: gateway.ts\n  cwd: .\n  timeout_ms: 500\n  memory_limit_mb: 64\n  max_stack_size_kb: 512\nplugins:\n  enabled: false\n"
         }
         ConfigTemplateKind::Iot => {
-            "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams:\n        - 127.0.0.1:18831\n        - 127.0.0.1:18832\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:56831\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n  rate_limit:\n    stream:\n      enabled: true\n      algorithm: token_bucket\n      connections: 600\n      window_ms: 60000\n      burst: 1200\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
+            "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams:\n        - 127.0.0.1:18831\n        - 127.0.0.1:18832\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:56831\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n  rate_limit:\n    stream:\n      enabled: true\n      algorithm: token_bucket\n      connections: 600\n      window_ms: 60000\n      burst: 1200\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  performance:\n    enabled: true\n    profile: latency\n    traffic_profile: small\n    adaptive_system: true\n    socket_extreme: true\n    log_on_start: true\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
         }
     }
 }
@@ -2145,6 +2174,46 @@ support : http / https / http3 / tcp / udp / ws / wss
     );
 }
 
+fn emit_runtime_tune_plan(plan: &linux_tune::RuntimeTunePlan, log_on_start: bool) {
+    if !log_on_start {
+        return;
+    }
+
+    let enabled = if plan.enabled { "enabled" } else { "disabled" };
+    let distro = if plan.distro_id.is_empty() && plan.version_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        format!("{} {}", plan.distro_id, plan.version_id)
+            .trim()
+            .to_string()
+    };
+
+    println!(
+        "runtime performance: {enabled}, os={}, distro={}, profile={:?}, socket_level={:?}",
+        plan.os, distro, plan.profile, plan.socket_level
+    );
+    for feature in &plan.enabled_features {
+        println!("runtime performance enabled: {feature}");
+    }
+    for feature in &plan.skipped_features {
+        println!("runtime performance skipped: {feature}");
+    }
+
+    tracing::info!(
+        enabled = plan.enabled,
+        os = %plan.os,
+        distro = ?plan.distro,
+        distro_id = %plan.distro_id,
+        version_id = %plan.version_id,
+        major_version = ?plan.major_version,
+        profile = ?plan.profile,
+        socket_level = ?plan.socket_level,
+        enabled_features = ?plan.enabled_features,
+        skipped_features = ?plan.skipped_features,
+        "runtime performance plan"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2215,6 +2284,7 @@ mod tests {
                 strip_prefix: true,
                 set_headers: std::collections::BTreeMap::new(),
                 strip_headers: Vec::new(),
+                forward_headers: true,
                 compression: crate::config::ResponseCompressionConfig::default(),
                 cache: crate::config::ResponseCacheConfig::default(),
                 rate_limit: crate::config::HttpRateLimitConfig::default(),
@@ -2277,6 +2347,9 @@ mod tests {
     fn reload_plan_lists_hot_reload_and_restart_boundaries() {
         let plan = render_reload_plan(&GatewayConfig::default());
         assert!(plan.contains("reverse_proxy routes"));
+        assert!(plan.contains("hot_reload.enabled=false"));
+        assert!(plan.contains("manual reload through POST /v1/reload"));
+        assert!(plan.contains("background file watching is opt-in"));
         assert!(plan.contains("auto-loaded plugin scripts"));
         assert!(plan.contains("the main proxysss.yaml file"));
         assert!(plan.contains("services.ftp.enabled/services.ftp.bind"));

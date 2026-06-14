@@ -941,7 +941,7 @@
         <div class="map">
           <div class="map-item">
             <strong>1. Listen</strong>
-            <p>Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams.</p>
+            <p>Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams with explicit TCP backlog and default-on runtime.performance tuning. On Linux, plain HTTP, TLS HTTP, TCP stream, and UDP listener binds fan out across CPU-adaptive SO_REUSEPORT workers when performance mode is enabled. Startup detects the OS version, applies portable Linux socket tuning, enables the Ubuntu 24.x extreme policy when supported, and logs any downgrade reason.</p>
           </div>
           <div class="map-item">
             <strong>2. Understand enough</strong>
@@ -953,7 +953,7 @@
           </div>
           <div class="map-item">
             <strong>4. Proxy or serve</strong>
-            <p>proxysss forwards to upstream pools, serves static/WebDAV/docs, bridges FTP data channels, or answers admin API calls.</p>
+            <p>proxysss forwards to upstream pools with separate hot paths instead of one global tuning profile. HTTP uses a Hyper fast path for general routes and raw plain-HTTP reverse/SSE/WebSocket lanes for simple no-policy routes. Raw HTTP keepalive pooling uses a lock-free bounded queue instead of a shared mutex. Static delivery uses a bounded cache with mmap-backed objects where supported, plus a traffic-profile-aware Linux fast lane: default small mode favors cached hot files and low-latency HTTP2/SSE/WebSocket/TCP/UDP feedback, bulk mode favors sendfile/zero-copy large transfers, and balanced mode prepares both. Config load preloads eligible index/top-level static files or sendfile descriptors according to runtime.performance.traffic_profile. TCP stream listeners run on a dedicated proxysss-stream runtime in performance mode, fan out accept loops with CPU-adaptive SO_REUSEPORT workers on Linux, and bypass the generic upstream planner for single-upstream direct routes when scripts, affinity, active health, and passive health are disabled. UDP listeners in performance mode also fan out datagram receive loops with SO_REUSEPORT, share the global association table, and keep worker-local association cache entries so established datagrams avoid global lookups and only refresh the global TTL timestamp once per second. Stream relays choose independent profiles: game/MQTT/tool long connections use small relay buffers and parallel one-way pumps, while explicit bulk/file stream protocols may use Linux splice zero-copy when runtime performance tuning is enabled.</p>
           </div>
         </div>
       </div>
@@ -976,6 +976,7 @@
       domains: [example.com]
       path_prefix: /
       upstream: http://127.0.0.1:9000
+      forward_headers: false
 
   ai_proxy:
     enabled: true
@@ -1016,7 +1017,7 @@ udp:
         <div class="roadmap">
           <article>
             <strong>Benchmark matrix</strong>
-            <p>Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming.</p>
+            <p>Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming. Production performance validation is Linux-only and must use the mixed matrix by default: enable the realistic multi-feature gateway shape and run CDN/static, HTTPS static, reverse proxy, New API/SSE, WebSocket long connections, game/TCP streams, generic TCP stream, UDP stream, and KCP-style UDP concurrently per gateway. The default critical gate is fairness-adjusted: aggregate throughput plus WebSocket and game/realtime TCP, UDP, and KCP-style scenarios use a 0.97 proxysss/nginx ratio floor because proxysss carries built-in policy and gateway behavior that nginx usually needs extra modules or configuration to approximate; static/reverse/SSE must stay above the soft floor with low errors; HTTPS static and static-large still run and are reported, but only block releases when explicitly included for TLS/static or bulk-transfer releases. Single-scenario runs are diagnostic only, and strict greater-than-nginx gates are opt-in.</p>
           </article>
           <article>
             <strong>Chaos testing</strong>
@@ -1028,7 +1029,7 @@ udp:
           </article>
           <article>
             <strong>Kernel tuning guide</strong>
-            <p>Document Linux socket backlog, file descriptors, ephemeral ports, UDP buffers, QUIC UDP settings, and systemd restart policy.</p>
+            <p>Keep Ubuntu 22.04, 24.04, 26.04 LTS and Debian socket backlog, file descriptor, ephemeral port, UDP buffer, QUIC UDP, jemalloc, and systemd restart guidance aligned with <code>proxysss tune linux</code>.</p>
           </article>
           <article>
             <strong>Observability packs</strong>
@@ -1063,8 +1064,8 @@ udp:
         steps: [
           "Client opens a connection on port 80 or 443 and sends a method, host, path, headers, and optional body.",
           "proxysss checks access control and rate limits, then chooses the most specific domain/path route.",
-          "The upstream pool is filtered by health state, load-balancing policy, and retry settings.",
-          "The response can be cached, compressed, logged, and streamed back to the client."
+          "The upstream pool is filtered by health state, load-balancing policy, and retry settings; hot single-upstream paths use the shortest native route.",
+          "The response can be cached, compressed, logged, streamed back to the client, or kept unbuffered for New API/SSE token streams."
         ]
       },
       {
@@ -1120,15 +1121,15 @@ udp:
         name: "TCP stream",
         hint: "reliable byte pipe",
         chip: "stream",
-        summary: "TCP is a reliable ordered byte pipe. proxysss accepts a connection, dials an upstream, and copies bytes both ways.",
+        summary: "TCP is a reliable ordered byte pipe. proxysss accepts a connection, dials an upstream, then chooses a relay profile for low-latency long connections or bulk byte movement.",
         note: "TCP is like a numbered conveyor belt. If a box is missing, the sender knows and retries. proxysss connects two belts together.",
         labels: ["client", "connect + policy", "service", "SYN", "bytes", "bytes", "ACK"],
-        tags: ["TCP_NODELAY", "stream_routes", "SNI passthrough"],
+        tags: ["TCP_NODELAY", "SO_REUSEPORT", "direct TCP fast path"],
         steps: [
-          "Client opens a TCP connection to a configured listener.",
-          "proxysss checks stream access control and rate limits, then selects an upstream.",
+          "Client opens a TCP connection to a configured listener; Linux performance mode can spread accepts across per-bind SO_REUSEPORT workers.",
+          "proxysss checks stream access control and rate limits, then either selects an upstream through policy or uses the direct single-upstream fast path.",
           "With nodelay enabled, small packets are sent promptly for latency-sensitive traffic.",
-          "Bytes are copied in both directions until either side closes."
+          "Game, MQTT, and tool streams use small fixed buffers and parallel one-way pumps on the stream runtime; explicit bulk/file stream protocols can use Linux splice zero-copy when it wins."
         ]
       },
       {
@@ -1136,14 +1137,15 @@ udp:
         name: "UDP and KCP-style traffic",
         hint: "datagrams + association",
         chip: "datagram",
-        summary: "UDP has no connection handshake. proxysss creates a temporary client-to-upstream association and refreshes it when packets arrive.",
+        summary: "UDP has no connection handshake. proxysss creates a temporary client-to-upstream association, then sends established datagrams through CPU-adaptive reuseport workers, worker-local association cache, and an in-loop fast path.",
         note: "UDP is like tossing labeled postcards. Fast, simple, no built-in promise that every card arrives. KCP-style protocols add their own reliability above UDP.",
         labels: ["game/device", "association", "udp service", "datagram", "forward", "datagram", "reply"],
         tags: ["KCP", "CoAP", "voice", "max_associations"],
         steps: [
           "A datagram arrives on a UDP listener, often from a game, voice, or device client.",
           "proxysss maps that client address to an upstream and stores the association.",
-          "Each packet refreshes the session TTL; idle associations are pruned.",
+          "Established packets refresh the global session TTL at most once per second and send directly to the connected upstream socket without per-packet routing, global association lookups, or task spawning.",
+          "Idle associations are pruned.",
           "max_associations caps memory use under huge churn."
         ]
       },
@@ -1191,23 +1193,24 @@ udp:
         steps: [
           "The client calls a provider-shaped endpoint such as /v1/chat/completions.",
           "services.ai_proxy matches host/path and rewrites the base path when needed.",
-          "Provider metadata and headers are shaped by gateway config.",
+          "Provider metadata headers can be emitted for observability or disabled for nginx-parity SSE paths.",
           "Streaming responses are flushed back without waiting for the whole body."
         ]
       },
       {
         key: "reload",
-        name: "Hot reload and admin API",
+        name: "Manual reload and admin API",
         hint: "change without guessing",
         chip: "ops",
-        summary: "The admin API and config reload path let automation update routes and listeners while keeping dangerous write operations disabled by default.",
-        note: "Think of YAML as the lab schedule. Hot reload means changing which rooms are open without rebuilding the whole building.",
+        summary: "The admin API and reload path let automation update routes and listeners while keeping dangerous write operations disabled by default.",
+        note: "Think of YAML as the lab schedule. Manual reload changes which rooms are open without running a background hall monitor; file watching is available when explicitly enabled.",
         labels: ["agent", "admin + reload", "yaml/runtime", "token", "persist", "state", "metrics"],
         tags: ["127.0.0.1:7777", "token", "reload-plan", "metrics"],
         steps: [
           "Operators inspect the gateway with config explain, routes, capabilities, and nginx-parity.",
           "Token-authenticated admin calls can upsert domain routes, reverse proxy routes, TCP listeners, UDP listeners, and blacklists.",
           "Writes persist atomically into the YAML config and reload eligible changes in process.",
+          "POST /v1/reload is the default manual reload path; runtime.hot_reload.enabled=true turns on background file watching.",
           "Listener identity, TLS mode, and logging sink changes still require restart."
         ]
       }

@@ -14,12 +14,12 @@ irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.
 
 **Upgrade to a specific version:**
 ```bash
-proxysss update --version v1.2.11
+proxysss update --version v1.3.0
 ```
 
 proxysss is a high-performance load balancer and reverse proxy server built to replace nginx as a general-purpose edge gateway. It handles HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP/KCP-style datagrams, MQTT/IoT stream gateways, FTP, WebDAV, AI API reverse proxying, and static delivery in one Rust binary while keeping the operational model straightforward.
 
-Current version: v1.2.11
+Current version: v1.3.0
 
 ## Why proxysss
 
@@ -53,19 +53,7 @@ proxysss is designed as a same-level nginx replacement for general gateway work:
 
 ### Performance comparison
 
-Performance depends on kernel, network card, TLS settings, payload shape, cache behavior, backend latency, worker count, and whether scripts/plugins sit on the request path. The table below is the checked repository quick gate, not a universal benchmark claim.
-
-| Benchmark item | proxysss v1.2.11 | nginx 1.31.0 | Result |
-| --- | ---: | ---: | --- |
-| Workload | static HTTP payload | static HTTP payload | same local Windows host |
-| Command | `.\scripts\benchmark-gateways.ps1 -Quick` | `.\scripts\benchmark-gateways.ps1 -Quick` | run on 2026-06-12 |
-| Concurrency / duration | 128 / 10s | 128 / 10s | same gate settings |
-| Requests per second | 11,559.70 | 6,349.90 | proxysss 1.82x nginx in this run |
-| Throughput | 2.01 MiB/s | 1.10 MiB/s | static payload gate |
-| p50 latency | 10.894 ms | 19.971 ms | lower is better |
-| p95 latency | 13.418 ms | 24.488 ms | lower is better |
-| p99 latency | 14.251 ms | 26.355 ms | lower is better |
-| Errors | 0 | 0 | benchmark gate passed |
+Performance depends on kernel, network card, TLS settings, payload shape, cache behavior, backend latency, worker count, and whether scripts/plugins sit on the request path. proxysss performance claims and release gates are Linux-only because production gateway deployments run on Linux; Windows/macOS measurements are development diagnostics, not nginx replacement evidence.
 
 For production decisions, benchmark the exact traffic you plan to migrate:
 
@@ -82,7 +70,9 @@ For production decisions, benchmark the exact traffic you plan to migrate:
 | FTP / WebDAV | control/data channel behavior, upload/download throughput, policy hooks | migration tests against target clients |
 | Cache/compression | hit ratio, stale behavior, CPU cost for gzip/brotli/zstd | `services.response_policy`, route cache settings |
 
-The hot path is intentionally simple: Rust async I/O, transparent stream forwarding for opaque protocols, route policy in native structures, optional TypeScript plugins outside ordinary gateway setup, nonblocking logs, and runtime watchdog metrics. Add plugin hooks only where business behavior is needed.
+On Ubuntu/Linux, run `proxysss tune linux --apply` first, then run `scripts/benchmark-all-scenarios.sh` on the host or in the Ubuntu 24 benchmark container. The default benchmark is a mixed multi-proxy load (`MIXED_MATRIX=1`, `FAST_GATE=0`, `CRITICAL_RATIO=0.97`, `AGGREGATE_RATIO=0.97`): nginx runs first, then proxysss runs the same concurrent wave. The wave includes static small files, static large files, CDN hot-update static files, HTTPS static files, HTTP reverse proxy, New API/SSE streaming, WebSocket long connections, game-style long TCP connections, TCP stream, UDP stream, and KCP-style UDP. Scenario concurrency is derived from detected CPU cores instead of hard-coded user input and weighted for the default small/latency traffic profile. Release success uses a fair ratio floor rather than a blind `>1.0`: the default critical game/realtime scenarios (WebSocket long connections, game TCP, generic TCP, UDP, and KCP-style UDP) and aggregate mixed load may be within 1-3% of nginx because proxysss ships many gateway policy surfaces that nginx commonly needs extra modules or config to match. Static-small, CDN hot-update, reverse proxy, and New API/SSE still run in the same wave and must remain above the soft floor (`MIN_RATIO=0.50`) with low errors; HTTPS static and static-large are reported but diagnostic by default unless a TLS/static or bulk-transfer release promotes them. Strict `>1.0` head-to-head gates can still be requested with explicit environment overrides.
+
+The hot path is intentionally simple but not one-size-fits-all: Rust async I/O, explicit TCP sockets with large backlog and `TCP_NODELAY`, default-on `runtime.performance` adaptive Linux tuning, Ubuntu 24.x extreme socket policy (`TCP_QUICKACK`, `TCP_NOTSENT_LOWAT`, `TCP_USER_TIMEOUT`) with logged downgrade on older or unknown distros, Linux plain-HTTP and TCP stream accept fanout through `SO_REUSEPORT`, HTTP/1 writev plus HTTP/2 adaptive-window server settings, tuned HTTP upstream keepalive pools, Linux builds using jemalloc for lower allocation overhead, hot static files served from a bounded cache that can hold mmap-backed `Bytes`, eligible plain-HTTP static files served through a traffic-profile-aware fast lane, raw plain-HTTP reverse/SSE/WebSocket lanes for simple no-policy routes, and transparent TCP forwarding with an isolated stream runtime plus independent relay profiles. `runtime.performance.traffic_profile` defaults to `small`, favoring cached small files, HTTP/2/SSE feedback latency, TCP/WebSocket long connections, and UDP/KCP-style realtime traffic; `bulk` moves static fast lanes toward sendfile/zero-copy large transfers; `balanced` enables both preload styles. Data-plane worker counts are not exposed as user knobs: Linux accept loops and runtime budgets derive from detected CPU cores so higher-core hosts automatically scale up and users cannot accidentally cap production throughput with a bad config value. The stream runtime receives an automatic CPU budget instead of taking every core, leaving HTTP/static/SSE capacity available during mixed gateway load. Shared hot-path pools avoid global mutex bottlenecks; raw HTTP upstream keepalive uses a lock-free bounded queue, while control-plane synchronization remains isolated to config reload, certificates, and one-time static-cache fill coordination. Config load preloads eligible static index/top-level hot files or sendfile descriptors according to `traffic_profile`. When performance mode is enabled, TCP listeners run on a dedicated `proxysss-stream` Tokio runtime with per-bind reuseport accept workers so long-lived game/MQTT/tool connections do not compete with HTTP/static/SSE workers. Single-upstream direct TCP routes with scripts, affinity, active health, and passive health disabled bypass the generic upstream planner entirely. TCP latency streams use 16KB relay buffers and parallel one-way pumps; explicit bulk/file stream protocols can use a Linux `splice` profile when zero-copy beats user-space copy. Raw reverse avoids `Uri` reparsing, byte-filters hop headers, skips redundant `Content-Length: 0`, and can coalesce response head plus small fixed bodies into one write; raw SSE uses connection-close byte passthrough after the response head to minimize first-token latency; raw WebSocket tunnels no-policy `ws://` routes before the general Hyper upgrade path. Route policy stays in native structures, optional TypeScript plugins stay outside ordinary gateway setup, logs are nonblocking, and watchdog metrics cover background loops. File watching is opt-in; the default reload model is manual `/v1/reload` or admin mutations that persist YAML and reload in process. Normal startup never writes host sysctl files; `proxysss tune linux --apply` uses guarded sysctl apply with unsupported-key filtering, SSH-safe scope, backup, and rollback unless `--unsafe-apply` is explicitly used. When active/passive upstream health is disabled, the single-upstream path skips runtime health bookkeeping. Add plugin hooks only where business behavior is needed.
 
 ### Protocol and gateway surface comparison
 
@@ -142,6 +132,9 @@ services:
       domains: [example.com, www.example.com]
       path_prefix: /
       upstream: http://127.0.0.1:9000
+      # Optional nginx-parity/high-throughput mode when you do not need
+      # X-Forwarded-* / Forwarded headers added by the gateway.
+      forward_headers: false
 ```
 
 MQTT TCP plus MQTT-over-WebSocket:
@@ -386,7 +379,7 @@ In that example:
 
 ## Example: AI API reverse proxy
 
-Use `services.ai_proxy` for New API, sub2api, and OpenAI-compatible upstreams when the gateway should own path rewrites and provider metadata without custom business code.
+Use `services.ai_proxy` for New API, sub2api, and OpenAI-compatible upstreams when the gateway should own path rewrites and optional provider metadata without custom business code.
 
 ```yaml
 services:
@@ -400,6 +393,7 @@ services:
         path_prefix: /v1
         upstream: http://127.0.0.1:3000
         rewrite_base_path: /v1
+        emit_metadata_headers: false
       - name: sub2api
         provider: sub2api
         match_host: sub2api.example.com
@@ -445,6 +439,13 @@ load_balance:
     udp_expect_response: true
 
 runtime:
+  performance:
+    enabled: true
+    profile: latency
+    traffic_profile: small
+    adaptive_system: true
+    socket_extreme: true
+    log_on_start: true
   watchdog:
     enabled: true
     restart_critical_tasks: true

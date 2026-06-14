@@ -32,6 +32,10 @@ pub struct AiProxyRouteConfig {
     pub add_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub strip_headers: Vec<String>,
+    #[serde(default = "default_true")]
+    pub forward_headers: bool,
+    #[serde(default = "default_true")]
+    pub emit_metadata_headers: bool,
 }
 
 impl Default for AiProxyConfig {
@@ -58,11 +62,7 @@ pub fn route_matches(route: &AiProxyRouteConfig, host: &str, path: &str) -> bool
     if !host_ok {
         return false;
     }
-    let prefix = normalize_prefix(&route.path_prefix);
-    if prefix == "/" {
-        return path.starts_with('/');
-    }
-    path == prefix || path.starts_with(&format!("{prefix}/"))
+    route_prefix_matches(&route.path_prefix, path)
 }
 
 pub fn build_route_decision(
@@ -72,16 +72,18 @@ pub fn build_route_decision(
 ) -> RouteDecision {
     let prefix = normalize_header_prefix(header_prefix);
     let mut set_headers = route.add_headers.clone();
-    set_headers.insert(format!("{prefix}ai-route"), route.name.clone());
-    set_headers.insert(
-        format!("{prefix}ai-provider"),
-        if route.provider.is_empty() {
-            route.name.clone()
-        } else {
-            route.provider.clone()
-        },
-    );
-    set_headers.insert(format!("{prefix}ai-original-path"), uri.path().to_string());
+    if route.emit_metadata_headers {
+        set_headers.insert(format!("{prefix}ai-route"), route.name.clone());
+        set_headers.insert(
+            format!("{prefix}ai-provider"),
+            if route.provider.is_empty() {
+                route.name.clone()
+            } else {
+                route.provider.clone()
+            },
+        );
+        set_headers.insert(format!("{prefix}ai-original-path"), uri.path().to_string());
+    }
 
     RouteDecision {
         upstream: route.upstream.clone(),
@@ -96,15 +98,41 @@ pub fn build_route_decision(
     }
 }
 
-fn normalize_prefix(prefix: &str) -> String {
-    let trimmed = prefix.trim();
-    if trimmed.is_empty() {
-        return "/".to_string();
+fn default_true() -> bool {
+    true
+}
+
+fn route_prefix_matches(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim().trim_end_matches('/');
+    if prefix.is_empty() {
+        return path.starts_with('/');
     }
-    if trimmed.starts_with('/') {
-        trimmed.trim_end_matches('/').to_string()
+
+    let suffix = if prefix.starts_with('/') {
+        path.strip_prefix(prefix)
     } else {
-        format!("/{}", trimmed.trim_end_matches('/'))
+        path.strip_prefix('/')
+            .and_then(|path_without_slash| path_without_slash.strip_prefix(prefix))
+    };
+
+    match suffix {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+fn route_prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    let prefix = prefix.trim().trim_end_matches('/');
+    if prefix.is_empty() {
+        return Some(path);
+    }
+
+    if prefix.starts_with('/') {
+        path.strip_prefix(prefix)
+    } else {
+        path.strip_prefix('/')
+            .and_then(|path_without_slash| path_without_slash.strip_prefix(prefix))
     }
 }
 
@@ -121,8 +149,7 @@ fn rewrite_path(route: &AiProxyRouteConfig, uri: &Uri) -> Option<String> {
     if rewrite_base.is_empty() {
         return None;
     }
-    let path_prefix = normalize_prefix(&route.path_prefix);
-    let suffix = uri.path().strip_prefix(&path_prefix).unwrap_or(uri.path());
+    let suffix = route_prefix_suffix(&route.path_prefix, uri.path()).unwrap_or(uri.path());
     let suffix = if suffix.is_empty() {
         "/"
     } else if suffix.starts_with('/') {
@@ -154,6 +181,8 @@ pub fn provider_presets() -> Vec<AiProxyRouteConfig> {
                 "new-api".to_string(),
             )]),
             strip_headers: Vec::new(),
+            forward_headers: true,
+            emit_metadata_headers: true,
         },
         AiProxyRouteConfig {
             name: "sub2api".to_string(),
@@ -167,6 +196,8 @@ pub fn provider_presets() -> Vec<AiProxyRouteConfig> {
                 "sub2api".to_string(),
             )]),
             strip_headers: Vec::new(),
+            forward_headers: true,
+            emit_metadata_headers: true,
         },
     ]
 }
@@ -199,5 +230,24 @@ mod tests {
                 .map(String::as_str),
             Some("sub2api")
         );
+    }
+
+    #[test]
+    fn metadata_headers_can_be_disabled_for_nginx_parity() {
+        let mut route = provider_presets()[0].clone();
+        route.emit_metadata_headers = false;
+        let uri: Uri = "/v1/chat/completions".parse().unwrap();
+
+        let decision = build_route_decision(&route, &uri, "proxysss-");
+
+        assert_eq!(
+            decision.rewrite_path.as_deref(),
+            Some("/v1/chat/completions")
+        );
+        assert!(!decision.set_headers.contains_key("proxysss-ai-provider"));
+        assert!(!decision.set_headers.contains_key("proxysss-ai-route"));
+        assert!(!decision
+            .set_headers
+            .contains_key("proxysss-ai-original-path"));
     }
 }

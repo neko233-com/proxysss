@@ -6,22 +6,33 @@ This checklist is for high-importance gateway deployments where correctness, lat
 
 Run these before promoting a build:
 
-```powershell
+```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --release
-.\scripts\benchmark-gateways.ps1 -Quick
 ```
 
-For a full HTTP parity baseline against nginx:
+Performance promotion is Linux-only because proxysss production deployments are Linux gateways. Windows/macOS benchmark scripts are development diagnostics and must not be used as nginx-replacement release evidence.
 
-```powershell
-.\scripts\benchmark-gateways.ps1 -Concurrency 1024 -DurationSecs 60
-.\scripts\benchmark-gate-check.ps1 -ResultsFile .benchmark\runs\latest\results.json
+Run the production nginx comparison matrix after Linux host tuning:
+
+```bash
+proxysss tune linux --apply
+scripts/benchmark-all-scenarios.sh
 ```
 
-The gate compares proxysss against nginx on the same static payload and fails when errors are nonzero or the configured ratio drops below `scripts/benchmark-baseline.json`.
+That default gate is mixed-load (`MIXED_MATRIX=1`, `FAST_GATE=0`, `CRITICAL_RATIO=0.97`, `AGGREGATE_RATIO=0.97`). nginx runs the full concurrent wave first, then proxysss runs the same full concurrent wave. The wave enables the realistic multi-service gateway shape at once: static small files, static large files, CDN hot-update static files, HTTPS static files, HTTP reverse proxying, New API/SSE streaming, WebSocket long connections, game-style long TCP connections, TCP stream proxying, UDP stream proxying, and KCP-style UDP. Concurrency is derived from detected CPU cores and weighted by traffic shape; operators should not hand-tune worker counts or per-scenario defaults for release evidence.
+
+The default critical gate is game/realtime oriented but fairness-adjusted: aggregate mixed load plus WebSocket long connections, game TCP, generic TCP, UDP, and KCP-style UDP default to a `0.97` proxysss/nginx ratio floor, not a blind `>1.0`. A 1-3% gap is acceptable because proxysss includes built-in gateway behavior that nginx commonly needs extra modules, directives, or policy paths to approximate; all functional checks and benchmark error budgets still must pass. Static-small, CDN hot-update, reverse proxy, and New API/SSE are part of the same wave and must stay above the soft floor (`MIN_RATIO=0.50`) with low errors. HTTPS small static and static-large remain in the same concurrent wave and report, but are diagnostic by default because TLS/static and large-file sendfile tuning can trade off against small-file/long-connection feedback. For a TLS/static or bulk-transfer release, add `https-static-small` or `static-large` to `CRITICAL_SCENARIOS` and set `runtime.performance.traffic_profile` to the profile under test. For strict head-to-head speed experiments, explicitly set `CRITICAL_RATIO=1.0` or higher and `AGGREGATE_RATIO=1.0` or higher.
+
+Use `QUICK=1` only when you need a shorter mixed smoke gate:
+
+```bash
+QUICK=1 scripts/benchmark-all-scenarios.sh
+```
+
+Single-scenario benchmark runs are root-cause diagnostics only. Do not promote a performance build because one isolated module beats nginx while the combined CDN/static/reverse-proxy/SSE/WebSocket/TCP/UDP gateway load does not. Results are written to `.benchmark/runs/all-scenarios/results.json`, `summary.md`, and `summary.html`; the default gate fails on unexpected errors, any default critical stream scenario below `CRITICAL_RATIO=0.97`, non-diagnostic scenarios below `MIN_RATIO`, or aggregate mixed-load ratio below `AGGREGATE_RATIO=0.97`.
 
 ## Protocol smoke baselines
 
@@ -63,6 +74,13 @@ load_balance:
     udp_expect_response: true
 
 runtime:
+  performance:
+    enabled: true
+    profile: edge
+    traffic_profile: small
+    adaptive_system: true
+    socket_extreme: true
+    log_on_start: true
   watchdog:
     enabled: true
     restart_critical_tasks: true
@@ -89,7 +107,10 @@ Use the built-in assistant first:
 
 ```bash
 proxysss tune tcp
+proxysss tune linux
 ```
+
+Normal gateway startup never writes host sysctl files. Use `proxysss tune linux --apply` only during a controlled maintenance window. The apply path is guarded by default: it does not mutate sshd, firewall, routes, or `rp_filter`; it filters unsupported sysctl keys, skips unavailable congestion controls, writes a backup of the previous proxysss sysctl profile, and restores that profile if `sysctl --system` fails. Reserve `--unsafe-apply` for disposable lab hosts.
 
 For large TCP/UDP/KCP fleets, verify these outside proxysss as part of host provisioning:
 
@@ -100,6 +121,8 @@ For large TCP/UDP/KCP fleets, verify these outside proxysss as part of host prov
 - conntrack limits when firewall/NAT is in the path
 - NIC queue, RSS, and CPU pinning on very high packet rates
 - MQTT broker connection/session limits and WebSocket idle timeout alignment
+
+For nginx-parity reverse proxy benchmarks or routes that do not need forwarding metadata, set `forward_headers: false` on `services.reverse_proxy.routes`, `services.domain_routes`, or `services.ai_proxy.routes`. The default remains `true` so upstream applications still receive `X-Forwarded-*` and `Forwarded` unless operators opt out.
 
 ## HA pattern
 

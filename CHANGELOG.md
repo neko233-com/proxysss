@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.0 - 2026-06-15
+
+- Added bounded lock-free buffer pooling (`ByteBufferPool`) for the hot-path raw HTTP/SSE relay and UDP association readers, cutting per-connection heap churn under very high concurrent socket counts while keeping resident pool memory bounded (no leak): surplus buffers are freed on return.
+- Added startup/reload self-optimization warm-up: hot static files are preloaded into the bounded fast-lane cache and reverse-proxy/AI-proxy upstream keepalive pools are pre-dialed before listeners begin serving, so the first live request never pays a cold connect. Warm-up reruns after every hot reload, and `/healthz` now reports a `warm` readiness flag.
+- Reduced UDP datagram loss for game/KCP/IoT traffic by enlarging UDP socket buffers (`SO_RCVBUF`/`SO_SNDBUF` plus privileged `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`) on both listener and upstream sockets under Linux performance mode.
+- Removed a redundant per-chunk copy in the streaming SSE relay and enlarged its read buffer for lower latency and overhead on long-lived event streams.
+- Added file-descriptor ceiling tuning (`fs.nr_open`, `fs.file-max`) to the Linux sysctl profile to support super-scale gateways targeting 100k–1M concurrent sockets, paired with a high systemd `LimitNOFILE`.
+
 ## v1.2.11 - 2026-06-12
 
 - Added production hardening for critical gateway operation: supervised runtime watchdog, watchdog heartbeat metrics, and critical task failure counters.

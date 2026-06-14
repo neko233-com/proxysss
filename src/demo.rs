@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Args, Subcommand};
+use futures::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -12,11 +13,13 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum DemoCommand {
     HttpEcho(HttpEchoArgs),
+    WsEcho(WsEchoArgs),
     TcpEcho(TcpEchoArgs),
     UdpEcho(UdpEchoArgs),
 }
@@ -24,6 +27,12 @@ pub enum DemoCommand {
 #[derive(Args, Debug, Clone)]
 pub struct HttpEchoArgs {
     #[arg(long, default_value = "127.0.0.1:8081")]
+    pub listen: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WsEchoArgs {
+    #[arg(long, default_value = "127.0.0.1:8082")]
     pub listen: String,
 }
 
@@ -42,6 +51,7 @@ pub struct UdpEchoArgs {
 pub async fn run(command: DemoCommand) -> Result<()> {
     match command {
         DemoCommand::HttpEcho(args) => run_http_echo(args).await,
+        DemoCommand::WsEcho(args) => run_ws_echo(args).await,
         DemoCommand::TcpEcho(args) => run_tcp_echo(args).await,
         DemoCommand::UdpEcho(args) => run_udp_echo(args).await,
     }
@@ -101,6 +111,52 @@ async fn run_http_echo(args: HttpEchoArgs) -> Result<()> {
                 .await
             {
                 tracing::warn!(?error, %remote_addr, "http echo connection failed");
+            }
+        });
+    }
+}
+
+async fn run_ws_echo(args: WsEchoArgs) -> Result<()> {
+    let listener = TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("failed to bind websocket echo listener {}", args.listen))?;
+
+    tracing::info!(bind = %args.listen, "websocket echo demo ready");
+
+    loop {
+        let (stream, remote_addr) = listener.accept().await.context("websocket accept failed")?;
+        tokio::spawn(async move {
+            let Ok(mut websocket) = accept_async(stream).await else {
+                tracing::warn!(%remote_addr, "websocket handshake failed");
+                return;
+            };
+            while let Some(message) = websocket.next().await {
+                match message {
+                    Ok(Message::Binary(bytes)) => {
+                        if websocket.send(Message::Binary(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Text(text)) => {
+                        if websocket.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Ping(bytes)) => {
+                        if websocket.send(Message::Pong(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(frame)) => {
+                        let _ = websocket.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, %remote_addr, "websocket echo read failed");
+                        break;
+                    }
+                }
             }
         });
     }
