@@ -582,11 +582,11 @@ proxysss token show
 如果你刚跑起来：
 
 - 先读 `README.md`
-- 再看 `docs/index.html`
+- 再看 `docs/ARCHITECTURE.md`
 - 然后按本文档的场景段落复制配置
 
 如果你已经在做正式网关：
 
-- 去看 `docs/architecture.html`
+- 去看 `docs/ARCHITECTURE.md`
 - 去看 `nginx-to-proxysss.md`
 - 做 Linux 调优和 mixed-load benchmark

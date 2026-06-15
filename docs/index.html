@@ -252,7 +252,7 @@
     .recipes,
     .links {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      grid-template-columns: 1fr;
       gap: 18px;
     }
 
@@ -693,40 +693,35 @@ proxysss token show</code></pre>
           </div>
 
           <div class="links">
-            <a class="link-card" href="CONFIGURATION.md">
+            <a class="link-card" href="configuration.html">
               <span class="tag beginner">配置总览</span>
-              <h3>CONFIGURATION.md</h3>
-              <p class="subtle">完整配置指南，带可复制 YAML、字段解释、常见误区和性能注意事项。</p>
+              <h3>配置指南</h3>
+              <p class="subtle">给人看的配置页。先讲场景和落地路径，再讲该选哪一个配置面。</p>
             </a>
             <a class="link-card" href="architecture.html">
               <span class="tag expert">架构视图</span>
               <h3>architecture.html</h3>
               <p class="subtle">看清 listener、route、热重载、扩展脚本和数据路径边界。</p>
             </a>
-            <a class="link-card" href="../nginx-to-proxysss.md">
-              <span class="tag expert">迁移</span>
-              <h3>nginx-to-proxysss.md</h3>
-              <p class="subtle">面向已有 nginx 经验用户的配置迁移对照。</p>
-            </a>
             <a class="link-card" href="nginx-to-proxysss.html">
               <span class="tag expert">迁移子页</span>
               <h3>nginx -> proxysss</h3>
               <p class="subtle">独立 HTML 迁移页。先看场景映射，再看高级网关能力和 mixed-load 验证节奏。</p>
-            </a>
-            <a class="link-card" href="../caddy-to-proxysss.md">
-              <span class="tag expert">迁移</span>
-              <h3>caddy-to-proxysss.md</h3>
-              <p class="subtle">面向 Caddy 用户的迁移说明，强调从站点代理走向完整网关能力面。</p>
             </a>
             <a class="link-card" href="caddy-to-proxysss.html">
               <span class="tag expert">迁移子页</span>
               <h3>caddy -> proxysss</h3>
               <p class="subtle">独立 HTML 迁移页。适合先抄配置，再理解 `reverse_proxy`、`static_sites`、`ai_proxy`、`tcp/udp` 的分层。</p>
             </a>
-            <a class="link-card" href="../ts-how-to-use.md">
+            <a class="link-card" href="ts-how-to-use.html">
               <span class="tag expert">脚本扩展</span>
-              <h3>ts-how-to-use.md</h3>
-              <p class="subtle">当原生配置面不够时，再进入 TypeScript 扩展，不要反过来。</p>
+              <h3>TypeScript 扩展</h3>
+              <p class="subtle">给人看的脚本扩展页。先判断该不该写 TS，再看 hook、返回值和边界。</p>
+            </a>
+            <a class="link-card" href="benchmark-linux.html">
+              <span class="tag expert">Linux benchmark</span>
+              <h3>Linux benchmark</h3>
+              <p class="subtle">最新官方 Linux quick benchmark 的人类可读页，同时明确 mixed-load 才是正式性能发布口径。</p>
             </a>
           </div>
         </section>

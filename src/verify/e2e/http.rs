@@ -68,6 +68,79 @@ services:
 }
 
 #[tokio::test]
+async fn integration_e2e_http_reverse_proxy_plain_fast_lane_keeps_forwarding_headers() -> Result<()>
+{
+    let root = temp_root("proxysss-e2e-http-forwarding");
+    let upstream_port = reserve_port().await?;
+    let gateway_port = reserve_port().await?;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config_path = write_config(
+        &root,
+        &format!(
+            r#"config_version: 1
+logging:
+  access_log: false
+http:
+  plain_bind: 127.0.0.1:{gateway_port}
+  tls_bind: ''
+  h3_bind: ''
+script:
+  enabled: false
+plugins:
+  enabled: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: false
+services:
+  reverse_proxy:
+    routes:
+      - name: integration-e2e-forward
+        path_prefix: /proxy
+        strip_prefix: true
+        upstream: http://127.0.0.1:{upstream_port}
+"#
+        ),
+    )?;
+    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+
+    let url = format!("http://127.0.0.1:{gateway_port}/proxy/ping");
+    wait_http_ok(&url).await?;
+
+    let payload: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("x-forwarded-for", "198.51.100.10")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(payload["path"], "/ping");
+    assert_eq!(payload["x_real_ip"], "127.0.0.1");
+    assert_eq!(
+        payload["x_forwarded_for"],
+        serde_json::Value::String("198.51.100.10, 127.0.0.1".to_string())
+    );
+    assert_eq!(
+        payload["x_forwarded_host"],
+        serde_json::Value::String(format!("127.0.0.1:{gateway_port}"))
+    );
+    assert_eq!(payload["x_forwarded_proto"], "http");
+    assert!(payload["forwarded"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("for=127.0.0.1"));
+
+    cleanup(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_e2e_ai_proxy_streams_sse_without_buffering() -> Result<()> {
     let root = temp_root("proxysss-e2e-ai-sse");
     let upstream_port = reserve_port().await?;
@@ -143,5 +216,146 @@ fn integration_e2e_http3_bind_is_validated() -> Result<()> {
     config.http.tls_bind = "127.0.0.1:443".to_string();
     config.http.tls.mode = TlsMode::SelfSigned;
     config.validate()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_e2e_ai_proxy_raw_sse_fast_lane_keeps_forwarding_and_metadata_headers(
+) -> Result<()> {
+    let root = temp_root("proxysss-e2e-ai-sse-headers");
+    let upstream_port = reserve_port().await?;
+    let gateway_port = reserve_port().await?;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config_path = write_config(
+        &root,
+        &format!(
+            r#"config_version: 1
+logging:
+  access_log: false
+http:
+  plain_bind: 127.0.0.1:{gateway_port}
+  tls_bind: ''
+  h3_bind: ''
+script:
+  enabled: false
+plugins:
+  enabled: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: false
+services:
+  ai_proxy:
+    enabled: true
+    routes:
+      - name: new-api-stream
+        provider: new-api
+        match_host: ai.local
+        path_prefix: /v1
+        upstream: http://127.0.0.1:{upstream_port}
+        rewrite_base_path: /v1
+"#
+        ),
+    )?;
+    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+
+    let url = format!("http://127.0.0.1:{gateway_port}/v1/chat/completions");
+    let payload: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .header("host", "ai.local")
+        .header("accept", "text/event-stream")
+        .header("x-forwarded-for", "198.51.100.55")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(payload["path"], "/v1/chat/completions");
+    assert_eq!(payload["ai_route"], "new-api-stream");
+    assert_eq!(payload["ai_provider"], "new-api");
+    assert_eq!(payload["ai_original_path"], "/v1/chat/completions");
+    assert_eq!(payload["x_real_ip"], "127.0.0.1");
+    assert_eq!(
+        payload["x_forwarded_for"],
+        serde_json::Value::String("198.51.100.55, 127.0.0.1".to_string())
+    );
+    assert_eq!(payload["x_forwarded_host"], "ai.local");
+    assert_eq!(payload["x_forwarded_proto"], "http");
+
+    cleanup(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_e2e_https_http2_reverse_proxy_roundtrip() -> Result<()> {
+    let root = temp_root("proxysss-e2e-https-h2");
+    let upstream_port = reserve_port().await?;
+    let gateway_port = reserve_port().await?;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cert_path = root.join("proxysss-test.crt");
+    let key_path = root.join("proxysss-test.key");
+    let cert_path = cert_path.display().to_string().replace('\\', "/");
+    let key_path = key_path.display().to_string().replace('\\', "/");
+
+    let config_path = write_config(
+        &root,
+        &format!(
+            r#"config_version: 1
+logging:
+  access_log: false
+http:
+  plain_bind: ''
+  tls_bind: 127.0.0.1:{gateway_port}
+  h3_bind: ''
+  tls:
+    mode: self_signed
+    generate_self_signed_if_missing: true
+    cert_path: '{cert_path}'
+    key_path: '{key_path}'
+    server_name: localhost
+script:
+  enabled: false
+plugins:
+  enabled: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: false
+services:
+  reverse_proxy:
+    routes:
+      - name: integration-e2e-h2
+        path_prefix: /proxy
+        strip_prefix: true
+        upstream: http://127.0.0.1:{upstream_port}
+"#
+        ),
+    )?;
+    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+
+    let url = format!("https://127.0.0.1:{gateway_port}/proxy/ping");
+    let response = reqwest::Client::builder()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(true)
+        .build()?
+        .get(&url)
+        .send()
+        .await?;
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["path"], "/ping");
+    assert_eq!(payload["x_forwarded_proto"], "https");
+
+    cleanup(&root);
     Ok(())
 }

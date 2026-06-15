@@ -132,6 +132,46 @@ pub async fn spawn_json_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> 
                         .get("content-type")
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_string);
+                    let x_real_ip = request
+                        .headers()
+                        .get("x-real-ip")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let x_forwarded_for = request
+                        .headers()
+                        .get("x-forwarded-for")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let x_forwarded_host = request
+                        .headers()
+                        .get("x-forwarded-host")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let x_forwarded_proto = request
+                        .headers()
+                        .get("x-forwarded-proto")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let forwarded = request
+                        .headers()
+                        .get("forwarded")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let ai_route = request
+                        .headers()
+                        .get("proxysss-ai-route")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let ai_provider = request
+                        .headers()
+                        .get("proxysss-ai-provider")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let ai_original_path = request
+                        .headers()
+                        .get("proxysss-ai-original-path")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
                     let body = request
                         .into_body()
                         .collect()
@@ -144,6 +184,14 @@ pub async fn spawn_json_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> 
                         "path": path,
                         "host": host,
                         "content_type": content_type,
+                        "x_real_ip": x_real_ip,
+                        "x_forwarded_for": x_forwarded_for,
+                        "x_forwarded_host": x_forwarded_host,
+                        "x_forwarded_proto": x_forwarded_proto,
+                        "forwarded": forwarded,
+                        "ai_route": ai_route,
+                        "ai_provider": ai_provider,
+                        "ai_original_path": ai_original_path,
                         "body_len": body.len(),
                     });
                     Ok::<_, hyper::Error>(

@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>proxysss TypeScript</title>
+  <style>
+    :root {
+      --bg: #f5efe6;
+      --paper: rgba(255, 252, 247, 0.92);
+      --paper-strong: #fffdf8;
+      --ink: #0f172a;
+      --muted: #526071;
+      --line: rgba(15, 23, 42, 0.12);
+      --accent: #ff6b35;
+      --accent-soft: rgba(255, 107, 53, 0.14);
+      --teal: #0f766e;
+      --teal-soft: rgba(15, 118, 110, 0.14);
+      --slate-soft: rgba(15, 23, 42, 0.05);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --max: 1240px;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      line-height: 1.65;
+      background:
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 32%),
+        linear-gradient(180deg, #f7f2ea 0%, #f3eadf 48%, #efe6d9 100%);
+    }
+
+    a { color: inherit; text-decoration: none; }
+
+    .shell {
+      width: min(calc(100% - 32px), var(--max));
+      margin: 0 auto;
+      padding: 24px 0 64px;
+    }
+
+    .topbar,
+    .hero,
+    .panel,
+    .card {
+      background: var(--paper);
+      border: 1px solid rgba(255, 255, 255, 0.78);
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+      border-radius: var(--radius-lg);
+    }
+
+    .topbar {
+      position: sticky;
+      top: 12px;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 14px 18px;
+      margin-bottom: 18px;
+      backdrop-filter: blur(16px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .logo {
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--teal), #62d5c8);
+      box-shadow: 0 14px 28px rgba(15, 118, 110, 0.24);
+      position: relative;
+      flex: 0 0 auto;
+    }
+
+    .logo::after {
+      content: "";
+      position: absolute;
+      inset: 8px;
+      border-radius: 9px;
+      border: 2px solid rgba(255, 255, 255, 0.76);
+    }
+
+    .brand strong {
+      display: block;
+      font-size: 15px;
+    }
+
+    .brand span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .nav a {
+      padding: 9px 11px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      background: var(--slate-soft);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 34px;
+      margin-bottom: 24px;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -90px;
+      bottom: -100px;
+      width: 300px;
+      height: 300px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(15, 118, 110, 0.24), transparent 64%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 18px 0 12px;
+      max-width: 920px;
+      font-size: clamp(38px, 7vw, 68px);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 820px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    .hero-actions a {
+      padding: 12px 16px;
+      border-radius: 14px;
+      font-weight: 700;
+    }
+
+    .hero-actions .warm { background: var(--accent-soft); color: #a53d18; }
+    .hero-actions .cool { background: var(--teal-soft); color: var(--teal); }
+    .hero-actions .dark { background: var(--ink); color: #fff; }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .meta-item {
+      padding: 16px 18px;
+      background: rgba(255, 255, 255, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.76);
+      border-radius: var(--radius-lg);
+    }
+
+    .meta-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .meta-value {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 92px;
+      padding: 22px;
+    }
+
+    .sidebar h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+    }
+
+    .sidebar-links {
+      display: grid;
+      gap: 10px;
+    }
+
+    .sidebar-links a {
+      padding: 10px 12px;
+      border-radius: 14px;
+      color: var(--muted);
+      background: var(--slate-soft);
+      font-weight: 600;
+    }
+
+    .content {
+      display: grid;
+      gap: 24px;
+    }
+
+    .panel {
+      padding: 28px;
+    }
+
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .kicker {
+      color: var(--teal);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 34px);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }
+
+    h3 {
+      margin: 14px 0 10px;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    .subtle {
+      color: var(--muted);
+      max-width: 760px;
+      margin: 0;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 18px;
+    }
+
+    .card {
+      padding: 22px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .tag.beginner { background: var(--accent-soft); color: #a53d18; }
+    .tag.expert { background: var(--teal-soft); color: var(--teal); }
+
+    ul,
+    ol {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    li + li {
+      margin-top: 8px;
+    }
+
+    pre {
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      overflow: auto;
+      background: #111827;
+      color: #e5eef9;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font: 13px/1.55 var(--mono);
+    }
+
+    code { font-family: var(--mono); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 18px;
+      overflow: hidden;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--paper-strong);
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.04);
+    }
+
+    .footer {
+      margin-top: 26px;
+      padding: 22px 24px;
+      border-radius: var(--radius-lg);
+      background: rgba(15, 23, 42, 0.94);
+      color: rgba(255, 255, 255, 0.82);
+    }
+
+    .footer strong { color: #fff; }
+
+    @media (max-width: 1040px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+    }
+
+    @media (max-width: 720px) {
+      .shell { width: min(calc(100% - 20px), var(--max)); }
+      .topbar,
+      .hero,
+      .panel,
+      .sidebar,
+      .card { padding: 20px; }
+      h1 { font-size: 40px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <strong>proxysss TypeScript</strong>
+          <span>脚本是扩展层，不是基础配置面的替身</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="index.html">Docs 首页</a>
+        <a href="configuration.html">配置指南</a>
+        <a href="architecture.html">架构视图</a>
+        <a href="#hooks">常用 hook</a>
+      </nav>
+    </div>
+
+    <header class="hero">
+      <div class="eyebrow">typescript / extension layer</div>
+      <h1>先判断你该不该写 TS，再决定写哪一个 hook。</h1>
+      <p>proxysss 的 TypeScript 运行时是内嵌 QuickJS，不依赖 node、deno 或 tsc。它的目标是给你业务感知、亲和选路、实验逻辑和插件扩展点，而不是替代 YAML 主配置面。</p>
+      <div class="hero-actions">
+        <a class="dark" href="#when">先判断该不该写脚本</a>
+        <a class="warm" href="#setup">先搭最小脚本</a>
+        <a class="cool" href="#hooks">直接看 hook</a>
+      </div>
+      <div class="meta">
+        <div class="meta-item">
+          <div class="meta-label">Runtime</div>
+          <div class="meta-value">Embedded QuickJS</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Type Support</div>
+          <div class="meta-value">proxysss-script.d.ts</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Default Use</div>
+          <div class="meta-value">Optional extensions</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Not Included</div>
+          <div class="meta-value">Node / Deno / tsc</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar panel">
+        <h2>本页导航</h2>
+        <div class="sidebar-links">
+          <a href="#when">什么时候该写 TS</a>
+          <a href="#setup">最小接入</a>
+          <a href="#hooks">常用 hook</a>
+          <a href="#fields">常用字段</a>
+          <a href="#returns">返回值</a>
+          <a href="#mistakes">常见误区</a>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section id="when" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">First decision</div>
+              <h2>先判断这件事该不该交给脚本。</h2>
+            </div>
+            <p class="subtle">如果规则脱离业务上下文后仍然成立，它大概率应该写在 YAML；只有业务感知、租户感知、player_id 感知和特殊上游选择，才适合进入 TS。</p>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>优先用 YAML</th>
+                <th>适合用 TS</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>固定 host/path 反代、静态文件、WebDAV、FTP、TCP、UDP、TLS、健康检查、缓存、限流、访问控制。</td>
+                <td>业务相关 header 注入、player_id / tenant / device 维度选路、亲和路由、灰度、实验逻辑、特殊 API 兼容层。</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="setup" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Setup</div>
+              <h2>最小可用脚本应该足够小，先验证加载链路。</h2>
+            </div>
+            <p class="subtle">推荐布局是 `gateway.ts` 作为主入口，`plugins/*.ts` 放可选插件，`proxysss-script.d.ts` 提供类型提示。</p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="tag beginner">文件布局</span>
+              <pre><code>gateway.ts
+plugins/
+  player-affinity.ts
+  traffic-stats.ts
+proxysss-script.d.ts</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">类型声明</span>
+              <pre><code>/// &lt;reference path="./proxysss-script.d.ts" /&gt;</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">第一个最小插件</span>
+              <pre><code>/// &lt;reference path="./proxysss-script.d.ts" /&gt;
+
+const plugin: ProxysssPlugin = {
+  name: "gateway",
+  priority: -1000000,
+  enabled: true,
+
+  access(message, current) {
+    if (message.ctx.path === "/healthz") {
+      return { upstream: "proxysss://healthz" };
+    }
+    return current;
+  },
+};
+
+export default plugin;</code></pre>
+            </article>
+          </div>
+        </section>
+
+        <section id="hooks" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Hooks</div>
+              <h2>最常用的几个 hook，一次把职责边界讲清。</h2>
+            </div>
+            <p class="subtle">hook 应该保持同步、快速、可解释。它是扩展点，不是长期业务 worker。</p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="tag expert">HTTP 路由阶段</span>
+              <h3>`access`</h3>
+              <p class="subtle">适合 host/path 级决策，比如动态改写 path、插 header，或者把很少量特殊 path 重定向到内建上游。</p>
+              <pre><code>access(message, current) {
+  if (message.ctx.host === "api.example.com" &&
+      message.ctx.path.startsWith("/tenant-a/")) {
+    return {
+      ...current,
+      rewrite_path: message.ctx.path.replace("/tenant-a", "/api"),
+      set_headers: {
+        "x-tenant-id": "tenant-a",
+      },
+    };
+  }
+  return current;
+}</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag expert">上游选择阶段</span>
+              <h3>`balancer`</h3>
+              <p class="subtle">路由已经命中，只想改上游选择或追加 header 时最合适，典型是灰度、亲和和流量打标。</p>
+              <pre><code>balancer(message, current) {
+  const user = message.ctx.headers["x-user-id"];
+  if (user && Number(user) % 10 === 0) {
+    return {
+      ...current,
+      upstream: "http://10.0.0.12:8080",
+      set_headers: {
+        "x-release-bucket": "canary",
+      },
+    };
+  }
+  return current;
+}</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag expert">TCP / UDP 预读</span>
+              <h3>`preread`</h3>
+              <p class="subtle">适合根据 listener、player_id、首包预览做非 HTTP 流量落点选择，比如游戏分区和设备亲和。</p>
+              <pre><code>preread(message, current) {
+  if (message.listener === "game-tcp" && message.ctx.player_id) {
+    const shard = Number(message.ctx.player_id) % 2;
+    return {
+      ...current,
+      upstream: shard === 0 ? "10.0.1.10:7000" : "10.0.1.11:7000",
+    };
+  }
+  return current;
+}</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag expert">观测</span>
+              <h3>`log`、`init_worker`、`onDispose`</h3>
+              <p class="subtle">`log` 适合观测和统计；`init_worker` 适合初始化插件状态；`onDispose` 适合卸载或热重载时清理资源。它们都不适合做慢操作。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="fields" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Fields</div>
+              <h2>最常用字段不要拍脑袋猜，先对照类型声明。</h2>
+            </div>
+            <p class="subtle">HTTP 和流式 listener 的字段不同。想用哪个字段，先对照 `proxysss-script.d.ts`，不要发明不存在的属性名。</p>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>HTTP</th>
+                <th>TCP / UDP</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>`message.ctx.host`、`method`、`path`、`query`、`remote_addr`、`player_id`、`headers`</td>
+                <td>`message.listener`、`message.ctx.protocol`、`remote_addr`、`player_id`、`first_packet_preview`、`payload_len`</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="returns" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Return values</div>
+              <h2>返回值的理解顺序：先 upstream，再 path，再 header。</h2>
+            </div>
+            <p class="subtle">最常见的写法是覆盖 `upstream`，其次是 `rewrite_path`，最后才是 `set_headers` / `strip_headers` 这类附加动作。</p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="tag beginner">最小可用</span>
+              <pre><code>return { upstream: "http://127.0.0.1:8080" };</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">带 upstream pool</span>
+              <pre><code>return {
+  upstream: "http://127.0.0.1:8080",
+  upstreams: [
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8081",
+  ],
+};</code></pre>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">带 path 和 header 改写</span>
+              <pre><code>return {
+  upstream: "http://127.0.0.1:9000",
+  rewrite_path: "/internal/api",
+  set_headers: {
+    "x-proxysss-plugin": "custom-business-route",
+    "x-tenant-id": "tenant-a",
+  },
+  strip_headers: ["x-remove-me"],
+};</code></pre>
+            </article>
+          </div>
+        </section>
+
+        <section id="mistakes" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Mistakes</div>
+              <h2>写 TS 时最容易走歪的四个方向</h2>
+            </div>
+            <p class="subtle">这些错误的共同点是：把脚本当成主配置面、把 QuickJS 当 Node、把 hook 当 worker。</p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="tag beginner">误区 1</span>
+              <h3>把普通反向代理全搬进 TS</h3>
+              <p class="subtle">YAML 更稳定、更快，也更容易给团队和 agent 看懂。普通网关规则优先留在 YAML。</p>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">误区 2</span>
+              <h3>把 QuickJS 当 Node.js</h3>
+              <p class="subtle">不要假设有 `fetch`、`fs`、`process` 或 `node:*` 模块。这是内嵌 QuickJS，不是 Node 运行时。</p>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">误区 3</span>
+              <h3>在 hook 里做重逻辑或慢逻辑</h3>
+              <p class="subtle">hook 必须保持同步和快速。慢逻辑会直接伤害热路径和可预测性。</p>
+            </article>
+
+            <article class="card">
+              <span class="tag beginner">误区 4</span>
+              <h3>用脚本掩盖配置面缺口</h3>
+              <p class="subtle">如果某个能力应该是通用网关能力，就应该推动 YAML / Rust 本体，而不是长期用脚本打补丁。</p>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <footer class="footer">
+      <strong>文档分工写清楚：</strong> 这页负责给人讲清脚本扩展边界；仓库里另有面向 agent、检索和差异跟踪的机器文档入口。
+    </footer>
+  </div>
+</body>
+</html>

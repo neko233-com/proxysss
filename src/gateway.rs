@@ -266,8 +266,8 @@ const HTTP2_CONNECTION_WINDOW_SIZE_BYTES: u32 = 16 * 1024 * 1024;
 const HTTP2_MAX_SEND_BUF_BYTES: usize = 4 * 1024 * 1024;
 const HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 15;
 const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 20;
-const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 512;
-const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 32 * 1024;
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
+const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 64 * 1024;
 
 static RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 static UDP_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
@@ -6720,7 +6720,7 @@ impl Gateway {
         config: &GatewayConfig,
         downstream: &mut TcpStream,
         request: &PlainFastLaneRequest,
-        _remote_addr: SocketAddr,
+        remote_addr: SocketAddr,
     ) -> Result<bool> {
         if !request.accepts_sse {
             return Ok(false);
@@ -6755,13 +6755,52 @@ impl Gateway {
         })?;
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_gateway(&upstream_io);
-        let request_bytes = serialize_raw_fast_lane_request(
-            request,
-            path_and_query,
-            host,
-            None,
-            route.forward_headers,
-        );
+        let request_bytes = if route.emit_metadata_headers {
+            let prefix = config
+                .services
+                .ai_proxy
+                .header_prefix
+                .trim()
+                .trim_start_matches('/');
+            let ai_route_header = format!("{prefix}ai-route");
+            let ai_provider_header = format!("{prefix}ai-provider");
+            let ai_original_path_header = format!("{prefix}ai-original-path");
+            let provider = if route.provider.trim().is_empty() {
+                route.name.as_str()
+            } else {
+                route.provider.as_str()
+            };
+            let extra_headers = [
+                (ai_route_header.as_str(), route.name.as_str()),
+                (ai_provider_header.as_str(), provider),
+                (ai_original_path_header.as_str(), request.path.as_str()),
+            ];
+            serialize_raw_fast_lane_request(
+                request,
+                path_and_query,
+                host,
+                RawFastLaneSerializeOptions {
+                    connection: None,
+                    remote_addr,
+                    scheme: "http",
+                    forward_headers: route.forward_headers,
+                    extra_headers: &extra_headers,
+                },
+            )
+        } else {
+            serialize_raw_fast_lane_request(
+                request,
+                path_and_query,
+                host,
+                RawFastLaneSerializeOptions {
+                    connection: None,
+                    remote_addr,
+                    scheme: "http",
+                    forward_headers: route.forward_headers,
+                    extra_headers: &[],
+                },
+            )
+        };
         upstream_io
             .write_all(&request_bytes)
             .await
@@ -6856,7 +6895,7 @@ impl Gateway {
         config: &GatewayConfig,
         downstream: &mut TcpStream,
         request: &PlainFastLaneRequest,
-        _remote_addr: SocketAddr,
+        remote_addr: SocketAddr,
         lane_upstream: &mut Option<RawReverseLaneUpstream>,
     ) -> Result<bool> {
         let host = request.host.as_deref().unwrap_or("localhost");
@@ -6903,8 +6942,13 @@ impl Gateway {
             request,
             path_and_query.as_ref(),
             host,
-            None,
-            route.forward_headers,
+            RawFastLaneSerializeOptions {
+                connection: None,
+                remote_addr,
+                scheme: "http",
+                forward_headers: route.forward_headers,
+                extra_headers: &[],
+            },
         );
         upstream_io
             .write_all(&request_bytes)
@@ -8888,11 +8932,21 @@ struct StaticFastPathCandidate {
     sendfile: Option<Arc<std::fs::File>>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RawForwardingHeaderSnapshot {
+    x_real_ip: Option<String>,
+    x_forwarded_for: Option<String>,
+    x_forwarded_host: Option<String>,
+    x_forwarded_proto: Option<String>,
+    forwarded: Option<String>,
+}
+
 struct PlainFastLaneRequest {
     method: Method,
     target: String,
     path: String,
     forward_header_bytes: Vec<u8>,
+    forwarding_headers: RawForwardingHeaderSnapshot,
     accepts_sse: bool,
     host: Option<String>,
     keep_alive: bool,
@@ -9047,6 +9101,7 @@ fn parse_plain_fast_lane_request(buffer: &[u8]) -> Option<PlainFastLaneRequest> 
         .map(|(path, _)| path)
         .unwrap_or(target);
     let mut forward_header_bytes = Vec::with_capacity(head_end.min(1024));
+    let mut forwarding_headers = RawForwardingHeaderSnapshot::default();
     let mut accepts_sse = false;
     let mut host = None;
     let mut connection_close = false;
@@ -9078,6 +9133,9 @@ fn parse_plain_fast_lane_request(buffer: &[u8]) -> Option<PlainFastLaneRequest> 
                 }
             }
         }
+        if capture_forwarding_header_snapshot(&mut forwarding_headers, name, value) {
+            continue;
+        }
         if !is_hop_header(name)
             && !name.eq_ignore_ascii_case("host")
             && !name.eq_ignore_ascii_case("content-length")
@@ -9099,11 +9157,55 @@ fn parse_plain_fast_lane_request(buffer: &[u8]) -> Option<PlainFastLaneRequest> 
         target: target.to_string(),
         path: path.to_string(),
         forward_header_bytes,
+        forwarding_headers,
         accepts_sse,
         host,
         keep_alive,
         head_len: head_end + 4,
     })
+}
+
+fn capture_forwarding_header_snapshot(
+    snapshot: &mut RawForwardingHeaderSnapshot,
+    name: &str,
+    value: &str,
+) -> bool {
+    let trimmed = value.trim();
+    if name.eq_ignore_ascii_case("x-real-ip") {
+        snapshot.x_real_ip = Some(trimmed.to_string());
+        return true;
+    }
+    if name.eq_ignore_ascii_case("x-forwarded-for") {
+        merge_csv_header_value(&mut snapshot.x_forwarded_for, trimmed);
+        return true;
+    }
+    if name.eq_ignore_ascii_case("x-forwarded-host") {
+        snapshot.x_forwarded_host = Some(trimmed.to_string());
+        return true;
+    }
+    if name.eq_ignore_ascii_case("x-forwarded-proto") {
+        snapshot.x_forwarded_proto = Some(trimmed.to_string());
+        return true;
+    }
+    if name.eq_ignore_ascii_case("forwarded") {
+        merge_csv_header_value(&mut snapshot.forwarded, trimmed);
+        return true;
+    }
+    false
+}
+
+fn merge_csv_header_value(slot: &mut Option<String>, next: &str) {
+    if next.is_empty() {
+        return;
+    }
+    match slot {
+        Some(existing) if !existing.trim().is_empty() => {
+            existing.push_str(", ");
+            existing.push_str(next);
+        }
+        Some(existing) => *existing = next.to_string(),
+        None => *slot = Some(next.to_string()),
+    }
 }
 
 fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSocketFastLaneRequest> {
@@ -12079,17 +12181,32 @@ fn apply_forwarding_headers(
 }
 
 fn append_csv_header(existing: Option<&HeaderValue>, next: &str) -> String {
-    match existing
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-    {
+    append_csv_header_value(existing.and_then(|value| value.to_str().ok()), next)
+}
+
+fn append_forwarded_header(
+    existing: Option<&HeaderValue>,
+    remote_ip: &str,
+    host: &str,
+    scheme: &str,
+) -> String {
+    append_forwarded_header_value(
+        existing.and_then(|value| value.to_str().ok()),
+        remote_ip,
+        host,
+        scheme,
+    )
+}
+
+fn append_csv_header_value(existing: Option<&str>, next: &str) -> String {
+    match existing.map(str::trim) {
         Some(value) if !value.is_empty() => format!("{value}, {next}"),
         _ => next.to_string(),
     }
 }
 
-fn append_forwarded_header(
-    existing: Option<&HeaderValue>,
+fn append_forwarded_header_value(
+    existing: Option<&str>,
     remote_ip: &str,
     host: &str,
     scheme: &str,
@@ -12100,10 +12217,7 @@ fn append_forwarded_header(
         forwarded_for_value(remote_ip),
         safe_host
     );
-    match existing
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-    {
+    match existing.map(str::trim) {
         Some(value) if !value.is_empty() => format!("{value}, {next}"),
         _ => next,
     }
@@ -13998,7 +14112,6 @@ fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bo
         && route.upstream_weights.is_empty()
         && route.set_headers.is_empty()
         && route.strip_headers.is_empty()
-        && !route.forward_headers
         && !route.compression.enabled
         && !route.cache.enabled
         && !route.rate_limit.enabled
@@ -14010,10 +14123,7 @@ fn websocket_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
 }
 
 fn ai_proxy_route_fast_path_eligible(route: &crate::ai_proxy::AiProxyRouteConfig) -> bool {
-    route.add_headers.is_empty()
-        && route.strip_headers.is_empty()
-        && !route.forward_headers
-        && !route.emit_metadata_headers
+    route.add_headers.is_empty() && route.strip_headers.is_empty()
 }
 
 fn reverse_proxy_rewrite_path(route: &ReverseProxyRouteConfig, uri: &Uri) -> Option<String> {
@@ -19067,28 +19177,107 @@ fn serialize_raw_fast_lane_request(
     request: &PlainFastLaneRequest,
     path_and_query: &str,
     host: &str,
-    connection: Option<&str>,
-    forward_headers: bool,
+    options: RawFastLaneSerializeOptions<'_>,
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(128 + request.forward_header_bytes.len());
+    let extra_headers_bytes = options
+        .extra_headers
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + 4)
+        .sum::<usize>();
+    let mut bytes = Vec::with_capacity(
+        192 + request.forward_header_bytes.len()
+            + path_and_query.len()
+            + host.len()
+            + extra_headers_bytes,
+    );
     bytes.extend_from_slice(request.method.as_str().as_bytes());
     bytes.extend_from_slice(b" ");
     bytes.extend_from_slice(path_and_query.as_bytes());
     bytes.extend_from_slice(b" HTTP/1.1\r\n");
-    if forward_headers {
-        bytes.extend_from_slice(&request.forward_header_bytes);
+    bytes.extend_from_slice(&request.forward_header_bytes);
+    if options.forward_headers {
+        append_raw_forwarding_headers(
+            &mut bytes,
+            request,
+            host,
+            options.remote_addr,
+            options.scheme,
+        );
+    } else {
+        append_preserved_raw_forwarding_headers(&mut bytes, request);
+    }
+    for (name, value) in options.extra_headers {
+        append_raw_header_line(&mut bytes, name, value);
     }
 
     bytes.extend_from_slice(b"host: ");
     bytes.extend_from_slice(host.as_bytes());
     bytes.extend_from_slice(b"\r\n");
-    if let Some(connection) = connection {
+    if let Some(connection) = options.connection {
         bytes.extend_from_slice(b"connection: ");
         bytes.extend_from_slice(connection.as_bytes());
         bytes.extend_from_slice(b"\r\n");
     }
     bytes.extend_from_slice(b"\r\n");
     bytes
+}
+
+struct RawFastLaneSerializeOptions<'a> {
+    connection: Option<&'a str>,
+    remote_addr: SocketAddr,
+    scheme: &'a str,
+    forward_headers: bool,
+    extra_headers: &'a [(&'a str, &'a str)],
+}
+
+fn append_raw_forwarding_headers(
+    bytes: &mut Vec<u8>,
+    request: &PlainFastLaneRequest,
+    host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+) {
+    let remote_ip = remote_addr.ip().to_string();
+    let xff = append_csv_header_value(
+        request.forwarding_headers.x_forwarded_for.as_deref(),
+        &remote_ip,
+    );
+    let forwarded = append_forwarded_header_value(
+        request.forwarding_headers.forwarded.as_deref(),
+        &remote_ip,
+        host,
+        scheme,
+    );
+    append_raw_header_line(bytes, "x-real-ip", &remote_ip);
+    append_raw_header_line(bytes, "x-forwarded-for", &xff);
+    append_raw_header_line(bytes, "x-forwarded-host", host);
+    append_raw_header_line(bytes, "x-forwarded-proto", scheme);
+    append_raw_header_line(bytes, "forwarded", &forwarded);
+}
+
+fn append_preserved_raw_forwarding_headers(bytes: &mut Vec<u8>, request: &PlainFastLaneRequest) {
+    if let Some(value) = request.forwarding_headers.x_real_ip.as_deref() {
+        append_raw_header_line(bytes, "x-real-ip", value);
+    }
+    if let Some(value) = request.forwarding_headers.x_forwarded_for.as_deref() {
+        append_raw_header_line(bytes, "x-forwarded-for", value);
+    }
+    if let Some(value) = request.forwarding_headers.x_forwarded_host.as_deref() {
+        append_raw_header_line(bytes, "x-forwarded-host", value);
+    }
+    if let Some(value) = request.forwarding_headers.x_forwarded_proto.as_deref() {
+        append_raw_header_line(bytes, "x-forwarded-proto", value);
+    }
+    if let Some(value) = request.forwarding_headers.forwarded.as_deref() {
+        append_raw_header_line(bytes, "forwarded", value);
+    }
+}
+
+fn append_raw_header_line(bytes: &mut Vec<u8>, name: &str, value: &str) {
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(b": ");
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.extend_from_slice(b"\r\n");
 }
 
 fn serialize_raw_websocket_fast_lane_request(

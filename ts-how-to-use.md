@@ -344,8 +344,8 @@ hook 应保持同步和快速。它是扩展点，不是业务 worker。
 如果你先学整体配置：
 
 - 看 `README.md`
-- 看 `docs/index.html`
 - 看 `docs/CONFIGURATION.md`
+- 看 `docs/ARCHITECTURE.md`
 
 如果你在做迁移：
 

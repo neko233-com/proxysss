@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.3 - 2026-06-15
+
+- Kept the low-allocation plain raw reverse-proxy and AI/SSE fast lanes side-effect free: default `X-Forwarded-*` / `Forwarded` semantics and `proxysss-ai-*` metadata headers now survive the fast path, so upstream observability and agent-stream routing do not regress just because the route uses the optimized path.
+- Raised the default HTTP/2 reverse-proxy tuning ceiling and added end-to-end coverage for plain fast-lane forwarding semantics plus HTTPS/HTTP2 round trips, tightening the release gate around SSE / reverse proxy / HTTP2 behavior instead of chasing one isolated throughput win.
+- Added an official Linux benchmark documentation pair for humans and release bundles: `benchmark-linux.md` explains the latest GitHub Actions Linux quick benchmark, and `docs/benchmark-linux.html` gives the matching HTML entry while keeping mixed-load release validation and no-side-effect performance rules explicit.
+
 ## v1.3.2 - 2026-06-15
 
 - Hardened the no-side-effect performance validation toolchain around the Go benchmark helper: CI benchmark runs now trigger when `scripts/benchmark-helper.go` changes, and obsolete Python benchmark report dependencies were removed from GitHub Actions so the official benchmark path stays Go-first end to end.

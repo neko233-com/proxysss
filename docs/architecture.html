@@ -318,7 +318,7 @@
     .steps,
     .code-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      grid-template-columns: 1fr;
       gap: 18px;
     }
 
@@ -511,7 +511,7 @@
       </div>
       <nav class="nav">
         <a href="index.html">Docs 首页</a>
-        <a href="CONFIGURATION.md">配置指南</a>
+        <a href="configuration.html">配置指南</a>
         <a href="#http-flow">HTTP 数据路径</a>
         <a href="#reload">热重载边界</a>
       </nav>
@@ -864,6 +864,11 @@ plugins:
               <span class="tag expert">Validation</span>
               <h3>只赢一项，不算赢</h3>
               <p class="subtle">SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP、KCP-style 都要一起看，不能出现一项快了、另一项掉队还当成成功。</p>
+            </article>
+            <article class="card">
+              <span class="tag expert">Fast lane</span>
+              <h3>默认头语义也要能吃到快路径</h3>
+              <p class="subtle">plain HTTP 的 raw reverse proxy 和 raw SSE fast lane 会保留 `X-Forwarded-*` / `Forwarded`，AI 路由默认的 `proxysss-ai-*` metadata 也会一起带上，不需要为了性能去关闭可观测性或改配置语义。</p>
             </article>
           </div>
 

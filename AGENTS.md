@@ -27,9 +27,10 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Logging must expose access logs (`logs/access.log`), error logs (`logs/error.log`), and level control for `debug`, `info`, `warn`, and `error`; default to `info`, with `debug` reserved for internal diagnostics.
 - Official demo plugins ship with `proxysss init`: `structured-log` (log hook demo), `traffic-stats` (traffic/error counters), and `player-affinity` (affinity routing demo).
 - Automated tests should protect nginx-parity defaults and capability declarations whenever related code changes.
-- `AGENTS.md`、内建 `docs.html` / `/docs` 页面、`docs/architecture.html`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`caddy-to-proxysss.md`、`proxysss-script.d.ts` 必须随能力和脚本 API 一起维护，不允许文档长期落后于实现。
+- `AGENTS.md`、内建 `docs.html` / `/docs` 页面、`docs/index.html`、`docs/configuration.html`、`docs/architecture.html`、`docs/ts-how-to-use.html`、`docs/nginx-to-proxysss.html`、`docs/caddy-to-proxysss.html`、`docs/CONFIGURATION.md`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`caddy-to-proxysss.md`、`proxysss-script.d.ts` 必须随能力和脚本 API 一起维护，不允许文档长期落后于实现。
 - 官方文档统一 `中文 first`，只在必要术语、协议名、配置面名、命令名处保留 `English`。不要把官方文档写成英文营销页，也不要写成只给熟手看的参数堆。
-- 官方文档中的重要主题应同时维护 `.md` 与 `docs/*.html` 两个入口，尤其是迁移文档：`nginx -> proxysss` 与 `caddy -> proxysss` 必须同时存在独立 Markdown 文档和独立子 HTML 页面，并保持内容口径一致。
+- `docs/*.html` 是给人看的官方文档入口，公共站点和内建 docs 导航必须只链接 HTML，不要把用户从 HTML 页面跳到 `.md`；`.md` 文档主要给 agent / 机器 / 仓库检索使用，`README.md` 和性能对比文档除外。
+- 官方文档中的重要主题应同时维护 `.md` 与 `docs/*.html` 两个入口，尤其是 `docs/index.html`、`docs/configuration.html`、`docs/architecture.html`、`docs/ts-how-to-use.html`、`docs/nginx-to-proxysss.html`、`docs/caddy-to-proxysss.html` 及其对应 Markdown 文档，并保持内容口径一致。
 - **Agents MUST update `docs/architecture.html`** whenever proxysss architecture or request/data-path behavior changes (new listeners, policy chains, reload boundaries, extension hooks, etc.).
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance must be treated as a core product requirement: production performance claims and release gates are Linux-only because proxysss targets real Linux gateway deployments, not Windows/macOS desktop benchmarks. Aim to match or exceed nginx on Ubuntu/Linux after `proxysss tune linux`, where proxysss can use Rust, async IO, Linux `SO_REUSEPORT` HTTP/TCP accept fanout, direct no-policy TCP fast paths, and script isolation effectively.
@@ -121,7 +122,7 @@ Benchmark helpers in that flow are Go-based (`scripts/benchmark-helper.go`); do 
 - Any new user-facing command should be useful for both humans and autonomous agents.
 - Keep install paths and startup instructions scriptable so an agent can bootstrap proxysss without manual discovery.
 - Prefer CLI inspection surfaces for agent workflows.
-- 任何涉及脚本 API、内建文档、nginx 对照配置、caddy 对照配置、模板、错误页、运维入口的变更，都必须同步更新 `AGENTS.md`、内建 `docs.html`、`docs/architecture.html`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`caddy-to-proxysss.md`、`proxysss-script.d.ts`、README/模板/测试中的对应内容。
+- 任何涉及脚本 API、内建文档、nginx 对照配置、caddy 对照配置、模板、错误页、运维入口的变更，都必须同步更新 `AGENTS.md`、内建 `docs.html`、`docs/index.html`、`docs/configuration.html`、`docs/architecture.html`、`docs/ts-how-to-use.html`、`docs/nginx-to-proxysss.html`、`docs/caddy-to-proxysss.html`、`docs/CONFIGURATION.md`、`ts-how-to-use.md`、`nginx-to-proxysss.md`、`caddy-to-proxysss.md`、`proxysss-script.d.ts`、README/模板/测试中的对应内容。
 - For hot-path code, measure or reason about throughput, allocation pressure, backpressure, and lock contention before adding abstractions.
 - Every performance optimization must ship with benchmark evidence for the target path and a mixed-load regression check over adjacent gateway paths. If the change speeds up one path but degrades another without explicit approval, keep iterating instead of landing the regression.
 - Do not keep legacy code merely because it already exists; if a simpler high-performance design better serves nginx replacement, migrate decisively and cover it with tests.

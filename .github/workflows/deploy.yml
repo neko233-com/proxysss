@@ -68,7 +68,7 @@ jobs:
           mkdir -p bundle/scripts
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
           cp README.md bundle/
-          for doc in proxysss-script.d.ts ts-how-to-use.md nginx-to-proxysss.md caddy-to-proxysss.md; do
+          for doc in proxysss-script.d.ts ts-how-to-use.md nginx-to-proxysss.md caddy-to-proxysss.md benchmark-linux.md; do
             if [ -f "$doc" ]; then cp "$doc" bundle/; fi
           done
           for script in install.sh install.ps1; do
@@ -85,7 +85,7 @@ jobs:
           New-Item -ItemType Directory -Path bundle/scripts -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
           Copy-Item README.md "bundle/" -Force
-          foreach ($doc in @('proxysss-script.d.ts', 'ts-how-to-use.md', 'nginx-to-proxysss.md', 'caddy-to-proxysss.md')) {
+          foreach ($doc in @('proxysss-script.d.ts', 'ts-how-to-use.md', 'nginx-to-proxysss.md', 'caddy-to-proxysss.md', 'benchmark-linux.md')) {
             if (Test-Path $doc) { Copy-Item $doc "bundle/" -Force }
           }
           foreach ($script in @('install.sh', 'install.ps1')) {

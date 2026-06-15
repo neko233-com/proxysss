@@ -437,20 +437,29 @@ What that benchmark means:
 
 ## Docs Map
 
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — scenario-based configuration cookbook
+- [docs/configuration.html](docs/configuration.html) — human-facing configuration guide
 - [docs/PRODUCTION-HARDENING.md](docs/PRODUCTION-HARDENING.md) — Linux tuning, benchmark gates, and production guardrails
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — text architecture walkthrough
 - [docs/architecture.html](docs/architecture.html) — visual architecture lab
 - [docs/AGENT-API.md](docs/AGENT-API.md) — admin API automation examples
 - [docs/SECURITY.md](docs/SECURITY.md) — security defaults and hardening
-- [nginx-to-proxysss.md](nginx-to-proxysss.md) — migration notes
-- [ts-how-to-use.md](ts-how-to-use.md) — embedded TypeScript runtime guide
+- [docs/nginx-to-proxysss.html](docs/nginx-to-proxysss.html) — human-facing nginx migration guide
+- [docs/caddy-to-proxysss.html](docs/caddy-to-proxysss.html) — human-facing Caddy migration guide
+- [docs/ts-how-to-use.html](docs/ts-how-to-use.html) — human-facing embedded TypeScript guide
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — machine-facing configuration cookbook
+- [nginx-to-proxysss.md](nginx-to-proxysss.md) — machine-facing nginx migration notes
+- [caddy-to-proxysss.md](caddy-to-proxysss.md) — machine-facing Caddy migration notes
+- [ts-how-to-use.md](ts-how-to-use.md) — machine-facing embedded TypeScript runtime guide
 - [proxysss-script.d.ts](proxysss-script.d.ts) — scripting types
 
 Public docs site:
 
 - [https://neko233-com.github.io/proxysss/](https://neko233-com.github.io/proxysss/)
+- [https://neko233-com.github.io/proxysss/configuration.html](https://neko233-com.github.io/proxysss/configuration.html)
 - [https://neko233-com.github.io/proxysss/architecture.html](https://neko233-com.github.io/proxysss/architecture.html)
+- [https://neko233-com.github.io/proxysss/nginx-to-proxysss.html](https://neko233-com.github.io/proxysss/nginx-to-proxysss.html)
+- [https://neko233-com.github.io/proxysss/caddy-to-proxysss.html](https://neko233-com.github.io/proxysss/caddy-to-proxysss.html)
+- [https://neko233-com.github.io/proxysss/ts-how-to-use.html](https://neko233-com.github.io/proxysss/ts-how-to-use.html)
 
 Runtime-built docs inside a live gateway:
 

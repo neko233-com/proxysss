@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>proxysss Linux benchmark</title>
+  <style>
+    :root {
+      --bg: #f5efe6;
+      --paper: rgba(255, 252, 247, 0.92);
+      --paper-strong: #fffdf8;
+      --ink: #0f172a;
+      --muted: #526071;
+      --line: rgba(15, 23, 42, 0.12);
+      --accent: #ff6b35;
+      --accent-soft: rgba(255, 107, 53, 0.14);
+      --teal: #0f766e;
+      --teal-soft: rgba(15, 118, 110, 0.14);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --max: 1160px;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      line-height: 1.68;
+      background:
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 32%),
+        linear-gradient(180deg, #f7f2ea 0%, #f3eadf 48%, #efe6d9 100%);
+    }
+
+    a { color: inherit; text-decoration: none; }
+
+    .shell {
+      width: min(calc(100% - 32px), var(--max));
+      margin: 0 auto;
+      padding: 24px 0 64px;
+    }
+
+    .hero, .panel, .card {
+      background: var(--paper);
+      border: 1px solid rgba(255,255,255,0.8);
+      box-shadow: var(--shadow);
+      border-radius: var(--radius-lg);
+    }
+
+    .hero {
+      padding: 34px;
+      margin-bottom: 22px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -80px;
+      bottom: -90px;
+      width: 280px;
+      height: 280px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255, 107, 53, 0.26), transparent 66%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 18px 0 10px;
+      font-size: clamp(34px, 6vw, 58px);
+      line-height: 1.04;
+      letter-spacing: -0.04em;
+    }
+
+    .hero p {
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px;
+      padding: 0 18px;
+      border-radius: 16px;
+      font-weight: 700;
+      border: 1px solid transparent;
+      transition: transform 140ms ease, background 140ms ease;
+    }
+
+    .button:hover { transform: translateY(-2px); }
+    .button.primary { background: var(--ink); color: #fff; }
+    .button.warm {
+      background: var(--accent-soft);
+      color: #a53d18;
+      border-color: rgba(255, 107, 53, 0.18);
+    }
+    .button.cool {
+      background: var(--teal-soft);
+      color: var(--teal);
+      border-color: rgba(15, 118, 110, 0.18);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .card {
+      padding: 18px 20px;
+    }
+
+    .label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .value {
+      font-size: 22px;
+      font-weight: 800;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .panel {
+      padding: 26px;
+      grid-column: span 12;
+    }
+
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 28px;
+      letter-spacing: -0.03em;
+    }
+
+    .panel p,
+    .panel li {
+      color: var(--muted);
+    }
+
+    .two-up {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .note {
+      padding: 18px;
+      border-radius: var(--radius-md);
+      background: rgba(15, 23, 42, 0.04);
+      border: 1px solid rgba(15, 23, 42, 0.08);
+    }
+
+    .note.good {
+      background: var(--teal-soft);
+      border-color: rgba(15, 118, 110, 0.16);
+    }
+
+    .note.warn {
+      background: var(--accent-soft);
+      border-color: rgba(255, 107, 53, 0.16);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      background: var(--paper-strong);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    th, td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: rgba(15, 23, 42, 0.05);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+
+    td strong { color: var(--ink); }
+
+    code, pre {
+      font-family: var(--mono);
+      font-size: 14px;
+    }
+
+    pre {
+      margin: 14px 0 0;
+      padding: 16px 18px;
+      border-radius: 16px;
+      background: #0f172a;
+      color: #f8fafc;
+      overflow-x: auto;
+    }
+
+    .footer {
+      margin-top: 22px;
+      padding: 20px 22px;
+      border-radius: var(--radius-lg);
+      background: rgba(15, 23, 42, 0.86);
+      color: rgba(248, 250, 252, 0.94);
+      font-size: 15px;
+    }
+
+    @media (max-width: 760px) {
+      .hero, .panel, .card { border-radius: 20px; }
+      .hero { padding: 26px; }
+      .panel { padding: 22px; }
+      th, td { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="eyebrow">Linux benchmark</div>
+      <h1>Linux benchmark 先看口径，再看数字。</h1>
+      <p>这页讲的是最新官方 GitHub Actions Linux quick benchmark。它适合回答“当前主干 Linux 小文件热路径到哪了”，但不会把单场景截图伪装成完整发布结论。</p>
+      <div class="actions">
+        <a class="button primary" href="index.html">回到 docs 首页</a>
+        <a class="button warm" href="architecture.html">看架构与快路径边界</a>
+        <a class="button cool" href="nginx-to-proxysss.html">看 nginx 迁移页</a>
+      </div>
+    </section>
+
+    <section class="stats">
+      <article class="card">
+        <div class="label">Official Linux snapshot</div>
+        <div class="value">2.366x vs nginx</div>
+      </article>
+      <article class="card">
+        <div class="label">proxysss ops/sec</div>
+        <div class="value">76099.60</div>
+      </article>
+      <article class="card">
+        <div class="label">p95 latency</div>
+        <div class="value">2.85 ms</div>
+      </article>
+      <article class="card">
+        <div class="label">Errors</div>
+        <div class="value">0</div>
+      </article>
+    </section>
+
+    <div class="layout">
+      <section class="panel">
+        <h2>这页到底在讲什么</h2>
+        <p>这是“当前官方 Linux quick benchmark”的人类可读解释页。它和仓库里的 Markdown 版本一一对应，方便 GitHub Pages、内建 docs 导航和 release bundle 同时有口径一致的性能说明。</p>
+        <div class="two-up">
+          <div class="note good">
+            <strong>它适合回答：</strong>
+            <p>当前主干在 Linux 上，小文件 HTTP/1.1 热路径、预热、缓存命中和 benchmark helper 链路是不是健康。</p>
+          </div>
+          <div class="note warn">
+            <strong>它不适合回答：</strong>
+            <p>是不是已经证明 reverse proxy、AI/SSE、WebSocket、TCP、UDP、KCP-style 全部都同步更快。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>最新官方 GitHub Actions Linux 快照</h2>
+        <p>来源：`benchmark-results-linux` 工件，生成时间 `2026-06-15 13:46:39 UTC`，`proxysss 1.3.2`，workload 为 static `index.html` over HTTP/1.1，`concurrency=128`，`duration=10s`。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Gateway</th>
+              <th>ops/sec</th>
+              <th>vs nginx</th>
+              <th>MiB/s</th>
+              <th>p50 ms</th>
+              <th>p95 ms</th>
+              <th>p99 ms</th>
+              <th>success</th>
+              <th>errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>proxysss</strong></td>
+              <td>76099.60</td>
+              <td><strong>2.366x</strong></td>
+              <td>13.14</td>
+              <td>1.58</td>
+              <td>2.85</td>
+              <td>3.71</td>
+              <td>760996</td>
+              <td>0</td>
+            </tr>
+            <tr>
+              <td><strong>nginx</strong></td>
+              <td>32158.10</td>
+              <td>1.000x</td>
+              <td>5.55</td>
+              <td>4.07</td>
+              <td>4.61</td>
+              <td>5.65</td>
+              <td>321581</td>
+              <td>0</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <h2>怎么正确解读这个数字</h2>
+        <div class="two-up">
+          <div class="note">
+            <strong>这说明：</strong>
+            <p>`proxysss` 当前 Linux 小文件热路径已经很强，`0 errors` 也说明它不是靠错误换吞吐。</p>
+          </div>
+          <div class="note">
+            <strong>这不说明：</strong>
+            <p>不能因为这里赢了，就默认 SSE、HTTP reverse proxy、TCP、UDP 也都无副作用地跟着赢。</p>
+          </div>
+        </div>
+        <p>团队约束很明确：性能优化必须是 <code>no-side-effect optimization</code>。如果某个局部路径更快了，但兄弟场景更慢、更脆、观测性更差，那不算成功。</p>
+      </section>
+
+      <section class="panel">
+        <h2>正式发布为什么还要 mixed-load</h2>
+        <p>正式 Linux 发布口径仍然是 mixed-load，而不是单场景快照。要一起看这些路径：</p>
+        <div class="two-up">
+          <div class="note">
+            <strong>HTTP 族</strong>
+            <p>static-small、static-large、CDN hot-update、HTTP reverse proxy、New API/SSE、HTTPS static。</p>
+          </div>
+          <div class="note">
+            <strong>长连接 / 实时族</strong>
+            <p>WebSocket、game TCP、generic TCP、UDP、KCP-style UDP。</p>
+          </div>
+        </div>
+        <p>如果你在调 SSE 或 HTTP/2，最终也必须证明它没有把 static、reverse proxy、TCP、UDP 一起拖慢。</p>
+      </section>
+
+      <section class="panel">
+        <h2>怎么复现正式 Linux benchmark</h2>
+        <p>正式发布前请先把 Linux host 调优到位，再跑 mixed matrix：</p>
+        <pre><code>proxysss tune linux --apply --profile latency --max-connections 200000
+PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
+  bash scripts/benchmark-all-scenarios.sh</code></pre>
+        <p>如果你只是想看当前 quick throughput snapshot，则查看 GitHub Actions 的 `benchmark-results-linux` 工件即可；它适合趋势观察，不适合单独充当发版结论。</p>
+      </section>
+
+      <section class="panel">
+        <h2>和这次 SSE / HTTP2 优化的关系</h2>
+        <p>这次不是简单追一个 SSE 数字，而是要求快路径继续保留默认 `X-Forwarded-*` / `Forwarded` 语义，以及 `proxysss-ai-*` metadata header，同时把 HTTP/2 默认调优抬高。也就是说，优化必须建立在“默认行为不倒退”的前提上。</p>
+      </section>
+    </div>
+
+    <div class="footer">
+      正式发布请继续坚持这条线：先 Linux 调优，再 mixed-load benchmark，再看 CI / benchmark / deploy / release 全绿。单场景图只负责帮助我们定位热点，不负责替代发布标准。
+    </div>
+  </div>
+</body>
+</html>
