@@ -46,6 +46,9 @@ jobs:
       - name: Build proxysss release
         run: cargo build --locked --release
 
+      - name: Apply Linux benchmark tuning
+        run: sudo ./target/release/proxysss tune linux --apply --profile latency --max-connections 200000
+
       - name: Gateway mixed all-protocol benchmark
         env:
           QUICK: "1"
