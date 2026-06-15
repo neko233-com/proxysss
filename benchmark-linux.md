@@ -1,47 +1,59 @@
 # proxysss Linux benchmark（官方 Linux 口径）
 
-> 中文 first。这个文档讲的是“当前官方 GitHub Actions Linux benchmark 快照”，不是拿单场景截图冒充正式发布结论。
+> 中文 first。官方 Linux benchmark 现在默认就是“全协议 mixed-load 对比”，不是只看一个 static quick screenshot。
 
 ## 1. 先看结论
 
-- **最新官方 Linux quick benchmark** 里，`proxysss` 对静态小文件 HTTP/1.1 热路径已经明显超过 `nginx`。
-- 这份快照来自 **GitHub Actions Linux** 产物，适合回答“现在主干的 Linux 小文件热路径大概到什么水平了”。
-- **它不是正式发版唯一依据。** 正式性能发布仍然必须看 Linux mixed-load：静态、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style 一起压，不能只挑一个好看的数字。
+- **官方 GitHub Actions Linux benchmark 必须同时对比所有核心协议面。**
+- 这条官方产物现在应该回答的是：`proxysss` 在 Linux 上和 `nginx` 做同波次 mixed-load 时，`HTTP / HTTPS / reverse proxy / New API / SSE / WebSocket / TCP / UDP / KCP-style UDP` 有没有一起站住。
+- **单场景 quick benchmark 仍然可以保留，但它只是诊断工具，不再代表官方发布口径。**
 
-## 2. 当前官方快照
+## 2. 官方 Linux benchmark 现在对比哪些协议
 
-- Generated: `2026-06-15 13:46:39 UTC`
-- Source: GitHub Actions `benchmark-results-linux`
-- proxysss version: `proxysss 1.3.2`
-- Workload: static `index.html` over HTTP/1.1
-- Concurrency: `128`
-- Duration: `10s`
+默认 mixed matrix 需要一起跑这些场景：
 
-| Gateway | ops/sec | vs nginx | MiB/s | p50 ms | p95 ms | p99 ms | success | errors |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| proxysss | 76099.60 | **2.366x** | 13.14 | 1.58 | 2.85 | 3.71 | 760996 | 0 |
-| nginx | 32158.10 | 1.000x | 5.55 | 4.07 | 4.61 | 5.65 | 321581 | 0 |
+- `static-small`
+- `static-large`
+- `cdn-hot-update`
+- `https-static-small`
+- `reverse-proxy`
+- `new-api-sse`
+- `websocket-long-connection`
+- `game-long-connection`
+- `tcp-stream`
+- `udp-stream`
+- `kcp-style-udp`
 
-## 3. 这个结果说明了什么
+这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。
 
-- `proxysss` 的 **静态小文件热路径**、预热、缓存命中、连接处理和 Go benchmark helper 链路当前是健康的。
-- `0 errors` 说明这次官方 Linux quick run 至少没有靠“错误换吞吐”。
-- `2.366x` 是一个很好的 **单场景快照**，适合放在“当前主干 Linux throughput 状态”这一层。
+## 3. GitHub Actions 官方工件现在应该长什么样
 
-## 4. 这个结果不应该被拿来说明什么
+Linux 官方 benchmark 工件名仍然是：
 
-- 它**不能单独证明** `reverse proxy`、`AI/SSE`、`WebSocket`、`TCP`、`UDP`、`KCP-style` 全部都已经同步更快。
-- 它**不能替代** mixed-load release gate。
-- 它**不能推翻**“性能优化必须无副作用”的团队约束。
+- `benchmark-results-linux`
 
-换句话说：
+但它的内容应该来自：
 
-- 单场景 quick benchmark 用来发现热点、看方向。
-- mixed-load benchmark 用来决定“这次优化能不能真正发布”。
+- `.benchmark/runs/all-scenarios/results.json`
+- `.benchmark/runs/all-scenarios/summary.md`
+- `.benchmark/runs/all-scenarios/summary.html`
 
-## 5. 正式 Linux 发布口径
+也就是说：
 
-正式发布请继续按下面顺序来：
+- `results.json` 给机器、脚本、agent 用
+- `summary.md` 给仓库里快速 diff / 审阅用
+- `summary.html` 给人直接打开看
+
+## 4. Windows benchmark 还要不要留
+
+要留，但角色不同。
+
+- **Linux mixed-load**：官方发布口径，必须比较所有协议
+- **Windows throughput smoke**：本地 / CI 烟雾测试，用来发现 bench 命令、构建链和基础 throughput 有没有炸
+
+不要把 Windows quick smoke 当成正式性能发布结论。
+
+## 5. 正式 Linux 发布怎么跑
 
 ```bash
 proxysss tune linux --apply --profile latency --max-connections 200000
@@ -49,40 +61,32 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
   bash scripts/benchmark-all-scenarios.sh
 ```
 
-发布判断重点不是“某一项有没有破 1.0”，而是：
+判断重点不是“某一项截图好不好看”，而是：
 
-- 关键长连接路径要守住公平比值底线。
-- static/reverse/SSE 要维持软门槛和低错误。
-- sibling 场景不能因为一次局部优化而明显退化。
+- 关键长连接路径守住公平比值底线
+- static / reverse / SSE 保持软门槛和低错误
+- sibling 场景不能因为一次局部优化而明显退化
+- 聚合 mixed ratio 也要站住
 
-## 6. 为什么现在要单独补这份文档
+## 6. 单场景 quick benchmark 现在放到哪里
 
-之前仓库里已经有一份更深的 Ubuntu 24 mixed-load 报告：`docs/BENCHMARK-ubuntu24-vs-nginx.md`。
+单场景 quick benchmark 仍然有价值，但只应该放在这些用途里：
 
-但它讲的是：
+- 定位热点
+- 验证某个局部 fast path 有没有明显改善
+- 在 Windows / 本地环境做低成本 smoke
 
-- 更早一轮版本
-- 更重的 mixed-load 场景
-- 更接近“发布结论”的口径
+它不应该继续承担“官方 Linux benchmark”这个角色。
 
-而这份新文档讲的是：
+## 7. 为什么这次必须改
 
-- **最新主干**
-- **GitHub Actions Linux 官方 quick snapshot**
-- 给人看得懂的、和 HTML 页面一致的解释入口
+如果官方 benchmark 只比 static small：
 
-两者不是互相替代，而是互相补位。
+- 会误导人以为发布门槛只看一个 HTTP 小文件数字
+- 会淡化 `SSE / WebSocket / TCP / UDP / KCP-style` 的 release gate 地位
+- 会和仓库里的 AGENTS / 架构文档 / 生产硬化文档口径打架
 
-## 7. 和这次 SSE / HTTP2 优化的关系
-
-这次优化的要求不是“只把 SSE 数字拉高”，而是：
-
-- SSE raw fast lane 保持 `X-Forwarded-*` / `Forwarded` 语义不丢
-- AI route 的 `proxysss-ai-*` metadata header 不丢
-- HTTP/2 默认调优继续提升
-- 不能为了一个流式路径让兄弟场景观测性、兼容性或稳定性倒退
-
-这也是为什么 benchmark 文档里必须把 **no-side-effect optimization** 写清楚。
+所以这次不是“补一页文档”，而是把 **benchmark workflow、artifact、文档口径** 统一回“全协议 Linux mixed-load”。
 
 ## 8. 推荐阅读
 

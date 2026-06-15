@@ -22,7 +22,7 @@ on:
       - ".github/workflows/benchmark.yml"
 
 jobs:
-  throughput-linux:
+  all-protocols-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -46,25 +46,25 @@ jobs:
       - name: Build proxysss release
         run: cargo build --locked --release
 
-      - name: Gateway throughput benchmark
+      - name: Gateway mixed all-protocol benchmark
         env:
           QUICK: "1"
+          DURATION_SECS: "12"
+          MIXED_MATRIX: "1"
         run: |
-          chmod +x scripts/benchmark-gateways.sh scripts/benchmark-gate-check.sh
-          bash scripts/benchmark-gateways.sh
+          chmod +x scripts/benchmark-all-scenarios.sh
+          bash scripts/benchmark-all-scenarios.sh
 
       - uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-linux
           path: |
-            .benchmark/runs/latest/results.json
-            .benchmark/runs/latest/report.md
-            .benchmark/runs/latest/report.html
-            .benchmark/runs/latest/nginx-compare.md
-            .benchmark/runs/latest/nginx-compare.html
+            .benchmark/runs/all-scenarios/results.json
+            .benchmark/runs/all-scenarios/summary.md
+            .benchmark/runs/all-scenarios/summary.html
           if-no-files-found: error
 
-  throughput-windows:
+  throughput-windows-smoke:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -83,7 +83,7 @@ jobs:
       - name: Build proxysss release
         run: cargo build --locked --release
 
-      - name: Gateway throughput benchmark
+      - name: Gateway throughput smoke benchmark
         shell: pwsh
         run: ./scripts/benchmark-gateways.ps1 -Quick
 

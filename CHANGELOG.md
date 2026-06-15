@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.4 - 2026-06-15
+
+- Promoted the official GitHub Actions Linux benchmark from a single-scenario throughput snapshot to the real mixed all-protocol matrix: the Linux benchmark workflow now runs `scripts/benchmark-all-scenarios.sh` with `QUICK=1`, `DURATION_SECS=12`, and `MIXED_MATRIX=1`, then publishes the mixed results artifact (`results.json`, `summary.md`, `summary.html`) instead of a static-only quick report.
+- Clarified benchmark roles across docs: the official Linux benchmark docs now say the release-facing artifact must compare `static / reverse proxy / New API / SSE / WebSocket / TCP / UDP / KCP-style UDP` together, while Windows quick throughput remains a smoke-only auxiliary path.
+
 ## v1.3.3 - 2026-06-15
 
 - Kept the low-allocation plain raw reverse-proxy and AI/SSE fast lanes side-effect free: default `X-Forwarded-*` / `Forwarded` semantics and `proxysss-ai-*` metadata headers now survive the fast path, so upstream observability and agent-stream routing do not regress just because the route uses the optimized path.
