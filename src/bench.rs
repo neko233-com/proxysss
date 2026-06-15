@@ -199,7 +199,12 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(args.insecure)
-        .tcp_nodelay(true);
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true)
+        .http2_keep_alive_timeout(Duration::from_secs(90))
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_while_idle(true)
+        .timeout(request_timeout);
     if args.http1_only {
         builder = builder.http1_only();
     }

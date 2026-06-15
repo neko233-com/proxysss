@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+﻿use std::borrow::Cow;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
@@ -39,7 +39,7 @@ use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
     Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
@@ -261,6 +261,13 @@ impl std::ops::DerefMut for PooledBuffer {
 }
 
 const POOL_BUFFER_BYTES: usize = 64 * 1024;
+const HTTP2_STREAM_WINDOW_SIZE_BYTES: u32 = 4 * 1024 * 1024;
+const HTTP2_CONNECTION_WINDOW_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+const HTTP2_MAX_SEND_BUF_BYTES: usize = 4 * 1024 * 1024;
+const HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 15;
+const HTTP2_KEEP_ALIVE_TIMEOUT_SECS: u64 = 20;
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 512;
+const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 32 * 1024;
 
 static RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 static UDP_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
@@ -1449,6 +1456,7 @@ impl Gateway {
             .reverse_proxy
             .routes
             .iter()
+            .filter(|route| reverse_proxy_route_fast_path_eligible(route))
             .map(|route| route.upstream.clone())
             .collect();
         if config.services.ai_proxy.enabled {
@@ -1458,6 +1466,7 @@ impl Gateway {
                     .ai_proxy
                     .routes
                     .iter()
+                    .filter(|route| ai_proxy_route_fast_path_eligible(route))
                     .map(|route| route.upstream.clone()),
             );
         }
@@ -6579,6 +6588,9 @@ impl Gateway {
         );
 
         if self.simple_hyper_response_can_return_direct(status, &parts.headers) {
+            if upstream_response_is_sse(&parts.headers) {
+                apply_streaming_response_headers_map(&mut parts.headers)?;
+            }
             let response_body = if stream_upstream_body {
                 GatewayBody::Stream(
                     upstream_body
@@ -6640,12 +6652,11 @@ impl Gateway {
     fn simple_hyper_response_can_return_direct(
         &self,
         status: StatusCode,
-        headers: &HeaderMap,
+        _headers: &HeaderMap,
     ) -> bool {
         status.is_success()
             && !self.bootstrap_config.logging.access_log
             && !self.bootstrap_config.runtime.hot_reload.enabled
-            && !upstream_response_is_sse(headers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6665,7 +6676,6 @@ impl Gateway {
         let upstream_url = build_upstream_url_with_rewrite(upstream, rewrite_path, uri)?;
         let mut upstream_headers =
             build_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
-        upstream_headers.insert(CONNECTION, HeaderValue::from_static("close"));
         if !body.is_empty() && !upstream_headers.contains_key(CONTENT_LENGTH) {
             upstream_headers.insert(
                 CONTENT_LENGTH,
@@ -6733,13 +6743,13 @@ impl Gateway {
         }
 
         let rewrite_path = ai_proxy_raw_rewrite_path(route, &request.target, &request.path);
-        let Some((_, upstream_host, upstream_port)) =
-            raw_http_pool_parts_from_upstream(&route.upstream)?
+        let Some((_, pool)) = self.raw_http_pool_for_upstream(&route.upstream)?
         else {
             return Ok(false);
         };
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
-        let mut upstream_io = TcpStream::connect((upstream_host.as_str(), upstream_port))
+        let mut upstream_io = pool
+            .checkout()
             .await
             .with_context(|| {
                 format!(
@@ -6771,19 +6781,76 @@ impl Gateway {
                     route.upstream
                 )
             })?;
+        let upstream_keep_alive = !response_head.connection_close;
+        let content_length = response_head.content_length;
+        let transfer_chunked = response_head.transfer_chunked;
         let response_head_bytes = build_raw_http_response_head_bytes(
             response_head.status,
             &response_head.headers,
-            false,
-            false,
+            upstream_keep_alive,
+            transfer_chunked,
         );
-        downstream
-            .write_all(&response_head_bytes)
-            .await
-            .context("failed writing raw SSE response head")?;
-        relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
+        if request.method == Method::HEAD || status_has_no_body(response_head.status) {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw SSE response head")?;
+            if upstream_keep_alive {
+                pool.checkin(upstream_io);
+            }
+        } else if let Some(len) = content_length {
+            let reusable = if let Some(leftover) = response_head.leftover {
+                let leftover_len = leftover.len() as u64;
+                if leftover_len >= len {
+                    let mut response_bytes = Vec::with_capacity(response_head_bytes.len() + len as usize);
+                    response_bytes.extend_from_slice(&response_head_bytes);
+                    response_bytes.extend_from_slice(&leftover[..len as usize]);
+                    downstream
+                        .write_all(&response_bytes)
+                        .await
+                        .context("failed writing raw SSE response head/body")?;
+                    leftover_len == len
+                } else {
+                    downstream
+                        .write_all(&response_head_bytes)
+                        .await
+                        .context("failed writing raw SSE response head")?;
+                    relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
+                }
+            } else {
+                downstream
+                    .write_all(&response_head_bytes)
+                    .await
+                    .context("failed writing raw SSE response head")?;
+                relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
+            };
+            if reusable && upstream_keep_alive {
+                pool.checkin(upstream_io);
+            }
+        } else if transfer_chunked {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw SSE response head")?;
+            let reusable = relay_passthrough_chunked_http_body(
+                &mut upstream_io,
+                downstream,
+                response_head.leftover,
+            )
             .await
             .context("plain raw SSE stream relay failed")?;
+            if reusable && upstream_keep_alive {
+                pool.checkin(upstream_io);
+            }
+        } else {
+            downstream
+                .write_all(&response_head_bytes)
+                .await
+                .context("failed writing raw SSE response head")?;
+            relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
+                .await
+                .context("plain raw SSE stream relay failed")?;
+        }
         Ok(true)
     }
 
@@ -8786,12 +8853,24 @@ fn full_body(body: Bytes) -> GatewayBody {
 }
 
 fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
+    let timer = TokioTimer::new();
     let mut builder = AutoBuilder::new(TokioExecutor::new());
-    builder.http1().writev(true).max_buf_size(1024 * 1024);
+    builder
+        .http1()
+        .writev(true)
+        .max_buf_size(1024 * 1024)
+        .timer(timer.clone());
     builder
         .http2()
+        .timer(timer)
         .adaptive_window(true)
-        .max_send_buf_size(1024 * 1024);
+        .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
+        .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
+        .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
+        .max_concurrent_streams(Some(HTTP2_MAX_CONCURRENT_STREAMS))
+        .keep_alive_interval(Some(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS)))
+        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
+        .max_send_buf_size(HTTP2_MAX_SEND_BUF_BYTES);
     builder
 }
 
@@ -9565,14 +9644,14 @@ fn file_streaming_body(file: tokio::fs::File) -> GatewayBody {
 struct RawSseStreamState {
     upstream: BoxedProxyIo,
     leftover: Option<Bytes>,
-    buffer: Box<[u8]>,
+    buffer: PooledBuffer,
 }
 
 fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> GatewayBody {
     let state = RawSseStreamState {
         upstream,
         leftover,
-        buffer: vec![0_u8; 16 * 1024].into_boxed_slice(),
+        buffer: relay_buffer_pool().acquire(),
     };
     let stream = futures::stream::try_unfold(state, |mut state| async move {
         // Forward the head-read leftover first, then stream upstream reads as
@@ -10127,7 +10206,12 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         .no_zstd()
         .no_deflate()
         .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Some(Duration::from_secs(15)))
+        .http2_initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE_BYTES)
+        .http2_initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE_BYTES)
+        .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
+        .http2_keep_alive_interval(Some(Duration::from_secs(
+            HTTP2_KEEP_ALIVE_INTERVAL_SECS,
+        )))
         .http2_keep_alive_while_idle(true)
         .timeout(Duration::from_millis(config.http.request_timeout_ms.max(1)))
         .build()
@@ -11167,17 +11251,59 @@ fn apply_streaming_response_headers(response: &mut GatewayHttpResponse) -> Resul
     if !response_content_type_is(response, "text/event-stream") {
         return Ok(());
     }
-
     append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-cache")?;
     append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-transform")?;
     response
         .headers
-        .retain(|(name, _)| name != CONTENT_LENGTH && name != CONTENT_ENCODING);
+        .retain(|(name, _)| *name != CONTENT_LENGTH && *name != CONTENT_ENCODING);
     set_header(
         &mut response.headers,
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
+    Ok(())
+}
+
+fn apply_streaming_response_headers_map(headers: &mut HeaderMap) -> Result<()> {
+    if !upstream_response_is_sse(headers) {
+        return Ok(());
+    }
+
+    append_header_token_once_map(headers, CACHE_CONTROL, "no-cache")?;
+    append_header_token_once_map(headers, CACHE_CONTROL, "no-transform")?;
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(CONTENT_ENCODING);
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(())
+}
+
+fn append_header_token_once_map(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &str,
+) -> Result<()> {
+    let existing_name = name.clone();
+    if let Some(existing) = headers.get_mut(&existing_name) {
+        let existing_value = existing
+            .to_str()
+            .with_context(|| format!("invalid existing header value for {}", name.as_str()))?;
+        if existing_value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case(value))
+        {
+            return Ok(());
+        }
+        let merged = format!("{existing_value}, {value}");
+        *existing = HeaderValue::from_str(merged.trim())
+            .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+        return Ok(());
+    }
+    let header_value = HeaderValue::from_str(value)
+        .with_context(|| format!("invalid header value for {}", name.as_str()))?;
+    headers.insert(name, header_value);
     Ok(())
 }
 
@@ -13801,9 +13927,6 @@ fn plain_raw_reverse_fast_lane_matches(
     config: &GatewayConfig,
     request: &PlainFastLaneRequest,
 ) -> bool {
-    if request.accepts_sse {
-        return false;
-    }
     let host = request.host.as_deref().unwrap_or("localhost");
     config.services.reverse_proxy.routes.iter().any(|route| {
         reverse_proxy_route_fast_path_eligible(route)
@@ -14024,14 +14147,26 @@ fn status_has_no_body(status: StatusCode) -> bool {
 }
 
 fn raw_http_pool_keys_for_config(config: &GatewayConfig) -> HashSet<String> {
-    config
+    let mut keys: HashSet<String> = config
         .services
         .reverse_proxy
         .routes
         .iter()
         .filter(|route| reverse_proxy_route_fast_path_eligible(route))
         .filter_map(|route| raw_http_pool_key_from_upstream(&route.upstream))
-        .collect()
+        .collect();
+    if config.services.ai_proxy.enabled {
+        keys.extend(
+            config
+                .services
+                .ai_proxy
+                .routes
+                .iter()
+                .filter(|route| ai_proxy_route_fast_path_eligible(route))
+                .filter_map(|route| raw_http_pool_key_from_upstream(&route.upstream)),
+        );
+    }
+    keys
 }
 
 fn raw_http_pool_key_from_upstream(upstream: &str) -> Option<String> {
@@ -15961,193 +16096,496 @@ fn render_welcome_html(_config: &GatewayConfig) -> String {
     include_str!("../templates/welcome.html").replace("__VERSION__", env!("CARGO_PKG_VERSION"))
 }
 pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
-    let reverse_proxy = docs_template_reverse_proxy();
-    let ai_proxy = docs_template_ai_proxy();
-    let static_site = docs_template_static_site();
-    let webdav = docs_template_webdav();
-    let streams = docs_template_streams();
-    let iot = docs_template_iot();
-    let ftp = docs_template_ftp();
-    let acme_dns = docs_template_acme_dns();
-    let health = docs_template_health();
-    let maintenance = docs_template_maintenance();
-    let error_pages = docs_template_error_pages();
-
-    format!(
-        r##"<!doctype html>
-<html lang="en">
+    let mut html = r###"<!doctype html>
+<html lang="zh-CN">
 <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>proxysss docs</title>
-    <style>
-        :root {{
-            --bg: #08131d;
-            --bg-2: #0d1d2d;
-            --panel: rgba(11, 21, 36, 0.88);
-            --line: rgba(140, 192, 255, 0.12);
-            --text: #eef6ff;
-            --muted: #93a8c4;
-            --accent: #59d0ff;
-            --accent-2: #7ef4b0;
-            --gold: #f3d27c;
-        }}
-        * {{ box-sizing: border-box; }}
-        body {{
-            margin: 0;
-            font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
-            color: var(--text);
-            background:
-                radial-gradient(circle at top left, rgba(89, 208, 255, 0.18), transparent 28%),
-                linear-gradient(160deg, var(--bg), var(--bg-2));
-        }}
-        .shell {{ width: min(1400px, calc(100vw - 28px)); margin: 14px auto; display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; }}
-        .nav, .content {{ background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: 0 24px 70px rgba(0,0,0,.24); backdrop-filter: blur(16px); }}
-        .nav {{ padding: 22px; position: sticky; top: 14px; align-self: start; display: grid; gap: 18px; }}
-        .content {{ padding: 22px; display: grid; gap: 18px; }}
-        h1, h2, h3, p {{ margin: 0; }}
-        h1 {{ font-size: 34px; letter-spacing: -0.04em; }}
-        h2 {{ font-size: 24px; margin-bottom: 10px; }}
-        h3 {{ font-size: 17px; margin-bottom: 8px; }}
-        .eyebrow {{ font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--accent-2); }}
-        .muted {{ color: var(--muted); }}
-        nav a {{ display: block; padding: 10px 12px; margin-top: 6px; border-radius: 12px; color: var(--text); text-decoration: none; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.04); }}
-        section {{ padding: 18px; border-radius: 20px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05); }}
-        .cards {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
-        .card {{ padding: 14px; border-radius: 16px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05); }}
-        .list {{ display: grid; gap: 8px; color: var(--muted); }}
-        .list strong {{ color: var(--text); }}
-        pre {{ margin: 0; padding: 16px; border-radius: 18px; overflow: auto; background: rgba(3, 9, 18, .78); border: 1px solid rgba(255,255,255,.05); color: #d7e9ff; font-size: 12px; line-height: 1.5; }}
-        .table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-        .table th, .table td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: top; }}
-        .table th {{ color: var(--muted); }}
-        .pill {{ display: inline-flex; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; background: rgba(255,255,255,.08); }}
-        .pill.good {{ color: var(--accent-2); background: rgba(126,244,176,.14); }}
-        .pill.warn {{ color: var(--gold); background: rgba(243,210,124,.14); }}
-        .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
-        .actions a {{ display: inline-flex; align-items: center; text-decoration: none; padding: 12px 16px; border-radius: 999px; font-weight: 800; }}
-        .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04111a; }}
-        .ghost {{ background: rgba(255,255,255,.06); color: var(--text); }}
-        @media (max-width: 1080px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ position: static; }} .cards {{ grid-template-columns: 1fr; }} }}
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>proxysss docs</title>
+  <style>
+    :root {
+      --bg: #f5efe6;
+      --panel: rgba(255, 252, 247, 0.94);
+      --panel-strong: #fffdf8;
+      --ink: #0f172a;
+      --muted: #526071;
+      --line: rgba(15, 23, 42, 0.12);
+      --accent: #ff6b35;
+      --accent-soft: rgba(255, 107, 53, 0.14);
+      --teal: #0f766e;
+      --teal-soft: rgba(15, 118, 110, 0.14);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      line-height: 1.65;
+      background:
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 32%),
+        linear-gradient(180deg, #f7f2ea 0%, #f3eadf 46%, #efe6d9 100%);
+    }
+
+    .shell {
+      width: min(calc(100% - 24px), 1200px);
+      margin: 0 auto;
+      padding: 18px 0 44px;
+    }
+
+    .hero,
+    .panel,
+    .card,
+    .path {
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.8);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      border-radius: 34px;
+      padding: 28px;
+      margin-bottom: 18px;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -70px;
+      bottom: -90px;
+      width: 240px;
+      height: 240px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255, 107, 53, 0.28), transparent 68%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 18px 0 10px;
+      font-size: clamp(34px, 6vw, 58px);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 34px);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }
+
+    h3 {
+      margin: 14px 0 10px;
+      font-size: 21px;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    p {
+      margin: 0;
+    }
+
+    .lead,
+    .subtle,
+    li,
+    td {
+      color: var(--muted);
+    }
+
+    .lead {
+      max-width: 760px;
+      font-size: 17px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    .meta-item,
+    .panel,
+    .card,
+    .path {
+      border-radius: var(--radius-lg);
+    }
+
+    .meta-item {
+      padding: 14px 16px;
+      background: rgba(255, 255, 255, 0.42);
+      border: 1px solid rgba(255, 255, 255, 0.72);
+    }
+
+    .meta-label {
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .meta-value {
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .layout {
+      display: grid;
+      gap: 18px;
+    }
+
+    .panel {
+      padding: 24px;
+    }
+
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .kicker {
+      color: var(--accent);
+      font-size: 12px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .paths,
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+
+    .path,
+    .card {
+      padding: 20px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .tag.beginner {
+      background: var(--accent-soft);
+      color: #a53d18;
+    }
+
+    .tag.expert {
+      background: var(--teal-soft);
+      color: var(--teal);
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    li + li {
+      margin-top: 8px;
+    }
+
+    pre {
+      margin: 16px 0 0;
+      padding: 18px;
+      overflow: auto;
+      border-radius: var(--radius-md);
+      background: #111827;
+      color: #e5eef9;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font: 13px/1.55 var(--mono);
+    }
+
+    code {
+      font-family: var(--mono);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      margin-top: 18px;
+      background: var(--panel-strong);
+    }
+
+    th,
+    td {
+      text-align: left;
+      vertical-align: top;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    th {
+      background: rgba(15, 23, 42, 0.04);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    td strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+    }
+
+    .command-block {
+      margin-top: 16px;
+    }
+
+    .note {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border-radius: var(--radius-md);
+      background: rgba(15, 23, 42, 0.92);
+      color: rgba(255, 255, 255, 0.84);
+    }
+
+    .note strong {
+      color: #fff;
+    }
+
+    @media (max-width: 720px) {
+      .hero,
+      .panel,
+      .card,
+      .path {
+        padding: 18px;
+      }
+
+      h1 {
+        font-size: 38px;
+      }
+    }
+  </style>
 </head>
 <body>
-    <main class="shell">
-        <aside class="nav">
-            <div>
-                <div class="eyebrow">documentation</div>
-                <h1>proxysss</h1>
-                <p class="muted">Built-in manual, operational guide, config templates, and parity notes.</p>
-            </div>
-            <nav>
-                <a href="#quickstart">Quick Start</a>
-                <a href="#operations">Operations</a>
-                <a href="#templates">Templates</a>
-                <a href="#wildcard-ssl">Wildcard SSL</a>
-                <a href="#parity">Nginx Parity</a>
-                <a href="#gaps">Tracked Gaps</a>
-            </nav>
-            <div class="actions">
-                <a class="primary" href="/">Back to Welcome</a>
-                <a class="ghost" href="/admin">Open Admin</a>
-            </div>
-        </aside>
+  <div class="shell">
+    <header class="hero">
+      <div class="eyebrow">proxysss docs / human first</div>
+      <h1>先复制成功，再看完整能力面。</h1>
+      <p class="lead">这页内建文档同时服务两类人：新手要能在几分钟内跑起一个站点；高手要能立刻找到路由面、TLS、AI SSE、TCP/UDP、reload 和运维边界，不需要先看一屏宣传。</p>
+      <div class="meta">
+        <div class="meta-item">
+          <div class="meta-label">Default HTTP</div>
+          <div class="meta-value">80</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Default HTTPS / H2 / H3</div>
+          <div class="meta-value">443</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Admin</div>
+          <div class="meta-value">127.0.0.1:7777</div>
+        </div>
+        <div class="meta-item">
+          <div class="meta-label">Main config</div>
+          <div class="meta-value">proxysss.yaml</div>
+        </div>
+      </div>
+    </header>
 
-        <section class="content">
-            <section id="quickstart">
-                <div class="eyebrow">Quick Start</div>
-                <h2>Default Behavior</h2>
-                <div class="cards">
-                    <article class="card"><strong>Public HTTP</strong><p class="muted">Port 80 with a built-in welcome page and optional automatic redirect to HTTPS for managed TLS domains.</p></article>
-                    <article class="card"><strong>Public TLS</strong><p class="muted">Port 443 for HTTPS/HTTP2, optional HTTP3 on the same public edge, managed ACME, SNI certs, and WebSocket tunneling.</p></article>
-                    <article class="card"><strong>Admin</strong><p class="muted">Port 7777 with stats, upstream health, maintenance mode toggles, and live runtime inspection.</p></article>
-                </div>
-            </section>
+    <main class="layout">
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Beginner path</div>
+            <h2>如果你是新手，先跑通一条 HTTP 链路。</h2>
+          </div>
+          <p class="subtle">你最需要的不是术语，而是一份能工作的最小配置和一段清楚的解释。</p>
+        </div>
 
-            <section id="operations">
-                <div class="eyebrow">Operations</div>
-                <h2>Built-in Control Plane</h2>
-                <div class="list">
-                    <div><strong>Health:</strong> active HTTP/TCP health probes plus passive quarantine and manual drain state.</div>
-                    <div><strong>Reload:</strong> manual <code>POST /v1/reload</code> is the default high-performance path; optional file watching fingerprints the main YAML config, scripts, plugins, and route-level health policy when enabled.</div>
-                    <div><strong>Route automation:</strong> token-authenticated `POST /v1/domain-routes/upsert` can persist new domain routes into the main YAML file and reload them in process.</div>
-                    <div><strong>Maintenance:</strong> upstream disable/restore can be persisted on disk through runtime maintenance state.</div>
-                    <div><strong>Error Pages:</strong> configurable status-page bodies/files plus polished built-in browser-facing 404/403/5xx pages.</div>
-                    <div><strong>Runtime tuning:</strong> Ubuntu/Debian-first TCP tuning assistant via <code>proxysss tune tcp</code>, plus Linux SO_REUSEPORT accept fanout for HTTP and TCP streams when performance mode is enabled.</div>
-                </div>
-            </section>
+        <div class="paths">
+          <article class="path">
+            <span class="tag beginner">5 分钟可用</span>
+            <h3>第一个反向代理</h3>
+            <p class="subtle">把 `app.example.com` 代理到本地 9000 端口，先确认域名、端口和源站都通。</p>
+            <pre><code>{{REVERSE_PROXY}}</code></pre>
+          </article>
 
-            <section id="templates">
-                <div class="eyebrow">Templates</div>
-                <h2>Configuration Templates</h2>
-                <h3>HTTP Reverse Proxy</h3>
-                <pre>{}</pre>
-                <h3>AI API Reverse Proxy</h3>
-                <pre>{}</pre>
-                <h3>Static Site</h3>
-                <pre>{}</pre>
-                <h3>WebDAV</h3>
-                <pre>{}</pre>
-                <h3>TCP / UDP Streams</h3>
-                <pre>{}</pre>
-                <h3>MQTT / IoT Gateways</h3>
-                <pre>{}</pre>
-                <h3>FTP Native Control + Data Channels</h3>
-                <pre>{}</pre>
-                <h3 id="wildcard-ssl">Wildcard SSL with built-in DNS-01</h3>
-                <p class="muted">Use <code>http.tls.mode: acme_managed</code> with <code>http.tls.acme.challenge: dns01</code> for wildcard certificates. Without cloud tokens, HTTP-01/TLS-ALPN-01 still works via <code>auto_https</code>. Built-in providers: <code>cloudflare</code>, <code>aliyun_cn</code>, <code>aliyun_intl</code>, <code>tencent</code>, <code>volcengine</code>, <code>aws</code>, <code>azure</code>, <code>google</code>.</p>
-                <pre>{}</pre>
-                <h3>Active Health, Maintenance Persistence, Alerts</h3>
-                <pre>{}</pre>
-                <h3>Custom Error Pages</h3>
-                <pre>{}</pre>
-                <h3>Maintenance Persistence</h3>
-                <pre>{}</pre>
-            </section>
+          <article class="path">
+            <span class="tag beginner">正式上线</span>
+            <h3>给站点加自动 HTTPS</h3>
+            <p class="subtle">做单域名上线时，内建 ACME 是默认首选；做泛域名时再切到 DNS-01。</p>
+            <pre><code>{{ACME_DNS}}</code></pre>
+          </article>
+        </div>
+      </section>
 
-            <section id="parity">
-                <div class="eyebrow">Parity</div>
-                <h2>Regular Gateway Behavior</h2>
-                <table class="table">
-                    <thead><tr><th>Surface</th><th>Status</th><th>Notes</th></tr></thead>
-                    <tbody>
-                        <tr><td>HTTP reverse proxy</td><td><span class="pill good">supported</span></td><td>host/path matching, upstream pools, strip prefix, header set/strip, retry, health, maintenance drain</td></tr>
-                        <tr><td>AI API reverse proxy</td><td><span class="pill good">supported</span></td><td>native New API, sub2api, and OpenAI-compatible routes through services.ai_proxy</td></tr>
-                        <tr><td>HTTPS / HTTP2 / HTTP3</td><td><span class="pill good">supported</span></td><td>self-signed, manual SNI, managed ACME HTTP-01/TLS-ALPN-01/DNS-01, WebSocket, automatic redirect for managed domains</td></tr>
-                        <tr><td>Static files</td><td><span class="pill good">supported</span></td><td>index files, autoindex, default welcome, custom browser error pages</td></tr>
-                        <tr><td>WebDAV</td><td><span class="pill good">supported</span></td><td>OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE</td></tr>
-                        <tr><td>TCP / UDP streams</td><td><span class="pill good">supported</span></td><td>YAML listeners with upstream pools and runtime health</td></tr>
-                        <tr><td>MQTT / IoT</td><td><span class="pill good">supported</span></td><td>MQTT TCP, MQTT TLS passthrough, MQTT over WebSocket, CoAP-style UDP, stream policies, and watchdog/health metrics</td></tr>
-                        <tr><td>FTP</td><td><span class="pill good">supported</span></td><td>nginx ftp module directive parity: bind/proxy_pass, passive range, pasv_address, allow/deny, command and transfer policies, per-user rules, lifecycle logs</td></tr>
-                    </tbody>
-                </table>
-            </section>
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Copy-paste recipes</div>
+            <h2>核心场景都给可复制案例，而且告诉你为什么这样配。</h2>
+          </div>
+          <p class="subtle">官方文档不该让你一边猜字段名，一边猜设计意图。下面这些场景是最常见的第一批生产配置。</p>
+        </div>
 
-            <section id="gaps">
-                <div class="eyebrow">Tracked Gaps</div>
-                <h2>Still Honest About What Remains</h2>
-                <div class="list">
-                    <div><strong>On-demand TLS:</strong> not yet policy-gated first-hit certificate issuance.</div>
-                    <div><strong>Auto HTTPS boundary:</strong> built-in managed ACME covers HTTP-01, TLS-ALPN-01, and DNS-01 wildcard issuance through provider strategies; legacy <code>acme_dns_external</code> remains for acme.sh-only providers.</div>
-                </div>
-            </section>
-        </section>
+        <div class="grid">
+          <article class="card">
+            <span class="tag beginner">Static site</span>
+            <h3>静态站点</h3>
+            <p class="subtle">适合官网、文档站、小型下载站。会参与配置加载后的 warm-up。</p>
+            <pre><code>{{STATIC_SITE}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag beginner">AI / SSE</span>
+            <h3>流式 AI 代理</h3>
+            <p class="subtle">面向 OpenAI-compatible / New API / SSE，优先关注小包 flush、nodelay 和上游健康。</p>
+            <pre><code>{{AI_PROXY}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">TCP / UDP</span>
+            <h3>游戏 / 原生协议网关</h3>
+            <p class="subtle">HTTP 面解决不了的实时流量，应该直接落到 `tcp.listeners` / `udp.listeners`。</p>
+            <pre><code>{{STREAMS}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">MQTT / IoT</span>
+            <h3>设备边缘接入</h3>
+            <p class="subtle">MQTT TCP、MQTT over WebSocket、CoAP-style UDP 都能组合，但 proxysss 不是 broker。</p>
+            <pre><code>{{IOT}}</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Expert path</div>
+            <h2>高手速查：先确认应该把配置落在哪个能力面。</h2>
+          </div>
+          <p class="subtle">这张表的目标是减少“功能明明支持，但找不到入口”的摩擦。</p>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>配置面</th>
+              <th>适合什么</th>
+              <th>常见误用</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>services.reverse_proxy.routes</strong>普通 HTTP / API / WebSocket / SSE</td>
+              <td>网站、后台、长响应 API、缓存、限流、健康检查都从这里开始。</td>
+              <td>不要拿它去承载 TCP / UDP 原生协议。</td>
+            </tr>
+            <tr>
+              <td><strong>services.ai_proxy</strong>OpenAI-compatible / New API</td>
+              <td>更明确的 AI 网关语义、上游池和流式传输细节。</td>
+              <td>不要把所有 HTTP 都无脑归进 AI proxy。</td>
+            </tr>
+            <tr>
+              <td><strong>services.domain_routes</strong>站点级编排</td>
+              <td>同一域名下把静态、API、WebDAV 等组合成统一入口。</td>
+              <td>不要把它理解成唯一执行面。</td>
+            </tr>
+            <tr>
+              <td><strong>tcp.listeners</strong>TCP 原生流量</td>
+              <td>数据库、游戏长连接、MQTT TCP、TLS passthrough/SNI 场景。</td>
+              <td>不要期待 HTTP 头级别策略。</td>
+            </tr>
+            <tr>
+              <td><strong>udp.listeners</strong>UDP / KCP-style / CoAP-style</td>
+              <td>实时设备、游戏、会话型 UDP 网关。</td>
+              <td>不要把它包装成应用终端本身。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Ops and validation</div>
+            <h2>文档最后一定要回到运维命令和压测纪律。</h2>
+          </div>
+          <p class="subtle">这是官方文档最容易写丢的部分，但它决定了你的配置是不是能真正上线。</p>
+        </div>
+
+        <div class="command-block">
+          <pre><code>proxysss config explain
+proxysss config capabilities
+proxysss config watched-scripts
+proxysss config routes
+proxysss config reload-plan
+proxysss config nginx-parity --format yaml
+proxysss token show
+{{HEALTH}}</code></pre>
+        </div>
+
+        <div class="note">
+          <strong>性能约束：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 都要一起看，不能出现“这一项快了，另一项明显变差”还把它当成成功。
+        </div>
+      </section>
     </main>
+  </div>
 </body>
-</html>"##,
-        reverse_proxy,
-        ai_proxy,
-        static_site,
-        webdav,
-        streams,
-        iot,
-        ftp,
-        acme_dns,
-        health,
-        error_pages,
-        maintenance,
-    )
+</html>"###
+    .to_string();
+
+    for (token, value) in [
+        ("{{REVERSE_PROXY}}", docs_template_reverse_proxy()),
+        ("{{AI_PROXY}}", docs_template_ai_proxy()),
+        ("{{STATIC_SITE}}", docs_template_static_site()),
+        ("{{STREAMS}}", docs_template_streams()),
+        ("{{IOT}}", docs_template_iot()),
+        ("{{ACME_DNS}}", docs_template_acme_dns()),
+        ("{{HEALTH}}", docs_template_health()),
+    ] {
+        html = html.replace(token, value);
+    }
+
+    html
 }
+
 
 fn docs_template_reverse_proxy() -> &'static str {
     "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  access_control:\n    http:\n      enabled: true\n      blacklist: [203.0.113.10, 198.51.100.0/24]\n  domain_routes:\n    - name: example-site\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n    - name: neko233-store\n      domains: [neko233.store]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9001\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 120\n        window_ms: 60000\n        burst: 30\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
@@ -18368,7 +18806,7 @@ async fn relay_passthrough_chunked_http_body(
         }
     }
 
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut buffer = relay_buffer_pool().acquire();
     loop {
         let read = upstream
             .read(&mut buffer)
@@ -18506,7 +18944,7 @@ async fn relay_fixed_http_body(
         }
     }
 
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut buffer = relay_buffer_pool().acquire();
     while remaining > 0 {
         let read_target = remaining.min(buffer.len() as u64) as usize;
         let read = upstream
@@ -20455,3 +20893,4 @@ mod tests {
         assert!(!apply_stream_rate_limit(&store, &config, addr));
     }
 }
+

@@ -68,6 +68,8 @@ VENDOR_DIR="$BENCH_ROOT/vendors"
 RUN_DIR="$BENCH_ROOT/runs/all-scenarios"
 WWW_DIR="$RUN_DIR/www"
 PROXY_DIR="$RUN_DIR/proxysss"
+BENCH_HELPER_SRC="$ROOT/scripts/benchmark-helper.go"
+BENCH_HELPER_BIN="$RUN_DIR/benchmark-helper"
 PID_FILE="$RUN_DIR/pids.txt"
 NGINX_PID_FILE="$RUN_DIR/nginx.pid"
 RESULTS_FILE="$RUN_DIR/results.json"
@@ -99,7 +101,7 @@ require_cmd() {
   }
 }
 
-require_cmd python3
+require_cmd go
 require_cmd curl
 require_cmd tar
 require_cmd make
@@ -113,6 +115,7 @@ stop_bench_processes
 rm -rf "$RUN_DIR"
 mkdir -p "$VENDOR_DIR" "$WWW_DIR" "$PROXY_DIR"
 : >"$PID_FILE"
+go build -o "$BENCH_HELPER_BIN" "$BENCH_HELPER_SRC"
 
 NGINX_TARBALL="$VENDOR_DIR/nginx-$NGINX_VERSION.tar.gz"
 NGINX_PREFIX="$VENDOR_DIR/nginx-$NGINX_VERSION-all-scenarios"
@@ -151,11 +154,7 @@ cat >"$WWW_DIR/small.html" <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"><title>small bench</title></head><body><h1>proxysss small static benchmark</h1><p>same payload for proxysss and nginx.</p></body></html>
 HTML
 printf 'hot-update-v1\n' >"$WWW_DIR/hot.dat"
-python3 - "$WWW_DIR/large.bin" <<'PY'
-from pathlib import Path
-import sys
-Path(sys.argv[1]).write_bytes((b"proxysss-large-static-benchmark\n" * 4096) * 128)
-PY
+"$BENCH_HELPER_BIN" write-large-file --path "$WWW_DIR/large.bin"
 
 mkdir -p "$RUN_DIR/certs"
 openssl req -x509 -newkey rsa:2048 -nodes \
@@ -163,57 +162,6 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -out "$RUN_DIR/certs/bench.crt" \
   -subj "/CN=localhost" \
   -days 1 >/dev/null 2>&1
-
-cat >"$RUN_DIR/sse-upstream.py" <<'PY'
-import json
-import sys
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *_):
-        return
-
-    def do_GET(self):
-        self._handle()
-
-    def do_POST(self):
-        length = int(self.headers.get("content-length", "0") or "0")
-        if length:
-            self.rfile.read(length)
-        self._handle()
-
-    def _handle(self):
-        if self.path.startswith("/v1/chat/completions") or self.path.startswith("/sse"):
-            self.send_response(200)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("cache-control", "no-cache")
-            self.send_header("connection", "close")
-            self.end_headers()
-            for idx in range(8):
-                payload = {
-                    "id": "chatcmpl-proxysss-bench",
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": f"token-{idx}"}}],
-                }
-                self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
-                self.wfile.flush()
-                time.sleep(0.002)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-            return
-        body = json.dumps({"ok": True, "path": self.path}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-port = int(sys.argv[1])
-ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
-PY
 
 cat >"$PROXY_DIR/proxysss.yaml" <<YAML
 config_version: 1
@@ -415,41 +363,13 @@ wait_http() {
 
 parse_bench_output() {
   local scenario="$1" gateway="$2" protocol="$3" target="$4" bench_concurrency="$5" output="$6"
-  python3 - "$scenario" "$gateway" "$protocol" "$target" "$bench_concurrency" "$DURATION_SECS" "$output" <<'PY'
-import json, re, sys
-scenario, gateway, protocol, target, concurrency, duration, output = sys.argv[1:8]
-row = {
-    "scenario": scenario,
-    "gateway": gateway,
-    "name": f"{scenario}:{gateway}",
-    "protocol": protocol,
-    "target": target,
-    "concurrency": int(concurrency),
-    "duration_secs": int(duration),
-    "success": 0,
-    "errors": 0,
-    "ops_per_sec": 0.0,
-    "throughput_mib_s": 0.0,
-    "latency_p50_ms": None,
-    "latency_p95_ms": None,
-    "latency_p99_ms": None,
-}
-patterns = {
-    "success": r"success\s+:\s+(\d+)",
-    "errors": r"errors\s+:\s+(\d+)",
-    "ops_per_sec": r"ops/sec\s+:\s+([\d.]+)",
-    "throughput_mib_s": r"throughput\s+:\s+([\d.]+)\s+MiB/s",
-    "latency_p50_ms": r"latency p50\s+:\s+([\d.]+)\s+ms",
-    "latency_p95_ms": r"latency p95\s+:\s+([\d.]+)\s+ms",
-    "latency_p99_ms": r"latency p99\s+:\s+([\d.]+)\s+ms",
-}
-for key, pattern in patterns.items():
-    match = re.search(pattern, output)
-    if match:
-        value = match.group(1)
-        row[key] = float(value) if "." in value else int(value)
-print(json.dumps(row))
-PY
+  printf '%s' "$output" | "$BENCH_HELPER_BIN" parse-bench \
+    --scenario "$scenario" \
+    --gateway "$gateway" \
+    --protocol "$protocol" \
+    --target "$target" \
+    --concurrency "$bench_concurrency" \
+    --duration "$DURATION_SECS"
 }
 
 run_http_bench() {
@@ -523,7 +443,7 @@ run_udp_bench() {
 SSE_UPSTREAM_PID=""
 
 start_sse_backend() {
-  python3 "$RUN_DIR/sse-upstream.py" 18191 >/dev/null 2>&1 &
+  "$BENCH_HELPER_BIN" serve-sse --listen 127.0.0.1:18191 >/dev/null 2>&1 &
   SSE_UPSTREAM_PID="$!"
   echo "$SSE_UPSTREAM_PID" >>"$PID_FILE"
   wait_http "http://127.0.0.1:18191/sse"
@@ -672,30 +592,9 @@ if [[ "$FAST_GATE" == "1" ]]; then
   SSE_CONCURRENCY="$SAVED_SSE_CONCURRENCY"
   DURATION_SECS="$SAVED_DURATION_SECS"
 
-  python3 - "$FAST_GATE_RATIO" "${QUICK_ROWS[@]}" <<'PY'
-import json, sys
-from collections import defaultdict
-min_ratio = float(sys.argv[1])
-rows = [json.loads(item) for item in sys.argv[2:]]
-by_scenario = defaultdict(dict)
-for row in rows:
-    by_scenario[row["scenario"]][row["gateway"]] = row
-failures = []
-for scenario, gateways in sorted(by_scenario.items()):
-    proxy = gateways.get("proxysss", {})
-    nginx = gateways.get("nginx", {})
-    proxy_ops = float(proxy.get("ops_per_sec") or 0)
-    nginx_ops = float(nginx.get("ops_per_sec") or 0)
-    ratio = proxy_ops / nginx_ops if nginx_ops else 0.0
-    print(f"quick gate {scenario}: proxysss={proxy_ops:.2f} nginx={nginx_ops:.2f} ratio={ratio:.3f}x")
-    if int(proxy.get("errors") or 0) or int(nginx.get("errors") or 0):
-        failures.append(f"{scenario} errors proxysss={proxy.get('errors')} nginx={nginx.get('errors')}")
-    elif ratio < min_ratio:
-        failures.append(f"{scenario} ratio={ratio:.3f}x < {min_ratio:.2f}x")
-if failures:
-    raise SystemExit("quick benchmark gate failed; deep matrix skipped: " + "; ".join(failures))
-print("quick benchmark gate passed; starting deep matrix")
-PY
+  QUICK_ROWS_FILE="$RUN_DIR/quick-rows.jsonl"
+  printf '%s\n' "${QUICK_ROWS[@]}" >"$QUICK_ROWS_FILE"
+  "$BENCH_HELPER_BIN" quick-gate --min-ratio "$FAST_GATE_RATIO" --rows "$QUICK_ROWS_FILE"
 fi
 
 append_deep_matrix_serial() {
@@ -808,124 +707,32 @@ else
   append_deep_matrix_serial
 fi
 
-python3 - "$RESULTS_FILE" "${RESULT_ROWS[@]}" <<'PY'
-import json, sys
-path = sys.argv[1]
-rows = [json.loads(item) for item in sys.argv[2:]]
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(rows, handle, indent=2)
-    handle.write("\n")
-PY
+RESULT_ROWS_FILE="$RUN_DIR/results.jsonl"
+printf '%s\n' "${RESULT_ROWS[@]}" >"$RESULT_ROWS_FILE"
+"$BENCH_HELPER_BIN" write-json-array --in "$RESULT_ROWS_FILE" --out "$RESULTS_FILE"
 
-python3 - "$RESULTS_FILE" "$SUMMARY_MD" "$SUMMARY_HTML" "$MIN_RATIO" "$CRITICAL_RATIO" "$CRITICAL_SCENARIOS" "$DIAGNOSTIC_SCENARIOS" "$WEBSOCKET_ERROR_TOLERANCE" "$AGGREGATE_RATIO" "$MIXED_MATRIX" "$CPU_CORES" "$CONCURRENCY" "$HTTPS_CONCURRENCY" "$STATIC_LARGE_CONCURRENCY" "$SSE_CONCURRENCY" "$STREAM_CONNECTIONS" <<'PY'
-import html, json, sys
-from collections import defaultdict
-results_path, md_path, html_path = sys.argv[1], sys.argv[2], sys.argv[3]
-min_ratio, critical_ratio = float(sys.argv[4]), float(sys.argv[5])
-critical_scenarios = set(sys.argv[6].split())
-diagnostic_scenarios = set(sys.argv[7].split())
-websocket_error_tolerance = int(sys.argv[8])
-aggregate_ratio = float(sys.argv[9])
-mixed_matrix = sys.argv[10] == "1"
-cpu_cores, http_concurrency, https_concurrency, static_large_concurrency, sse_concurrency, stream_connections = sys.argv[11:17]
-rows = json.load(open(results_path, encoding="utf-8"))
-by_scenario = defaultdict(dict)
-for row in rows:
-    by_scenario[row["scenario"]][row["gateway"]] = row
-errors = []
-for scenario, gateways in by_scenario.items():
-    proxy = gateways.get("proxysss", {})
-    nginx = gateways.get("nginx", {})
-    proxy_errors = int(proxy.get("errors") or 0)
-    nginx_errors = int(nginx.get("errors") or 0)
-    protocol = proxy.get("protocol") or nginx.get("protocol")
-    if protocol == "udp":
-        if proxy_errors > nginx_errors + 2:
-            errors.append(f"{scenario} udp errors proxysss={proxy_errors} nginx={nginx_errors}")
-    elif protocol == "websocket":
-        if proxy_errors > nginx_errors + websocket_error_tolerance:
-            errors.append(f"{scenario} websocket errors proxysss={proxy_errors} nginx={nginx_errors}")
-    elif proxy_errors or nginx_errors:
-        errors.append(f"{scenario} errors proxysss={proxy_errors} nginx={nginx_errors}")
+MIXED_MATRIX_BOOL=false
+if [[ "$MIXED_MATRIX" == "1" ]]; then
+  MIXED_MATRIX_BOOL=true
+fi
 
-lines = [
-    "# proxysss all-scenarios benchmark",
-    "",
-    f"- Matrix mode: `{'mixed concurrent' if mixed_matrix else 'serial diagnostic'}`",
-    f"- Detected CPU cores: `{cpu_cores}`",
-    f"- Auto concurrency: HTTP `{http_concurrency}`, HTTPS `{https_concurrency}`, static-large `{static_large_concurrency}`, SSE `{sse_concurrency}`, TCP/UDP/WebSocket `{stream_connections}`",
-    f"- Non-critical minimum proxysss/nginx ops ratio: `{min_ratio:.2f}` except diagnostic scenarios `{', '.join(sorted(diagnostic_scenarios))}`",
-    f"- WebSocket reconnect/error tolerance: `proxysss <= nginx + {websocket_error_tolerance}`",
-    f"- Critical long-connection fair ratio gate: `{critical_ratio:.2f}` for `{', '.join(sorted(critical_scenarios))}`",
-    f"- Aggregate mixed-load fair ratio gate: `{aggregate_ratio:.2f}`",
-    f"- Result file: `{results_path}`",
-    "",
-    "| Scenario | proxysss ops/s | nginx ops/s | Ratio | proxysss p95 ms | nginx p95 ms | Errors |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-]
-ratios = []
-proxy_total_ops = 0.0
-nginx_total_ops = 0.0
-for scenario in sorted(by_scenario):
-    proxy = by_scenario[scenario].get("proxysss")
-    nginx = by_scenario[scenario].get("nginx")
-    proxy_ops = float((proxy or {}).get("ops_per_sec") or 0)
-    nginx_ops = float((nginx or {}).get("ops_per_sec") or 0)
-    ratio = proxy_ops / nginx_ops if nginx_ops > 0 else 0.0
-    proxy_total_ops += proxy_ops
-    nginx_total_ops += nginx_ops
-    ratios.append((scenario, ratio))
-    err = int((proxy or {}).get("errors") or 0) + int((nginx or {}).get("errors") or 0)
-    lines.append(
-        f"| {scenario} | {proxy_ops:.2f} | {nginx_ops:.2f} | {ratio:.3f}x | "
-        f"{float((proxy or {}).get('latency_p95_ms') or 0):.3f} | "
-        f"{float((nginx or {}).get('latency_p95_ms') or 0):.3f} | {err} |"
-    )
-
-aggregate = proxy_total_ops / nginx_total_ops if nginx_total_ops > 0 else 0.0
-lines.extend([
-    "",
-    f"- Aggregate proxysss ops/s: `{proxy_total_ops:.2f}`",
-    f"- Aggregate nginx ops/s: `{nginx_total_ops:.2f}`",
-    f"- Aggregate proxysss/nginx ratio: `{aggregate:.3f}x`",
-])
-
-with open(md_path, "w", encoding="utf-8") as handle:
-    handle.write("\n".join(lines) + "\n")
-
-body_rows = "\n".join(
-    "<tr>"
-    f"<td>{html.escape(scenario)}</td>"
-    f"<td>{by_scenario[scenario].get('proxysss', {}).get('ops_per_sec', 0):.2f}</td>"
-    f"<td>{by_scenario[scenario].get('nginx', {}).get('ops_per_sec', 0):.2f}</td>"
-    f"<td>{ratio:.3f}x</td>"
-    "</tr>"
-    for scenario, ratio in ratios
-)
-with open(html_path, "w", encoding="utf-8") as handle:
-    handle.write(f"<!doctype html><meta charset='utf-8'><title>proxysss all-scenarios benchmark</title><h1>proxysss all-scenarios benchmark</h1><table><thead><tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ratio</th></tr></thead><tbody>{body_rows}</tbody></table>")
-
-failures = [
-    f"{scenario} ratio={ratio:.3f}"
-    for scenario, ratio in ratios
-    if scenario not in diagnostic_scenarios and ratio < min_ratio
-]
-aggregate_failure = mixed_matrix and aggregate < aggregate_ratio
-critical_failures = [
-    f"{scenario} ratio={ratio:.3f} < {critical_ratio:.2f}"
-    for scenario, ratio in ratios
-    if scenario in critical_scenarios and ratio < critical_ratio
-]
-if errors:
-    raise SystemExit("benchmark errors: " + "; ".join(errors))
-if critical_failures:
-    raise SystemExit("critical fair benchmark ratio gate failed: " + "; ".join(critical_failures))
-if aggregate_failure:
-    raise SystemExit(f"aggregate mixed fair benchmark ratio gate failed: {aggregate:.3f} < {aggregate_ratio:.2f}")
-if failures:
-    raise SystemExit("benchmark ratio gate failed: " + "; ".join(failures))
-print(f"all-scenarios benchmark gate passed ({len(rows)} rows, aggregate ratio {aggregate:.3f}x)")
-PY
+"$BENCH_HELPER_BIN" write-all-scenarios-summary \
+  --results "$RESULTS_FILE" \
+  --md "$SUMMARY_MD" \
+  --html "$SUMMARY_HTML" \
+  --min-ratio "$MIN_RATIO" \
+  --critical-ratio "$CRITICAL_RATIO" \
+  --critical-scenarios "$CRITICAL_SCENARIOS" \
+  --diagnostic-scenarios "$DIAGNOSTIC_SCENARIOS" \
+  --websocket-error-tolerance "$WEBSOCKET_ERROR_TOLERANCE" \
+  --aggregate-ratio "$AGGREGATE_RATIO" \
+  --mixed-matrix="$MIXED_MATRIX_BOOL" \
+  --cpu-cores "$CPU_CORES" \
+  --http-concurrency "$CONCURRENCY" \
+  --https-concurrency "$HTTPS_CONCURRENCY" \
+  --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
+  --sse-concurrency "$SSE_CONCURRENCY" \
+  --stream-connections "$STREAM_CONNECTIONS"
 
 echo "results saved to $RESULTS_FILE"
 echo "summary markdown: $SUMMARY_MD"

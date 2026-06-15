@@ -1,25 +1,28 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>proxysss Docs</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>proxysss docs</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #061018;
-      --bg-2: #0b1823;
-      --panel: rgba(10, 23, 34, 0.84);
-      --panel-strong: rgba(12, 28, 41, 0.94);
-      --line: rgba(171, 210, 244, 0.14);
-      --line-strong: rgba(112, 226, 201, 0.34);
-      --text: #edf7ff;
-      --soft: #a7bccf;
-      --muted: #6e8498;
-      --accent: #6ef0d0;
-      --accent-2: #90beff;
-      --warn: #ffd27a;
-      --max: 1180px;
+      --bg: #f5efe6;
+      --paper: rgba(255, 252, 247, 0.9);
+      --paper-strong: #fffdf8;
+      --ink: #0f172a;
+      --muted: #526071;
+      --line: rgba(15, 23, 42, 0.12);
+      --accent: #ff6b35;
+      --accent-soft: rgba(255, 107, 53, 0.14);
+      --teal: #0f766e;
+      --teal-soft: rgba(15, 118, 110, 0.14);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --max: 1240px;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
 
     * {
@@ -28,670 +31,711 @@
 
     body {
       margin: 0;
-      min-height: 100vh;
-      color: var(--text);
-      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      font-family: var(--sans);
       background:
-        radial-gradient(circle at top left, rgba(110, 240, 208, 0.14), transparent 28%),
-        radial-gradient(circle at top right, rgba(144, 190, 255, 0.18), transparent 32%),
-        linear-gradient(180deg, var(--bg-2), var(--bg));
-    }
-
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background-image:
-        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
-      background-size: 38px 38px;
-      mask-image: linear-gradient(180deg, rgba(0,0,0,0.95), rgba(0,0,0,0.2));
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 32%),
+        linear-gradient(180deg, #f7f2ea 0%, #f3eadf 48%, #efe6d9 100%);
+      color: var(--ink);
+      line-height: 1.65;
     }
 
     a {
       color: inherit;
+      text-decoration: none;
     }
 
     .shell {
-      width: min(var(--max), calc(100vw - 32px));
+      width: min(calc(100% - 32px), var(--max));
       margin: 0 auto;
-    }
-
-    .topbar {
-      position: sticky;
-      top: 0;
-      z-index: 30;
-      border-bottom: 1px solid var(--line);
-      background: rgba(6, 16, 24, 0.82);
-      backdrop-filter: blur(18px);
-    }
-
-    .topbar-inner {
-      width: min(var(--max), calc(100vw - 32px));
-      min-height: 68px;
-      margin: 0 auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      min-width: 0;
-    }
-
-    .logo {
-      width: 36px;
-      height: 36px;
-      border-radius: 12px;
-      border: 2px solid var(--accent);
-      box-shadow: 0 0 26px rgba(110, 240, 208, 0.18);
-      position: relative;
-      transform: rotate(-5deg);
-      flex: 0 0 auto;
-    }
-
-    .logo::after {
-      content: "";
-      position: absolute;
-      inset: 7px;
-      border-radius: 8px;
-      border: 2px solid var(--accent-2);
-      transform: rotate(8deg);
-    }
-
-    .brand strong {
-      display: block;
-      font-size: 15px;
-      letter-spacing: 0.02em;
-    }
-
-    .brand span {
-      display: block;
-      font-size: 12px;
-      color: var(--soft);
-      white-space: nowrap;
-    }
-
-    .topnav {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-    }
-
-    .topnav a,
-    .topnav button,
-    .button {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 42px;
-      padding: 0 16px;
-      text-decoration: none;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.04);
-      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
-    }
-
-    .topnav a:hover,
-    .topnav button:hover,
-    .button:hover {
-      transform: translateY(-2px);
-      border-color: var(--line-strong);
-      background: rgba(255,255,255,0.07);
-    }
-
-    .lang-switch {
-      display: inline-flex;
-      padding: 4px;
-      gap: 4px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.03);
-    }
-
-    .lang-switch button {
-      min-height: 34px;
-      padding: 0 12px;
-      border: 0;
-      border-radius: 999px;
-      color: var(--soft);
-      background: transparent;
-      cursor: pointer;
-      font: inherit;
-      transition: background 0.18s ease, color 0.18s ease;
-    }
-
-    .lang-switch button.active {
-      color: #031117;
-      font-weight: 800;
-      background: linear-gradient(135deg, var(--accent), #baf4ff);
-    }
-
-    .button.primary {
-      color: #031117;
-      font-weight: 800;
-      border-color: transparent;
-      background: linear-gradient(135deg, var(--accent), #baf4ff);
-    }
-
-    main {
-      padding: clamp(34px, 7vw, 80px) 0 72px;
+      padding: 28px 0 72px;
     }
 
     .hero {
-      display: grid;
-      grid-template-columns: minmax(0, 1.08fr) minmax(330px, 0.78fr);
-      gap: 26px;
-      align-items: stretch;
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(135deg, rgba(255, 253, 248, 0.95), rgba(255, 248, 240, 0.88));
+      border: 1px solid rgba(255, 255, 255, 0.75);
+      border-radius: 36px;
+      box-shadow: var(--shadow);
+      padding: 38px;
+      margin-bottom: 28px;
     }
 
-    .hero-copy,
-    .hero-note,
-    .section,
-    .card,
-    .path-box {
-      border: 1px solid var(--line);
-      background: var(--panel);
-      border-radius: 24px;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.22);
-    }
-
-    .hero-copy {
-      padding: clamp(28px, 5vw, 48px);
-      background:
-        radial-gradient(circle at top left, rgba(110, 240, 208, 0.12), transparent 32%),
-        linear-gradient(180deg, rgba(13, 32, 45, 0.96), rgba(7, 17, 26, 0.94));
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -80px -100px auto;
+      width: 280px;
+      height: 280px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(255, 107, 53, 0.3), transparent 65%);
+      pointer-events: none;
     }
 
     .eyebrow {
       display: inline-flex;
-      margin-bottom: 18px;
-      color: var(--accent);
-      font-size: 12px;
-      line-height: 1;
-      font-weight: 800;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.05);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
-      letter-spacing: 0.16em;
-    }
-
-    h1,
-    h2,
-    h3 {
-      margin: 0;
-      letter-spacing: -0.03em;
     }
 
     h1 {
-      font-size: clamp(42px, 7vw, 78px);
-      line-height: 0.94;
-      max-width: 720px;
+      margin: 20px 0 12px;
+      max-width: 920px;
+      font-size: clamp(36px, 7vw, 64px);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
     }
 
-    .lead {
-      margin: 20px 0 0;
-      max-width: 720px;
-      color: var(--soft);
-      line-height: 1.7;
-      font-size: clamp(17px, 1.7vw, 21px);
+    .hero p {
+      max-width: 760px;
+      margin: 0;
+      font-size: 18px;
+      color: var(--muted);
     }
 
-    .hero-actions {
+    .actions {
       display: flex;
       flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 24px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 16px;
+      font-weight: 700;
+      border: 1px solid transparent;
+      transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+    }
+
+    .button:hover {
+      transform: translateY(-2px);
+    }
+
+    .button.primary {
+      background: var(--ink);
+      color: #fff;
+      box-shadow: 0 14px 30px rgba(15, 23, 42, 0.18);
+    }
+
+    .button.warm {
+      background: var(--accent-soft);
+      color: #a53d18;
+      border-color: rgba(255, 107, 53, 0.18);
+    }
+
+    .button.cool {
+      background: var(--teal-soft);
+      color: var(--teal);
+      border-color: rgba(15, 118, 110, 0.18);
+    }
+
+    .meta-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
       margin-top: 28px;
     }
 
-    .hero-note {
-      padding: 24px;
-      background: linear-gradient(180deg, rgba(15, 36, 50, 0.96), rgba(8, 19, 28, 0.96));
+    .meta-card,
+    .panel,
+    .recipe,
+    .path,
+    .link-card {
+      background: var(--paper);
+      border: 1px solid rgba(255, 255, 255, 0.8);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.06);
+    }
+
+    .meta-card {
+      padding: 16px 18px;
+    }
+
+    .meta-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .meta-value {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .layout {
       display: grid;
-      align-content: start;
-      gap: 16px;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
     }
 
-    .hero-note h2 {
-      font-size: 28px;
-      line-height: 1;
+    .sidebar {
+      position: sticky;
+      top: 22px;
+      padding: 22px;
     }
 
-    .hero-note p,
-    .hero-note li,
-    .section-copy,
-    .card p,
-    .path-box p,
-    .footer {
-      color: var(--soft);
-      line-height: 1.7;
+    .sidebar h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
     }
 
-    .path-box {
-      margin-top: 22px;
-      padding: 18px 20px;
-      border-radius: 18px;
-      background: rgba(4, 11, 17, 0.76);
+    .nav-links {
+      display: grid;
+      gap: 10px;
     }
 
-    .path-box code {
-      color: #dff7ff;
-      font-size: 13px;
-      word-break: break-all;
+    .nav-links a {
+      padding: 10px 12px;
+      border-radius: 14px;
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.04);
+      font-weight: 600;
     }
 
-    .section {
-      margin-top: 28px;
+    .content {
+      display: grid;
+      gap: 24px;
+    }
+
+    .panel {
       padding: 28px;
-      background: linear-gradient(180deg, rgba(11, 26, 38, 0.96), rgba(7, 17, 25, 0.94));
     }
 
     .section-head {
       display: flex;
+      flex-wrap: wrap;
       align-items: end;
       justify-content: space-between;
-      gap: 20px;
+      gap: 12px;
       margin-bottom: 18px;
     }
 
-    .section h2 {
-      font-size: clamp(28px, 4.2vw, 48px);
-      line-height: 0.96;
+    .kicker {
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-size: 12px;
+      font-weight: 700;
     }
 
-    .section-copy {
-      max-width: 780px;
+    h2 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 34px);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }
+
+    .subtle {
+      color: var(--muted);
+      max-width: 760px;
       margin: 0;
     }
 
-    .grid {
+    .paths,
+    .recipes,
+    .links {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 16px;
-      margin-top: 22px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 18px;
     }
 
-    .card {
+    .path,
+    .recipe,
+    .link-card {
       padding: 22px;
-      border-radius: 20px;
-      background: var(--panel-strong);
-      display: grid;
-      align-content: start;
-      gap: 12px;
     }
 
-    .card h3 {
-      font-size: 21px;
-      line-height: 1.05;
-    }
-
-    .label {
+    .tag {
       display: inline-flex;
       align-items: center;
-      min-height: 28px;
-      width: fit-content;
-      padding: 0 10px;
+      padding: 6px 10px;
       border-radius: 999px;
-      border: 1px solid rgba(112, 226, 201, 0.3);
-      color: var(--accent);
-      background: rgba(110, 240, 208, 0.07);
       font-size: 12px;
-      font-weight: 800;
+      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
 
-    .card a {
-      color: var(--text);
-      text-decoration: none;
-      font-weight: 700;
+    .tag.beginner {
+      background: var(--accent-soft);
+      color: #a53d18;
     }
 
-    .card a:hover {
-      color: var(--accent);
+    .tag.expert {
+      background: var(--teal-soft);
+      color: var(--teal);
     }
 
-    .inline-links {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
+    h3 {
+      margin: 14px 0 10px;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    ul,
+    ol {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    li + li {
       margin-top: 8px;
     }
 
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      padding: 0 12px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.03);
-      text-decoration: none;
-      font-size: 13px;
+    pre {
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      overflow: auto;
+      background: #111827;
+      color: #e5eef9;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font: 13px/1.55 var(--mono);
     }
 
-    .pill:hover {
-      border-color: var(--line-strong);
-      color: var(--text);
+    code {
+      font-family: var(--mono);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 18px;
+      overflow: hidden;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--paper-strong);
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.04);
+    }
+
+    td strong {
+      display: block;
+      margin-bottom: 4px;
     }
 
     .footer {
-      margin-top: 26px;
-      padding-bottom: 8px;
-      font-size: 14px;
+      margin-top: 28px;
+      padding: 24px 28px;
+      border-radius: var(--radius-lg);
+      background: rgba(15, 23, 42, 0.92);
+      color: rgba(255, 255, 255, 0.82);
     }
 
-    .footer a {
-      color: var(--accent);
+    .footer strong {
+      color: #fff;
     }
 
     @media (max-width: 980px) {
-      .hero,
-      .grid {
+      .layout {
         grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
       }
     }
 
-    @media (max-width: 680px) {
-      .topbar-inner {
-        padding: 14px 0;
-        align-items: flex-start;
-        flex-direction: column;
+    @media (max-width: 720px) {
+      .shell {
+        width: min(calc(100% - 20px), var(--max));
       }
 
-      .section,
-      .hero-copy,
-      .hero-note {
-        border-radius: 20px;
+      .hero,
+      .panel,
+      .sidebar,
+      .path,
+      .recipe,
+      .link-card {
+        padding: 20px;
       }
 
-      .section-head {
-        align-items: start;
-        flex-direction: column;
+      h1 {
+        font-size: 40px;
       }
     }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand">
-        <div class="logo" aria-hidden="true"></div>
-        <div>
-          <strong id="brandTitle">proxysss Docs</strong>
-          <span id="brandSubtitle">public GitHub Pages entry for the nginx-replacement gateway</span>
+  <div class="shell">
+    <header class="hero">
+      <div class="eyebrow">proxysss docs / nginx-level gateway, but readable</div>
+      <h1>先给你能跑的配置，再给你完整能力地图。</h1>
+      <p>这套文档分成两条路线：新手先复制成功，再理解每个字段；高手直接定位 `HTTP / TLS / AI SSE / TCP / UDP / reload / performance` 的真实边界，不用在宣传文案里兜圈子。</p>
+      <div class="actions">
+        <a class="button primary" href="#beginner">我是新手，先跑起来</a>
+        <a class="button warm" href="#recipes">直接抄配置案例</a>
+        <a class="button cool" href="#expert">我是高手，直接看结构</a>
+      </div>
+      <div class="meta-strip">
+        <div class="meta-card">
+          <div class="meta-label">Default HTTP</div>
+          <div class="meta-value">80</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Default HTTPS / H2 / H3</div>
+          <div class="meta-value">443</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Admin</div>
+          <div class="meta-value">127.0.0.1:7777</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Main config</div>
+          <div class="meta-value">proxysss.yaml</div>
         </div>
       </div>
-      <nav class="topnav" aria-label="Primary">
-        <a id="navArchitecture" href="./architecture.html">Architecture Lab</a>
-        <a id="navGithub" href="https://github.com/neko233-com/proxysss">GitHub Repo</a>
-        <div class="lang-switch" aria-label="Language switch">
-          <button id="langEn" type="button">EN</button>
-          <button id="langZh" type="button">中文</button>
-        </div>
-      </nav>
-    </div>
-  </header>
+    </header>
 
-  <main class="shell">
-    <section class="hero">
-      <div class="hero-copy">
-        <span id="heroEyebrow" class="eyebrow">Public documentation</span>
-        <h1 id="heroTitle">proxysss docs now have a real front door.</h1>
-        <p id="heroLead" class="lead">GitHub Pages publishes this repository's <code>docs/</code> folder as the site root, so the correct public base URL is <code>https://neko233-com.github.io/proxysss/</code>. This page is the hub for architecture, configuration, agent automation, security, and production runbooks.</p>
-        <div class="hero-actions">
-          <a id="heroActionPrimary" class="button primary" href="./architecture.html">Open Architecture Lab</a>
-          <a id="heroActionConfig" class="button" href="./CONFIGURATION.md">Read Configuration Guide</a>
-          <a id="heroActionSource" class="button" href="https://github.com/neko233-com/proxysss">View Source</a>
-        </div>
-      </div>
-
-      <aside class="hero-note">
-        <div id="noteLabel" class="label">Path note</div>
-        <h2 id="noteTitle">Drop the extra <code>/docs/</code>.</h2>
-        <p id="noteBody">Because Pages is already serving the repository's <code>docs/</code> folder, URLs such as <code>/proxysss/docs/architecture.html</code> will 404. The correct public path is <code>/proxysss/architecture.html</code>.</p>
-        <div class="path-box">
-          <p id="pathIntro">Correct public URLs:</p>
-          <code>https://neko233-com.github.io/proxysss/</code><br />
-          <code>https://neko233-com.github.io/proxysss/architecture.html</code>
+    <div class="layout">
+      <aside class="sidebar panel">
+        <h2>文档导航</h2>
+        <div class="nav-links">
+          <a href="#beginner">新手快速入口</a>
+          <a href="#recipes">核心配置案例</a>
+          <a href="#expert">高手速查结构</a>
+          <a href="#commands">运维与排障命令</a>
+          <a href="#more">继续阅读什么</a>
         </div>
       </aside>
-    </section>
 
-    <section class="section">
-      <div class="section-head">
-        <div>
-          <span id="coreEyebrow" class="eyebrow">Start here</span>
-          <h2 id="coreTitle">Core docs</h2>
-        </div>
-        <p id="coreCopy" class="section-copy">These are the main documents for understanding how proxysss replaces nginx as a same-level general-purpose gateway.</p>
-      </div>
+      <main class="content">
+        <section id="beginner" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Beginner path</div>
+              <h2>如果你是新手，先把一条链路跑通。</h2>
+            </div>
+            <p class="subtle">这不是“先背概念再动手”的文档。你应该先有一个能工作的配置，然后再知道为什么它工作。</p>
+          </div>
 
-      <div class="grid">
-        <article class="card">
-          <div id="card1Label" class="label">Visual</div>
-          <h3><a id="card1Title" href="./architecture.html">Architecture Lab</a></h3>
-          <p id="card1Body">Animated walkthrough of listeners, policy chains, request paths, stream forwarding, TLS, reload boundaries, MQTT/IoT traffic, and AI API streaming.</p>
-        </article>
+          <div class="paths">
+            <article class="path">
+              <span class="tag beginner">5 分钟可用</span>
+              <h3>第一个反向代理</h3>
+              <p class="subtle">你只有一个站点，要把 `app.example.com` 代理到本机 9000 端口。</p>
+              <pre><code>http:
+  plain_bind: 0.0.0.0:80
 
-        <article class="card">
-          <div id="card2Label" class="label">Guide</div>
-          <h3><a id="card2Title" href="./CONFIGURATION.md">Configuration</a></h3>
-          <p id="card2Body">Human-friendly YAML configuration reference covering HTTP, TLS, TCP, UDP, FTP, WebDAV, AI proxy routes, and hot reload behavior.</p>
-        </article>
+services:
+  reverse_proxy:
+    routes:
+      - name: app
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:9000"</code></pre>
+            </article>
 
-        <article class="card">
-          <div id="card3Label" class="label">Ops</div>
-          <h3><a id="card3Title" href="./PRODUCTION-HARDENING.md">Production Hardening</a></h3>
-          <p id="card3Body">Linux tuning, benchmark gates, watchdog expectations, warm-up readiness, and operational guardrails for production gateway deployments.</p>
-        </article>
+            <article class="path">
+              <span class="tag beginner">正式上线</span>
+              <h3>给站点加自动 HTTPS</h3>
+              <p class="subtle">当 80 / 443 能直连公网时，用内建 ACME 是默认首选，不需要额外起证书脚本。</p>
+              <pre><code>http:
+  tls_bind: 0.0.0.0:443
+  tls:
+    mode: acme_managed
+    acme:
+      enabled: true
+      email: "ops@example.com"
+      challenge: http01</code></pre>
+            </article>
+          </div>
+        </section>
 
-        <article class="card">
-          <div id="card4Label" class="label">Automation</div>
-          <h3><a id="card4Title" href="./AGENT-API.md">Agent API</a></h3>
-          <p id="card4Body">Loopback admin API, token-authenticated route upserts, reload flows, TLS automation, and safe write-operation defaults for autonomous tools.</p>
-        </article>
+        <section id="recipes" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Copy-paste recipes</div>
+              <h2>核心场景都给你现成配置，不让你猜。</h2>
+            </div>
+            <p class="subtle">每个案例都围绕真实落地场景写：为什么要这样配、哪些字段必须改、最容易踩的坑是什么。</p>
+          </div>
 
-        <article class="card">
-          <div id="card5Label" class="label">Security</div>
-          <h3><a id="card5Title" href="./SECURITY.md">Security</a></h3>
-          <p id="card5Body">Secure defaults, admin exposure rules, secret redaction expectations, and recommended production posture for the gateway edge.</p>
-        </article>
+          <div class="recipes">
+            <article class="recipe">
+              <span class="tag beginner">Static + API</span>
+              <h3>官网静态站点 + API 反向代理</h3>
+              <p class="subtle">官网直接从磁盘分发，API 单独走后端服务，便于缓存和排障。</p>
+              <pre><code>services:
+  static_sites:
+    - name: homepage
+      hosts: ["www.example.com"]
+      root_dir: "./www"
+      index_files: ["index.html"]
 
-        <article class="card">
-          <div id="card6Label" class="label">Roadmap</div>
-          <h3><a id="card6Title" href="./IMPROVEMENT-BACKLOG.md">Improvement Backlog</a></h3>
-          <p id="card6Body">Open work across performance validation, protocol fixtures, observability, and stability for ongoing nginx-parity hardening.</p>
-        </article>
-      </div>
-    </section>
+  reverse_proxy:
+    routes:
+      - name: api
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:8080"</code></pre>
+            </article>
 
-    <section class="section">
-      <div class="section-head">
-        <div>
-          <span id="devEyebrow" class="eyebrow">Developer context</span>
-          <h2 id="devTitle">Repository and local runtime docs</h2>
-        </div>
-        <p id="devCopy" class="section-copy">Some documents live in the repository root or are served only by a running proxysss instance. Those do not appear under this Pages site root, so use the links below when you need them.</p>
-      </div>
+            <article class="recipe">
+              <span class="tag beginner">AI / SSE</span>
+              <h3>给 LLM 流式输出做网关</h3>
+              <p class="subtle">面向 OpenAI-compatible / New API / SSE 长响应，强调小包 flush 和无副作用性能优化。</p>
+              <pre><code>runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
 
-      <div class="grid">
-        <article class="card">
-          <div id="devCard1Label" class="label">Repo</div>
-          <h3><a id="devCard1Title" href="https://github.com/neko233-com/proxysss/blob/main/README.md">README</a></h3>
-          <p id="devCard1Body">Installation, gateway scope, YAML examples, benchmarks, migration framing, and quick-start commands.</p>
-        </article>
+services:
+  ai_proxy:
+    routes:
+      - name: llm-edge
+        match:
+          hosts: ["ai.example.com"]
+          path_prefix: "/v1"
+        upstreams:
+          - url: "https://api.openai.com"
+        transport:
+          flush_interval_ms: 0
+          tcp_nodelay: true</code></pre>
+            </article>
 
-        <article class="card">
-          <div id="devCard2Label" class="label">Repo</div>
-          <h3><a id="devCard2Title" href="https://github.com/neko233-com/proxysss/blob/main/nginx-to-proxysss.md">nginx to proxysss</a></h3>
-          <p id="devCard2Body">Migration-oriented notes for moving existing nginx behavior into proxysss YAML and built-in gateway surfaces.</p>
-        </article>
+            <article class="recipe">
+              <span class="tag expert">Weighted cluster</span>
+              <h3>权重 + 健康检查 + 缓存 + 限流</h3>
+              <p class="subtle">给正式 API 集群用的骨架，不是演示配置。适合上线前进一步叠加观察和压测。</p>
+              <pre><code>services:
+  reverse_proxy:
+    routes:
+      - name: api-cluster
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://10.0.0.11:8080"
+            weight: 3
+          - url: "http://10.0.0.12:8080"
+            weight: 2
+        load_balance:
+          strategy: weighted_round_robin
+          active_health:
+            path: "/healthz"
+            interval_secs: 5
+            timeout_ms: 1200</code></pre>
+            </article>
 
-        <article class="card">
-          <div id="devCard3Label" class="label">Repo</div>
-          <h3><a id="devCard3Title" href="https://github.com/neko233-com/proxysss/blob/main/ts-how-to-use.md">TypeScript runtime</a></h3>
-          <p id="devCard3Body">Embedded TypeScript/JavaScript scripting guidance for optional plugin hooks and custom business routing.</p>
-        </article>
-      </div>
+            <article class="recipe">
+              <span class="tag expert">Game / Realtime</span>
+              <h3>游戏 TCP + UDP / KCP-style</h3>
+              <p class="subtle">HTTP 以外的边缘网关能力也要明确可配，不需要把实时服务硬塞进反向代理语义里。</p>
+              <pre><code>tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      nodelay: true
+      routes:
+        - name: zone-a
+          upstreams:
+            - addr: "10.0.1.10:7000"
 
-      <div class="inline-links">
-        <a id="pill1" class="pill" href="https://github.com/neko233-com/proxysss/blob/main/proxysss-script.d.ts">proxysss-script.d.ts</a>
-        <a id="pill2" class="pill" href="https://github.com/neko233-com/proxysss/tree/main/docs">docs/ source directory</a>
-        <a id="pill3" class="pill" href="https://github.com/neko233-com/proxysss/tree/main/examples">examples/</a>
-      </div>
-    </section>
+udp:
+  listeners:
+    - name: game-udp
+      bind: 0.0.0.0:7001
+      session_ttl_secs: 45
+      max_associations: 150000</code></pre>
+            </article>
 
-    <p id="footerText" class="footer">For runtime-built docs inside a live gateway, use <code>http://localhost/docs</code> or <code>http://localhost/docs.html</code>. For the public Pages site, stay under <code>https://neko233-com.github.io/proxysss/</code> without adding an extra <code>/docs/</code> segment.</p>
-  </main>
+            <article class="recipe">
+              <span class="tag expert">MQTT / IoT</span>
+              <h3>MQTT TCP、MQTT over WebSocket、CoAP-style UDP</h3>
+              <p class="subtle">proxysss 是设备和 broker 前面的边缘网关，不是假装自己是 broker。</p>
+              <pre><code>services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-ws
+        match:
+          hosts: ["iot.example.com"]
+          path_prefix: "/mqtt"
+        upstreams:
+          - url: "http://127.0.0.1:8083"
 
-  <script>
-    const storageKey = "proxysss-docs-lang";
-    const translations = {
-      en: {
-        title: "proxysss Docs",
-        brandTitle: "proxysss Docs",
-        brandSubtitle: "public GitHub Pages entry for the nginx-replacement gateway",
-        navArchitecture: "Architecture Lab",
-        navGithub: "GitHub Repo",
-        heroEyebrow: "Public documentation",
-        heroTitle: "proxysss docs now have a real front door.",
-        heroLead: "GitHub Pages publishes this repository's <code>docs/</code> folder as the site root, so the correct public base URL is <code>https://neko233-com.github.io/proxysss/</code>. This page is the hub for architecture, configuration, agent automation, security, and production runbooks.",
-        heroActionPrimary: "Open Architecture Lab",
-        heroActionConfig: "Read Configuration Guide",
-        heroActionSource: "View Source",
-        noteLabel: "Path note",
-        noteTitle: "Drop the extra <code>/docs/</code>.",
-        noteBody: "Because Pages is already serving the repository's <code>docs/</code> folder, URLs such as <code>/proxysss/docs/architecture.html</code> will 404. The correct public path is <code>/proxysss/architecture.html</code>.",
-        pathIntro: "Correct public URLs:",
-        coreEyebrow: "Start here",
-        coreTitle: "Core docs",
-        coreCopy: "These are the main documents for understanding how proxysss replaces nginx as a same-level general-purpose gateway.",
-        card1Label: "Visual",
-        card1Title: "Architecture Lab",
-        card1Body: "Animated walkthrough of listeners, policy chains, request paths, stream forwarding, TLS, reload boundaries, MQTT/IoT traffic, and AI API streaming.",
-        card2Label: "Guide",
-        card2Title: "Configuration",
-        card2Body: "Human-friendly YAML configuration reference covering HTTP, TLS, TCP, UDP, FTP, WebDAV, AI proxy routes, and hot reload behavior.",
-        card3Label: "Ops",
-        card3Title: "Production Hardening",
-        card3Body: "Linux tuning, benchmark gates, watchdog expectations, warm-up readiness, and operational guardrails for production gateway deployments.",
-        card4Label: "Automation",
-        card4Title: "Agent API",
-        card4Body: "Loopback admin API, token-authenticated route upserts, reload flows, TLS automation, and safe write-operation defaults for autonomous tools.",
-        card5Label: "Security",
-        card5Title: "Security",
-        card5Body: "Secure defaults, admin exposure rules, secret redaction expectations, and recommended production posture for the gateway edge.",
-        card6Label: "Roadmap",
-        card6Title: "Improvement Backlog",
-        card6Body: "Open work across performance validation, protocol fixtures, observability, and stability for ongoing nginx-parity hardening.",
-        devEyebrow: "Developer context",
-        devTitle: "Repository and local runtime docs",
-        devCopy: "Some documents live in the repository root or are served only by a running proxysss instance. Those do not appear under this Pages site root, so use the links below when you need them.",
-        devCard1Label: "Repo",
-        devCard1Title: "README",
-        devCard1Body: "Installation, gateway scope, YAML examples, benchmarks, migration framing, and quick-start commands.",
-        devCard2Label: "Repo",
-        devCard2Title: "nginx to proxysss",
-        devCard2Body: "Migration-oriented notes for moving existing nginx behavior into proxysss YAML and built-in gateway surfaces.",
-        devCard3Label: "Repo",
-        devCard3Title: "TypeScript runtime",
-        devCard3Body: "Embedded TypeScript/JavaScript scripting guidance for optional plugin hooks and custom business routing.",
-        pill1: "proxysss-script.d.ts",
-        pill2: "docs/ source directory",
-        pill3: "examples/",
-        footerText: "For runtime-built docs inside a live gateway, use <code>http://localhost/docs</code> or <code>http://localhost/docs.html</code>. For the public Pages site, stay under <code>https://neko233-com.github.io/proxysss/</code> without adding an extra <code>/docs/</code> segment."
-      },
-      zh: {
-        title: "proxysss 文档",
-        brandTitle: "proxysss 文档",
-        brandSubtitle: "nginx 替代型通用网关的 GitHub Pages 公网入口",
-        navArchitecture: "架构实验室",
-        navGithub: "GitHub 仓库",
-        heroEyebrow: "公网文档",
-        heroTitle: "proxysss 文档现在有了真正的首页入口。",
-        heroLead: "GitHub Pages 会把仓库里的 <code>docs/</code> 目录直接发布成站点根目录，所以正确的公网基础地址是 <code>https://neko233-com.github.io/proxysss/</code>。这个页面就是架构、配置、Agent 自动化、安全和生产运维文档的统一入口。",
-        heroActionPrimary: "打开架构实验室",
-        heroActionConfig: "阅读配置指南",
-        heroActionSource: "查看源码",
-        noteLabel: "路径提示",
-        noteTitle: "不要再多写一层 <code>/docs/</code>。",
-        noteBody: "因为 Pages 已经把仓库的 <code>docs/</code> 目录当成站点根目录，像 <code>/proxysss/docs/architecture.html</code> 这样的 URL 会直接 404。正确的公网路径应该是 <code>/proxysss/architecture.html</code>。",
-        pathIntro: "正确的公网地址：",
-        coreEyebrow: "从这里开始",
-        coreTitle: "核心文档",
-        coreCopy: "这些文档是理解 proxysss 如何作为与 nginx 同级的通用网关替代方案的主要入口。",
-        card1Label: "可视化",
-        card1Title: "架构实验室",
-        card1Body: "用动画讲清监听器、策略链、请求路径、流量转发、TLS、热重载边界、MQTT/IoT 流量与 AI API 流式代理。",
-        card2Label: "指南",
-        card2Title: "配置说明",
-        card2Body: "面向人的 YAML 配置参考，覆盖 HTTP、TLS、TCP、UDP、FTP、WebDAV、AI 代理路由和热重载行为。",
-        card3Label: "运维",
-        card3Title: "生产加固",
-        card3Body: "Linux 调优、基准门槛、watchdog 预期、预热就绪和生产网关的运维护栏。",
-        card4Label: "自动化",
-        card4Title: "Agent API",
-        card4Body: "回环管理 API、基于令牌的路由更新、重载流程、TLS 自动化，以及面向自动化工具的安全写操作默认值。",
-        card5Label: "安全",
-        card5Title: "安全说明",
-        card5Body: "安全默认值、管理面暴露规则、密钥脱敏要求，以及网关边缘的推荐生产姿态。",
-        card6Label: "路线图",
-        card6Title: "改进积压",
-        card6Body: "围绕性能验证、协议夹具、可观测性和稳定性持续推进 nginx 对齐能力。",
-        devEyebrow: "开发者上下文",
-        devTitle: "仓库文档与本地运行时文档",
-        devCopy: "有些文档位于仓库根目录，或只会在运行中的 proxysss 实例里提供。这些内容不会直接出现在当前 Pages 站点根路径下，需要时请使用下面的链接。",
-        devCard1Label: "仓库",
-        devCard1Title: "README",
-        devCard1Body: "安装方式、网关定位、YAML 示例、基准测试、迁移说明和快速上手命令。",
-        devCard2Label: "仓库",
-        devCard2Title: "nginx 到 proxysss",
-        devCard2Body: "把现有 nginx 行为迁移到 proxysss YAML 和内建网关能力时的说明与注意事项。",
-        devCard3Label: "仓库",
-        devCard3Title: "TypeScript 运行时",
-        devCard3Body: "面向可选插件钩子和自定义业务路由的内嵌 TypeScript/JavaScript 脚本说明。",
-        pill1: "proxysss-script.d.ts",
-        pill2: "docs/ 源目录",
-        pill3: "examples/",
-        footerText: "如果要查看运行中的网关内建文档，请使用 <code>http://localhost/docs</code> 或 <code>http://localhost/docs.html</code>。如果访问公网 Pages 站点，请保持在 <code>https://neko233-com.github.io/proxysss/</code> 下，不要再多写一层 <code>/docs/</code>。"
-      }
-    };
+tcp:
+  listeners:
+    - name: mqtt-tcp
+      bind: 0.0.0.0:1883</code></pre>
+            </article>
 
-    function detectLanguage() {
-      const saved = localStorage.getItem(storageKey);
-      if (saved === "en" || saved === "zh") {
-        return saved;
-      }
-      return navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
-    }
+            <article class="recipe">
+              <span class="tag expert">Wildcard TLS</span>
+              <h3>泛域名证书 + DNS-01</h3>
+              <p class="subtle">做 `*.example.com` 或多节点证书管理时，直接走内建 `acme_managed` 的 DNS provider 工厂。</p>
+              <pre><code>http:
+  tls:
+    mode: acme_managed
+    acme:
+      enabled: true
+      email: "ops@example.com"
+      challenge: dns01
+      dns:
+        provider: cloudflare
+        credentials:
+          api_token: "REDACTED"</code></pre>
+            </article>
+          </div>
+        </section>
 
-    function applyLanguage(lang) {
-      const copy = translations[lang];
-      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
-      document.title = copy.title;
-      Object.entries(copy).forEach(([key, value]) => {
-        if (key === "title") {
-          return;
-        }
-        const element = document.getElementById(key);
-        if (element) {
-          element.innerHTML = value;
-        }
-      });
-      document.getElementById("langEn").classList.toggle("active", lang === "en");
-      document.getElementById("langZh").classList.toggle("active", lang === "zh");
-      localStorage.setItem(storageKey, lang);
-    }
+        <section id="expert" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Expert path</div>
+              <h2>如果你是高手，先看能力面边界，再决定配置落点。</h2>
+            </div>
+            <p class="subtle">这张表不是营销词汇表，而是“应该配到哪里”的决策速查。</p>
+          </div>
 
-    document.getElementById("langEn").addEventListener("click", () => applyLanguage("en"));
-    document.getElementById("langZh").addEventListener("click", () => applyLanguage("zh"));
-    applyLanguage(detectLanguage());
-  </script>
+          <table>
+            <thead>
+              <tr>
+                <th>配置面</th>
+                <th>适合什么</th>
+                <th>不要拿来做什么</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>services.reverse_proxy.routes</strong>普通 HTTP / API / WebSocket / SSE</td>
+                <td>大多数网站、后台、流式 API 都从这里开始。</td>
+                <td>不要用它去伪装 TCP / UDP 原生协议。</td>
+              </tr>
+              <tr>
+                <td><strong>services.ai_proxy</strong>OpenAI-compatible / New API</td>
+                <td>需要更明确的 AI 网关语义、上游池、SSE 传输策略。</td>
+                <td>不要把所有 HTTP 都硬塞进 AI proxy。</td>
+              </tr>
+              <tr>
+                <td><strong>services.domain_routes</strong>站点级编排</td>
+                <td>按域名把静态、API、WebDAV 等能力拼成一个站点。</td>
+                <td>不要把它当成唯一实际执行面。</td>
+              </tr>
+              <tr>
+                <td><strong>tcp.listeners</strong>TCP 原生流量</td>
+                <td>数据库、游戏长连接、MQTT TCP、TLS passthrough/SNI 场景。</td>
+                <td>不要期待 HTTP 头级别策略。</td>
+              </tr>
+              <tr>
+                <td><strong>udp.listeners</strong>UDP / KCP-style / CoAP-style</td>
+                <td>实时设备、游戏、会话型 UDP 网关。</td>
+                <td>不要把它包装成应用终端本身。</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="commands" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Operations</div>
+              <h2>文档不是终点，真正排障要回到 CLI。</h2>
+            </div>
+            <p class="subtle">下面这些命令都是给人和 agent 都能快速看懂的，不需要翻 YAML 原文猜最终效果。</p>
+          </div>
+
+          <pre><code>proxysss config explain
+proxysss config capabilities
+proxysss config watched-scripts
+proxysss config routes
+proxysss config reload-plan
+proxysss config nginx-parity --format yaml
+proxysss token show</code></pre>
+
+          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后跑 mixed-load benchmark，而不是只截一张单场景好看的图。</p>
+        </section>
+
+        <section id="more" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Read next</div>
+              <h2>继续往下看什么</h2>
+            </div>
+            <p class="subtle">把文档入口按角色拆开，避免新手一进来就掉进参数海，也避免高手被迫看一页介绍性废话。</p>
+          </div>
+
+          <div class="links">
+            <a class="link-card" href="CONFIGURATION.md">
+              <span class="tag beginner">配置总览</span>
+              <h3>CONFIGURATION.md</h3>
+              <p class="subtle">完整配置指南，带可复制 YAML、字段解释、常见误区和性能注意事项。</p>
+            </a>
+            <a class="link-card" href="architecture.html">
+              <span class="tag expert">架构视图</span>
+              <h3>architecture.html</h3>
+              <p class="subtle">看清 listener、route、热重载、扩展脚本和数据路径边界。</p>
+            </a>
+            <a class="link-card" href="../nginx-to-proxysss.md">
+              <span class="tag expert">迁移</span>
+              <h3>nginx-to-proxysss.md</h3>
+              <p class="subtle">面向已有 nginx 经验用户的配置迁移对照。</p>
+            </a>
+            <a class="link-card" href="nginx-to-proxysss.html">
+              <span class="tag expert">迁移子页</span>
+              <h3>nginx -> proxysss</h3>
+              <p class="subtle">独立 HTML 迁移页。先看场景映射，再看高级网关能力和 mixed-load 验证节奏。</p>
+            </a>
+            <a class="link-card" href="../caddy-to-proxysss.md">
+              <span class="tag expert">迁移</span>
+              <h3>caddy-to-proxysss.md</h3>
+              <p class="subtle">面向 Caddy 用户的迁移说明，强调从站点代理走向完整网关能力面。</p>
+            </a>
+            <a class="link-card" href="caddy-to-proxysss.html">
+              <span class="tag expert">迁移子页</span>
+              <h3>caddy -> proxysss</h3>
+              <p class="subtle">独立 HTML 迁移页。适合先抄配置，再理解 `reverse_proxy`、`static_sites`、`ai_proxy`、`tcp/udp` 的分层。</p>
+            </a>
+            <a class="link-card" href="../ts-how-to-use.md">
+              <span class="tag expert">脚本扩展</span>
+              <h3>ts-how-to-use.md</h3>
+              <p class="subtle">当原生配置面不够时，再进入 TypeScript 扩展，不要反过来。</p>
+            </a>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <footer class="footer">
+      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 应该一起看，不能出现“这个性能高了，那个性能差了”还当成成功的情况。
+    </footer>
+  </div>
 </body>
 </html>

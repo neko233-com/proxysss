@@ -20,6 +20,8 @@ BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 VENDOR_DIR="$BENCH_ROOT/vendors"
 RUN_DIR="$BENCH_ROOT/runs/latest"
 WWW_DIR="$RUN_DIR/www"
+BENCH_HELPER_SRC="$ROOT/scripts/benchmark-helper.go"
+BENCH_HELPER_BIN="$RUN_DIR/benchmark-helper"
 PID_FILE="$RUN_DIR/pids.txt"
 RESULTS_FILE="$RUN_DIR/results.json"
 BUILD_PROFILE_WAS_SET="${BUILD_PROFILE+x}"
@@ -41,10 +43,15 @@ stop_bench_processes() {
 if [[ ! -x "$PROXY_BIN" ]]; then
   cargo build --profile "$BUILD_PROFILE" --locked
 fi
+command -v go >/dev/null 2>&1 || {
+  echo "missing required command: go" >&2
+  exit 1
+}
 
 stop_bench_processes
 rm -rf "$RUN_DIR"
 mkdir -p "$VENDOR_DIR" "$WWW_DIR"
+go build -o "$BENCH_HELPER_BIN" "$BENCH_HELPER_SRC"
 
 NGINX_TARBALL="$VENDOR_DIR/nginx-$NGINX_VERSION.tar.gz"
 NGINX_PREFIX="$VENDOR_DIR/nginx-$NGINX_VERSION"
@@ -136,39 +143,12 @@ run_bench() {
   local output
   output="$("$PROXY_BIN" bench http --url "$url" --concurrency "$CONCURRENCY" --duration-secs "$DURATION_SECS" 2>&1)"
   echo "$output" >&2
-  python3 - "$name" "$url" "$CONCURRENCY" "$DURATION_SECS" "$output" <<'PY'
-import json, re, sys
-name, url, concurrency, duration, output = sys.argv[1:6]
-row = {
-    "name": name,
-    "url": url,
-    "concurrency": int(concurrency),
-    "duration_secs": int(duration),
-    "success": 0,
-    "errors": 0,
-    "ops_per_sec": 0.0,
-    "throughput_mib_s": 0.0,
-    "latency_p50_ms": None,
-    "latency_p95_ms": None,
-    "latency_p99_ms": None,
-}
-patterns = {
-    "success": r"success\s+:\s+(\d+)",
-    "errors": r"errors\s+:\s+(\d+)",
-    "ops_per_sec": r"ops/sec\s+:\s+([\d.]+)",
-    "throughput_mib_s": r"throughput\s+:\s+([\d.]+)\s+MiB/s",
-    "latency_p50_ms": r"latency p50\s+:\s+([\d.]+)\s+ms",
-    "latency_p95_ms": r"latency p95\s+:\s+([\d.]+)\s+ms",
-    "latency_p99_ms": r"latency p99\s+:\s+([\d.]+)\s+ms",
-}
-for key, pattern in patterns.items():
-    match = re.search(pattern, output)
-    if not match:
-        continue
-    value = match.group(1)
-    row[key] = float(value) if "." in value else int(value)
-print(json.dumps(row))
-PY
+  printf '%s' "$output" | "$BENCH_HELPER_BIN" parse-bench \
+    --gateway "$name" \
+    --protocol http \
+    --target "$url" \
+    --concurrency "$CONCURRENCY" \
+    --duration "$DURATION_SECS"
 }
 
 trap 'stop_bench_processes' EXIT
@@ -196,32 +176,18 @@ for target in "${TARGETS[@]}"; do
   sleep 2
 done
 
-python3 - "$RESULTS_FILE" "${RESULT_ROWS[@]}" <<'PY'
-import json, sys
-path = sys.argv[1]
-rows = [json.loads(item) for item in sys.argv[2:]]
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(rows, handle, indent=2)
-    handle.write("\n")
-PY
+RESULT_ROWS_FILE="$RUN_DIR/results.jsonl"
+printf '%s\n' "${RESULT_ROWS[@]}" >"$RESULT_ROWS_FILE"
+"$BENCH_HELPER_BIN" write-json-array --in "$RESULT_ROWS_FILE" --out "$RESULTS_FILE"
 
 echo ""
 echo "=== throughput summary (ops/sec) ==="
-python3 - "$RESULTS_FILE" <<'PY'
-import json, sys
-rows = json.load(open(sys.argv[1], encoding="utf-8"))
-rows.sort(key=lambda row: row.get("ops_per_sec", 0), reverse=True)
-print(f"{'name':<10} {'ops/s':>12} {'MiB/s':>10} {'p50ms':>8} {'errors':>8}")
-for row in rows:
-    print(f"{row['name']:<10} {row.get('ops_per_sec', 0):>12.2f} {row.get('throughput_mib_s', 0):>10.2f} {row.get('latency_p50_ms') or 0:>8.2f} {row.get('errors', 0):>8}")
-PY
+"$BENCH_HELPER_BIN" print-results-summary --results "$RESULTS_FILE"
 
 echo "results saved to $RESULTS_FILE"
 echo "vendor binaries cached under $VENDOR_DIR (gitignored)"
 
-python3 "$ROOT/scripts/benchmark-report.py" --results "$RESULTS_FILE" --out-dir "$RUN_DIR" --concurrency "$CONCURRENCY" --duration-secs "$DURATION_SECS"
-python3 "$ROOT/scripts/compare-report.py" --binary "$PROXY_BIN" --benchmark "$RESULTS_FILE" --out-dir "$RUN_DIR"
-echo "benchmark report markdown: $RUN_DIR/report.md"
-echo "benchmark report html:     $RUN_DIR/report.html"
+"$BENCH_HELPER_BIN" write-gateway-report --results "$RESULTS_FILE" --out-dir "$RUN_DIR" --concurrency "$CONCURRENCY" --duration "$DURATION_SECS"
+"$BENCH_HELPER_BIN" write-gateway-compare --results "$RESULTS_FILE" --out-dir "$RUN_DIR" --binary "$PROXY_BIN"
 
 bash "$ROOT/scripts/benchmark-gate-check.sh" "$RESULTS_FILE"

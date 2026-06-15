@@ -1,451 +1,592 @@
-# proxysss configuration guide
+# proxysss Configuration Guide
 
-proxysss uses a **single YAML file** as the runtime source of truth. The default path is `proxysss.yaml`; override it with `-config`, `--config`, or `-c`.
+proxysss 的配置目标不是“把 nginx 指令重新拼一遍”，而是让你先看懂，再改对，再上线。
 
-## File layout
+这份文档按两条路线写：
 
-```yaml
-config_version: 1
-http:          # listeners, TLS, error pages
-admin:         # control plane on 127.0.0.1:7777
-monitoring:    # /metrics exposition
-load_balance:  # algorithms, retries, health checks
-affinity:      # sticky sessions
-services:      # HTTP routes, static, webdav, ftp, policies
-tcp:           # stream listeners
-udp:           # datagram listeners
-script:        # embedded TypeScript entry
-plugins:       # auto-loaded plugin directory
-logging:       # access/error logs and levels
-runtime:       # hot reload, watchdog, and maintenance state
-```
+- `新手路线`：先复制能跑的 YAML，再理解每一段为什么这样写。
+- `高手路线`：直接定位 `domain_routes`、`reverse_proxy.routes`、`ai_proxy`、`tcp.listeners`、`udp.listeners`、TLS、热重载和性能边界。
 
-## AI reverse proxy
+所有例子都基于产品默认值：
 
-`services.ai_proxy` is the native surface for New API, sub2api, and OpenAI-compatible upstreams. It runs before generic domain/reverse-proxy routes, supports host/path matching, path rewrite, optional provider metadata headers, and header strip/set behavior.
+- 公网 HTTP 默认端口 `80`
+- 公网 HTTPS / HTTP2 / HTTP3 默认端口 `443`
+- 管理面默认 `127.0.0.1:7777`
+- 默认配置文件 `proxysss.yaml`
+
+## 1. 新手先从这里开始
+
+### 1.1 第一个可工作的反向代理
+
+适用场景：你只想先把一个站点从 `127.0.0.1:9000` 代理出来。
 
 ```yaml
+http:
+  plain_bind: 0.0.0.0:80
+
 services:
-  ai_proxy:
-    enabled: true
-    header_prefix: proxysss-
+  reverse_proxy:
     routes:
-      - name: new-api
-        provider: new-api
-        match_host: ai.example.com
-        path_prefix: /v1
-        upstream: http://127.0.0.1:3000
-        rewrite_base_path: /v1
-        emit_metadata_headers: false # optional: skip proxysss-ai-* upstream metadata headers
-      - name: sub2api
-        provider: sub2api
-        match_host: sub2api.example.com
-        path_prefix: /
-        upstream: http://127.0.0.1:3001
-        rewrite_base_path: /v1
-        strip_headers: [x-debug-token]
+      - name: app
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:9000"
 ```
 
-## HTTP reverse proxy
+这段配置做了什么：
 
-### Domain-first routes (recommended)
+- `http.plain_bind` 让 proxysss 在 80 端口接收 HTTP 请求。
+- `match.hosts` 表示只有访问 `app.example.com` 才命中这条规则。
+- `path_prefix: "/"` 表示根路径及其所有子路径都转发给后端。
+- `upstreams.url` 是你的源站地址，支持 HTTP 或 HTTPS。
+
+常见错误：
+
+- 源站只监听了错误的地址，结果 proxysss 连不上。
+- 域名没有解析到这台机器，浏览器永远打不到网关。
+- `match.hosts` 写的是 `example.com`，但你实际访问的是 `www.example.com`。
+
+### 1.2 给同一个站点加自动 HTTPS
+
+适用场景：你已经能跑 HTTP，现在要正式上 TLS。
+
+```yaml
+http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+  tls:
+    mode: acme_managed
+    acme:
+      enabled: true
+      email: "ops@example.com"
+      challenge: http01
+
+services:
+  reverse_proxy:
+    routes:
+      - name: secure-app
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:9000"
+```
+
+这段配置做了什么：
+
+- `tls.mode: acme_managed` 表示证书由 proxysss 内建 ACME 自动管理。
+- `challenge: http01` 适合单域名、80/443 能直接暴露到公网的常见场景。
+- 你不用额外跑 `certbot` 或 `acme.sh`，只要域名能正确访问到这台机器即可。
+
+上线前请确认：
+
+- 80 和 443 都已放行。
+- `app.example.com` 已解析到当前网关。
+- 这台机器没有别的程序先占用了 80 / 443。
+
+### 1.3 一个站点放静态文件，另一个站点做代理
+
+适用场景：官网走静态目录，API 继续走源站服务。
+
+```yaml
+http:
+  plain_bind: 0.0.0.0:80
+
+services:
+  static_sites:
+    - name: homepage
+      hosts: ["www.example.com"]
+      root_dir: "./www"
+      index_files: ["index.html"]
+
+  reverse_proxy:
+    routes:
+      - name: api
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:8080"
+```
+
+为什么这比“把所有东西都塞进一个服务里”更清晰：
+
+- 静态文件和 API 分别声明，排障时不会混淆。
+- 静态站点能参与 proxysss 的热文件缓存和 warm-up。
+- 你可以独立给 API 增加限流、健康检查、缓存和 SSE 优化。
+
+## 2. 路由面怎么选
+
+### 2.1 `services.reverse_proxy.routes` 适合什么
+
+适合：普通网站、API、后台系统、下载站、SSE、WebSocket。
+
+你会最常用到这些字段：
+
+- `match.hosts`
+- `match.path_prefix`
+- `upstreams`
+- `load_balance`
+- `response_policy`
+- `rate_limit`
+
+如果你只是在做“HTTP 请求 -> HTTP 后端”的代理，大多数时候就选这个面。
+
+### 2.2 `services.domain_routes` 适合什么
+
+适合：你想按域名统一声明站点入口，再把不同路径分流到不同服务。
 
 ```yaml
 services:
   domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      upstreams:
-        - http://127.0.0.1:8081
-      upstream_weights:
-        http://127.0.0.1:8080: 1
-        http://127.0.0.1:8081: 3
-      strip_prefix: true
-      compression:
-        enabled: true
-      rate_limit:
-        enabled: true
-        algorithm: token_bucket   # fixed_window, token_bucket, or leaky_bucket
-        requests: 120
-        window_ms: 60000
-        burst: 30
-      cache:
-        enabled: true
-        ttl_secs: 30
-        stale_while_revalidate_secs: 15
-        vary_headers: [Accept-Encoding]
-        key_prefix: api
-      active_health:
-        path: /healthz
-```
+    - domain: "example.com"
+      routes:
+        - path_prefix: "/"
+          service: static:homepage
+        - path_prefix: "/api"
+          service: reverse_proxy:main-api
 
-### Path/host routes
+  static_sites:
+    - name: homepage
+      hosts: ["example.com"]
+      root_dir: "./www"
 
-```yaml
-services:
   reverse_proxy:
     routes:
-      - name: legacy-api
-        hosts: [internal.local]
-        path_prefix: /v1
-        upstream: http://127.0.0.1:9000
-        forward_headers: false # optional: skip automatic X-Forwarded-* / Forwarded headers
+      - name: main-api
+        match:
+          hosts: ["example.com"]
+          path_prefix: "/api"
+        upstreams:
+          - url: "http://127.0.0.1:8080"
 ```
 
-## Load balancing
+理解方式：
 
-Set the global algorithm under `load_balance.algorithm`:
+- `domain_routes` 更像站点总路由表。
+- `reverse_proxy.routes`、`static_sites`、`webdav` 等是真正的能力面。
+- 想做多服务统一编排时，用 `domain_routes` 会更直观。
 
-| Value | Behavior |
-| --- | --- |
-| `rendezvous` | Consistent hash with optional sticky affinity (default) |
-| `round_robin` | Rotate primaries per scope |
-| `least_connections` | Prefer upstreams with fewer active connections |
-| `source_hash` | Hash client affinity key (IP, cookie, header, query) |
-| `weighted` | Weighted rotation using `upstream_weights` |
+### 2.3 AI / SSE / OpenAI-compatible 代理
 
-Passive circuit breaking quarantines failing upstreams:
+适用场景：New API、OpenAI-compatible API、SSE 流式输出、长连接推理响应。
 
 ```yaml
-load_balance:
-  algorithm: weighted
-  retries:
+http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+
+runtime:
+  performance:
     enabled: true
-    max_retries: 2
-  passive_health:
-    enabled: true
-    fail_threshold: 3
-    quarantine_secs: 15
-  active_health:
-    enabled: true
-    http_enabled: true
-    tcp_enabled: true
-    udp_enabled: false
-    path: /healthz
-    interval_secs: 10
-    timeout_ms: 2000
-    udp_payload: proxysss-health
-    udp_expect_response: true
+    traffic_profile: small
+
+services:
+  ai_proxy:
+    routes:
+      - name: llm-edge
+        match:
+          hosts: ["ai.example.com"]
+          path_prefix: "/v1"
+        upstreams:
+          - url: "https://api.openai.com"
+          - url: "https://api.deepseek.com"
+        load_balance:
+          strategy: latency_first
+          active_health:
+            interval_secs: 5
+            timeout_ms: 1500
+            path: "/v1/models"
+        transport:
+          flush_interval_ms: 0
+          tcp_nodelay: true
+          keepalive_secs: 75
 ```
 
-UDP probes are opt-in because many KCP/game protocols do not echo generic health payloads. When `udp_expect_response=false`, proxysss records a successful UDP send as the health signal.
+为什么这份配置适合 SSE：
 
-## Runtime performance
+- `traffic_profile: small` 更偏向小包、频繁 flush、HTTP2/SSE/TCP/UDP 的交互式流量。
+- `flush_interval_ms: 0` 让事件尽快往下游刷，减少 token 被代理层攒包。
+- `tcp_nodelay: true` 降低小块流式响应等待合并的概率。
+- `active_health` 让长连接代理在上游异常时更快切走。
 
-`runtime.performance` is enabled by default. It does not write sysctl files during normal gateway startup; instead it adapts runtime socket behavior to the detected host and prints the selected plan once on every process start/restart. Ubuntu 24.x enables the extreme socket policy, while older Ubuntu, Debian, unknown Linux, and non-Linux hosts log the reason they fall back or skip.
+建议：
 
-Data-plane CPU parallelism is intentionally not configurable in YAML. On Linux, proxysss derives HTTP accept workers, TCP stream accept workers, and the dedicated stream runtime worker count from detected CPU cores. This keeps high-core production machines scaling automatically and avoids performance regressions from user-supplied worker counts that are too low or too high.
+- 做性能优化时不要只盯单路 SSE，要按项目要求跑 mixed-load 压测。
+- 一切优化都要保持无副作用，不能让 SSE 快了却把静态、TCP、UDP 或 reload 打差。
 
-`profile` selects the Linux socket/sysctl tuning family (`edge`, `bulk`, or `latency`). `traffic_profile` selects the runtime data-path tradeoff. The default `small` profile favors cached small static files, HTTP/2/SSE first-token latency, TCP long connections, and UDP/KCP-style realtime traffic. Use `bulk` for large static/file transfer deployments that prefer sendfile/zero-copy behavior; use `balanced` when one gateway must preload both small hot files and bulk sendfile descriptors.
+### 2.4 静态站点
 
 ```yaml
 runtime:
   performance:
     enabled: true
-    profile: edge   # edge, bulk, or latency
-    traffic_profile: small   # small, balanced, or bulk
-    adaptive_system: true
-    socket_extreme: true
-    log_on_start: true
+    traffic_profile: balanced
+
+services:
+  static_sites:
+    - name: docs
+      hosts: ["docs.example.com"]
+      root_dir: "./site"
+      index_files: ["index.html"]
+      not_found_page: "404.html"
+      cache:
+        strategy: override
+        edge_ttl_secs: 300
 ```
 
-After config load, proxysss preloads eligible static index/top-level files according to `traffic_profile`: `small` warms bounded in-memory hot objects, `bulk` prepares sendfile descriptors, and `balanced` does both where applicable. Listener counts remain automatic; users should choose traffic shape, not worker counts.
+重点理解：
 
-Use `proxysss tune linux --apply` only when you intentionally want persistent `/etc/sysctl.d` host tuning. The apply path is guarded by default: it logs SSH/session safety scope, skips unsupported sysctl keys, skips unavailable congestion controls such as `bbr` when the kernel does not expose them, backs up the previous proxysss profile, and restores it if `sysctl --system` fails. Use `--unsafe-apply` only for lab machines where losing the session is acceptable.
+- `traffic_profile: balanced` 适合既有首页小文件，也有较大下载资源的站点。
+- 静态资源会参与配置加载后的 warm-up。
+- 如果你的发布流量明显偏大文件，可以改成 `bulk`；如果主要是首页、小图标、小 JS，就优先 `small`。
 
-## Runtime watchdog
-
-Critical background loops are supervised by `runtime.watchdog`. If a supervised task exits unexpectedly, proxysss increments `proxysss_critical_task_failures_total`; when `restart_critical_tasks=true`, it restarts the task after `restart_backoff_secs`.
-
-```yaml
-runtime:
-  watchdog:
-    enabled: true
-    restart_critical_tasks: true
-    restart_backoff_secs: 2
-    heartbeat_interval_secs: 30
-```
-
-Heartbeat ticks are exposed as `proxysss_watchdog_heartbeat_total` on `/metrics`. For strict process-manager deployments, set `restart_critical_tasks=false` so a critical task failure terminates the process and lets systemd/supervisor restart the whole gateway.
-
-## TLS, HTTP/2, HTTP/3, WebSocket, gRPC
-
-- Terminate TLS on `http.tls_bind` (default `0.0.0.0:443`).
-- HTTP/2 and HTTP/3 share the TLS listener configuration.
-- WebSocket upgrades are proxied when routes use `ws://` or `wss://` upstreams. In Linux performance mode, simple no-policy `ws://` reverse proxy routes can use the raw WebSocket fast lane before the general HTTP upgrade path.
-- gRPC (`application/grpc`, `application/grpc+proto`) works over HTTP/2 reverse proxying without extra directives.
-
-## Access control and rate limits
+### 2.5 WebDAV
 
 ```yaml
 services:
-  access_control:
-    http:
-      enabled: true
-      deny: [203.0.113.0/24]
-      allow: [198.51.100.0/24]
-  rate_limit:
-    http:
-      enabled: true
-      algorithm: fixed_window   # fixed_window, token_bucket, or leaky_bucket
-      zone: public
-      requests: 100
-      window_ms: 60000
-      burst: 20
-      max_connections: 200
-    stream:
-      enabled: true
-      zone: edge-tcp
-      algorithm: leaky_bucket
-      connections: 60
-      window_ms: 60000
-      burst: 10
+  webdav:
+    - name: assets-dav
+      hosts: ["dav.example.com"]
+      path_prefix: "/"
+      root_dir: "./dav-data"
+      read_only: false
+      auth:
+        basic:
+          - username: "editor"
+            password: "change-me"
 ```
 
-## Caching and compression
+适合：挂载设计资源、共享构建产物、轻量团队文件协作。
 
-Global defaults live in `services.response_policy`; routes can override `compression` and `cache`. Use `services.cache_zones` for shared zones and optional disk backing.
+要点：
 
-Cache modes (Cloudflare-style):
+- WebDAV 是文件协作入口，不等于对象存储。
+- 对公网开放时，至少要加认证和访问控制。
+- 如果你只想分发文件，不要默认启用写权限。
 
-| `behavior` | Effect |
-| --- | --- |
-| `respect_origin` | Default. Honor origin `Cache-Control` for storage; use `ttl_secs` when origin has no max-age. |
-| `override` | Force edge TTL from `ttl_secs`; ignore origin max-age for storage. |
-| `bypass` | Skip cache lookup and storage. |
-| `no_cache` | Always fetch upstream; emit `no-cache` when configured. |
-
-```yaml
-services:
-  response_policy:
-    cache:
-      enabled: true
-      behavior: override
-      ttl_secs: 3600          # edge TTL
-      browser_ttl_secs: 300   # 0 = pass through origin Cache-Control
-      stale_while_revalidate_secs: 60
-      stale_if_error_secs: 86400
-      emit_cdn_cache_control: true
-      vary_headers: [Accept-Encoding]
-```
-
-Send `PURGE` to invalidate entries when `allow_purge: true`. Responses include `X-Cache: HIT|MISS|STALE` when caching is active.
-
-## Domain stream proxy (Redis, MySQL, etc.)
-
-Route TCP/TLS workloads by SNI hostname (nginx `ssl_preread` / HAProxy style):
+### 2.6 TCP 直通
 
 ```yaml
 tcp:
-  stream_routes:
-    - name: redis-prod
-      domains: [redis.example.com]
-      listen: 6379
-      upstream: redis.internal:6379
-      protocol: redis
-    - name: mysql-prod
-      domains: [db.example.com]
-      listen: 3306
-      upstream: mysql.internal:3306
-      protocol: mysql
-      tls_mode: passthrough
+  listeners:
+    - name: postgres
+      bind: 0.0.0.0:5432
+      nodelay: true
+      connect_timeout_ms: 2000
+      routes:
+        - name: postgres-main
+          upstreams:
+            - addr: "10.0.0.12:5432"
 ```
 
-`listen` accepts `0.0.0.0:6379` or shorthand `6379`. `protocol` is an observability hint. Per-route `access_control` supports allow/deny IP lists.
+这类配置适合：
 
-## Direct TCP/UDP listeners for games, AI tools, and KCP-style traffic
+- PostgreSQL / MySQL / Redis / MongoDB 这类纯 TCP 服务
+- 游戏长连接网关
+- 你不想让业务协议被 HTTP 层感知的场景
 
-Direct listeners are for large realtime fleets that do not need HTTP semantics: game TCP, KCP-style UDP, voice, MQTT/IoT device protocols, AI tool bridges, and other long-lived binary connections.
+### 2.7 UDP / KCP-style / CoAP-style
+
+```yaml
+udp:
+  listeners:
+    - name: kcp-gateway
+      bind: 0.0.0.0:4000
+      session_ttl_secs: 120
+      max_associations: 200000
+      routes:
+        - name: kcp-upstream
+          upstreams:
+            - addr: "10.0.0.20:4000"
+```
+
+理解方式：
+
+- `session_ttl_secs` 控制 UDP 会话保活窗口。
+- `max_associations` 控制实时设备或玩家会话上限，避免无界膨胀。
+- 这条面向的是转发和边缘治理，不是协议终端本身。
+
+### 2.8 MQTT / IoT
+
+```yaml
+services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-ws
+        match:
+          hosts: ["iot.example.com"]
+          path_prefix: "/mqtt"
+        upstreams:
+          - url: "http://127.0.0.1:8083"
+
+tcp:
+  listeners:
+    - name: mqtt-tcp
+      bind: 0.0.0.0:1883
+      nodelay: true
+      routes:
+        - name: mqtt-broker
+          upstreams:
+            - addr: "10.0.0.30:1883"
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      session_ttl_secs: 30
+      max_associations: 50000
+      routes:
+        - name: coap-core
+          upstreams:
+            - addr: "10.0.0.31:5683"
+```
+
+这一组配置表示：
+
+- MQTT over WebSocket 走 HTTP 面。
+- MQTT 原生 TCP 走 `tcp.listeners`。
+- CoAP-style UDP 走 `udp.listeners`。
+- proxysss 是边缘网关，不是 broker。
+
+## 3. 高级用户最常用的组合
+
+### 3.1 反向代理 + 权重 + 健康检查 + 缓存 + 限流
+
+```yaml
+services:
+  reverse_proxy:
+    routes:
+      - name: api-cluster
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://10.0.0.11:8080"
+            weight: 3
+          - url: "http://10.0.0.12:8080"
+            weight: 2
+        load_balance:
+          strategy: weighted_round_robin
+          active_health:
+            interval_secs: 5
+            timeout_ms: 1200
+            path: "/healthz"
+        cache:
+          strategy: respect_origin
+          stale_while_revalidate_secs: 30
+          stale_if_error_secs: 120
+        rate_limit:
+          requests_per_second: 200
+          burst: 400
+```
+
+逐段解释：
+
+- `weight` 控制流量倾斜，不是绝对配额。
+- `active_health` 会主动剔除坏节点，不是被动等请求失败。
+- `respect_origin` 适合源站已经认真设置缓存头的 API 或静态服务。
+- `stale_*` 让缓存层在后端抖动时更稳。
+- `rate_limit` 用于削峰，不是代替鉴权。
+
+### 3.2 Wildcard TLS + DNS-01
+
+```yaml
+http:
+  tls_bind: 0.0.0.0:443
+  tls:
+    mode: acme_managed
+    acme:
+      enabled: true
+      email: "ops@example.com"
+      challenge: dns01
+      dns:
+        provider: cloudflare
+        credentials:
+          api_token: "REDACTED"
+```
+
+适用场景：
+
+- `*.example.com` 这类泛域名证书
+- 不方便走 HTTP-01 的多节点或内网入口
+
+注意：
+
+- `credentials` 要走配置文件密文或安全分发，不要把真实 token 放进示例仓库。
+- 云厂商 provider 是内建策略工厂的一部分，不要混用旧的外部 `acme.sh` 方式，除非目标厂商还没有内建支持。
+
+### 3.3 管理面 + 自动化
+
+```yaml
+admin:
+  enabled: true
+  bind: 127.0.0.1:7777
+  enable_write_ops: true
+  expose_config: false
+  token: "REDACTED"
+```
+
+建议理解为：
+
+- `bind: 127.0.0.1:7777` 是默认安全姿势。
+- `enable_write_ops` 只有在你明确要做自动化改配时才开启。
+- 配置查看尽量走 `proxysss config *` CLI，避免把敏感信息直接铺给外部系统。
+
+### 3.4 游戏长连接 + UDP 同时接入
 
 ```yaml
 tcp:
   listeners:
     - name: game-tcp
       bind: 0.0.0.0:7000
-      protocol: game_tcp
       nodelay: true
-      connect_timeout_ms: 3000
-      upstream: 127.0.0.1:9000
-      upstreams:
-        - 127.0.0.1:9000
-        - 127.0.0.1:9001
+      connect_timeout_ms: 1500
+      routes:
+        - name: zone-a
+          upstreams:
+            - addr: "10.0.1.10:7000"
 
 udp:
   listeners:
-    - name: game-kcp
+    - name: game-udp
       bind: 0.0.0.0:7001
-      protocol: kcp
-      session_ttl_secs: 180
-      max_associations: 262144
-      upstreams:
-        - 127.0.0.1:9100
-        - 127.0.0.1:9101
+      session_ttl_secs: 45
+      max_associations: 150000
+      routes:
+        - name: zone-a-udp
+          upstreams:
+            - addr: "10.0.1.10:7001"
 ```
 
-- `tcp.listeners[].nodelay` defaults to `true` so latency-sensitive streams do not wait on Nagle batching.
-- `tcp.listeners[].connect_timeout_ms` defaults to `3000`; tune lower for hot failover, higher for cold backends.
-- Linux `runtime.performance.enabled=true` fans TCP stream binds out across CPU-adaptive `SO_REUSEPORT` accept workers. A single-upstream TCP listener with scripts, affinity, active health, passive health, and extra upstreams disabled uses the direct fast path and bypasses the generic upstream planner.
-- `udp.listeners[].session_ttl_secs` defaults to `180`; keep it above the client heartbeat interval for KCP or mobile reconnect traffic.
-- `udp.listeners[].max_associations` defaults to `262144`; set `0` only for controlled labs where unbounded UDP association growth is acceptable.
-- `protocol` is an observability hint only. The hot path stays transparent and does not parse KCP/game payloads.
+为什么这里要关注性能边界：
 
-## MQTT and IoT patterns
+- TCP 长连接和 UDP 实时流量会拉高并发 socket 数。
+- 这类场景要结合 `proxysss tune linux --apply`、系统 `LimitNOFILE`、`fs.nr_open` / `fs.file-max` 一起看。
+- release gate 不是只看单项压测，而是看 mixed-load 是否仍然稳。
 
-Use proxysss as the edge and keep MQTT/CoAP protocol semantics in the upstream broker or device service.
+## 4. 热重载、预热和运维节奏
 
-```yaml
-tcp:
-  listeners:
-    - name: mqtt
-      bind: 0.0.0.0:1883
-      protocol: mqtt
-      nodelay: true
-      connect_timeout_ms: 3000
-      upstreams:
-        - 127.0.0.1:18831
-        - 127.0.0.1:18832
-  stream_routes:
-    - name: mqtt-tls
-      domains: [mqtt.example.com]
-      listen: 0.0.0.0:8883
-      upstream: 127.0.0.1:88831
-      protocol: mqtt
-      tls_mode: passthrough
+### 4.1 热重载会帮你做什么
 
-udp:
-  listeners:
-    - name: coap
-      bind: 0.0.0.0:5683
-      protocol: coap
-      session_ttl_secs: 120
-      max_associations: 262144
-      upstreams:
-        - 127.0.0.1:56831
+proxysss 在配置加载和热重载后会做几件关键事：
 
-services:
-  reverse_proxy:
-    routes:
-      - name: mqtt-websocket
-        hosts: [mqtt-ws.example.com]
-        path_prefix: /mqtt
-        upstream: ws://127.0.0.1:8083
-```
+- 重新计算路由和能力面。
+- 预热热文件缓存或 sendfile 描述符。
+- 预拨反向代理 / AI proxy 上游 keepalive 池。
+- 更新 `/healthz` 的 `warm` 状态。
 
-- MQTT TCP on `1883` uses transparent TCP proxying with upstream pools.
-- MQTT TLS on `8883` can be routed by SNI with `tcp.stream_routes` and `tls_mode: passthrough`.
-- MQTT over WebSocket uses the normal HTTP/WebSocket reverse proxy path.
-- CoAP and proprietary UDP device traffic use `udp.listeners` with TTL/cap controls.
-- Use `services.rate_limit.stream`, `services.access_control.stream`, active health, and watchdog metrics for production IoT fleets.
+这意味着：
 
-## TLS, on-demand certificates, and wildcards
+- 压测应该在 warm-up 完成后再开始。
+- 第一波线上流量不应该为“冷连接”额外付出代价。
 
-- Default automatic HTTPS uses built-in managed ACME with HTTP-01 and TLS-ALPN-01 (`http.tls.auto_https` or `http.tls.mode: acme_managed`).
-- On-demand TLS (Caddy-style first-hit issuance):
+### 4.2 哪些改动能热重载，哪些要重启
 
-```yaml
-http:
-  tls:
-    mode: acme_managed
-    on_demand:
-      enabled: true
-      allow: ['*.customers.example.com']
-      max_active_certs: 100
-      max_issues_per_hour: 30
-      ask_url: http://127.0.0.1:8080/allow-tls?domain={domain}
-```
+能热重载：
 
-- Wildcard certificates use built-in managed DNS-01: `http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01` + `http.tls.acme.dns.provider` (`cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`, or `manual` without API keys). Configure from the admin console at `http://127.0.0.1:7777/` or YAML/API. Legacy `acme_dns_external` + `acme.sh` remains for non-built-in providers only.
+- 大部分合并后的配置值
+- `proxysss.yaml`
+- 主脚本与自动加载插件脚本
+- `services.reverse_proxy.routes`
+- `static_sites`
+- `webdav`
+- FTP upstream
 
-## Monitoring
+需要重启：
 
-```yaml
-monitoring:
-  enabled: true
-  path: /metrics
-  format: prometheus   # or json
-```
+- `http.plain_bind`
+- `http.tls_bind`
+- `http.h3_bind`
+- `admin.bind`
+- TCP / UDP listener bind 集合
+- `http.tls.mode`
+- 日志路径和级别核心设置
 
-Prometheus scrapers should hit `http://<public-host>/metrics`. JSON format remains available for legacy dashboards.
+## 5. 性能建议要这样理解
 
-## Security
+### 5.1 先调 Linux，再谈结论
 
-```yaml
-security:
-  validate_admin_mutations: true
-  block_ssrf_targets: true
-  reject_ambiguous_http1: true
-  blocked_upstream_hosts: [metadata.google.internal, 169.254.169.254]
-```
-
-See [SECURITY.md](./SECURITY.md) for the full hardening guide.
-
-## Admin console
-
-```yaml
-admin:
-  enabled: true
-  bind: 127.0.0.1:7777
-  username: ops
-  password: change-me
-  bearer_token: cluster-automation-token
-  enable_write_ops: true   # default false — enable for agent automation
-  expose_config: false
-  loopback_only: true
-  https:
-    enabled: false         # set true after initial TLS bootstrap
-    path_prefix: /_proxysss/admin
-    hosts: []              # optional Host allowlist for HTTPS admin API
-  auth_rate_limit:
-    enabled: true
-    max_failures: 8
-    window_secs: 300
-    lockout_secs: 900
-```
-
-Bootstrap ACME/TLS on loopback (`http://127.0.0.1:7777/v1/tls/*`). After certificate material exists, enable `admin.https` and drive the same `/v1/*` endpoints over HTTPS at `path_prefix` (Bearer token recommended). Plain HTTP to the public admin path is rejected; HTTPS writes require existing cert/key files.
-
-Agent automation examples: [AGENT-API.md](./AGENT-API.md).
-
-## Kubernetes ingress-style mode
-
-```yaml
-kubernetes:
-  enabled: true
-  namespace: prod
-  cluster_domain: cluster.local
-  mappings:
-    - name: api
-      service: api-svc
-      port: 8080
-      domains: [api.example.com]
-      path_prefix: /
-```
-
-When enabled, mappings are expanded into `services.domain_routes` on each load/reload.
-
-Open `http://127.0.0.1:7777/` for the dashboard. Automation APIs live under `/v1/*`.
-
-## Hot reload vs restart
-
-Inspect boundaries anytime:
+Linux 生产验证流程建议固定为：
 
 ```bash
+proxysss tune linux --apply
+proxysss config explain
+proxysss config capabilities
 proxysss config reload-plan
-proxysss config routes
+scripts/benchmark-all-scenarios.sh
 ```
 
-Manual reload is the default high-performance mode: call `POST /v1/reload` on the admin API, or use the token-authenticated admin mutation APIs, which persist YAML and reload eligible changes immediately. Background file watching is opt-in with `runtime.hot_reload.enabled: true`; when enabled, the watcher fingerprints the main YAML file, the main script, and auto-loaded plugin scripts at `runtime.hot_reload.interval_ms`.
+### 5.2 只赢一条链路，不算赢
 
-Reload covers routes, scripts, plugins, and most `services.*` values. Listener binds, TLS mode, and logging sink paths require a process restart.
+对 proxysss 来说，合理的性能优化必须满足这些条件：
 
-## Learning templates
+- 不引入明显副作用。
+- 不把某一类流量优化成“特供冠军”。
+- 至少能解释它对 HTTP、SSE、WebSocket、TCP、UDP、静态文件、reload 的影响。
+- 最终以 mixed-load 压测为准，而不是 cherry-pick 单场景截图。
 
-Generate focused starter files:
+### 5.3 `traffic_profile` 怎么选
+
+```yaml
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
+```
+
+- `small`：优先小文件、SSE、HTTP2、频繁 flush、交互式流量。
+- `balanced`：默认推荐，大多数“网站 + API + 一点实时流量”场景都能接受。
+- `bulk`：明显偏大文件传输、下载分发、零拷贝吞吐优先。
+
+## 6. 一组好用的排障命令
 
 ```bash
-proxysss config create-template full ./starter.yaml
-proxysss config create-template http ./http-only.yaml
-proxysss config create-template tcp ./tcp-only.yaml
+proxysss config explain
+proxysss config capabilities
+proxysss config watched-scripts
+proxysss config routes
+proxysss config reload-plan
+proxysss config nginx-parity --format yaml
+proxysss token show
 ```
+
+这些命令分别解决的问题：
+
+- `config explain`：当前配置到底生效成了什么。
+- `config capabilities`：这个实例现在有哪些能力面真的开着。
+- `watched-scripts`：哪些脚本会参与热重载。
+- `routes`：最终路由视图。
+- `reload-plan`：哪些改动能热重载，哪些需要重启。
+- `nginx-parity`：当前 nginx 对照矩阵。
+- `token show`：本地查看管理 token，而不是去翻 YAML 原文。
+
+## 7. 常见误区
+
+### 7.1 把所有问题都塞进脚本
+
+脚本适合做业务定制，不适合替代网关本体的基础能力。HTTP/TLS/路由/限流/缓存/流量治理优先用原生配置面。
+
+### 7.2 拿单条 SSE benchmark 当发布结论
+
+项目要求已经明确：后续所有性能优化都要压测，而且要无副作用。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 都应该一起看。
+
+### 7.3 管理面一上来就开公网写操作
+
+默认的 loopback + `enable_write_ops=false` 是刻意设计的安全姿势。自动化需要时再显式开启。
+
+## 8. 继续往下看什么
+
+如果你刚跑起来：
+
+- 先读 `README.md`
+- 再看 `docs/index.html`
+- 然后按本文档的场景段落复制配置
+
+如果你已经在做正式网关：
+
+- 去看 `docs/architecture.html`
+- 去看 `nginx-to-proxysss.md`
+- 做 Linux 调优和 mixed-load benchmark

@@ -78,12 +78,17 @@ $ReleaseProxysss = Join-Path $Root "target\release\proxysss.exe"
 if (-not (Test-Path $ReleaseProxysss)) {
     cargo build --release --locked
 }
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    throw "go not found; install Go to build benchmark helpers"
+}
 
 # All vendor downloads and per-run artifacts stay under .benchmark/ (gitignored).
 $BenchRoot = Join-Path $Root ".benchmark"
 $Vendor = Join-Path $BenchRoot "vendors"
 $RunDir = Join-Path $BenchRoot "runs\latest"
 $Www = Join-Path $RunDir "www"
+$BenchHelperSrc = Join-Path $PSScriptRoot "benchmark-helper.go"
+$BenchHelperExe = Join-Path $RunDir "benchmark-helper.exe"
 $PidFile = Join-Path $RunDir "pids.txt"
 $ResultsFile = Join-Path $RunDir "results.json"
 
@@ -92,6 +97,7 @@ if (Test-Path $RunDir) {
     Remove-Item -Recurse -Force $RunDir
 }
 New-Item -ItemType Directory -Path $Vendor,$Www -Force | Out-Null
+go build -o $BenchHelperExe $BenchHelperSrc
 
 $NginxZip = Join-Path $Vendor "nginx-$NginxVersion.zip"
 $NginxDir = Join-Path $Vendor "nginx-$NginxVersion"
@@ -194,14 +200,10 @@ $Results | Sort-Object ops_per_sec -Descending | Format-Table name, ops_per_sec,
 Write-Host "results saved to $ResultsFile"
 Write-Host "vendor binaries cached under $Vendor (gitignored under .benchmark/)"
 
-$reportScript = Join-Path $PSScriptRoot "benchmark-report.py"
-$compareScript = Join-Path $PSScriptRoot "compare-report.py"
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) { $python = Get-Command py -ErrorAction SilentlyContinue }
-if (-not $python) { throw "python not found; install Python 3 to generate benchmark reports" }
-& $python.Source $reportScript --results $ResultsFile --out-dir $RunDir --concurrency $Concurrency --duration-secs $DurationSecs
-& $python.Source $compareScript --binary $ReleaseProxysss --benchmark $ResultsFile --out-dir $RunDir
-if ($LASTEXITCODE -ne 0) { throw "compare-report.py failed with exit code $LASTEXITCODE" }
+& $BenchHelperExe write-gateway-report --results $ResultsFile --out-dir $RunDir --concurrency $Concurrency --duration $DurationSecs
+if ($LASTEXITCODE -ne 0) { throw "write-gateway-report failed with exit code $LASTEXITCODE" }
+& $BenchHelperExe write-gateway-compare --results $ResultsFile --out-dir $RunDir --binary $ReleaseProxysss
+if ($LASTEXITCODE -ne 0) { throw "write-gateway-compare failed with exit code $LASTEXITCODE" }
 
 Write-Host "benchmark report markdown: $(Join-Path $RunDir 'report.md')"
 Write-Host "benchmark report html:     $(Join-Path $RunDir 'report.html')"

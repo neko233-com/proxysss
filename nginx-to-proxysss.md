@@ -1,41 +1,41 @@
-# nginx to proxysss
+# nginx 迁移到 proxysss
 
-This document answers one practical question: how to express common nginx configurations in proxysss.
+这份文档只回答一个实际问题：
 
-Configuration model:
+`nginx` 里常见的配置，在 `proxysss` 里应该怎么表达？
 
-- Keep runtime configuration in a single YAML file, usually `proxysss.yaml`.
-- Use `-config`, `--config`, or `-c` when you want a different YAML path.
-- Use YAML first for gateway behavior and reserve TypeScript plugins for optional business logic.
-- Treat Linux mixed-load validation as the migration performance proof: enable the same YAML surfaces you plan to run together, then compare proxysss and nginx with CDN/static, reverse proxy, New API/SSE, WebSocket, TCP, UDP, and KCP-style traffic running concurrently per gateway. The default release proof prioritizes aggregate throughput plus game/realtime TCP, UDP, and KCP-style long-connection scenarios; WebSocket/static/reverse/SSE must remain above the soft floor with low errors; HTTPS static and static-large remain reported but are gates only when explicitly requested. Single-route or single-protocol benchmarks are useful for diagnosis, not final migration sign-off.
+它不是功能总表，而是迁移手册。写法也按两条路线组织：
 
-## Domain service groups
+- `新手路线`：先迁一条能跑的链路
+- `高手路线`：快速确认该把配置落在哪个能力面
 
-`services.domain_routes` is the primary way to model multi-domain reverse proxying in one YAML file. Each route is a domain-scoped service group with its own upstream pool.
+文档规范说明：
 
-```yaml
-services:
-  domain_routes:
-    - name: example-site
-      domains: [example.com, www.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
+- 这份文档是 `中文 first`
+- 术语保留 `English`
+- 它有对应 HTML 子页：`docs/nginx-to-proxysss.html`
 
-    - name: neko233-store
-      domains: [neko233.store]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
-      upstreams:
-        - http://127.0.0.1:9001
-```
+## 1. 先建立迁移心智
 
-In that layout:
+### 1.1 nginx 的 `server` / `location`，在 proxysss 里怎么想
 
-- `example.com` goes to one backend machine.
-- `neko233.store` reuses that same backend and adds a second machine to the pool.
-- The grouping key is the domain route itself, not a shared global host list.
+| nginx 思路 | proxysss 更常用的落点 | 什么时候用 |
+| --- | --- | --- |
+| `server_name + location /` | `services.reverse_proxy.routes` | 普通整站反代 |
+| `location /api/` + `proxy_pass` | `match.path_prefix` + `strip_prefix` | API 前缀代理 |
+| 同一域名下多个路径组装一个站点 | `services.domain_routes` | 站点级编排 |
+| `upstream` 权重和健康管理 | `upstreams` + `load_balance` | 集群反代 |
+| `stream {}` | `tcp.listeners` / `udp.listeners` | 非 HTTP 协议 |
 
-## 1. 反代某个 API 前缀
+一个很实用的判断方法：
+
+- 你只是做 `HTTP -> HTTP`：优先看 `reverse_proxy.routes`
+- 你想按“整站结构”组织配置：优先看 `domain_routes`
+- 你在做数据库、游戏、MQTT、UDP：直接看 `tcp.listeners` / `udp.listeners`
+
+## 2. 新手先迁最常见的 6 类 nginx 配置
+
+### 2.1 反代某个 API 前缀
 
 nginx：
 
@@ -58,27 +58,26 @@ proxysss：
 ```yaml
 http:
   plain_bind: 0.0.0.0:80
-  tls_bind: 0.0.0.0:443
 
 services:
-  domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      strip_prefix: true
+  reverse_proxy:
+    routes:
+      - name: api
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/api"
+        strip_prefix: true
+        upstreams:
+          - url: "http://127.0.0.1:8080"
 ```
 
-说明：
+怎么理解：
 
 - `strip_prefix: true` 对应 nginx `location /api/` + `proxy_pass .../`
 - 常见 `Host` / `X-Real-IP` / `X-Forwarded-*` 会自动补齐
-- 如果 nginx 配置只设置 `Host`、没有追加 `X-Forwarded-*` / `Forwarded`，可以在 `domain_routes`、`reverse_proxy.routes` 或 `ai_proxy.routes` 上设置 `forward_headers: false`，让语义和高吞吐基准更接近 nginx 默认反代路径
-- 对 New API/SSE 迁移，如果上游不需要 `proxysss-ai-*` 元数据头，可以在 `ai_proxy.routes` 上设置 `emit_metadata_headers: false`，保留路径 rewrite 和 provider 路由，同时减少每请求 header 工作
+- 这类场景优先用 `reverse_proxy.routes`，不要先上脚本
 
-## 2. 反代某个域名 = 后面整个服务器
-
-这是前后端分离项目里最常见的整站反代。
+### 2.2 反代整个域名到一台后端
 
 nginx：
 
@@ -97,59 +96,26 @@ proxysss：
 
 ```yaml
 services:
-  domain_routes:
-    - name: app
-      domains: [app.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
-      strip_prefix: false
+  reverse_proxy:
+    routes:
+      - name: app
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:9000"
 ```
 
-说明：
+这代表：
 
-- 这会把 `/` 以及所有子路径一起交给后端服务器
-- `strip_prefix: false` 对应整站透传，后端自己处理路径
+- `/` 和所有子路径都交给后端
+- 后端自己决定 `/dashboard`、`/assets/app.js`、`/api/*` 等路径如何处理
 
-## 3. 整个域名反代，后端子路径也要一起处理
-
-典型场景：React/Vue 前端 + `/api/*` 后端接口都在同一台应用服务器。
-
-nginx：
-
-```nginx
-server {
-    listen 80;
-    server_name spa.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:9000;
-    }
-}
-```
-
-proxysss：
-
-```yaml
-services:
-  domain_routes:
-    - name: spa
-      domains: [spa.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
-```
-
-后端收到的仍然是：
-
-- `/`
-- `/dashboard`
-- `/api/user/profile`
-- `/assets/app.js`
-
-## 4. 同一域名下前后端分离
+### 2.3 同一域名下前后端分离
 
 例如：
 
-- `/` 走前端静态或 SSR 服务
+- `/` 走前端 SSR 或静态服务
 - `/api` 走后端 API
 
 nginx：
@@ -168,23 +134,67 @@ proxysss：
 
 ```yaml
 services:
-  domain_routes:
-    - name: backend-api
-      domains: [app.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      strip_prefix: true
+  reverse_proxy:
+    routes:
+      - name: backend-api
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/api"
+        strip_prefix: true
+        upstreams:
+          - url: "http://127.0.0.1:8080"
 
-    - name: frontend-app
-      domains: [app.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:3000
-      strip_prefix: false
+      - name: frontend-app
+        match:
+          hosts: ["app.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://127.0.0.1:3000"
 ```
 
-proxysss 会自动选最长匹配前缀，所以 `/api/*` 会优先命中 `backend-api`。
+为什么这样迁比较直观：
 
-## 5. 自定义增加额外 header
+- `/api/*` 会优先命中更长前缀
+- 你不用在一个 `server` 块里堆很多 `location`
+- 路由优先级从规则本身就能读出来
+
+### 2.4 静态站点
+
+nginx：
+
+```nginx
+server {
+    listen 80;
+    server_name www.example.com;
+
+    root /srv/www;
+    index index.html;
+}
+```
+
+proxysss：
+
+```yaml
+services:
+  static_sites:
+    - name: homepage
+      hosts: ["www.example.com"]
+      root_dir: "/srv/www"
+      index_files: ["index.html"]
+```
+
+适合：
+
+- 官网
+- 文档站
+- 小型下载站
+
+与 nginx 迁移时要注意：
+
+- proxysss 会把静态文件纳入 warm-up 和 `traffic_profile`
+- 如果你同时还有 API，不需要再拆第二套配置格式
+
+### 2.5 自定义 `header`
 
 nginx：
 
@@ -200,304 +210,210 @@ proxysss：
 
 ```yaml
 services:
-  domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      strip_prefix: true
-      set_headers:
-        x-tenant-id: tenant-a
-        x-env: production
+  reverse_proxy:
+    routes:
+      - name: api
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/api"
+        strip_prefix: true
+        upstreams:
+          - url: "http://127.0.0.1:8080"
+        set_headers:
+          x-tenant-id: tenant-a
+          x-env: production
 ```
 
-如果要删 header：
+如果要删 `header`：
 
 ```yaml
-      strip_headers:
-        - x-legacy-header
-        - x-debug-token
+        strip_headers:
+          - x-legacy-header
+          - x-debug-token
 ```
 
-## 6. 负载均衡 upstream pool
+### 2.6 自动 HTTPS
 
-nginx：
+nginx 常见做法通常是外部申请证书或自己管理 `certbot`。
 
-```nginx
-upstream api_upstream {
-    server 127.0.0.1:8080;
-    server 127.0.0.1:8081;
-}
-
-location /api/ {
-    proxy_pass http://api_upstream/;
-}
-```
-
-proxysss：
-
-```yaml
-load_balance:
-  algorithm: rendezvous
-
-services:
-  domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      upstreams:
-        - http://127.0.0.1:8080
-        - http://127.0.0.1:8081
-      strip_prefix: true
-```
-
-## 7. TLS / 自动 HTTPS
-
-nginx 常见上法通常要手配证书或配外部 certbot/acme.sh。
-
-proxysss：
+proxysss 推荐：
 
 ```yaml
 http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
   tls:
-    auto_https:
+    mode: acme_managed
+    acme:
       enabled: true
-      domains: [example.com, www.example.com]
-      email: admin@example.com
-      production: true
+      email: "ops@example.com"
+      challenge: http01
 ```
 
-泛域名证书使用内建 managed DNS-01（一个云厂商 = 一个 provider 策略；`aliyun_cn` 与 `aliyun_intl` 分开）：
+如果你做的是泛域名：
 
 ```yaml
 http:
   tls:
     mode: acme_managed
-    cert_path: certs/proxysss-cert.pem
-    key_path: certs/proxysss-key.pem
-    generate_self_signed_if_missing: false
-    server_name: example.com
     acme:
-      email: admin@example.com
+      enabled: true
+      email: "ops@example.com"
       challenge: dns01
-      domains: [example.com, "*.example.com"]
-      directory_production: true
-      renew_interval_hours: 12
       dns:
         provider: cloudflare
         credentials:
-          api_token: your-cloudflare-api-token
+          api_token: "REDACTED"
 ```
 
-内置 provider：`cloudflare`、`aliyun_cn`、`aliyun_intl`、`tencent`、`volcengine`、`aws`、`azure`、`google`。无云厂商 token 时使用 `http.tls.auto_https`（HTTP-01/TLS-ALPN-01），同样不依赖外部 ACME 客户端。
+## 3. 高手迁移：不只是普通 HTTP
 
-## 8. 健康检查与维护态
+### 3.1 用 `domain_routes` 组织整站
 
-proxysss 可直接在配置里打开：
-
-```yaml
-load_balance:
-  active_health:
-    enabled: true
-    http_enabled: true
-    tcp_enabled: true
-    udp_enabled: false
-    path: /healthz
-    failure_threshold: 2
-    success_threshold: 2
-    udp_payload: proxysss-health
-    udp_expect_response: true
-    alert_webhooks:
-      - https://ops.example.com/webhooks/proxysss
-
-runtime:
-  performance:
-    enabled: true
-    profile: edge
-    traffic_profile: small
-    adaptive_system: true
-    socket_extreme: true
-    log_on_start: true
-  watchdog:
-    enabled: true
-    restart_critical_tasks: true
-    restart_backoff_secs: 2
-    heartbeat_interval_secs: 30
-  maintenance_state:
-    enabled: true
-    path: ./runtime/maintenance-state.json
-```
-
-UDP 健康检查默认关闭，因为很多 KCP/游戏协议不会回显通用探测包；如果后端能处理探测包，可以启用 `udp_enabled`。`runtime.performance` 默认开启，启动/重启时会记录识别到的系统版本、启用的 Linux socket 策略，以及 Ubuntu 22/Debian/未知版本等降级原因。watchdog 会在关键后台任务异常退出时记录指标并按配置重启任务。
-
-路由级覆写：
+当你的 nginx 已经变成“一个域名下混静态、API、下载、管理后台”的结构，可以切成站点级编排：
 
 ```yaml
 services:
   domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /api
-      upstream: http://127.0.0.1:8080
-      active_health:
-        path: /readyz
-        failure_threshold: 3
-        success_threshold: 2
-```
+    - domain: "example.com"
+      routes:
+        - path_prefix: "/"
+          service: static:homepage
+        - path_prefix: "/api"
+          service: reverse_proxy:api
 
-## 9. 静态文件
-
-nginx：
-
-```nginx
-location /assets/ {
-    root /srv/www;
-    autoindex off;
-}
-```
-
-proxysss：
-
-```yaml
-services:
   static_sites:
-    - name: assets
-      path_prefix: /assets
-      root: /srv/www/assets
-      index_files: [index.html, index.htm]
-      autoindex: false
+    - name: homepage
+      hosts: ["example.com"]
+      root_dir: "./www"
+
+  reverse_proxy:
+    routes:
+      - name: api
+        match:
+          hosts: ["example.com"]
+          path_prefix: "/api"
+        upstreams:
+          - url: "http://127.0.0.1:8080"
 ```
 
-## 10. WebDAV
-
-proxysss 直接内建：
+### 3.2 upstream 集群迁移
 
 ```yaml
-services:
-  webdav:
-    enabled: true
-    path_prefix: /dav
-    root: ./webdav
-    allow_write: true
-```
-
-## 11. TCP / UDP
-
-```yaml
-tcp:
-  listeners:
-    - name: game-tcp
-      bind: 0.0.0.0:7000
-      protocol: game_tcp
-      nodelay: true
-      connect_timeout_ms: 3000
-      upstreams: [127.0.0.1:9000, 127.0.0.1:9001]
-
-udp:
-  listeners:
-    - name: game-kcp
-      bind: 0.0.0.0:7001
-      protocol: kcp
-      session_ttl_secs: 180
-      max_associations: 262144
-      upstreams: [127.0.0.1:9100, 127.0.0.1:9101]
-```
-
-`protocol` 只用于可观测性，不解析业务 payload。TCP 默认 `nodelay: true`，适合游戏、AI 工具桥接、设备长连接等低延迟流量。Linux 上启用 `runtime.performance` 时，TCP stream bind 会像高性能 nginx stream 部署一样通过 `SO_REUSEPORT` 拆成多 accept worker；当脚本、亲和、主动健康、被动健康和多上游策略都关闭时，单上游 TCP 直连会完全绕过通用 upstream plan。UDP/KCP 通过 `session_ttl_secs` 刷新透明客户端关联，并用 `max_associations` 给大规模移动端重连/掉线风暴设置上限。
-
-MQTT/IoT 也走同一套网关面：
-
-```yaml
-tcp:
-  listeners:
-    - name: mqtt
-      bind: 0.0.0.0:1883
-      protocol: mqtt
-      nodelay: true
-      connect_timeout_ms: 3000
-      upstreams: [127.0.0.1:18831, 127.0.0.1:18832]
-  stream_routes:
-    - name: mqtt-tls
-      domains: [mqtt.example.com]
-      listen: 0.0.0.0:8883
-      upstream: 127.0.0.1:88831
-      protocol: mqtt
-      tls_mode: passthrough
-
 services:
   reverse_proxy:
     routes:
-      - name: mqtt-websocket
-        hosts: [mqtt-ws.example.com]
-        path_prefix: /mqtt
-        upstream: ws://127.0.0.1:8083
+      - name: api-cluster
+        match:
+          hosts: ["api.example.com"]
+          path_prefix: "/"
+        upstreams:
+          - url: "http://10.0.0.11:8080"
+            weight: 3
+          - url: "http://10.0.0.12:8080"
+            weight: 2
+        load_balance:
+          strategy: weighted_round_robin
+          active_health:
+            path: "/healthz"
+            interval_secs: 5
+            timeout_ms: 1200
 ```
 
-proxysss 不是 MQTT broker；它是 broker/device service 前面的边缘网关，负责监听、TLS passthrough、WebSocket upgrade、上游池、限流、访问控制、健康检查和可观测性。
+这对应 nginx 中的 `upstream` + 健康管理诉求，但 proxysss 把它放在单条路由旁边，更适合人读。
 
-## 12. FTP
+### 3.3 `stream` 迁到 TCP / UDP
 
-nginx ftp module 常见指令在 proxysss 中落到 `services.ftp`：`listen`/`bind`、`proxy_pass`/`upstream`、`pasv_address`/`public_ip`、`port_start`/`port_end`、全局与按用户的命令/传输策略、超时、登录和速率控制。
+TCP：
 
 ```yaml
+tcp:
+  listeners:
+    - name: postgres
+      bind: 0.0.0.0:5432
+      nodelay: true
+      connect_timeout_ms: 2000
+      routes:
+        - name: main
+          upstreams:
+            - addr: "10.0.0.12:5432"
+```
+
+UDP：
+
+```yaml
+udp:
+  listeners:
+    - name: realtime
+      bind: 0.0.0.0:7001
+      session_ttl_secs: 45
+      max_associations: 150000
+      routes:
+        - name: zone-a
+          upstreams:
+            - addr: "10.0.1.10:7001"
+```
+
+### 3.4 SSE / AI 代理迁移
+
+如果你在 nginx 上已经做了 `OpenAI-compatible` / `New API` / `SSE` 代理，建议切到 `services.ai_proxy`：
+
+```yaml
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
+
 services:
-  ftp:
-    enabled: true
-    bind: 0.0.0.0:21
-    upstream: 127.0.0.1:2121
-    native_control: true
-    public_ip: 203.0.113.10
-    passive_port_start: 50000
-    passive_port_end: 50100
-    proxy_timeout_ms: 66000
-    max_login_attempts: 5
-    limit_rate: 0
-    allow: [198.51.100.0/24]
-    deny: [203.0.113.9]
-    command_deny: [SITE, STAT]
-    transfer_allow: [RETR, STOR]
-    user_policies:
-      - user: readonly
-        transfer_allow: [RETR]
-        transfer_deny: [STOR, DELE]
+  ai_proxy:
+    routes:
+      - name: llm-edge
+        match:
+          hosts: ["ai.example.com"]
+          path_prefix: "/v1"
+        upstreams:
+          - url: "https://api.openai.com"
+        transport:
+          flush_interval_ms: 0
+          tcp_nodelay: true
 ```
 
-## 13. 错误页 / 404
+原因很直接：
 
-```yaml
-http:
-  error_pages:
-    enabled: true
-    show_details: false
-    pages:
-      - status: 404
-        content_type: text/html; charset=utf-8
-        body: |
-          <html>
-            <body>
-              <h1>{{status}} {{reason}}</h1>
-              <p>proxysss could not match this route.</p>
-            </body>
-          </html>
+- 流式输出对 flush、`tcp_nodelay`、keepalive 更敏感
+- 后续性能优化必须看 mixed-load，而不是单独挑一条 SSE 压测图
+
+## 4. 迁移时最容易踩的坑
+
+### 4.1 把 `domain_routes` 和 `reverse_proxy.routes` 当成互斥关系
+
+它们不是二选一：
+
+- 简单代理用 `reverse_proxy.routes`
+- 站点级编排再用 `domain_routes`
+
+### 4.2 只迁 YAML 语法，不迁验证流程
+
+真正的迁移不是“配置能启动就算结束”，而是：
+
+```bash
+proxysss tune linux --apply
+proxysss config explain
+proxysss config routes
+proxysss config nginx-parity --format yaml
+scripts/benchmark-all-scenarios.sh
 ```
 
-## 14. include 子配置
+### 4.3 只挑最强单场景 benchmark
 
-```yaml
-include:
-  enabled: true
-  required: true
-  files:
-    - ./conf.d/http.yaml
-    - ./conf.d/streams.yaml
-```
+proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style 同时跑，而不是 cherry-pick 一条最漂亮的图。
 
-## 15. 什么时候还用 TS
+## 5. 一句迁移建议
 
-YAML 已覆盖常规网关入口职责；TS 更适合：
+如果你今天就要从 `nginx` 迁到 `proxysss`：
 
-- 自定义业务 header
-- 特殊 tenant / player / device 路由
-- API 兼容层
-- 插件式业务逻辑
+1. 先把一条 `reverse_proxy.routes` 跑通
+2. 再拆静态站点、API、AI proxy、TCP/UDP
+3. 最后补健康检查、缓存、TLS 和 benchmark
+
+这样最稳，也最容易发现有没有副作用回归。
