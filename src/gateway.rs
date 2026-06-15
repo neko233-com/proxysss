@@ -16695,7 +16695,7 @@ proxysss token show
         </div>
 
         <div class="note">
-          <strong>性能约束：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 都要一起看，不能出现“这一项快了，另一项明显变差”还把它当成成功。
+          <strong>性能与压测纪律：</strong> 官方 Linux benchmark 不该只讲口径，也要直接展示历史 nginx 对标基线。后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 都要一起看，不能出现“这一项快了，另一项明显变差”还把它当成成功。
         </div>
       </section>
     </main>

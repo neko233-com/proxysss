@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>proxysss Linux benchmark</title>
+  <title>proxysss Linux benchmark 与历史跑分</title>
   <style>
     :root {
       --bg: #f5efe6;
@@ -260,8 +260,8 @@
   <div class="shell">
     <section class="hero">
       <div class="eyebrow">Linux benchmark</div>
-      <h1>Linux benchmark 先看口径，再看数字。</h1>
-      <p>这页讲的是官方 GitHub Actions Linux 全协议 mixed-load benchmark。它要回答的是“所有核心协议一起跑时，proxysss 和 nginx 的整体表现怎么样”，而不是只挑一个 static quick 数字来讲故事。</p>
+      <h1>Linux benchmark 先看真实跑分，再看口径。</h1>
+      <p>这页不再只讲“官方 Linux 全协议 mixed-load benchmark 应该怎么跑”，还直接把你已经有的历史 nginx 对标跑分摆出来。先看真机 Ubuntu 24 与 Docker 校验基线，再看为什么发布口径必须坚持 all-protocol mixed-load。</p>
       <div class="actions">
         <a class="button primary" href="index.html">回到 docs 首页</a>
         <a class="button warm" href="architecture.html">看架构与快路径边界</a>
@@ -271,37 +271,98 @@
 
     <section class="stats">
       <article class="card">
-        <div class="label">Official Linux benchmark</div>
-        <div class="value">All protocols</div>
+        <div class="label">Ubuntu 24 真机聚合</div>
+        <div class="value">1.287x</div>
       </article>
       <article class="card">
-        <div class="label">Primary surface</div>
-        <div class="value">Mixed matrix</div>
+        <div class="label">Docker 校验聚合</div>
+        <div class="value">1.059x</div>
       </article>
       <article class="card">
-        <div class="label">Artifacts</div>
-        <div class="value">results + summary</div>
+        <div class="label">真机 new-api-sse</div>
+        <div class="value">0.849x</div>
       </article>
       <article class="card">
-        <div class="label">Release rule</div>
-        <div class="value">No side effects</div>
+        <div class="label">真机 game / tcp</div>
+        <div class="value">2.732x / 2.741x</div>
       </article>
     </section>
 
     <div class="layout">
       <section class="panel">
         <h2>这页到底在讲什么</h2>
-        <p>这是“官方 Linux 全协议 mixed-load benchmark”的人类可读解释页。它和仓库里的 Markdown 版本一一对应，方便 GitHub Pages、内建 docs 导航和 release bundle 同时把性能口径说清楚。</p>
+        <p>这是“官方 Linux 全协议 mixed-load benchmark”的人类可读解释页，但现在不只解释规则，也直接展示历史跑分基线。这样你打开页面时，先看到真实 Ubuntu 24 / Docker 对标 nginx 的结果，再去理解为什么后续优化必须按 mixed-load 口径继续压测。</p>
         <div class="two-up">
           <div class="note good">
             <strong>它适合回答：</strong>
-            <p>当前主干在 Linux 上，static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style UDP 一起跑时，到底有没有一起站住。</p>
+            <p>当前主干在 Linux 上，static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style UDP 一起跑时，到底有没有一起站住，以及历史上到底跑到了什么水平。</p>
           </div>
           <div class="note warn">
             <strong>它不适合回答：</strong>
             <p>不能只拿一个 static small 的快照，就说发布已经安全，或者说所有协议都自动跟着变快。</p>
           </div>
         </div>
+      </section>
+
+      <section class="panel">
+        <h2>历史跑分基线（直接对标 nginx）</h2>
+        <p>这些分数不是新编的结论，而是仓库里已经有的 mixed-load 历史结果。之前 benchmark 主页只解释口径，没有直接把数字展示出来；现在应该把它们摆到首页，让每次优化都有明确对照物。</p>
+        <div class="two-up">
+          <div class="note good">
+            <strong>真机 Ubuntu 24.04 LTS：</strong>
+            <p>聚合 <strong>1.287x</strong>，`game-long-connection` <strong>2.732x</strong>，`tcp-stream` <strong>2.741x</strong>，`websocket-long-connection` <strong>1.319x</strong>，`kcp-style-udp` 0 错误且接近持平。</p>
+          </div>
+          <div class="note">
+            <strong>Docker `ubuntu:24.04` 校验：</strong>
+            <p>聚合 <strong>1.059x</strong>，`new-api-sse` 已到 <strong>1.014x</strong>。UDP / KCP 受容器 `rmem_max` 环境限制，生产判断仍以真机 Linux 主机为准。</p>
+          </div>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>真机场景</th>
+              <th>Ratio</th>
+              <th>proxysss ops/s</th>
+              <th>nginx ops/s</th>
+              <th>Errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>cdn-hot-update</strong></td><td>1.074x</td><td>4134.17</td><td>3847.67</td><td>0</td></tr>
+            <tr><td><strong>game-long-connection</strong></td><td>2.732x</td><td>4729.17</td><td>1731.25</td><td>0</td></tr>
+            <tr><td><strong>https-static-small</strong></td><td>0.829x</td><td>908.83</td><td>1096.17</td><td>0</td></tr>
+            <tr><td><strong>kcp-style-udp</strong></td><td>0.988x</td><td>1549.08</td><td>1568.17</td><td>0</td></tr>
+            <tr><td><strong>new-api-sse</strong></td><td>0.849x</td><td>94.50</td><td>111.33</td><td>0</td></tr>
+            <tr><td><strong>reverse-proxy</strong></td><td>1.054x</td><td>2450.50</td><td>2325.42</td><td>0</td></tr>
+            <tr><td><strong>static-large</strong></td><td>1.180x</td><td>19.67</td><td>16.67</td><td>0</td></tr>
+            <tr><td><strong>static-small</strong></td><td>0.893x</td><td>4226.42</td><td>4733.42</td><td>0</td></tr>
+            <tr><td><strong>tcp-stream</strong></td><td>2.741x</td><td>4699.25</td><td>1714.50</td><td>0</td></tr>
+            <tr><td><strong>udp-stream</strong></td><td>0.855x</td><td>1533.08</td><td>1793.33</td><td>0</td></tr>
+            <tr><td><strong>websocket-long-connection</strong></td><td>1.319x</td><td>1303.67</td><td>988.42</td><td>0</td></tr>
+          </tbody>
+        </table>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Docker 校验场景</th>
+              <th>Ratio</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>game-long-connection</strong></td><td>1.429x</td></tr>
+            <tr><td><strong>tcp-stream</strong></td><td>1.438x</td></tr>
+            <tr><td><strong>reverse-proxy</strong></td><td>1.200x</td></tr>
+            <tr><td><strong>https-static-small</strong></td><td>1.269x</td></tr>
+            <tr><td><strong>new-api-sse</strong></td><td>1.014x</td></tr>
+            <tr><td><strong>static-small</strong></td><td>1.000x</td></tr>
+            <tr><td><strong>cdn-hot-update</strong></td><td>0.978x</td></tr>
+            <tr><td><strong>websocket-long-connection</strong></td><td>0.924x</td></tr>
+            <tr><td><strong>kcp-style-udp</strong></td><td>0.783x</td></tr>
+            <tr><td><strong>udp-stream</strong></td><td>0.861x</td></tr>
+          </tbody>
+        </table>
       </section>
 
       <section class="panel">
@@ -401,7 +462,7 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
     </div>
 
     <div class="footer">
-      正式发布请继续坚持这条线：先 Linux 调优，再 mixed-load benchmark，再看 CI / benchmark / deploy / release 全绿。单场景图只负责帮助我们定位热点，不负责替代发布标准。
+      正式发布请继续坚持这条线：先 Linux 调优，再 mixed-load benchmark，再看 CI / benchmark / deploy / release 全绿。历史真机基线已经摆在这里，后续优化必须整体对比，而不是拿单场景截图替代发布标准。
     </div>
   </div>
 </body>
