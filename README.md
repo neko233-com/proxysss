@@ -2,6 +2,8 @@
 
 proxysss is a same-level replacement for nginx as a general-purpose edge gateway. It keeps HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT/IoT edge patterns, FTP, WebDAV, AI reverse proxy routes, TLS automation, logs, and reload behavior in one Rust binary and one YAML file.
 
+It also keeps practical gateway features like cache/proxy cache, compression, gRPC-over-HTTP/2, and rate limiting algorithms including fixed-window, token-bucket, and leaky-bucket in the same configuration surface.
+
 If you only remember one thing, remember this: `proxysss` is for ordinary gateway work first, and optional TypeScript plugins second.
 
 ## Read This README In Two Ways

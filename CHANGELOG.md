@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.2 - 2026-06-15
+
+- Hardened the no-side-effect performance validation toolchain around the Go benchmark helper: CI benchmark runs now trigger when `scripts/benchmark-helper.go` changes, and obsolete Python benchmark report dependencies were removed from GitHub Actions so the official benchmark path stays Go-first end to end.
+- Cleaned the deploy/release packaging manifests so the new `caddy -> proxysss` migration guide ships alongside the existing nginx and TypeScript docs instead of leaving the release bundle with partial documentation.
+- Refreshed the built-in docs and README capability wording so supported surfaces like `token-bucket` rate limiting and migration tracks stay aligned with tests, docs, and release evidence.
+
 ## v1.3.1 - 2026-06-15
 
 - Static small-file delivery now copies response head + body into one pooled buffer and issues a single write syscall (nginx single-segment parity), removing the extra syscall and separate header packet; static-small and CDN hot-update now exceed nginx in the Ubuntu 24 mixed benchmark.

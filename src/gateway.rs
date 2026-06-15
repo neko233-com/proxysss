@@ -1,4 +1,4 @@
-﻿use std::borrow::Cow;
+use std::borrow::Cow;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
@@ -6743,20 +6743,16 @@ impl Gateway {
         }
 
         let rewrite_path = ai_proxy_raw_rewrite_path(route, &request.target, &request.path);
-        let Some((_, pool)) = self.raw_http_pool_for_upstream(&route.upstream)?
-        else {
+        let Some((_, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
             return Ok(false);
         };
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
-        let mut upstream_io = pool
-            .checkout()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed connecting plain raw SSE upstream {}",
-                    route.upstream
-                )
-            })?;
+        let mut upstream_io = pool.checkout().await.with_context(|| {
+            format!(
+                "failed connecting plain raw SSE upstream {}",
+                route.upstream
+            )
+        })?;
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_gateway(&upstream_io);
         let request_bytes = serialize_raw_fast_lane_request(
@@ -6802,7 +6798,8 @@ impl Gateway {
             let reusable = if let Some(leftover) = response_head.leftover {
                 let leftover_len = leftover.len() as u64;
                 if leftover_len >= len {
-                    let mut response_bytes = Vec::with_capacity(response_head_bytes.len() + len as usize);
+                    let mut response_bytes =
+                        Vec::with_capacity(response_head_bytes.len() + len as usize);
                     response_bytes.extend_from_slice(&response_head_bytes);
                     response_bytes.extend_from_slice(&leftover[..len as usize]);
                     downstream
@@ -10209,9 +10206,7 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         .http2_initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE_BYTES)
         .http2_initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE_BYTES)
         .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
-        .http2_keep_alive_interval(Some(Duration::from_secs(
-            HTTP2_KEEP_ALIVE_INTERVAL_SECS,
-        )))
+        .http2_keep_alive_interval(Some(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS)))
         .http2_keep_alive_while_idle(true)
         .timeout(Duration::from_millis(config.http.request_timeout_ms.max(1)))
         .build()
@@ -16491,6 +16486,34 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
             <p class="subtle">MQTT TCP、MQTT over WebSocket、CoAP-style UDP 都能组合，但 proxysss 不是 broker。</p>
             <pre><code>{{IOT}}</code></pre>
           </article>
+
+          <article class="card">
+            <span class="tag beginner">WebDAV</span>
+            <h3>文件协作入口</h3>
+            <p class="subtle">当你需要轻量文件写入、设计资产共享或受控协作时，用内建 WebDAV，而不是把所有文件需求都塞进静态站点。</p>
+            <pre><code>{{WEBDAV}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">FTP</span>
+            <h3>FTP 控制与传输治理</h3>
+            <p class="subtle">适合兼容旧客户端和传统分发链路，同时还能表达 allow/deny、命令策略、传输策略和按用户规则。</p>
+            <pre><code>{{FTP}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">Error pages</span>
+            <h3>错误页与维护窗口</h3>
+            <p class="subtle">生产入口不仅要能代理，还要能在失败和维护时给出可控反馈，而不是把异常页面交给默认实现碰运气。</p>
+            <pre><code>{{ERROR_PAGES}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">Maintenance</span>
+            <h3>维护状态切换</h3>
+            <p class="subtle">通过独立维护状态文件控制网关行为，避免靠临时改配置或人工停服务来完成维护窗口切换。</p>
+            <pre><code>{{MAINTENANCE}}</code></pre>
+          </article>
         </div>
       </section>
 
@@ -16577,15 +16600,18 @@ proxysss token show
         ("{{STATIC_SITE}}", docs_template_static_site()),
         ("{{STREAMS}}", docs_template_streams()),
         ("{{IOT}}", docs_template_iot()),
+        ("{{WEBDAV}}", docs_template_webdav()),
+        ("{{FTP}}", docs_template_ftp()),
         ("{{ACME_DNS}}", docs_template_acme_dns()),
         ("{{HEALTH}}", docs_template_health()),
+        ("{{ERROR_PAGES}}", docs_template_error_pages()),
+        ("{{MAINTENANCE}}", docs_template_maintenance()),
     ] {
         html = html.replace(token, value);
     }
 
     html
 }
-
 
 fn docs_template_reverse_proxy() -> &'static str {
     "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\nservices:\n  access_control:\n    http:\n      enabled: true\n      blacklist: [203.0.113.10, 198.51.100.0/24]\n  domain_routes:\n    - name: example-site\n      domains: [example.com, www.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      compression:\n        enabled: true\n    - name: neko233-store\n      domains: [neko233.store]\n      path_prefix: /\n      upstream: http://127.0.0.1:9000\n      upstreams:\n        - http://127.0.0.1:9001\n      cache:\n        enabled: true\n        ttl_secs: 30\n      rate_limit:\n        enabled: true\n        requests: 120\n        window_ms: 60000\n        burst: 30\n      active_health:\n        path: /healthz\n        failure_threshold: 2\n        success_threshold: 2\n"
@@ -19335,6 +19361,8 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.admin.enable_write_ops = true;
         config.admin.https.enabled = true;
+        config.http.tls.cert_path = std::env::temp_dir().join("proxysss-missing-admin-cert.pem");
+        config.http.tls.key_path = std::env::temp_dir().join("proxysss-missing-admin-key.pem");
         let denied = check_admin_mutation_access(
             &config,
             &AdminTransport::GatewayHttps {
@@ -20893,4 +20921,3 @@ mod tests {
         assert!(!apply_stream_rate_limit(&store, &config, addr));
     }
 }
-
