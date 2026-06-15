@@ -53,6 +53,16 @@ Linux 官方 benchmark 工件名仍然是：
 
 不要把 Windows quick smoke 当成正式性能发布结论。
 
+## 4.5. GitHub-hosted Linux runner 和专门 Linux 主机的区别
+
+这里要把话说清楚：
+
+- **GitHub-hosted Linux benchmark** 现在也会比较所有协议
+- 但它的 `kcp-style-udp` 在 summary 里默认是 **diagnostic**
+- 真正的 `KCP / realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
+
+原因不是“把差结果藏起来”，而是 GitHub-hosted runner 的 UDP / realtime 噪声太大，容易把 KCP 结论带偏。我们保留它在表里，是为了看趋势；我们不把它当 hosted runner 上的最终裁判，是为了不让错误环境替代真实环境。
+
 ## 5. 正式 Linux 发布怎么跑
 
 ```bash

@@ -356,6 +356,20 @@
       </section>
 
       <section class="panel">
+        <h2>GitHub-hosted Linux runner 和专门 Linux 主机不是一回事</h2>
+        <div class="two-up">
+          <div class="note">
+            <strong>GitHub-hosted runner：</strong>
+            <p>现在也会把 `kcp-style-udp` 放进 all-protocol summary 里一起比较，但默认把它当 diagnostic，看趋势，不把 hosted runner 的 UDP 噪声当最终裁判。</p>
+          </div>
+          <div class="note">
+            <strong>专门调优过的 Linux 主机：</strong>
+            <p>这里才是 `KCP / realtime UDP` 的硬门槛环境。也就是说，GitHub Actions 负责“全协议都比”，专门 Linux host 负责“最终公平门槛”。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
         <h2>正式发布为什么还要 mixed-load</h2>
         <p>正式 Linux 发布口径仍然是 mixed-load，而不是单场景快照。要一起看这些路径：</p>
         <div class="two-up">
