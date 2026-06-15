@@ -42,6 +42,7 @@ CRITICAL_RATIO="${CRITICAL_RATIO:-0.97}"
 CRITICAL_SCENARIOS="${CRITICAL_SCENARIOS:-websocket-long-connection game-long-connection tcp-stream udp-stream kcp-style-udp}"
 DIAGNOSTIC_SCENARIOS="${DIAGNOSTIC_SCENARIOS:-static-large https-static-small}"
 WEBSOCKET_ERROR_TOLERANCE="${WEBSOCKET_ERROR_TOLERANCE:-4}"
+SSE_ERROR_TOLERANCE="${SSE_ERROR_TOLERANCE:-1}"
 FAST_GATE="${FAST_GATE:-0}"
 FAST_GATE_RATIO="${FAST_GATE_RATIO:-$CRITICAL_RATIO}"
 FAST_GATE_CONCURRENCY="${FAST_GATE_CONCURRENCY:-$((CPU_CORES * 16))}"
@@ -724,6 +725,7 @@ fi
   --critical-ratio "$CRITICAL_RATIO" \
   --critical-scenarios "$CRITICAL_SCENARIOS" \
   --diagnostic-scenarios "$DIAGNOSTIC_SCENARIOS" \
+  --sse-error-tolerance "$SSE_ERROR_TOLERANCE" \
   --websocket-error-tolerance "$WEBSOCKET_ERROR_TOLERANCE" \
   --aggregate-ratio "$AGGREGATE_RATIO" \
   --mixed-matrix="$MIXED_MATRIX_BOOL" \

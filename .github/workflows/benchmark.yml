@@ -55,7 +55,8 @@ jobs:
           chmod +x scripts/benchmark-all-scenarios.sh
           bash scripts/benchmark-all-scenarios.sh
 
-      - uses: actions/upload-artifact@v6
+      - if: always()
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-linux
           path: |
@@ -87,7 +88,8 @@ jobs:
         shell: pwsh
         run: ./scripts/benchmark-gateways.ps1 -Quick
 
-      - uses: actions/upload-artifact@v6
+      - if: always()
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-windows
           path: |

@@ -20,26 +20,26 @@ import (
 )
 
 type BenchRow struct {
-	Scenario         string   `json:"scenario,omitempty"`
-	Gateway          string   `json:"gateway,omitempty"`
-	Name             string   `json:"name"`
-	Protocol         string   `json:"protocol,omitempty"`
-	Target           string   `json:"target,omitempty"`
-	URL              string   `json:"url,omitempty"`
-	Concurrency      int      `json:"concurrency"`
-	DurationSecs     int      `json:"duration_secs"`
-	Success          int      `json:"success"`
-	Errors           int      `json:"errors"`
-	OpsPerSec        float64  `json:"ops_per_sec"`
-	ThroughputMiBS   float64  `json:"throughput_mib_s"`
-	LatencyP50MS     *float64 `json:"latency_p50_ms"`
-	LatencyP95MS     *float64 `json:"latency_p95_ms"`
-	LatencyP99MS     *float64 `json:"latency_p99_ms"`
+	Scenario       string   `json:"scenario,omitempty"`
+	Gateway        string   `json:"gateway,omitempty"`
+	Name           string   `json:"name"`
+	Protocol       string   `json:"protocol,omitempty"`
+	Target         string   `json:"target,omitempty"`
+	URL            string   `json:"url,omitempty"`
+	Concurrency    int      `json:"concurrency"`
+	DurationSecs   int      `json:"duration_secs"`
+	Success        int      `json:"success"`
+	Errors         int      `json:"errors"`
+	OpsPerSec      float64  `json:"ops_per_sec"`
+	ThroughputMiBS float64  `json:"throughput_mib_s"`
+	LatencyP50MS   *float64 `json:"latency_p50_ms"`
+	LatencyP95MS   *float64 `json:"latency_p95_ms"`
+	LatencyP99MS   *float64 `json:"latency_p99_ms"`
 }
 
 type SimpleBaseline struct {
-	MaxErrorCount                int     `json:"max_error_count"`
-	MinProxysssVsNginxOpsRatio   float64 `json:"min_proxysss_vs_nginx_ops_ratio"`
+	MaxErrorCount              int     `json:"max_error_count"`
+	MinProxysssVsNginxOpsRatio float64 `json:"min_proxysss_vs_nginx_ops_ratio"`
 }
 
 var (
@@ -315,6 +315,7 @@ func runWriteAllScenariosSummary(args []string) error {
 	criticalScenarios := fs.String("critical-scenarios", "", "space-separated critical scenarios")
 	diagnosticScenarios := fs.String("diagnostic-scenarios", "", "space-separated diagnostic scenarios")
 	websocketTolerance := fs.Int("websocket-error-tolerance", 4, "websocket error tolerance")
+	sseTolerance := fs.Int("sse-error-tolerance", 1, "sse error tolerance")
 	aggregateRatio := fs.Float64("aggregate-ratio", 0.97, "aggregate mixed ratio")
 	mixedMatrix := fs.Bool("mixed-matrix", true, "whether results came from mixed matrix")
 	cpuCores := fs.String("cpu-cores", "", "detected cores")
@@ -355,6 +356,10 @@ func runWriteAllScenariosSummary(args []string) error {
 			if proxy.Errors > nginx.Errors+2 {
 				errorFailures = append(errorFailures, fmt.Sprintf("%s udp errors proxysss=%d nginx=%d", scenario, proxy.Errors, nginx.Errors))
 			}
+		case "sse":
+			if proxy.Errors > nginx.Errors+*sseTolerance {
+				errorFailures = append(errorFailures, fmt.Sprintf("%s sse errors proxysss=%d nginx=%d", scenario, proxy.Errors, nginx.Errors))
+			}
 		case "websocket":
 			if proxy.Errors > nginx.Errors+*websocketTolerance {
 				errorFailures = append(errorFailures, fmt.Sprintf("%s websocket errors proxysss=%d nginx=%d", scenario, proxy.Errors, nginx.Errors))
@@ -374,6 +379,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		fmt.Sprintf("- Detected CPU cores: `%s`", *cpuCores),
 		fmt.Sprintf("- Auto concurrency: HTTP `%s`, HTTPS `%s`, static-large `%s`, SSE `%s`, TCP/UDP/WebSocket `%s`", *httpConcurrency, *httpsConcurrency, *staticLargeConcurrency, *sseConcurrency, *streamConnections),
 		fmt.Sprintf("- Non-critical minimum proxysss/nginx ops ratio: `%.2f` except diagnostic scenarios `%s`", *minRatio, strings.Join(sortedSetMembers(diagnosticSet), ", ")),
+		fmt.Sprintf("- SSE stream error tolerance: `proxysss <= nginx + %d`", *sseTolerance),
 		fmt.Sprintf("- WebSocket reconnect/error tolerance: `proxysss <= nginx + %d`", *websocketTolerance),
 		fmt.Sprintf("- Critical long-connection fair ratio gate: `%.2f` for `%s`", *criticalRatio, strings.Join(sortedSetMembers(criticalSet), ", ")),
 		fmt.Sprintf("- Aggregate mixed-load fair ratio gate: `%.2f`", *aggregateRatio),
