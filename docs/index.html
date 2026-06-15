@@ -121,9 +121,11 @@
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+      align-items: center;
     }
 
     .topnav a,
+    .topnav button,
     .button {
       display: inline-flex;
       align-items: center;
@@ -138,10 +140,38 @@
     }
 
     .topnav a:hover,
+    .topnav button:hover,
     .button:hover {
       transform: translateY(-2px);
       border-color: var(--line-strong);
       background: rgba(255,255,255,0.07);
+    }
+
+    .lang-switch {
+      display: inline-flex;
+      padding: 4px;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .lang-switch button {
+      min-height: 34px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 999px;
+      color: var(--soft);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      transition: background 0.18s ease, color 0.18s ease;
+    }
+
+    .lang-switch button.active {
+      color: #031117;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), #baf4ff);
     }
 
     .button.primary {
@@ -393,13 +423,17 @@
       <div class="brand">
         <div class="logo" aria-hidden="true"></div>
         <div>
-          <strong>proxysss Docs</strong>
-          <span>public GitHub Pages entry for the nginx-replacement gateway</span>
+          <strong id="brandTitle">proxysss Docs</strong>
+          <span id="brandSubtitle">public GitHub Pages entry for the nginx-replacement gateway</span>
         </div>
       </div>
       <nav class="topnav" aria-label="Primary">
-        <a href="./architecture.html">Architecture Lab</a>
-        <a href="https://github.com/neko233-com/proxysss">GitHub Repo</a>
+        <a id="navArchitecture" href="./architecture.html">Architecture Lab</a>
+        <a id="navGithub" href="https://github.com/neko233-com/proxysss">GitHub Repo</a>
+        <div class="lang-switch" aria-label="Language switch">
+          <button id="langEn" type="button">EN</button>
+          <button id="langZh" type="button">中文</button>
+        </div>
       </nav>
     </div>
   </header>
@@ -407,22 +441,22 @@
   <main class="shell">
     <section class="hero">
       <div class="hero-copy">
-        <span class="eyebrow">Public documentation</span>
-        <h1>proxysss docs now have a real front door.</h1>
-        <p class="lead">GitHub Pages publishes this repository's <code>docs/</code> folder as the site root, so the correct public base URL is <code>https://neko233-com.github.io/proxysss/</code>. This page is the hub for architecture, configuration, agent automation, security, and production runbooks.</p>
+        <span id="heroEyebrow" class="eyebrow">Public documentation</span>
+        <h1 id="heroTitle">proxysss docs now have a real front door.</h1>
+        <p id="heroLead" class="lead">GitHub Pages publishes this repository's <code>docs/</code> folder as the site root, so the correct public base URL is <code>https://neko233-com.github.io/proxysss/</code>. This page is the hub for architecture, configuration, agent automation, security, and production runbooks.</p>
         <div class="hero-actions">
-          <a class="button primary" href="./architecture.html">Open Architecture Lab</a>
-          <a class="button" href="./CONFIGURATION.md">Read Configuration Guide</a>
-          <a class="button" href="https://github.com/neko233-com/proxysss">View Source</a>
+          <a id="heroActionPrimary" class="button primary" href="./architecture.html">Open Architecture Lab</a>
+          <a id="heroActionConfig" class="button" href="./CONFIGURATION.md">Read Configuration Guide</a>
+          <a id="heroActionSource" class="button" href="https://github.com/neko233-com/proxysss">View Source</a>
         </div>
       </div>
 
       <aside class="hero-note">
-        <div class="label">Path note</div>
-        <h2>Drop the extra <code>/docs/</code>.</h2>
-        <p>Because Pages is already serving the repository's <code>docs/</code> folder, URLs such as <code>/proxysss/docs/architecture.html</code> will 404. The correct public path is <code>/proxysss/architecture.html</code>.</p>
+        <div id="noteLabel" class="label">Path note</div>
+        <h2 id="noteTitle">Drop the extra <code>/docs/</code>.</h2>
+        <p id="noteBody">Because Pages is already serving the repository's <code>docs/</code> folder, URLs such as <code>/proxysss/docs/architecture.html</code> will 404. The correct public path is <code>/proxysss/architecture.html</code>.</p>
         <div class="path-box">
-          <p>Correct public URLs:</p>
+          <p id="pathIntro">Correct public URLs:</p>
           <code>https://neko233-com.github.io/proxysss/</code><br />
           <code>https://neko233-com.github.io/proxysss/architecture.html</code>
         </div>
@@ -432,47 +466,47 @@
     <section class="section">
       <div class="section-head">
         <div>
-          <span class="eyebrow">Start here</span>
-          <h2>Core docs</h2>
+          <span id="coreEyebrow" class="eyebrow">Start here</span>
+          <h2 id="coreTitle">Core docs</h2>
         </div>
-        <p class="section-copy">These are the main documents for understanding how proxysss replaces nginx as a same-level general-purpose gateway.</p>
+        <p id="coreCopy" class="section-copy">These are the main documents for understanding how proxysss replaces nginx as a same-level general-purpose gateway.</p>
       </div>
 
       <div class="grid">
         <article class="card">
-          <div class="label">Visual</div>
-          <h3><a href="./architecture.html">Architecture Lab</a></h3>
-          <p>Animated walkthrough of listeners, policy chains, request paths, stream forwarding, TLS, reload boundaries, MQTT/IoT traffic, and AI API streaming.</p>
+          <div id="card1Label" class="label">Visual</div>
+          <h3><a id="card1Title" href="./architecture.html">Architecture Lab</a></h3>
+          <p id="card1Body">Animated walkthrough of listeners, policy chains, request paths, stream forwarding, TLS, reload boundaries, MQTT/IoT traffic, and AI API streaming.</p>
         </article>
 
         <article class="card">
-          <div class="label">Guide</div>
-          <h3><a href="./CONFIGURATION.md">Configuration</a></h3>
-          <p>Human-friendly YAML configuration reference covering HTTP, TLS, TCP, UDP, FTP, WebDAV, AI proxy routes, and hot reload behavior.</p>
+          <div id="card2Label" class="label">Guide</div>
+          <h3><a id="card2Title" href="./CONFIGURATION.md">Configuration</a></h3>
+          <p id="card2Body">Human-friendly YAML configuration reference covering HTTP, TLS, TCP, UDP, FTP, WebDAV, AI proxy routes, and hot reload behavior.</p>
         </article>
 
         <article class="card">
-          <div class="label">Ops</div>
-          <h3><a href="./PRODUCTION-HARDENING.md">Production Hardening</a></h3>
-          <p>Linux tuning, benchmark gates, watchdog expectations, warm-up readiness, and operational guardrails for production gateway deployments.</p>
+          <div id="card3Label" class="label">Ops</div>
+          <h3><a id="card3Title" href="./PRODUCTION-HARDENING.md">Production Hardening</a></h3>
+          <p id="card3Body">Linux tuning, benchmark gates, watchdog expectations, warm-up readiness, and operational guardrails for production gateway deployments.</p>
         </article>
 
         <article class="card">
-          <div class="label">Automation</div>
-          <h3><a href="./AGENT-API.md">Agent API</a></h3>
-          <p>Loopback admin API, token-authenticated route upserts, reload flows, TLS automation, and safe write-operation defaults for autonomous tools.</p>
+          <div id="card4Label" class="label">Automation</div>
+          <h3><a id="card4Title" href="./AGENT-API.md">Agent API</a></h3>
+          <p id="card4Body">Loopback admin API, token-authenticated route upserts, reload flows, TLS automation, and safe write-operation defaults for autonomous tools.</p>
         </article>
 
         <article class="card">
-          <div class="label">Security</div>
-          <h3><a href="./SECURITY.md">Security</a></h3>
-          <p>Secure defaults, admin exposure rules, secret redaction expectations, and recommended production posture for the gateway edge.</p>
+          <div id="card5Label" class="label">Security</div>
+          <h3><a id="card5Title" href="./SECURITY.md">Security</a></h3>
+          <p id="card5Body">Secure defaults, admin exposure rules, secret redaction expectations, and recommended production posture for the gateway edge.</p>
         </article>
 
         <article class="card">
-          <div class="label">Roadmap</div>
-          <h3><a href="./IMPROVEMENT-BACKLOG.md">Improvement Backlog</a></h3>
-          <p>Open work across performance validation, protocol fixtures, observability, and stability for ongoing nginx-parity hardening.</p>
+          <div id="card6Label" class="label">Roadmap</div>
+          <h3><a id="card6Title" href="./IMPROVEMENT-BACKLOG.md">Improvement Backlog</a></h3>
+          <p id="card6Body">Open work across performance validation, protocol fixtures, observability, and stability for ongoing nginx-parity hardening.</p>
         </article>
       </div>
     </section>
@@ -480,40 +514,184 @@
     <section class="section">
       <div class="section-head">
         <div>
-          <span class="eyebrow">Developer context</span>
-          <h2>Repository and local runtime docs</h2>
+          <span id="devEyebrow" class="eyebrow">Developer context</span>
+          <h2 id="devTitle">Repository and local runtime docs</h2>
         </div>
-        <p class="section-copy">Some documents live in the repository root or are served only by a running proxysss instance. Those do not appear under this Pages site root, so use the links below when you need them.</p>
+        <p id="devCopy" class="section-copy">Some documents live in the repository root or are served only by a running proxysss instance. Those do not appear under this Pages site root, so use the links below when you need them.</p>
       </div>
 
       <div class="grid">
         <article class="card">
-          <div class="label">Repo</div>
-          <h3><a href="https://github.com/neko233-com/proxysss/blob/main/README.md">README</a></h3>
-          <p>Installation, gateway scope, YAML examples, benchmarks, migration framing, and quick-start commands.</p>
+          <div id="devCard1Label" class="label">Repo</div>
+          <h3><a id="devCard1Title" href="https://github.com/neko233-com/proxysss/blob/main/README.md">README</a></h3>
+          <p id="devCard1Body">Installation, gateway scope, YAML examples, benchmarks, migration framing, and quick-start commands.</p>
         </article>
 
         <article class="card">
-          <div class="label">Repo</div>
-          <h3><a href="https://github.com/neko233-com/proxysss/blob/main/nginx-to-proxysss.md">nginx to proxysss</a></h3>
-          <p>Migration-oriented notes for moving existing nginx behavior into proxysss YAML and built-in gateway surfaces.</p>
+          <div id="devCard2Label" class="label">Repo</div>
+          <h3><a id="devCard2Title" href="https://github.com/neko233-com/proxysss/blob/main/nginx-to-proxysss.md">nginx to proxysss</a></h3>
+          <p id="devCard2Body">Migration-oriented notes for moving existing nginx behavior into proxysss YAML and built-in gateway surfaces.</p>
         </article>
 
         <article class="card">
-          <div class="label">Repo</div>
-          <h3><a href="https://github.com/neko233-com/proxysss/blob/main/ts-how-to-use.md">TypeScript runtime</a></h3>
-          <p>Embedded TypeScript/JavaScript scripting guidance for optional plugin hooks and custom business routing.</p>
+          <div id="devCard3Label" class="label">Repo</div>
+          <h3><a id="devCard3Title" href="https://github.com/neko233-com/proxysss/blob/main/ts-how-to-use.md">TypeScript runtime</a></h3>
+          <p id="devCard3Body">Embedded TypeScript/JavaScript scripting guidance for optional plugin hooks and custom business routing.</p>
         </article>
       </div>
 
       <div class="inline-links">
-        <a class="pill" href="https://github.com/neko233-com/proxysss/blob/main/proxysss-script.d.ts">proxysss-script.d.ts</a>
-        <a class="pill" href="https://github.com/neko233-com/proxysss/tree/main/docs">docs/ source directory</a>
-        <a class="pill" href="https://github.com/neko233-com/proxysss/tree/main/examples">examples/</a>
+        <a id="pill1" class="pill" href="https://github.com/neko233-com/proxysss/blob/main/proxysss-script.d.ts">proxysss-script.d.ts</a>
+        <a id="pill2" class="pill" href="https://github.com/neko233-com/proxysss/tree/main/docs">docs/ source directory</a>
+        <a id="pill3" class="pill" href="https://github.com/neko233-com/proxysss/tree/main/examples">examples/</a>
       </div>
     </section>
 
-    <p class="footer">For runtime-built docs inside a live gateway, use <code>http://localhost/docs</code> or <code>http://localhost/docs.html</code>. For the public Pages site, stay under <code>https://neko233-com.github.io/proxysss/</code> without adding an extra <code>/docs/</code> segment.</p>
+    <p id="footerText" class="footer">For runtime-built docs inside a live gateway, use <code>http://localhost/docs</code> or <code>http://localhost/docs.html</code>. For the public Pages site, stay under <code>https://neko233-com.github.io/proxysss/</code> without adding an extra <code>/docs/</code> segment.</p>
   </main>
+
+  <script>
+    const storageKey = "proxysss-docs-lang";
+    const translations = {
+      en: {
+        title: "proxysss Docs",
+        brandTitle: "proxysss Docs",
+        brandSubtitle: "public GitHub Pages entry for the nginx-replacement gateway",
+        navArchitecture: "Architecture Lab",
+        navGithub: "GitHub Repo",
+        heroEyebrow: "Public documentation",
+        heroTitle: "proxysss docs now have a real front door.",
+        heroLead: "GitHub Pages publishes this repository's <code>docs/</code> folder as the site root, so the correct public base URL is <code>https://neko233-com.github.io/proxysss/</code>. This page is the hub for architecture, configuration, agent automation, security, and production runbooks.",
+        heroActionPrimary: "Open Architecture Lab",
+        heroActionConfig: "Read Configuration Guide",
+        heroActionSource: "View Source",
+        noteLabel: "Path note",
+        noteTitle: "Drop the extra <code>/docs/</code>.",
+        noteBody: "Because Pages is already serving the repository's <code>docs/</code> folder, URLs such as <code>/proxysss/docs/architecture.html</code> will 404. The correct public path is <code>/proxysss/architecture.html</code>.",
+        pathIntro: "Correct public URLs:",
+        coreEyebrow: "Start here",
+        coreTitle: "Core docs",
+        coreCopy: "These are the main documents for understanding how proxysss replaces nginx as a same-level general-purpose gateway.",
+        card1Label: "Visual",
+        card1Title: "Architecture Lab",
+        card1Body: "Animated walkthrough of listeners, policy chains, request paths, stream forwarding, TLS, reload boundaries, MQTT/IoT traffic, and AI API streaming.",
+        card2Label: "Guide",
+        card2Title: "Configuration",
+        card2Body: "Human-friendly YAML configuration reference covering HTTP, TLS, TCP, UDP, FTP, WebDAV, AI proxy routes, and hot reload behavior.",
+        card3Label: "Ops",
+        card3Title: "Production Hardening",
+        card3Body: "Linux tuning, benchmark gates, watchdog expectations, warm-up readiness, and operational guardrails for production gateway deployments.",
+        card4Label: "Automation",
+        card4Title: "Agent API",
+        card4Body: "Loopback admin API, token-authenticated route upserts, reload flows, TLS automation, and safe write-operation defaults for autonomous tools.",
+        card5Label: "Security",
+        card5Title: "Security",
+        card5Body: "Secure defaults, admin exposure rules, secret redaction expectations, and recommended production posture for the gateway edge.",
+        card6Label: "Roadmap",
+        card6Title: "Improvement Backlog",
+        card6Body: "Open work across performance validation, protocol fixtures, observability, and stability for ongoing nginx-parity hardening.",
+        devEyebrow: "Developer context",
+        devTitle: "Repository and local runtime docs",
+        devCopy: "Some documents live in the repository root or are served only by a running proxysss instance. Those do not appear under this Pages site root, so use the links below when you need them.",
+        devCard1Label: "Repo",
+        devCard1Title: "README",
+        devCard1Body: "Installation, gateway scope, YAML examples, benchmarks, migration framing, and quick-start commands.",
+        devCard2Label: "Repo",
+        devCard2Title: "nginx to proxysss",
+        devCard2Body: "Migration-oriented notes for moving existing nginx behavior into proxysss YAML and built-in gateway surfaces.",
+        devCard3Label: "Repo",
+        devCard3Title: "TypeScript runtime",
+        devCard3Body: "Embedded TypeScript/JavaScript scripting guidance for optional plugin hooks and custom business routing.",
+        pill1: "proxysss-script.d.ts",
+        pill2: "docs/ source directory",
+        pill3: "examples/",
+        footerText: "For runtime-built docs inside a live gateway, use <code>http://localhost/docs</code> or <code>http://localhost/docs.html</code>. For the public Pages site, stay under <code>https://neko233-com.github.io/proxysss/</code> without adding an extra <code>/docs/</code> segment."
+      },
+      zh: {
+        title: "proxysss 文档",
+        brandTitle: "proxysss 文档",
+        brandSubtitle: "nginx 替代型通用网关的 GitHub Pages 公网入口",
+        navArchitecture: "架构实验室",
+        navGithub: "GitHub 仓库",
+        heroEyebrow: "公网文档",
+        heroTitle: "proxysss 文档现在有了真正的首页入口。",
+        heroLead: "GitHub Pages 会把仓库里的 <code>docs/</code> 目录直接发布成站点根目录，所以正确的公网基础地址是 <code>https://neko233-com.github.io/proxysss/</code>。这个页面就是架构、配置、Agent 自动化、安全和生产运维文档的统一入口。",
+        heroActionPrimary: "打开架构实验室",
+        heroActionConfig: "阅读配置指南",
+        heroActionSource: "查看源码",
+        noteLabel: "路径提示",
+        noteTitle: "不要再多写一层 <code>/docs/</code>。",
+        noteBody: "因为 Pages 已经把仓库的 <code>docs/</code> 目录当成站点根目录，像 <code>/proxysss/docs/architecture.html</code> 这样的 URL 会直接 404。正确的公网路径应该是 <code>/proxysss/architecture.html</code>。",
+        pathIntro: "正确的公网地址：",
+        coreEyebrow: "从这里开始",
+        coreTitle: "核心文档",
+        coreCopy: "这些文档是理解 proxysss 如何作为与 nginx 同级的通用网关替代方案的主要入口。",
+        card1Label: "可视化",
+        card1Title: "架构实验室",
+        card1Body: "用动画讲清监听器、策略链、请求路径、流量转发、TLS、热重载边界、MQTT/IoT 流量与 AI API 流式代理。",
+        card2Label: "指南",
+        card2Title: "配置说明",
+        card2Body: "面向人的 YAML 配置参考，覆盖 HTTP、TLS、TCP、UDP、FTP、WebDAV、AI 代理路由和热重载行为。",
+        card3Label: "运维",
+        card3Title: "生产加固",
+        card3Body: "Linux 调优、基准门槛、watchdog 预期、预热就绪和生产网关的运维护栏。",
+        card4Label: "自动化",
+        card4Title: "Agent API",
+        card4Body: "回环管理 API、基于令牌的路由更新、重载流程、TLS 自动化，以及面向自动化工具的安全写操作默认值。",
+        card5Label: "安全",
+        card5Title: "安全说明",
+        card5Body: "安全默认值、管理面暴露规则、密钥脱敏要求，以及网关边缘的推荐生产姿态。",
+        card6Label: "路线图",
+        card6Title: "改进积压",
+        card6Body: "围绕性能验证、协议夹具、可观测性和稳定性持续推进 nginx 对齐能力。",
+        devEyebrow: "开发者上下文",
+        devTitle: "仓库文档与本地运行时文档",
+        devCopy: "有些文档位于仓库根目录，或只会在运行中的 proxysss 实例里提供。这些内容不会直接出现在当前 Pages 站点根路径下，需要时请使用下面的链接。",
+        devCard1Label: "仓库",
+        devCard1Title: "README",
+        devCard1Body: "安装方式、网关定位、YAML 示例、基准测试、迁移说明和快速上手命令。",
+        devCard2Label: "仓库",
+        devCard2Title: "nginx 到 proxysss",
+        devCard2Body: "把现有 nginx 行为迁移到 proxysss YAML 和内建网关能力时的说明与注意事项。",
+        devCard3Label: "仓库",
+        devCard3Title: "TypeScript 运行时",
+        devCard3Body: "面向可选插件钩子和自定义业务路由的内嵌 TypeScript/JavaScript 脚本说明。",
+        pill1: "proxysss-script.d.ts",
+        pill2: "docs/ 源目录",
+        pill3: "examples/",
+        footerText: "如果要查看运行中的网关内建文档，请使用 <code>http://localhost/docs</code> 或 <code>http://localhost/docs.html</code>。如果访问公网 Pages 站点，请保持在 <code>https://neko233-com.github.io/proxysss/</code> 下，不要再多写一层 <code>/docs/</code>。"
+      }
+    };
+
+    function detectLanguage() {
+      const saved = localStorage.getItem(storageKey);
+      if (saved === "en" || saved === "zh") {
+        return saved;
+      }
+      return navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+    }
+
+    function applyLanguage(lang) {
+      const copy = translations[lang];
+      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+      document.title = copy.title;
+      Object.entries(copy).forEach(([key, value]) => {
+        if (key === "title") {
+          return;
+        }
+        const element = document.getElementById(key);
+        if (element) {
+          element.innerHTML = value;
+        }
+      });
+      document.getElementById("langEn").classList.toggle("active", lang === "en");
+      document.getElementById("langZh").classList.toggle("active", lang === "zh");
+      localStorage.setItem(storageKey, lang);
+    }
+
+    document.getElementById("langEn").addEventListener("click", () => applyLanguage("en"));
+    document.getElementById("langZh").addEventListener("click", () => applyLanguage("zh"));
+    applyLanguage(detectLanguage());
+  </script>
 </body>
 </html>

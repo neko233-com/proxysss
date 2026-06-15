@@ -108,6 +108,40 @@
       background: rgba(255,255,255,0.04);
     }
 
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .lang-switch {
+      display: inline-flex;
+      padding: 4px;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .lang-switch button {
+      min-height: 34px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 999px;
+      color: var(--soft);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    .lang-switch button.active {
+      color: #031117;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), #baf4ff);
+    }
+
     .button.primary {
       color: #031117;
       font-weight: 800;
@@ -118,11 +152,17 @@
 </head>
 <body>
   <main class="card">
-    <span class="eyebrow">GitHub Pages path mismatch</span>
-    <h1>That docs URL does not exist.</h1>
-    <p>This repository publishes its <code>docs/</code> folder as the GitHub Pages site root. That means public URLs should start at <code>/proxysss/</code>, not at <code>/proxysss/docs/</code>.</p>
+    <div class="toolbar">
+      <span id="eyebrow" class="eyebrow">GitHub Pages path mismatch</span>
+      <div class="lang-switch" aria-label="Language switch">
+        <button id="langEn" type="button">EN</button>
+        <button id="langZh" type="button">中文</button>
+      </div>
+    </div>
+    <h1 id="title">That docs URL does not exist.</h1>
+    <p id="bodyText">This repository publishes its <code>docs/</code> folder as the GitHub Pages site root. That means public URLs should start at <code>/proxysss/</code>, not at <code>/proxysss/docs/</code>.</p>
     <div class="callout">
-      <strong>Common fix:</strong> if you opened a URL like <code>/proxysss/docs/architecture.html</code>, remove the extra <code>/docs/</code> segment.
+      <span id="calloutText"><strong>Common fix:</strong> if you opened a URL like <code>/proxysss/docs/architecture.html</code>, remove the extra <code>/docs/</code> segment.</span>
     </div>
     <div class="path">
       <p id="message">Recommended public docs hub:</p>
@@ -135,21 +175,73 @@
   </main>
 
   <script>
+    const storageKey = "proxysss-docs-lang";
+    const copy = {
+      en: {
+        title: "proxysss Docs Not Found",
+        eyebrow: "GitHub Pages path mismatch",
+        heading: "That docs URL does not exist.",
+        bodyText: "This repository publishes its <code>docs/</code> folder as the GitHub Pages site root. That means public URLs should start at <code>/proxysss/</code>, not at <code>/proxysss/docs/</code>.",
+        calloutText: "<strong>Common fix:</strong> if you opened a URL like <code>/proxysss/docs/architecture.html</code>, remove the extra <code>/docs/</code> segment.",
+        homeLink: "Open docs home",
+        fixedLink: "Open corrected page",
+        hubMessage: "Recommended public docs hub:",
+        correctedMessage: "This looks like the corrected URL:"
+      },
+      zh: {
+        title: "proxysss 文档未找到",
+        eyebrow: "GitHub Pages 路径不匹配",
+        heading: "这个文档地址不存在。",
+        bodyText: "这个仓库会把 <code>docs/</code> 目录直接发布成 GitHub Pages 站点根目录，所以公网 URL 应该从 <code>/proxysss/</code> 开始，而不是 <code>/proxysss/docs/</code>。",
+        calloutText: "<strong>常见修正：</strong>如果你打开的是 <code>/proxysss/docs/architecture.html</code> 这样的地址，请去掉多余的 <code>/docs/</code> 段。",
+        homeLink: "打开文档首页",
+        fixedLink: "打开修正后的页面",
+        hubMessage: "推荐的公网文档首页：",
+        correctedMessage: "这看起来就是修正后的地址："
+      }
+    };
+
     const path = window.location.pathname;
     const badSegment = "/proxysss/docs/";
     const fallback = "https://neko233-com.github.io/proxysss/";
     let corrected = fallback;
+    let correctedPathDetected = false;
 
     if (path.includes(badSegment)) {
       corrected = window.location.origin + path.replace("/proxysss/docs/", "/proxysss/");
+      correctedPathDetected = true;
+    }
+
+    function detectLanguage() {
+      const saved = localStorage.getItem(storageKey);
+      if (saved === "en" || saved === "zh") {
+        return saved;
+      }
+      return navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+    }
+
+    function applyLanguage(lang) {
+      const current = copy[lang];
+      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+      document.title = current.title;
+      document.getElementById("eyebrow").textContent = current.eyebrow;
+      document.getElementById("title").textContent = current.heading;
+      document.getElementById("bodyText").innerHTML = current.bodyText;
+      document.getElementById("calloutText").innerHTML = current.calloutText;
+      document.getElementById("homeLink").textContent = current.homeLink;
+      document.getElementById("fixedLink").textContent = current.fixedLink;
+      document.getElementById("message").textContent = correctedPathDetected ? current.correctedMessage : current.hubMessage;
+      document.getElementById("langEn").classList.toggle("active", lang === "en");
+      document.getElementById("langZh").classList.toggle("active", lang === "zh");
+      localStorage.setItem(storageKey, lang);
     }
 
     document.getElementById("target").textContent = corrected;
     document.getElementById("fixedLink").href = corrected;
     document.getElementById("homeLink").href = fallback;
-    document.getElementById("message").textContent = corrected === fallback
-      ? "Recommended public docs hub:"
-      : "This looks like the corrected URL:";
+    document.getElementById("langEn").addEventListener("click", () => applyLanguage("en"));
+    document.getElementById("langZh").addEventListener("click", () => applyLanguage("zh"));
+    applyLanguage(detectLanguage());
   </script>
 </body>
 </html>

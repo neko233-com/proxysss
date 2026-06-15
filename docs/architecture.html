@@ -128,9 +128,11 @@
       gap: 6px;
       flex-wrap: wrap;
       justify-content: flex-end;
+      align-items: center;
     }
 
-    .nav a {
+    .nav a,
+    .nav button {
       text-decoration: none;
       color: var(--soft);
       border: 1px solid transparent;
@@ -140,10 +142,37 @@
       transition: color .2s ease, border-color .2s ease, background .2s ease;
     }
 
-    .nav a:hover {
+    .nav a:hover,
+    .nav button:hover {
       color: var(--ink);
       border-color: var(--line);
       background: rgba(255,255,255,.04);
+    }
+
+    .lang-switch {
+      display: inline-flex;
+      padding: 4px;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.03);
+    }
+
+    .lang-switch button {
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      cursor: pointer;
+      min-height: 30px;
+      padding: 0 10px;
+      color: var(--soft);
+      font: inherit;
+    }
+
+    .lang-switch button.active {
+      color: #041017;
+      font-weight: 900;
+      background: linear-gradient(135deg, var(--accent), #b7f6ff);
     }
 
     .hero {
@@ -824,16 +853,20 @@
       <div class="mark">
         <div class="logo" aria-hidden="true"></div>
         <div>
-          <strong>proxysss Architecture Lab</strong>
-          <span>protocols explained like a first-year network lab</span>
+          <strong id="brandTitle">proxysss Architecture Lab</strong>
+          <span id="brandSubtitle">protocols explained like a first-year network lab</span>
         </div>
       </div>
       <nav class="nav" aria-label="Page sections">
-        <a href="./">Docs home</a>
-        <a href="#lesson">Protocol lab</a>
-        <a href="#map">Architecture</a>
-        <a href="#yaml">YAML</a>
-        <a href="#improve">Improve</a>
+        <a id="navDocsHome" href="./">Docs home</a>
+        <a id="navProtocolLab" href="#lesson">Protocol lab</a>
+        <a id="navArchitecture" href="#map">Architecture</a>
+        <a id="navYaml" href="#yaml">YAML</a>
+        <a id="navImprove" href="#improve">Improve</a>
+        <div class="lang-switch" aria-label="Language switch">
+          <button id="langEn" type="button">EN</button>
+          <button id="langZh" type="button">中文</button>
+        </div>
       </nav>
     </div>
   </header>
@@ -842,13 +875,13 @@
     <section class="hero">
       <div class="shell hero-grid">
         <div>
-          <span class="eyebrow">Gateway mental model</span>
-          <h1>One doorway, many network languages.</h1>
-          <p class="lede">Imagine proxysss as the smart front desk of a campus lab. Students arrive speaking HTTP, WebSocket, FTP, MQTT, TCP, UDP, or TLS. The front desk checks rules, chooses the right room, and keeps traffic moving without asking every service to stand at the public gate.</p>
+          <span id="heroEyebrow" class="eyebrow">Gateway mental model</span>
+          <h1 id="heroTitle">One doorway, many network languages.</h1>
+          <p id="heroLead" class="lede">Imagine proxysss as the smart front desk of a campus lab. Students arrive speaking HTTP, WebSocket, FTP, MQTT, TCP, UDP, or TLS. The front desk checks rules, chooses the right room, and keeps traffic moving without asking every service to stand at the public gate.</p>
           <div class="hero-actions">
-            <a class="button" href="./">Open docs hub</a>
-            <a class="button primary" href="#lesson">Start the animation</a>
-            <a class="button" href="#map">See the request path</a>
+            <a id="heroBtnDocs" class="button" href="./">Open docs hub</a>
+            <a id="heroBtnStart" class="button primary" href="#lesson">Start the animation</a>
+            <a id="heroBtnMap" class="button" href="#map">See the request path</a>
           </div>
         </div>
         <div class="lab-visual" aria-hidden="true">
@@ -856,13 +889,13 @@
           <div class="gateway-core">
             <div class="gateway-label">
               <strong>proxysss</strong>
-              <span>route, protect, proxy</span>
+              <span id="gatewayLabelSub">route, protect, proxy</span>
             </div>
           </div>
-          <div class="node client"><strong>Client</strong><span>browser, app, device</span></div>
-          <div class="node policy"><strong>Policy</strong><span>rate, auth, cache</span></div>
-          <div class="node upstream"><strong>Upstream</strong><span>service pool</span></div>
-          <div class="node config"><strong>YAML</strong><span>single source</span></div>
+          <div class="node client"><strong id="nodeClientTitle">Client</strong><span id="nodeClientSub">browser, app, device</span></div>
+          <div class="node policy"><strong id="nodePolicyTitle">Policy</strong><span id="nodePolicySub">rate, auth, cache</span></div>
+          <div class="node upstream"><strong id="nodeUpstreamTitle">Upstream</strong><span id="nodeUpstreamSub">service pool</span></div>
+          <div class="node config"><strong id="nodeConfigTitle">YAML</strong><span id="nodeConfigSub">single source</span></div>
           <div class="packet"></div>
           <div class="packet"></div>
           <div class="packet"></div>
@@ -874,10 +907,10 @@
       <div class="shell">
         <div class="section-head">
           <div>
-            <span class="eyebrow">Animated protocol lab</span>
-            <h2>Click a protocol and watch the traffic idea change.</h2>
+            <span id="lessonEyebrow" class="eyebrow">Animated protocol lab</span>
+            <h2 id="lessonTitle">Click a protocol and watch the traffic idea change.</h2>
           </div>
-          <p>For a freshman: every protocol is just an agreement about how two computers talk. proxysss does not need to understand every business meaning inside the bytes. It only needs enough edge knowledge to accept, protect, route, tunnel, and observe the traffic.</p>
+          <p id="lessonCopy">For a freshman: every protocol is just an agreement about how two computers talk. proxysss does not need to understand every business meaning inside the bytes. It only needs enough edge knowledge to accept, protect, route, tunnel, and observe the traffic.</p>
         </div>
 
         <div class="lesson-grid">
@@ -934,28 +967,28 @@
       <div class="shell">
         <div class="section-head">
           <div>
-            <span class="eyebrow">Data path</span>
-            <h2>The gateway is a pipeline, not magic.</h2>
+            <span id="mapEyebrow" class="eyebrow">Data path</span>
+            <h2 id="mapTitle">The gateway is a pipeline, not magic.</h2>
           </div>
-          <p>A request enters a listener, goes through safety and routing decisions, then becomes either a proxied HTTP exchange, a bidirectional stream, a static/WebDAV/FTP operation, or an admin/docs response.</p>
+          <p id="mapCopy">A request enters a listener, goes through safety and routing decisions, then becomes either a proxied HTTP exchange, a bidirectional stream, a static/WebDAV/FTP operation, or an admin/docs response.</p>
         </div>
 
         <div class="map">
           <div class="map-item">
-            <strong>1. Listen</strong>
-            <p>Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams with explicit TCP backlog and default-on runtime.performance tuning. On Linux, plain HTTP, TLS HTTP, TCP stream, and UDP listener binds fan out across CPU-adaptive SO_REUSEPORT workers when performance mode is enabled. Startup detects the OS version, applies portable Linux socket tuning, enables the Ubuntu 24.x extreme policy when supported, and logs any downgrade reason.</p>
+            <strong id="map1Title">1. Listen</strong>
+            <p id="map1Body">Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams with explicit TCP backlog and default-on runtime.performance tuning. On Linux, plain HTTP, TLS HTTP, TCP stream, and UDP listener binds fan out across CPU-adaptive SO_REUSEPORT workers when performance mode is enabled. Startup detects the OS version, applies portable Linux socket tuning, enables the Ubuntu 24.x extreme policy when supported, and logs any downgrade reason.</p>
           </div>
           <div class="map-item">
-            <strong>2. Understand enough</strong>
-            <p>HTTP gets host/path/header parsing. TCP and UDP stay mostly transparent. TLS uses SNI and ALPN where needed.</p>
+            <strong id="map2Title">2. Understand enough</strong>
+            <p id="map2Body">HTTP gets host/path/header parsing. TCP and UDP stay mostly transparent. TLS uses SNI and ALPN where needed.</p>
           </div>
           <div class="map-item">
-            <strong>3. Apply policy</strong>
-            <p>Access control, DDoS windows, rate limits, cache, compression, active health, and maintenance state shape the route.</p>
+            <strong id="map3Title">3. Apply policy</strong>
+            <p id="map3Body">Access control, DDoS windows, rate limits, cache, compression, active health, and maintenance state shape the route.</p>
           </div>
           <div class="map-item">
-            <strong>4. Proxy or serve</strong>
-            <p>proxysss forwards to upstream pools with separate hot paths instead of one global tuning profile. HTTP uses a Hyper fast path for general routes and raw plain-HTTP reverse/SSE/WebSocket lanes for simple no-policy routes. Raw HTTP keepalive pooling uses a lock-free bounded queue instead of a shared mutex. Static delivery uses a bounded cache with mmap-backed objects where supported, plus a traffic-profile-aware Linux fast lane: default small mode favors cached hot files and low-latency HTTP2/SSE/WebSocket/TCP/UDP feedback, bulk mode favors sendfile/zero-copy large transfers, and balanced mode prepares both. Config load preloads eligible index/top-level static files or sendfile descriptors according to runtime.performance.traffic_profile. TCP stream listeners run on a dedicated proxysss-stream runtime in performance mode, fan out accept loops with CPU-adaptive SO_REUSEPORT workers on Linux, and bypass the generic upstream planner for single-upstream direct routes when scripts, affinity, active health, and passive health are disabled. UDP listeners in performance mode also fan out datagram receive loops with SO_REUSEPORT, share the global association table, and keep worker-local association cache entries so established datagrams avoid global lookups and only refresh the global TTL timestamp once per second. Stream relays choose independent profiles: game/MQTT/tool long connections use small relay buffers and parallel one-way pumps, while explicit bulk/file stream protocols may use Linux splice zero-copy when runtime performance tuning is enabled.</p>
+            <strong id="map4Title">4. Proxy or serve</strong>
+            <p id="map4Body">proxysss forwards to upstream pools with separate hot paths instead of one global tuning profile. HTTP uses a Hyper fast path for general routes and raw plain-HTTP reverse/SSE/WebSocket lanes for simple no-policy routes. Raw HTTP keepalive pooling uses a lock-free bounded queue instead of a shared mutex. Static delivery uses a bounded cache with mmap-backed objects where supported, plus a traffic-profile-aware Linux fast lane: default small mode favors cached hot files and low-latency HTTP2/SSE/WebSocket/TCP/UDP feedback, bulk mode favors sendfile/zero-copy large transfers, and balanced mode prepares both. Config load preloads eligible index/top-level static files or sendfile descriptors according to runtime.performance.traffic_profile. TCP stream listeners run on a dedicated proxysss-stream runtime in performance mode, fan out accept loops with CPU-adaptive SO_REUSEPORT workers on Linux, and bypass the generic upstream planner for single-upstream direct routes when scripts, affinity, active health, and passive health are disabled. UDP listeners in performance mode also fan out datagram receive loops with SO_REUSEPORT, share the global association table, and keep worker-local association cache entries so established datagrams avoid global lookups and only refresh the global TTL timestamp once per second. Stream relays choose independent profiles: game/MQTT/tool long connections use small relay buffers and parallel one-way pumps, while explicit bulk/file stream protocols may use Linux splice zero-copy when runtime performance tuning is enabled.</p>
           </div>
         </div>
       </div>
@@ -965,10 +998,10 @@
       <div class="shell">
         <div class="section-head">
           <div>
-            <span class="eyebrow">Single config</span>
-            <h2>YAML is the lab notebook.</h2>
+            <span id="yamlEyebrow" class="eyebrow">Single config</span>
+            <h2 id="yamlTitle">YAML is the lab notebook.</h2>
           </div>
-          <p>nginx spreads power across directives and includes. proxysss keeps the full edge shape in one YAML file so people and agents can inspect it quickly.</p>
+          <p id="yamlCopy">nginx spreads power across directives and includes. proxysss keeps the full edge shape in one YAML file so people and agents can inspect it quickly.</p>
         </div>
 
         <div class="code-row">
@@ -1010,36 +1043,36 @@ udp:
       <div class="shell">
         <div class="section-head">
           <div>
-            <span class="eyebrow">What can improve next</span>
-            <h2>Stable gateways keep earning trust.</h2>
+            <span id="improveEyebrow" class="eyebrow">What can improve next</span>
+            <h2 id="improveTitle">Stable gateways keep earning trust.</h2>
           </div>
-          <p>The current design already covers the nginx-replacement surface. The next wins are deeper measurement, more protocol test fixtures, and sharper production runbooks.</p>
+          <p id="improveCopy">The current design already covers the nginx-replacement surface. The next wins are deeper measurement, more protocol test fixtures, and sharper production runbooks.</p>
         </div>
 
         <div class="roadmap">
           <article>
-            <strong>Benchmark matrix</strong>
-            <p>Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming. Production performance validation is Linux-only and must use the mixed matrix by default: enable the realistic multi-feature gateway shape and run CDN/static, HTTPS static, reverse proxy, New API/SSE, WebSocket long connections, game/TCP streams, generic TCP stream, UDP stream, and KCP-style UDP concurrently per gateway. The default critical gate is fairness-adjusted: aggregate throughput plus WebSocket and game/realtime TCP, UDP, and KCP-style scenarios use a 0.97 proxysss/nginx ratio floor because proxysss carries built-in policy and gateway behavior that nginx usually needs extra modules or configuration to approximate; static/reverse/SSE must stay above the soft floor with low errors; HTTPS static and static-large still run and are reported, but only block releases when explicitly included for TLS/static or bulk-transfer releases. Single-scenario runs are diagnostic only, and strict greater-than-nginx gates are opt-in.</p>
+            <strong id="road1Title">Benchmark matrix</strong>
+            <p id="road1Body">Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming. Production performance validation is Linux-only and must use the mixed matrix by default: enable the realistic multi-feature gateway shape and run CDN/static, HTTPS static, reverse proxy, New API/SSE, WebSocket long connections, game/TCP streams, generic TCP stream, UDP stream, and KCP-style UDP concurrently per gateway. The default critical gate is fairness-adjusted: aggregate throughput plus WebSocket and game/realtime TCP, UDP, and KCP-style scenarios use a 0.97 proxysss/nginx ratio floor because proxysss carries built-in policy and gateway behavior that nginx usually needs extra modules or configuration to approximate; static/reverse/SSE must stay above the soft floor with low errors; HTTPS static and static-large still run and are reported, but only block releases when explicitly included for TLS/static or bulk-transfer releases. Single-scenario runs are diagnostic only, and strict greater-than-nginx gates are opt-in.</p>
           </article>
           <article>
-            <strong>Chaos testing</strong>
-            <p>Inject upstream resets, slow bodies, packet loss, DNS failure, log backpressure, reload races, and certificate renewal failures.</p>
+            <strong id="road2Title">Chaos testing</strong>
+            <p id="road2Body">Inject upstream resets, slow bodies, packet loss, DNS failure, log backpressure, reload races, and certificate renewal failures.</p>
           </article>
           <article>
-            <strong>Protocol fixtures</strong>
-            <p>Keep small upstream simulators for MQTT, CoAP-style UDP, FTP active/passive, WebDAV clients, and SSE token streaming.</p>
+            <strong id="road3Title">Protocol fixtures</strong>
+            <p id="road3Body">Keep small upstream simulators for MQTT, CoAP-style UDP, FTP active/passive, WebDAV clients, and SSE token streaming.</p>
           </article>
           <article>
-            <strong>Kernel tuning guide</strong>
-            <p>Keep Ubuntu 22.04, 24.04, 26.04 LTS and Debian socket backlog, file descriptor, ephemeral port, UDP buffer, QUIC UDP, jemalloc, and systemd restart guidance aligned with <code>proxysss tune linux</code>.</p>
+            <strong id="road4Title">Kernel tuning guide</strong>
+            <p id="road4Body">Keep Ubuntu 22.04, 24.04, 26.04 LTS and Debian socket backlog, file descriptor, ephemeral port, UDP buffer, QUIC UDP, jemalloc, and systemd restart guidance aligned with <code>proxysss tune linux</code>.</p>
           </article>
           <article>
-            <strong>Observability packs</strong>
-            <p>Ship dashboard queries and alert rules for p95 latency, upstream quarantine, dropped UDP associations, watchdog restarts, and ACME renewal.</p>
+            <strong id="road5Title">Observability packs</strong>
+            <p id="road5Body">Ship dashboard queries and alert rules for p95 latency, upstream quarantine, dropped UDP associations, watchdog restarts, and ACME renewal.</p>
           </article>
           <article>
-            <strong>Plugin safety budgets</strong>
-            <p>Add examples for script timeout, memory budget, hook placement, and how to keep business logic away from byte-copy hot paths.</p>
+            <strong id="road6Title">Plugin safety budgets</strong>
+            <p id="road6Body">Add examples for script timeout, memory budget, hook placement, and how to keep business logic away from byte-copy hot paths.</p>
           </article>
         </div>
       </div>
@@ -1048,12 +1081,13 @@ udp:
 
   <footer class="footer">
     <div class="shell">
-      Public docs hub: <a href="./">/proxysss/</a>. This Pages site already serves the repository <code>docs/</code> folder as its root, so public URLs should not include an extra <code>/docs/</code> segment.<br />
-      Open the CLI views after editing config: <code>proxysss config explain</code>, <code>proxysss config routes</code>, <code>proxysss config reload-plan</code>, and <code>proxysss config nginx-parity --format yaml</code>.
+      <span id="footerHubLine">Public docs hub: <a href="./">/proxysss/</a>. This Pages site already serves the repository <code>docs/</code> folder as its root, so public URLs should not include an extra <code>/docs/</code> segment.</span><br />
+      <span id="footerCliLine">Open the CLI views after editing config: <code>proxysss config explain</code>, <code>proxysss config routes</code>, <code>proxysss config reload-plan</code>, and <code>proxysss config nginx-parity --format yaml</code>.</span>
     </div>
   </footer>
 
   <script>
+    const storageKey = "proxysss-docs-lang";
     const protocols = [
       {
         key: "http",
@@ -1219,6 +1253,280 @@ udp:
       }
     ];
 
+    const protocolZh = {
+      http: {
+        name: "HTTP 反向代理",
+        hint: "按主机与路径路由",
+        chip: "请求",
+        summary: "浏览器带着主机名和路径发来请求。proxysss 完成匹配后，把它转发给上游，再把响应流式送回。",
+        note: "把 HTTP 想成在窗口点餐：Host 是餐厅，path 是菜名，headers 是附注。proxysss 读懂这张单子，再把它交给正确的厨房。",
+        labels: ["浏览器", "匹配 + 策略", "应用服务", "请求", "转发", "响应", "返回"],
+        steps: [
+          "客户端在 80 或 443 端口建立连接，发送方法、主机名、路径、请求头，以及可选请求体。",
+          "proxysss 先做访问控制和限流，再选出最具体的域名/路径路由。",
+          "上游池会根据健康状态、负载均衡策略和重试设置做过滤；热门的单上游路径会走最短的原生快路。",
+          "响应可以被缓存、压缩、记录日志、流式回传，或者在 New API / SSE 场景下保持无缓冲直通。"
+        ]
+      },
+      tls: {
+        name: "HTTPS、TLS 与 ACME",
+        hint: "安全握手",
+        chip: "加密",
+        summary: "TLS 就像一只上锁的信封。客户端与代理先协商密钥，再让 HTTP 走进加密隧道。",
+        note: "对新生来说，TLS 就像先约好一套暗号再传纸条。ACME 则是自动化的办事处，用来证明域名归属并签发证书。",
+        labels: ["浏览器", "SNI + ALPN", "上游", "问候", "路由", "加密响应", "安全返回"],
+        steps: [
+          "客户端先发送带 SNI 的 ClientHello，proxysss 据此决定该展示哪个域名证书。",
+          "proxysss 会从手动配置、托管 ACME、按需 TLS 或 DNS-01 泛域名签发路径里选择或获取证书。",
+          "ALPN 决定后续使用 HTTP/1.1、HTTP/2 还是 HTTP/3。",
+          "握手完成后，请求就进入正常的解密 HTTP 路由流水线。"
+        ]
+      },
+      websocket: {
+        name: "WebSocket",
+        hint: "升级成隧道",
+        chip: "双工",
+        summary: "WebSocket 一开始像 HTTP，请求升级后就变成长连接双向字节流，适合聊天、仪表盘、游戏和实时控制。",
+        note: "HTTP 像填表，WebSocket 更像先递一张表说“请升级这次对话”，然后直接打电话持续沟通。",
+        labels: ["浏览器", "升级 + 隧道", "ws 上游", "Upgrade", "双工", "消息", "消息"],
+        steps: [
+          "客户端先发一个带 Upgrade 和 Connection 头的 HTTP 请求。",
+          "proxysss 校验路由后，把升级请求转发到 ws 或 wss 上游。",
+          "收到 101 Switching Protocols 后，双方就可以随时互发帧数据。",
+          "网关负责双向搬运流量，同时用超时、访问策略和日志保护边缘。"
+        ]
+      },
+      grpc: {
+        name: "基于 HTTP/2 的 gRPC",
+        hint: "有类型的流式调用",
+        chip: "h2",
+        summary: "gRPC 是建立在 HTTP/2 之上的结构化服务调用。proxysss 会把它当作 HTTP/2 流量稳定转发。",
+        note: "如果 REST 像填表，gRPC 更像一张有明确字段定义的实验记录表，双方约定好格式，再交给 HTTP/2 高效承载多路流。",
+        labels: ["客户端 SDK", "HTTP/2 路由", "gRPC 服务", "调用", "流", "trailer", "结果"],
+        steps: [
+          "客户端以 gRPC 内容类型打开一个 HTTP/2 请求。",
+          "proxysss 让头部、数据帧和 trailers 在 HTTP/2 路径里持续流动。",
+          "负载均衡和健康检查会挑选一个可用上游。",
+          "响应流最终带着状态元数据和可选 trailers 返回。"
+        ]
+      },
+      tcp: {
+        name: "TCP 流代理",
+        hint: "可靠字节管道",
+        chip: "流",
+        summary: "TCP 是有序可靠的字节管道。proxysss 接收连接、拨号上游，再根据场景选择低延迟长连接或大吞吐转发配置。",
+        note: "TCP 像一条编号传送带，箱子丢了发件人会知道并重发。proxysss 做的就是把两条传送带接起来。",
+        labels: ["客户端", "连接 + 策略", "服务", "SYN", "字节", "字节", "ACK"],
+        steps: [
+          "客户端连接到配置好的 TCP 监听器；在 Linux 性能模式下，accept 会通过按核自适应的 SO_REUSEPORT worker 扩散。",
+          "proxysss 做完流量访问控制和限速后，要么按策略选上游，要么直接走单上游快路径。",
+          "开启 nodelay 后，小包会更及时地发出，适合低时延流量。",
+          "游戏、MQTT 和工具类长连接会用固定小缓冲和并行单向泵；显式的大文件/大流量协议则可以在 Linux 上改用 splice 零拷贝。"
+        ]
+      },
+      udp: {
+        name: "UDP 与 KCP 风格流量",
+        hint: "数据报 + 关联",
+        chip: "数据报",
+        summary: "UDP 没有建连握手。proxysss 会先建立临时的客户端到上游关联，再通过按核扩散的 reuseport worker、worker 本地关联缓存和循环内快路径去转发已建立的数据报。",
+        note: "UDP 像往外丢带地址的明信片。它很快、很简单，但不承诺每张都送到。KCP 这类协议会在 UDP 之上自己补可靠性。",
+        labels: ["游戏/设备", "关联", "UDP 服务", "数据报", "转发", "数据报", "回复"],
+        steps: [
+          "数据报到达 UDP 监听器，常见来源是游戏、语音或设备客户端。",
+          "proxysss 把这个客户端地址映射到某个上游，并保存这段关联。",
+          "已建立的报文最多每秒刷新一次全局 TTL，并直接发往已连接上游套接字，不再为每个包重复做路由、全局查表或新建任务。",
+          "空闲关联会被清理。",
+          "max_associations 用来限制高频 churn 下的内存上限。"
+        ]
+      },
+      mqtt: {
+        name: "MQTT 与 IoT",
+        hint: "设备消息",
+        chip: "物联网",
+        summary: "MQTT 设备通常与 broker 通话。proxysss 在边缘保持透明，同时处理 TCP、TLS 透传、WebSocket 和限速策略。",
+        note: "MQTT 像传感器公告板：设备把消息发布到主题，其它客户端订阅这些主题。真正懂主题语义的是 broker，proxysss 负责守门。",
+        labels: ["设备", "透明边缘", "broker", "CONNECT", "路由", "PUBLISH", "SUBSCRIBE"],
+        steps: [
+          "设备可以走 MQTT TCP、MQTT TLS 透传，或者 MQTT over WebSocket 接入。",
+          "proxysss 负责施加监听策略并挑选一个 broker 上游。",
+          "MQTT 协议内容会保持在流里，交给 broker 自己解析。",
+          "可观测性只使用协议提示，不会把热路径拖进完整的负载解析。"
+        ]
+      },
+      ftp: {
+        name: "FTP",
+        hint: "控制 + 数据",
+        chip: "双路径",
+        summary: "FTP 的特别之处在于命令与文件数据可能分属不同连接。proxysss 会同时追踪两条链路，并重写被动/主动模式的数据地址。",
+        note: "FTP 像先用一个教室电话说明你要什么文件，再打开第二扇门真正搬箱子。",
+        labels: ["FTP 客户端", "控制策略", "FTP 服务器", "USER/LIST", "数据建立", "文件字节", "226 完成"],
+        steps: [
+          "控制通道负责登录以及 LIST、RETR、STOR 等命令。",
+          "proxysss 会施加 allow/deny、命令、传输和按用户策略。",
+          "在被动或主动传输模式下，网关会重写数据通道地址与端口。",
+          "结构化日志会记录控制链路和传输链路的完整生命周期事件。"
+        ]
+      },
+      ai: {
+        name: "AI API 反向代理",
+        hint: "流式 token",
+        chip: "SSE",
+        summary: "AI 提供商经常通过 SSE 流式输出 token。proxysss 已内建 New API、sub2api 和 OpenAI-compatible 路由。",
+        note: "AI 流就像老师不是等整篇作文写完再交，而是边想边把答案一个词一个词写出来。",
+        labels: ["应用/客户端", "ai_proxy", "AI 上游", "chat", "重写", "token", "SSE"],
+        steps: [
+          "客户端会请求像 /v1/chat/completions 这样的 provider 风格端点。",
+          "services.ai_proxy 会按 host/path 匹配，并在需要时重写基础路径。",
+          "用于观测的 provider 元数据头可以开启，也可以在追求 nginx 风格 SSE 直通时关闭。",
+          "流式响应会立即 flush 回客户端，而不是等待整个 body 收完。"
+        ]
+      },
+      reload: {
+        name: "手动重载与管理 API",
+        hint: "改动可控，不靠猜",
+        chip: "运维",
+        summary: "管理 API 与重载路径让自动化可以更新路由和监听器，同时默认仍然关闭危险写操作。",
+        note: "把 YAML 想成实验室排班表。手动重载是在不安排后台巡查员的前提下调整房间开放状态；只有显式开启时才会启用文件监听。",
+        labels: ["Agent", "管理 + 重载", "yaml/runtime", "token", "持久化", "状态", "指标"],
+        steps: [
+          "运维人员先通过 config explain、routes、capabilities 和 nginx-parity 了解网关当前形态。",
+          "带 token 的管理调用可以更新 domain routes、reverse proxy routes、TCP listeners、UDP listeners 和黑名单。",
+          "写操作会原子化落回 YAML 配置，再在进程内重载可热更新部分。",
+          "POST /v1/reload 是默认手动重载入口；runtime.hot_reload.enabled=true 才会开启后台文件监听。",
+          "监听器身份、TLS 模式以及日志输出目标的变化仍然需要重启。"
+        ]
+      }
+    };
+
+    const uiCopy = {
+      en: {
+        title: "proxysss Architecture Lab",
+        brandTitle: "proxysss Architecture Lab",
+        brandSubtitle: "protocols explained like a first-year network lab",
+        navDocsHome: "Docs home",
+        navProtocolLab: "Protocol lab",
+        navArchitecture: "Architecture",
+        navYaml: "YAML",
+        navImprove: "Improve",
+        heroEyebrow: "Gateway mental model",
+        heroTitle: "One doorway, many network languages.",
+        heroLead: "Imagine proxysss as the smart front desk of a campus lab. Students arrive speaking HTTP, WebSocket, FTP, MQTT, TCP, UDP, or TLS. The front desk checks rules, chooses the right room, and keeps traffic moving without asking every service to stand at the public gate.",
+        heroBtnDocs: "Open docs hub",
+        heroBtnStart: "Start the animation",
+        heroBtnMap: "See the request path",
+        gatewayLabelSub: "route, protect, proxy",
+        nodeClientTitle: "Client",
+        nodeClientSub: "browser, app, device",
+        nodePolicyTitle: "Policy",
+        nodePolicySub: "rate, auth, cache",
+        nodeUpstreamTitle: "Upstream",
+        nodeUpstreamSub: "service pool",
+        nodeConfigTitle: "YAML",
+        nodeConfigSub: "single source",
+        lessonEyebrow: "Animated protocol lab",
+        lessonTitle: "Click a protocol and watch the traffic idea change.",
+        lessonCopy: "For a freshman: every protocol is just an agreement about how two computers talk. proxysss does not need to understand every business meaning inside the bytes. It only needs enough edge knowledge to accept, protect, route, tunnel, and observe the traffic.",
+        svgTitle: "Protocol animation",
+        svgDesc: "Animated packet flow from client to proxysss to upstream and back.",
+        svgClient: "Client",
+        svgUpstream: "Upstream",
+        mapEyebrow: "Data path",
+        mapTitle: "The gateway is a pipeline, not magic.",
+        mapCopy: "A request enters a listener, goes through safety and routing decisions, then becomes either a proxied HTTP exchange, a bidirectional stream, a static/WebDAV/FTP operation, or an admin/docs response.",
+        map1Title: "1. Listen",
+        map1Body: "Ports 80, 443, 7777, TCP, UDP, FTP, and custom binds accept connections or datagrams with explicit TCP backlog and default-on runtime.performance tuning. On Linux, plain HTTP, TLS HTTP, TCP stream, and UDP listener binds fan out across CPU-adaptive SO_REUSEPORT workers when performance mode is enabled. Startup detects the OS version, applies portable Linux socket tuning, enables the Ubuntu 24.x extreme policy when supported, and logs any downgrade reason.",
+        map2Title: "2. Understand enough",
+        map2Body: "HTTP gets host/path/header parsing. TCP and UDP stay mostly transparent. TLS uses SNI and ALPN where needed.",
+        map3Title: "3. Apply policy",
+        map3Body: "Access control, DDoS windows, rate limits, cache, compression, active health, and maintenance state shape the route.",
+        map4Title: "4. Proxy or serve",
+        map4Body: "proxysss forwards to upstream pools with separate hot paths instead of one global tuning profile. HTTP uses a Hyper fast path for general routes and raw plain-HTTP reverse/SSE/WebSocket lanes for simple no-policy routes. Raw HTTP keepalive pooling uses a lock-free bounded queue instead of a shared mutex. Static delivery uses a bounded cache with mmap-backed objects where supported, plus a traffic-profile-aware Linux fast lane: default small mode favors cached hot files and low-latency HTTP2/SSE/WebSocket/TCP/UDP feedback, bulk mode favors sendfile/zero-copy large transfers, and balanced mode prepares both. Config load preloads eligible index/top-level static files or sendfile descriptors according to runtime.performance.traffic_profile. TCP stream listeners run on a dedicated proxysss-stream runtime in performance mode, fan out accept loops with CPU-adaptive SO_REUSEPORT workers on Linux, and bypass the generic upstream planner for single-upstream direct routes when scripts, affinity, active health, and passive health are disabled. UDP listeners in performance mode also fan out datagram receive loops with SO_REUSEPORT, share the global association table, and keep worker-local association cache entries so established datagrams avoid global lookups and only refresh the global TTL timestamp once per second. Stream relays choose independent profiles: game/MQTT/tool long connections use small relay buffers and parallel one-way pumps, while explicit bulk/file stream protocols may use Linux splice zero-copy when runtime performance tuning is enabled.",
+        yamlEyebrow: "Single config",
+        yamlTitle: "YAML is the lab notebook.",
+        yamlCopy: "nginx spreads power across directives and includes. proxysss keeps the full edge shape in one YAML file so people and agents can inspect it quickly.",
+        improveEyebrow: "What can improve next",
+        improveTitle: "Stable gateways keep earning trust.",
+        improveCopy: "The current design already covers the nginx-replacement surface. The next wins are deeper measurement, more protocol test fixtures, and sharper production runbooks.",
+        road1Title: "Benchmark matrix",
+        road1Body: "Add repeatable Linux CI/staging runs for TLS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT, FTP, WebDAV, cache, and AI streaming. Production performance validation is Linux-only and must use the mixed matrix by default: enable the realistic multi-feature gateway shape and run CDN/static, HTTPS static, reverse proxy, New API/SSE, WebSocket long connections, game/TCP streams, generic TCP stream, UDP stream, and KCP-style UDP concurrently per gateway. The default critical gate is fairness-adjusted: aggregate throughput plus WebSocket and game/realtime TCP, UDP, and KCP-style scenarios use a 0.97 proxysss/nginx ratio floor because proxysss carries built-in policy and gateway behavior that nginx usually needs extra modules or configuration to approximate; static/reverse/SSE must stay above the soft floor with low errors; HTTPS static and static-large still run and are reported, but only block releases when explicitly included for TLS/static or bulk-transfer releases. Single-scenario runs are diagnostic only, and strict greater-than-nginx gates are opt-in.",
+        road2Title: "Chaos testing",
+        road2Body: "Inject upstream resets, slow bodies, packet loss, DNS failure, log backpressure, reload races, and certificate renewal failures.",
+        road3Title: "Protocol fixtures",
+        road3Body: "Keep small upstream simulators for MQTT, CoAP-style UDP, FTP active/passive, WebDAV clients, and SSE token streaming.",
+        road4Title: "Kernel tuning guide",
+        road4Body: "Keep Ubuntu 22.04, 24.04, 26.04 LTS and Debian socket backlog, file descriptor, ephemeral port, UDP buffer, QUIC UDP, jemalloc, and systemd restart guidance aligned with <code>proxysss tune linux</code>.",
+        road5Title: "Observability packs",
+        road5Body: "Ship dashboard queries and alert rules for p95 latency, upstream quarantine, dropped UDP associations, watchdog restarts, and ACME renewal.",
+        road6Title: "Plugin safety budgets",
+        road6Body: "Add examples for script timeout, memory budget, hook placement, and how to keep business logic away from byte-copy hot paths.",
+        footerHubLine: "Public docs hub: <a href=\"./\">/proxysss/</a>. This Pages site already serves the repository <code>docs/</code> folder as its root, so public URLs should not include an extra <code>/docs/</code> segment.",
+        footerCliLine: "Open the CLI views after editing config: <code>proxysss config explain</code>, <code>proxysss config routes</code>, <code>proxysss config reload-plan</code>, and <code>proxysss config nginx-parity --format yaml</code>."
+      },
+      zh: {
+        title: "proxysss 架构实验室",
+        brandTitle: "proxysss 架构实验室",
+        brandSubtitle: "像大一网络实验课一样讲清协议与数据路径",
+        navDocsHome: "文档首页",
+        navProtocolLab: "协议实验室",
+        navArchitecture: "架构路径",
+        navYaml: "YAML",
+        navImprove: "后续改进",
+        heroEyebrow: "网关心智模型",
+        heroTitle: "一个入口，接住多种网络语言。",
+        heroLead: "把 proxysss 想成校园实验室的智能前台。学生可能说 HTTP、WebSocket、FTP、MQTT、TCP、UDP 或 TLS。前台负责检查规则、分配正确房间，并让流量持续流动，而不是要求每个后端服务都直接站到公网门口。",
+        heroBtnDocs: "打开文档首页",
+        heroBtnStart: "开始动画",
+        heroBtnMap: "查看请求路径",
+        gatewayLabelSub: "路由、保护、代理",
+        nodeClientTitle: "客户端",
+        nodeClientSub: "浏览器、应用、设备",
+        nodePolicyTitle: "策略",
+        nodePolicySub: "限速、认证、缓存",
+        nodeUpstreamTitle: "上游",
+        nodeUpstreamSub: "服务池",
+        nodeConfigTitle: "YAML",
+        nodeConfigSub: "唯一配置源",
+        lessonEyebrow: "动画协议实验室",
+        lessonTitle: "点一个协议，看流量逻辑如何变化。",
+        lessonCopy: "如果你是新生，可以这样理解：协议只是两台计算机约定“怎么说话”的规则。proxysss 不需要理解字节内部的全部业务语义，只需要在边缘知道足够多的信息，就能完成接入、保护、路由、隧道转发和观测。",
+        svgTitle: "协议动画",
+        svgDesc: "从客户端到 proxysss，再到上游并返回的动画数据流。",
+        svgClient: "客户端",
+        svgUpstream: "上游",
+        mapEyebrow: "数据路径",
+        mapTitle: "网关是一条流水线，不是魔法。",
+        mapCopy: "一个请求进入监听器后，会经过安全与路由决策，最终变成代理 HTTP 交换、双向流、静态/WebDAV/FTP 操作，或管理/文档响应。",
+        map1Title: "1. 监听",
+        map1Body: "80、443、7777、TCP、UDP、FTP 以及自定义绑定端口会接收连接或数据报，并配合显式 TCP backlog 与默认开启的 runtime.performance 调优。在 Linux 上，只要启用性能模式，纯 HTTP、TLS HTTP、TCP 流和 UDP 监听都会通过按 CPU 核数自适应的 SO_REUSEPORT worker 扩散。启动时会识别系统版本，应用可移植的 Linux socket 调优，在支持时启用 Ubuntu 24.x 极限策略，并把所有降级原因记入日志。",
+        map2Title: "2. 只理解足够多",
+        map2Body: "HTTP 会解析主机名、路径和请求头。TCP 与 UDP 尽量保持透明。TLS 则在需要时使用 SNI 与 ALPN。",
+        map3Title: "3. 应用策略",
+        map3Body: "访问控制、DDoS 窗口、限流、缓存、压缩、主动健康检查和维护态都会共同塑造最终路由。",
+        map4Title: "4. 代理或直接服务",
+        map4Body: "proxysss 会按不同流量类型使用独立热路径，而不是一套全局调优模式。HTTP 通用路由走 Hyper 快路径，简单无策略路由则可以走原始 plain-HTTP reverse/SSE/WebSocket 快路。原始 HTTP keepalive 池使用有界无锁队列，避免共享互斥锁。静态分发基于有界缓存和可选 mmap 对象，并叠加面向 Linux 的 traffic_profile 快速通道：默认 small 模式偏向热点小文件缓存、HTTP2/SSE/WebSocket/TCP/UDP 低延迟反馈；bulk 模式偏向 sendfile/zero-copy 大文件传输；balanced 同时准备两条路线。配置加载时会根据 runtime.performance.traffic_profile 预热符合条件的首页/顶层静态文件或 sendfile 描述符。TCP stream 监听器在性能模式下运行于独立的 proxysss-stream runtime，并在 Linux 上用按核自适应的 SO_REUSEPORT accept worker 扩散；当脚本、亲和路由、主动健康与被动健康都关闭时，单上游直连路由会绕过通用上游规划器。UDP 监听器在性能模式下同样使用 SO_REUSEPORT datagram worker，复用全局关联表，并持有 worker 本地关联缓存，这样已建立的数据报既不用全局查表，也只需每秒刷新一次全局 TTL。流量中继还能按场景选独立配置：游戏/MQTT/工具类长连接使用小缓冲和并行单向泵，而显式的大流量/文件型流协议则可在启用性能调优时使用 Linux splice 零拷贝。",
+        yamlEyebrow: "单一配置",
+        yamlTitle: "YAML 就是实验笔记本。",
+        yamlCopy: "nginx 会把能力分散在 directives 与 include 文件里。proxysss 则把完整的边缘形态收敛到一个 YAML 文件中，让人和 Agent 都能快速检查全貌。",
+        improveEyebrow: "下一步还能怎么更好",
+        improveTitle: "稳定网关要持续赢得信任。",
+        improveCopy: "当前设计已经覆盖 nginx 替代面的核心能力。接下来的收益点，是更深的测量、更完整的协议夹具，以及更锋利的生产运维手册。",
+        road1Title: "基准矩阵",
+        road1Body: "补齐可重复的 Linux CI / staging 基准，覆盖 TLS、HTTP/2、HTTP/3、WebSocket、TCP、UDP、MQTT、FTP、WebDAV、缓存和 AI 流式代理。生产性能验证必须是 Linux-only，并默认使用 mixed matrix：启用真实的多能力网关形态，让 CDN/静态、HTTPS 静态、反向代理、New API / SSE、WebSocket 长连接、游戏/TCP 流、通用 TCP 流、UDP 流和 KCP 风格 UDP 在每个网关上并发跑起来。默认 critical gate 采用公平系数：聚合吞吐以及 WebSocket、游戏/实时 TCP、UDP、KCP 风格场景允许使用 0.97 的 proxysss/nginx 比值底线，因为 proxysss 内建了许多 nginx 常常需要额外模块或复杂配置才能逼近的策略行为；静态/反代/SSE 仍必须在低错误率下站稳 soft floor；HTTPS 静态和 static-large 会继续跑并出报告，但只有在显式提升为 TLS/静态或大文件发布门槛时才会阻塞发布。单场景测试仅用于根因定位，严格大于 nginx 的门槛需要显式开启。",
+        road2Title: "混沌测试",
+        road2Body: "注入上游重置、慢响应体、丢包、DNS 故障、日志背压、重载竞争和证书续签失败等故障。",
+        road3Title: "协议夹具",
+        road3Body: "保留小型上游模拟器，用于 MQTT、类 CoAP UDP、FTP 主被动模式、WebDAV 客户端和 SSE token 流。",
+        road4Title: "内核调优手册",
+        road4Body: "让 Ubuntu 22.04、24.04、26.04 LTS 与 Debian 的 backlog、文件描述符、临时端口、UDP buffer、QUIC UDP、jemalloc 和 systemd 重启建议持续对齐 <code>proxysss tune linux</code>。",
+        road5Title: "可观测性包",
+        road5Body: "提供 p95 延迟、上游隔离、UDP 关联丢失、watchdog 重启和 ACME 续签的仪表盘查询与告警规则。",
+        road6Title: "插件安全预算",
+        road6Body: "增加脚本超时、内存预算、钩子放置位置，以及如何避免把业务逻辑塞进字节复制热路径的示例。",
+        footerHubLine: "公网文档首页：<a href=\"./\">/proxysss/</a>。这个 Pages 站点已经把仓库 <code>docs/</code> 目录当成根目录，所以公网 URL 里不要再额外加一层 <code>/docs/</code>。",
+        footerCliLine: "改完配置后，可以用这些 CLI 视图快速确认结果：<code>proxysss config explain</code>、<code>proxysss config routes</code>、<code>proxysss config reload-plan</code>、<code>proxysss config nginx-parity --format yaml</code>。"
+      }
+    };
+
     const menu = document.getElementById("protocolMenu");
     const title = document.getElementById("protocolTitle");
     const summary = document.getElementById("protocolSummary");
@@ -1236,6 +1544,16 @@ udp:
       document.getElementById("svgBack")
     ];
     const hotPaths = ["pathA", "pathB", "pathC", "pathD"].map((id) => document.getElementById(id));
+    let activeLanguage = "en";
+    let selectedProtocolKey = protocols[0].key;
+
+    function detectLanguage() {
+      const saved = localStorage.getItem(storageKey);
+      if (saved === "en" || saved === "zh") {
+        return saved;
+      }
+      return navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+    }
 
     function restartAnimation() {
       hotPaths.forEach((path) => {
@@ -1245,7 +1563,21 @@ udp:
       });
     }
 
-    function setProtocol(protocol) {
+    function getProtocolByKey(key) {
+      return protocols.find((protocol) => protocol.key === key) || protocols[0];
+    }
+
+    function getLocalizedProtocol(protocol) {
+      if (activeLanguage !== "zh") {
+        return protocol;
+      }
+      const translated = protocolZh[protocol.key];
+      return translated ? { ...protocol, ...translated } : protocol;
+    }
+
+    function setProtocolByKey(key) {
+      selectedProtocolKey = key;
+      const protocol = getLocalizedProtocol(getProtocolByKey(key));
       title.textContent = protocol.name;
       summary.textContent = protocol.summary;
       chip.textContent = protocol.chip;
@@ -1261,17 +1593,48 @@ udp:
       restartAnimation();
     }
 
-    protocols.forEach((protocol) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "protocol-btn";
-      button.dataset.key = protocol.key;
-      button.innerHTML = `<strong>${protocol.name}</strong><span>${protocol.hint}</span>`;
-      button.addEventListener("click", () => setProtocol(protocol));
-      menu.appendChild(button);
-    });
+    function renderProtocolMenu() {
+      menu.innerHTML = "";
+      protocols.forEach((protocol) => {
+        const localized = getLocalizedProtocol(protocol);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "protocol-btn";
+        button.dataset.key = protocol.key;
+        button.innerHTML = `<strong>${localized.name}</strong><span>${localized.hint}</span>`;
+        button.addEventListener("click", () => setProtocolByKey(protocol.key));
+        menu.appendChild(button);
+      });
+    }
 
-    setProtocol(protocols[0]);
+    function applyStaticLanguage(lang) {
+      const copy = uiCopy[lang];
+      document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+      document.title = copy.title;
+      Object.entries(copy).forEach(([key, value]) => {
+        if (key === "title") {
+          return;
+        }
+        const element = document.getElementById(key);
+        if (element) {
+          element.innerHTML = value;
+        }
+      });
+      document.getElementById("langEn").classList.toggle("active", lang === "en");
+      document.getElementById("langZh").classList.toggle("active", lang === "zh");
+    }
+
+    function applyLanguage(lang) {
+      activeLanguage = lang;
+      applyStaticLanguage(lang);
+      renderProtocolMenu();
+      setProtocolByKey(selectedProtocolKey);
+      localStorage.setItem(storageKey, lang);
+    }
+
+    document.getElementById("langEn").addEventListener("click", () => applyLanguage("en"));
+    document.getElementById("langZh").addEventListener("click", () => applyLanguage("zh"));
+    applyLanguage(detectLanguage());
 
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
