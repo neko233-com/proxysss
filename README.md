@@ -667,6 +667,8 @@ Scrape `http://<host>/metrics` or inspect JSON stats from the admin API at `GET 
 
 ## Related docs
 
+- Public GitHub Pages docs hub: [https://neko233-com.github.io/proxysss/](https://neko233-com.github.io/proxysss/)
+- Public architecture lab: [https://neko233-com.github.io/proxysss/architecture.html](https://neko233-com.github.io/proxysss/architecture.html)
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — configuration tutorial
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime architecture
 - [docs/architecture.html](docs/architecture.html) — animated protocol and architecture lab for first-year readers
@@ -679,3 +681,5 @@ Scrape `http://<host>/metrics` or inspect JSON stats from the admin API at `GET 
 - `proxysss-script.d.ts`
 - `http://localhost/docs.html`
 - `http://localhost/docs`
+
+GitHub Pages serves the repository `docs/` directory as the site root, so the public URL path is `/proxysss/...`, not `/proxysss/docs/...`.
