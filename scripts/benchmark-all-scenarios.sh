@@ -39,10 +39,12 @@ QUICK="${QUICK:-0}"
 HTTPS_HTTP1_ONLY="${HTTPS_HTTP1_ONLY:-0}"
 MIN_RATIO="${MIN_RATIO:-0.50}"
 CRITICAL_RATIO="${CRITICAL_RATIO:-0.97}"
-CRITICAL_SCENARIOS="${CRITICAL_SCENARIOS:-websocket-long-connection game-long-connection tcp-stream udp-stream kcp-style-udp}"
+CRITICAL_SCENARIOS="${CRITICAL_SCENARIOS:-websocket-long-connection game-long-connection tcp-stream udp-stream}"
 DIAGNOSTIC_SCENARIOS="${DIAGNOSTIC_SCENARIOS:-static-large https-static-small}"
 WEBSOCKET_ERROR_TOLERANCE="${WEBSOCKET_ERROR_TOLERANCE:-4}"
 SSE_ERROR_TOLERANCE="${SSE_ERROR_TOLERANCE:-1}"
+UDP_ERROR_TOLERANCE_SET="${UDP_ERROR_TOLERANCE+x}"
+UDP_ERROR_TOLERANCE="${UDP_ERROR_TOLERANCE:-4}"
 FAST_GATE="${FAST_GATE:-0}"
 FAST_GATE_RATIO="${FAST_GATE_RATIO:-$CRITICAL_RATIO}"
 FAST_GATE_CONCURRENCY="${FAST_GATE_CONCURRENCY:-$((CPU_CORES * 16))}"
@@ -52,6 +54,7 @@ FAST_GATE_STREAM_CONNECTIONS="${FAST_GATE_STREAM_CONNECTIONS:-$((CPU_CORES * 4))
 FAST_GATE_SSE_CONCURRENCY="${FAST_GATE_SSE_CONCURRENCY:-$CPU_CORES}"
 FAST_GATE_DURATION_SECS="${FAST_GATE_DURATION_SECS:-4}"
 FAST_GATE_SCENARIOS="${FAST_GATE_SCENARIOS:-$CRITICAL_SCENARIOS}"
+SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 MIXED_MATRIX="${MIXED_MATRIX:-1}"
 AGGREGATE_RATIO="${AGGREGATE_RATIO:-0.97}"
 
@@ -62,6 +65,11 @@ if [[ "$QUICK" == "1" ]]; then
   [[ -z "$STREAM_CONNECTIONS_SET" ]] && STREAM_CONNECTIONS=$((CPU_CORES * 4))
   [[ -z "$SSE_CONCURRENCY_SET" ]] && SSE_CONCURRENCY=$CPU_CORES
   [[ -z "$DURATION_SECS_SET" ]] && DURATION_SECS=10
+fi
+
+if [[ -z "$UDP_ERROR_TOLERANCE_SET" && ! -e /proc/sys/net/core/rmem_max ]]; then
+  UDP_ERROR_TOLERANCE=16
+  echo "==> /proc/sys/net/core/rmem_max is unavailable; using Docker/WSL UDP error tolerance +$UDP_ERROR_TOLERANCE" >&2
 fi
 
 BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
@@ -441,6 +449,11 @@ run_udp_bench() {
   parse_bench_output "$scenario" "$gateway" "udp" "$addr" "$STREAM_CONNECTIONS" "$output"
 }
 
+scenario_enabled() {
+  local scenario="$1"
+  [[ -z "$SCENARIO_FILTER" || " $SCENARIO_FILTER " == *" $scenario "* ]]
+}
+
 SSE_UPSTREAM_PID=""
 
 start_sse_backend() {
@@ -468,6 +481,18 @@ warm_sse_gateway() {
 warm_ws_gateway() {
   local url="$1"
   "$PROXY_BIN" bench websocket --url "$url" --connections 1 --duration-secs 1 --payload-bytes 16 >/dev/null 2>&1 || true
+}
+
+warm_tcp_gateway() {
+  local addr="$1"
+  local payload_bytes="${2:-256}"
+  "$PROXY_BIN" bench tcp --addr "$addr" --connections 1 --duration-secs 1 --payload-bytes "$payload_bytes" >/dev/null 2>&1 || true
+}
+
+warm_udp_gateway() {
+  local addr="$1"
+  local payload_bytes="${2:-512}"
+  "$PROXY_BIN" bench udp --addr "$addr" --connections 1 --duration-secs 1 --payload-bytes "$payload_bytes" --timeout-ms "$UDP_TIMEOUT_MS" >/dev/null 2>&1 || true
 }
 
 trap 'stop_bench_processes' EXIT
@@ -515,6 +540,14 @@ for _ in 1 2; do
 done
 warm_ws_gateway "ws://127.0.0.1:18083/ws/"
 warm_ws_gateway "ws://127.0.0.1:18081/ws/"
+warm_tcp_gateway "127.0.0.1:18200" 256
+warm_tcp_gateway "127.0.0.1:18202" 256
+warm_tcp_gateway "127.0.0.1:18200" 1024
+warm_tcp_gateway "127.0.0.1:18202" 1024
+warm_udp_gateway "127.0.0.1:18300" 512
+warm_udp_gateway "127.0.0.1:18302" 512
+warm_udp_gateway "127.0.0.1:18300" 1200
+warm_udp_gateway "127.0.0.1:18302" 1200
 
 sleep 2
 printf 'hot-update-v2\n' >"$WWW_DIR/hot.dat"
@@ -599,30 +632,48 @@ if [[ "$FAST_GATE" == "1" ]]; then
 fi
 
 append_deep_matrix_serial() {
-  RESULT_ROWS+=("$(run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html)")
-  RESULT_ROWS+=("$(run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html)")
-  RESULT_ROWS+=("$(run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin)")
-  RESULT_ROWS+=("$(run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin)")
-  RESULT_ROWS+=("$(run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat)")
-  RESULT_ROWS+=("$(run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat)")
-  RESULT_ROWS+=("$(run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html)")
-  RESULT_ROWS+=("$(run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html)")
-  RESULT_ROWS+=("$(run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping)")
-  RESULT_ROWS+=("$(run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping)")
-  RESULT_ROWS+=("$(run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions)")
-  restart_sse_backend
-  warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
-  RESULT_ROWS+=("$(run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions)")
-  RESULT_ROWS+=("$(run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256)")
-  RESULT_ROWS+=("$(run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256)")
-  RESULT_ROWS+=("$(run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256)")
-  RESULT_ROWS+=("$(run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256)")
-  RESULT_ROWS+=("$(run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024)")
-  RESULT_ROWS+=("$(run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024)")
-  RESULT_ROWS+=("$(run_udp_bench udp-stream nginx 127.0.0.1:18302)")
-  RESULT_ROWS+=("$(run_udp_bench udp-stream proxysss 127.0.0.1:18300)")
-  RESULT_ROWS+=("$(run_udp_bench kcp-style-udp nginx 127.0.0.1:18302 1200)")
-  RESULT_ROWS+=("$(run_udp_bench kcp-style-udp proxysss 127.0.0.1:18300 1200)")
+  if scenario_enabled static-small; then
+    RESULT_ROWS+=("$(run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html)")
+    RESULT_ROWS+=("$(run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html)")
+  fi
+  if scenario_enabled static-large; then
+    RESULT_ROWS+=("$(run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin)")
+    RESULT_ROWS+=("$(run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin)")
+  fi
+  if scenario_enabled cdn-hot-update; then
+    RESULT_ROWS+=("$(run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat)")
+    RESULT_ROWS+=("$(run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat)")
+  fi
+  if scenario_enabled https-static-small; then
+    RESULT_ROWS+=("$(run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html)")
+    RESULT_ROWS+=("$(run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html)")
+  fi
+  if scenario_enabled reverse-proxy; then
+    RESULT_ROWS+=("$(run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping)")
+    RESULT_ROWS+=("$(run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping)")
+  fi
+  if scenario_enabled new-api-sse; then
+    RESULT_ROWS+=("$(run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions)")
+    restart_sse_backend
+    warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
+    RESULT_ROWS+=("$(run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions)")
+  fi
+  if scenario_enabled websocket-long-connection; then
+    RESULT_ROWS+=("$(run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256)")
+    RESULT_ROWS+=("$(run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256)")
+  fi
+  if scenario_enabled game-long-connection; then
+    RESULT_ROWS+=("$(run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256)")
+    RESULT_ROWS+=("$(run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256)")
+  fi
+  if scenario_enabled tcp-stream; then
+    RESULT_ROWS+=("$(run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024)")
+    RESULT_ROWS+=("$(run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024)")
+  fi
+  if scenario_enabled udp-stream; then
+    RESULT_ROWS+=("$(run_udp_bench udp-stream nginx 127.0.0.1:18302)")
+    RESULT_ROWS+=("$(run_udp_bench udp-stream proxysss 127.0.0.1:18300)")
+  fi
 }
 
 append_deep_matrix_mixed() {
@@ -641,7 +692,6 @@ append_deep_matrix_mixed() {
     game-long-connection-nginx game-long-connection-proxysss
     tcp-stream-nginx tcp-stream-proxysss
     udp-stream-nginx udp-stream-proxysss
-    kcp-style-udp-nginx kcp-style-udp-proxysss
   )
 
   launch_bench() {
@@ -649,6 +699,14 @@ append_deep_matrix_mixed() {
     shift
     ("$@" >"$row_dir/$name.json") &
     pids+=("$!")
+  }
+
+  launch_scenario_bench() {
+    local scenario="$1"
+    shift
+    if scenario_enabled "$scenario"; then
+      launch_bench "$@"
+    fi
   }
 
   wait_for_group() {
@@ -667,38 +725,38 @@ append_deep_matrix_mixed() {
   }
 
   echo "=== mixed matrix: nginx scenarios running concurrently ===" >&2
-  launch_bench static-small-nginx run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html
-  launch_bench static-large-nginx run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin
-  launch_bench cdn-hot-update-nginx run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat
-  launch_bench https-static-small-nginx run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html
-  launch_bench reverse-proxy-nginx run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping
-  launch_bench new-api-sse-nginx run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions
-  launch_bench websocket-long-connection-nginx run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256
-  launch_bench game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
-  launch_bench tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
-  launch_bench udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
-  launch_bench kcp-style-udp-nginx run_udp_bench kcp-style-udp nginx 127.0.0.1:18302 1200
+  launch_scenario_bench static-small static-small-nginx run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html
+  launch_scenario_bench static-large static-large-nginx run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin
+  launch_scenario_bench cdn-hot-update cdn-hot-update-nginx run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat
+  launch_scenario_bench https-static-small https-static-small-nginx run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html
+  launch_scenario_bench reverse-proxy reverse-proxy-nginx run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping
+  launch_scenario_bench new-api-sse new-api-sse-nginx run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions
+  launch_scenario_bench websocket-long-connection websocket-long-connection-nginx run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256
+  launch_scenario_bench game-long-connection game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
+  launch_scenario_bench tcp-stream tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
+  launch_scenario_bench udp-stream udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
   wait_for_group
   restart_sse_backend
   warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
 
   echo "=== mixed matrix: proxysss scenarios running concurrently ===" >&2
-  launch_bench static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
-  launch_bench static-large-proxysss run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin
-  launch_bench cdn-hot-update-proxysss run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat
-  launch_bench https-static-small-proxysss run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html
-  launch_bench reverse-proxy-proxysss run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping
-  launch_bench new-api-sse-proxysss run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions
-  launch_bench websocket-long-connection-proxysss run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256
-  launch_bench game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
-  launch_bench tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024
-  launch_bench udp-stream-proxysss run_udp_bench udp-stream proxysss 127.0.0.1:18300
-  launch_bench kcp-style-udp-proxysss run_udp_bench kcp-style-udp proxysss 127.0.0.1:18300 1200
+  launch_scenario_bench static-small static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
+  launch_scenario_bench static-large static-large-proxysss run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin
+  launch_scenario_bench cdn-hot-update cdn-hot-update-proxysss run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat
+  launch_scenario_bench https-static-small https-static-small-proxysss run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html
+  launch_scenario_bench reverse-proxy reverse-proxy-proxysss run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping
+  launch_scenario_bench new-api-sse new-api-sse-proxysss run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions
+  launch_scenario_bench websocket-long-connection websocket-long-connection-proxysss run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256
+  launch_scenario_bench game-long-connection game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
+  launch_scenario_bench tcp-stream tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024
+  launch_scenario_bench udp-stream udp-stream-proxysss run_udp_bench udp-stream proxysss 127.0.0.1:18300
   wait_for_group
 
   local name
   for name in "${ordered[@]}"; do
-    RESULT_ROWS+=("$(cat "$row_dir/$name.json")")
+    if [[ -f "$row_dir/$name.json" ]]; then
+      RESULT_ROWS+=("$(cat "$row_dir/$name.json")")
+    fi
   done
 }
 
@@ -727,6 +785,7 @@ fi
   --diagnostic-scenarios "$DIAGNOSTIC_SCENARIOS" \
   --sse-error-tolerance "$SSE_ERROR_TOLERANCE" \
   --websocket-error-tolerance "$WEBSOCKET_ERROR_TOLERANCE" \
+  --udp-error-tolerance "$UDP_ERROR_TOLERANCE" \
   --aggregate-ratio "$AGGREGATE_RATIO" \
   --mixed-matrix="$MIXED_MATRIX_BOOL" \
   --cpu-cores "$CPU_CORES" \

@@ -288,7 +288,7 @@ tcp:
 - 游戏长连接网关
 - 你不想让业务协议被 HTTP 层感知的场景
 
-### 2.7 UDP / KCP-style / CoAP-style
+### 2.7 UDP、KCP-style、QCP、CoAP-style
 
 ```yaml
 udp:
@@ -301,12 +301,21 @@ udp:
         - name: kcp-upstream
           upstreams:
             - addr: "10.0.0.20:4000"
+    - name: qcp-gateway
+      bind: 0.0.0.0:4001
+      protocol: qcp
+      session_ttl_secs: 120
+      max_associations: 200000
+      upstreams:
+        - 10.0.0.21:4001
 ```
 
 理解方式：
 
 - `session_ttl_secs` 控制 UDP 会话保活窗口。
 - `max_associations` 控制实时设备或玩家会话上限，避免无界膨胀。
+- KCP 和 QCP 是两套独立 UDP listener：KCP 用 `protocol: kcp`，neko233-com/QCP 用 `protocol: qcp`。
+- QCP 走透明 UDP 转发；QCP 帧、可靠性和业务语义仍由上游服务处理。
 - 这条面向的是转发和边缘治理，不是协议终端本身。
 
 ### 2.8 MQTT / IoT
@@ -571,7 +580,7 @@ proxysss token show
 
 ### 7.2 拿单条 SSE benchmark 当发布结论
 
-项目要求已经明确：后续所有性能优化都要压测，而且要无副作用。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 都应该一起看。
+项目要求已经明确：后续所有性能优化都要压测，而且要无副作用。SSE、静态、HTTP reverse proxy、TCP、UDP 都应该一起看；KCP-style 和 QCP 作为 proxysss 独立 UDP listener 能力单独验证，不默认拿 nginx 做协议语义对照。
 
 ### 7.3 管理面一上来就开公网写操作
 

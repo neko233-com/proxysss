@@ -559,7 +559,7 @@ services:
 
             <article class="recipe">
               <span class="tag expert">Game / Realtime</span>
-              <h3>游戏 TCP + UDP / KCP-style</h3>
+              <h3>游戏 TCP、UDP、KCP、QCP</h3>
               <p class="subtle">HTTP 以外的边缘网关能力也要明确可配，不需要把实时服务硬塞进反向代理语义里。</p>
               <pre><code>tcp:
   listeners:
@@ -657,7 +657,7 @@ tcp:
                 <td>不要期待 HTTP 头级别策略。</td>
               </tr>
               <tr>
-                <td><strong>udp.listeners</strong>UDP / KCP-style / CoAP-style</td>
+                <td><strong>udp.listeners</strong>UDP、KCP、QCP、CoAP-style</td>
                 <td>实时设备、游戏、会话型 UDP 网关。</td>
                 <td>不要把它包装成应用终端本身。</td>
               </tr>
@@ -731,7 +731,7 @@ proxysss token show</code></pre>
     </div>
 
     <footer class="footer">
-      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP、KCP-style 应该一起看，不能出现“这个性能高了，那个性能差了”还当成成功的情况。
+      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP/QCP 作为 proxysss 独立 UDP listener 能力单独验，不能出现“这个性能高了，那个性能差了”还当成成功的情况。
     </footer>
   </div>
 </body>

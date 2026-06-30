@@ -47,9 +47,10 @@
 | `udp-stream` | `0.861x` |
 
 - Docker 聚合：`248015 / 234176` → **`1.059x`**
-- Docker 上 UDP / KCP 受容器 `rmem_max` 环境限制噪声更大，所以生产判断以真机 Linux 主机为准。
+- Docker 上 UDP 和 KCP 受容器 `rmem_max` 环境限制噪声更大，所以生产判断以真机 Linux 主机为准。
 
 > 上面这些数字来自仓库里已经存在的 mixed-load 历史报告，只是之前官方 benchmark 页没有把它们直接展示出来。现在应该把它们作为“历史基线”放在台面上，便于对照后续 SSE / HTTP2 / TCP / UDP 优化是不是整体前进。
+> KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。QCP 结论看 proxysss 自身协议服务验证，不拿 nginx 伪装成 QCP 对照组。
 
 ## 3. 官方 Linux benchmark 现在对比哪些协议
 
@@ -65,9 +66,8 @@
 - `game-long-connection`
 - `tcp-stream`
 - `udp-stream`
-- `kcp-style-udp`
 
-这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。
+这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。KCP/QCP 作为 proxysss 独立 UDP listener 能力单独验证，不进入默认 nginx head-to-head gate。
 
 ## 4. GitHub Actions 官方工件现在应该长什么样
 
@@ -100,11 +100,12 @@ Linux 官方 benchmark 工件名仍然是：
 
 这里要把话说清楚：
 
-- **GitHub-hosted Linux benchmark** 现在也会比较所有协议
-- 但它的 `kcp-style-udp` 在 summary 里默认是 **diagnostic**
-- 真正的 `KCP / realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
+- **GitHub-hosted Linux benchmark** 现在会比较 nginx 可对标的主要网关协议
+- `KCP`、`QCP` 是 proxysss 独立 UDP listener 能力，不默认拿 nginx 做协议对照
+- 真正的 `realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
+- Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`
 
-原因不是“把差结果藏起来”，而是 GitHub-hosted runner 的 UDP / realtime 噪声太大，容易把 KCP 结论带偏。我们保留它在表里，是为了看趋势；我们不把它当 hosted runner 上的最终裁判，是为了不让错误环境替代真实环境。
+原因不是“把差结果藏起来”，而是 GitHub-hosted runner 的 UDP / realtime 噪声太大，且 nginx 没有 KCP/QCP 语义；默认 benchmark 不把错误环境或错误对照组包装成最终裁判。
 
 ## 7. 正式 Linux 发布怎么跑
 
@@ -136,7 +137,7 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
 如果官方 benchmark 只比 static small：
 
 - 会误导人以为发布门槛只看一个 HTTP 小文件数字
-- 会淡化 `SSE / WebSocket / TCP / UDP / KCP-style` 的 release gate 地位
+- 会淡化 `SSE`、`WebSocket`、`TCP`、`UDP` 的 release gate 地位，也会把 KCP/QCP 这类 proxysss 独立能力误写成 nginx 对标项
 - 会和仓库里的 AGENTS / 架构文档 / 生产硬化文档口径打架
 
 所以这次不是“补一页文档”，而是把 **benchmark workflow、artifact、文档口径** 统一回“全协议 Linux mixed-load”。

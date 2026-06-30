@@ -290,7 +290,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "udp stream proxy",
-        "supported; per-listener association TTL and caps protect large-scale game/voice/KCP traffic",
+        "supported; per-listener association TTL and caps protect large-scale game/voice traffic, KCP-style UDP, and independent QCP UDP",
     ),
     (
         "mqtt/iot gateway",
@@ -476,7 +476,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TCP/UDP stream proxy",
         status: ParityStatus::Supported,
-        evidence: "tcp.listeners support nodelay/connect_timeout_ms and udp.listeners support protocol/session_ttl_secs/max_associations with YAML upstream pools and optional script extension hooks",
+        evidence: "tcp.listeners support nodelay/connect_timeout_ms and udp.listeners support protocol/session_ttl_secs/max_associations with YAML upstream pools, independent KCP-style UDP and QCP UDP listener configs, and optional script extension hooks",
         next_gap: "",
     },
     NginxParityItem {
@@ -1649,7 +1649,7 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
             "tcp:\n  listeners:\n    - name: game-tcp\n      bind: 0.0.0.0:7000\n      protocol: game_tcp\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstream: 127.0.0.1:9000\n      upstreams:\n        - 127.0.0.1:9000\n        - 127.0.0.1:9001\n"
         }
         ConfigTemplateKind::Udp => {
-            "udp:\n  listeners:\n    - name: game-kcp\n      bind: 0.0.0.0:7001\n      protocol: kcp\n      session_ttl_secs: 180\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:9100\n        - 127.0.0.1:9101\n"
+            "udp:\n  listeners:\n    - name: game-kcp\n      bind: 0.0.0.0:7001\n      protocol: kcp\n      session_ttl_secs: 180\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:9100\n        - 127.0.0.1:9101\n    - name: game-qcp\n      bind: 0.0.0.0:7002\n      protocol: qcp\n      session_ttl_secs: 180\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:9200\n        - 127.0.0.1:9201\n"
         }
         ConfigTemplateKind::StaticSite => {
             "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
@@ -2325,7 +2325,7 @@ mod tests {
             upstream: String::new(),
             upstreams: vec!["127.0.0.1:9100".to_string()],
             upstream_weights: std::collections::BTreeMap::new(),
-            protocol: "kcp".to_string(),
+            protocol: "qcp".to_string(),
             session_ttl_secs: 180,
             max_associations: 262_144,
         });
@@ -2382,6 +2382,7 @@ mod tests {
         assert!(render_config_template(ConfigTemplateKind::Http).contains("domain_routes"));
         assert!(render_config_template(ConfigTemplateKind::Tcp).contains("tcp:"));
         assert!(render_config_template(ConfigTemplateKind::Udp).contains("udp:"));
+        assert!(render_config_template(ConfigTemplateKind::Udp).contains("protocol: qcp"));
         assert!(render_config_template(ConfigTemplateKind::Iot).contains("protocol: mqtt"));
         assert!(render_config_template(ConfigTemplateKind::Iot).contains("mqtt-websocket"));
         assert!(render_config_template(ConfigTemplateKind::Script).contains("script:"));

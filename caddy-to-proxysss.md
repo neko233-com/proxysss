@@ -387,7 +387,7 @@ proxysss 的性能优化和迁移结论都要遵循同一条纪律：
 
 - 后续所有性能优化都要压测
 - 必须是无副作用优化
-- SSE、static、HTTP reverse proxy、TCP、UDP、KCP-style 要一起看
+- SSE、static、HTTP reverse proxy、TCP、UDP、KCP-style、QCP 要一起看
 
 ## 5. 一句迁移建议
 

@@ -295,7 +295,7 @@
         <div class="two-up">
           <div class="note good">
             <strong>它适合回答：</strong>
-            <p>当前主干在 Linux 上，static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style UDP 一起跑时，到底有没有一起站住，以及历史上到底跑到了什么水平。</p>
+            <p>当前主干在 Linux 上，static、reverse proxy、New API/SSE、WebSocket、TCP、UDP 这些 nginx 可公平对标场景一起跑时，到底有没有一起站住，以及历史上到底跑到了什么水平。KCP/QCP 作为 proxysss 独立 UDP listener 能力单独验证。</p>
           </div>
           <div class="note warn">
             <strong>它不适合回答：</strong>
@@ -314,7 +314,7 @@
           </div>
           <div class="note">
             <strong>Docker `ubuntu:24.04` 校验：</strong>
-            <p>聚合 <strong>1.059x</strong>，`new-api-sse` 已到 <strong>1.014x</strong>。UDP / KCP 受容器 `rmem_max` 环境限制，生产判断仍以真机 Linux 主机为准。</p>
+            <p>聚合 <strong>1.059x</strong>，`new-api-sse` 已到 <strong>1.014x</strong>。UDP 和 KCP 受容器 `rmem_max` 环境限制，生产判断仍以真机 Linux 主机为准。</p>
           </div>
         </div>
 
@@ -342,6 +342,7 @@
             <tr><td><strong>websocket-long-connection</strong></td><td>1.319x</td><td>1303.67</td><td>988.42</td><td>0</td></tr>
           </tbody>
         </table>
+        <p>说明：KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。QCP 结论看 proxysss 自身协议服务验证，不拿 nginx 伪装成 QCP 对照组。</p>
 
         <table>
           <thead>
@@ -393,9 +394,9 @@
               <td>验证长连接时延、连接 churn、stream relay 和 realtime 公平比值底线。</td>
             </tr>
             <tr>
-              <td><strong>udp-stream / kcp-style-udp</strong></td>
-              <td>UDP / KCP-style</td>
-              <td>验证会话 TTL、关联上限、缓冲、丢包和 realtime 稳定性，避免只在 HTTP 上好看。</td>
+              <td><strong>udp-stream</strong></td>
+              <td>UDP</td>
+              <td>验证会话 TTL、关联上限、缓冲、丢包和 realtime 稳定性；KCP 与 QCP 作为 proxysss 独立 UDP listener 能力单独验证，不进入默认 nginx head-to-head gate。</td>
             </tr>
           </tbody>
         </table>
@@ -421,13 +422,14 @@
         <div class="two-up">
           <div class="note">
             <strong>GitHub-hosted runner：</strong>
-            <p>现在也会把 `kcp-style-udp` 放进 all-protocol summary 里一起比较，但默认把它当 diagnostic，看趋势，不把 hosted runner 的 UDP 噪声当最终裁判。</p>
+            <p>现在比较 nginx 可公平对标的主要网关协议；hosted runner 上的 UDP 噪声仍只适合看趋势，不替代专门 Linux 主机结论。</p>
           </div>
           <div class="note">
             <strong>专门调优过的 Linux 主机：</strong>
-            <p>这里才是 `KCP / realtime UDP` 的硬门槛环境。也就是说，GitHub Actions 负责“全协议都比”，专门 Linux host 负责“最终公平门槛”。</p>
+            <p>这里才是 `realtime UDP` 的硬门槛环境。KCP/QCP 走 proxysss 独立 UDP listener 能力验证，不拿 nginx 做协议语义对照。</p>
           </div>
         </div>
+        <p>Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`。</p>
       </section>
 
       <section class="panel">
@@ -440,7 +442,7 @@
           </div>
           <div class="note">
             <strong>长连接 / 实时族</strong>
-            <p>WebSocket、game TCP、generic TCP、UDP、KCP-style UDP。</p>
+            <p>WebSocket、game TCP、generic TCP、UDP。</p>
           </div>
         </div>
         <p>如果你在调 SSE 或 HTTP/2，最终也必须证明它没有把 static、reverse proxy、TCP、UDP 一起拖慢。</p>

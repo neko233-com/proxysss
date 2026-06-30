@@ -706,7 +706,7 @@ services:
             <article class="card">
               <span class="tag beginner">UDP</span>
               <h3>UDP listener</h3>
-              <p class="subtle">重点不只是转发，还有 `session_ttl_secs` 和 `max_associations` 这类会话治理。</p>
+              <p class="subtle">重点不只是转发，还有 `session_ttl_secs` 和 `max_associations` 这类会话治理；KCP 和 QCP 是独立 listener，协议帧都留给各自上游服务。</p>
             </article>
             <article class="card">
               <span class="tag expert">Hook</span>
@@ -730,12 +730,14 @@ udp:
   listeners:
     - name: game-udp
       bind: 0.0.0.0:7001
+      protocol: qcp
       session_ttl_secs: 45
       max_associations: 150000
       routes:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
+          <p class="subtle">Linux 性能模式下 UDP 使用 CPU 自适应 `SO_REUSEPORT` worker、复用有界 UDP buffer pool；新会话 pending 去重是分片集合，association prune 按时间、创建数量和容量压力节流，避免重连风暴每建一条会话就扫全表。</p>
         </section>
 
         <section id="hooks" class="panel">
@@ -863,7 +865,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Validation</span>
               <h3>只赢一项，不算赢</h3>
-              <p class="subtle">SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP、KCP-style 都要一起看，不能出现一项快了、另一项掉队还当成成功。</p>
+              <p class="subtle">SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 都要一起看；KCP/QCP 作为独立 UDP listener 能力单独验，不能出现一项快了、另一项掉队还当成成功。</p>
             </article>
             <article class="card">
               <span class="tag expert">Fast lane</span>

@@ -28,6 +28,17 @@ udp:
       upstream_weights:
         "127.0.0.1:9100": 1
         "127.0.0.1:9101": 1
+    - name: game-qcp
+      bind: 0.0.0.0:7002
+      protocol: qcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:9200
+        - 127.0.0.1:9201
+      upstream_weights:
+        "127.0.0.1:9200": 1
+        "127.0.0.1:9201": 1
 
 services:
   rate_limit:

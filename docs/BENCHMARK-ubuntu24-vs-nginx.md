@@ -126,7 +126,7 @@ cat .benchmark/runs/all-scenarios/summary.md
 
 - **游戏 TCP 长连接（LOL/DNF 核心路径）**：proxysss 稳定领先 30%–59%，且 p95 延迟仅为 nginx 的 ~55%（13.7ms vs 22–30ms）。这是 splice 零拷贝 + 多核 reuseport 扇出 + 低延迟 relay 的直接收益。
 - **HTTP 反向代理 / HTTPS 小文件 / 静态小文件**：proxysss 领先或持平，p95 延迟普遍更低。
-- **UDP / KCP**：Docker 内未达门槛系容器内核 `rmem_max` 不可调所致（优化被钳制不生效）；两侧均有少量丢包（proxysss 与 nginx 同量级），属容器虚拟网络高并发噪声。**真实判定以生产 128MB `rmem_max` 主机为准。**
+- **UDP 和 KCP**：Docker 内未达门槛系容器内核 `rmem_max` 不可调所致（优化被钳制不生效）；两侧均有少量丢包（proxysss 与 nginx 同量级），属容器虚拟网络高并发噪声。**真实判定以生产 128MB `rmem_max` 主机为准。**
 - **static-large / new-api-sse**：诊断类场景（受后端/磁盘吞吐主导，样本量小、强噪声），不计入关键门槛。
 
 ## 6. 复现命令

@@ -406,7 +406,7 @@ scripts/benchmark-all-scenarios.sh
 
 ### 4.3 只挑最强单场景 benchmark
 
-proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style 同时跑，而不是 cherry-pick 一条最漂亮的图。
+proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy、New API/SSE、WebSocket、TCP、UDP、KCP-style、QCP 同时跑，而不是 cherry-pick 一条最漂亮的图。
 
 ## 5. 一句迁移建议
 

@@ -188,7 +188,7 @@ Why this is different from a normal reverse proxy:
 | static files | `services.static_sites` | built-in file serving and welcome page fallback |
 | WebDAV | `services.webdav` | built-in authoring file surface |
 | raw TCP | `tcp.listeners` | long-lived binary streams, games, tools, MQTT |
-| raw UDP / KCP-style traffic | `udp.listeners` | realtime datagram traffic with TTL and cap control |
+| raw UDP, KCP-style UDP, or QCP UDP traffic | `udp.listeners` | realtime datagram traffic with TTL and cap control |
 | TLS SNI stream routing | `tcp.stream_routes` | Redis/MySQL/PostgreSQL/MongoDB-style passthrough |
 
 ### Reverse proxy with cache, rate limit, and health
@@ -288,7 +288,7 @@ How to read this example:
 - MQTT over WebSocket stays on the HTTP/WebSocket surface
 - CoAP-style device traffic stays on `udp.listeners`
 
-### Game TCP and KCP-style UDP
+### Game TCP, KCP-style UDP, and QCP UDP
 
 ```yaml
 tcp:
@@ -312,6 +312,14 @@ udp:
       upstreams:
         - 127.0.0.1:9100
         - 127.0.0.1:9101
+    - name: game-qcp
+      bind: 0.0.0.0:7002
+      protocol: qcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams:
+        - 127.0.0.1:9200
+        - 127.0.0.1:9201
 ```
 
 Important knobs:
@@ -320,6 +328,8 @@ Important knobs:
 - `connect_timeout_ms` controls how long a new upstream dial may block.
 - `session_ttl_secs` should be comfortably above your client heartbeat interval.
 - `max_associations` protects the box from unbounded UDP churn.
+- KCP and QCP are configured as independent UDP listeners. Use `protocol: kcp` for KCP-style traffic and `protocol: qcp` for neko233-com/QCP.
+- `protocol: qcp` is transparent UDP forwarding; QCP framing and reliability stay in your upstream service.
 
 ### Built-in wildcard TLS with DNS-01
 
@@ -419,7 +429,7 @@ Performance work in `proxysss` follows two rules:
 - benchmark the path you changed
 - prove you did not make sibling paths worse
 
-That means a faster SSE path is not accepted if it makes static delivery, reverse proxy, WebSocket, TCP, UDP, or KCP-style traffic slower or less stable without explicit approval.
+That means a faster SSE path is not accepted if it makes static delivery, reverse proxy, WebSocket, TCP, UDP, KCP-style UDP, or QCP UDP slower or less stable without explicit approval.
 
 Production validation flow:
 
@@ -432,7 +442,8 @@ What that benchmark means:
 
 - it is Linux-only release evidence
 - it runs a mixed matrix, not a cherry-picked single test
-- it compares static, reverse proxy, AI SSE, WebSocket, game TCP, generic TCP, UDP, and KCP-style UDP together
+- it compares nginx-comparable static, reverse proxy, AI SSE, WebSocket, game TCP, generic TCP, and UDP together
+- KCP-style UDP and QCP UDP stay supported as independent proxysss listener modes, but they are not default nginx head-to-head scenarios because nginx has no native KCP/QCP semantics
 - it uses a fair default ratio floor instead of pretending every feature-rich gateway must win every micro-benchmark outright
 
 ## Docs Map

@@ -564,7 +564,7 @@ services:
                 <td>不要期待这里能做 HTTP 头级别策略。</td>
               </tr>
               <tr>
-                <td><strong>udp.listeners</strong><br>UDP / KCP-style / CoAP-style</td>
+                <td><strong>udp.listeners</strong><br>UDP、KCP、QCP、CoAP-style</td>
                 <td>实时设备、游戏、会话型 UDP 网关。</td>
                 <td>不要把它包装成协议终端本身。</td>
               </tr>
@@ -698,7 +698,7 @@ udp:
               <div class="kicker">Performance</div>
               <h2>性能结论必须看 mixed-load，不看单场景截图。</h2>
             </div>
-            <p class="subtle">proxysss 的性能优化必须是无副作用优化。SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP、KCP-style 要一起看。</p>
+              <p class="subtle">proxysss 的性能优化必须是无副作用优化。SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 作为独立 UDP listener 能力单独验。</p>
           </div>
 
           <div class="cards">

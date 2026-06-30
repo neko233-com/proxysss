@@ -351,7 +351,7 @@ pub struct UdpListenerConfig {
     pub upstreams: Vec<String>,
     #[serde(default)]
     pub upstream_weights: BTreeMap<String, u32>,
-    /// Observability hint: kcp, quic-game, voip, custom-datagram, etc.
+    /// Observability hint: kcp, qcp, quic-game, voip, custom-datagram, etc.
     #[serde(default)]
     pub protocol: String,
     /// Idle UDP association TTL. KCP and game traffic should keep this above client heartbeat interval.

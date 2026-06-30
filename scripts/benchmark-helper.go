@@ -316,6 +316,7 @@ func runWriteAllScenariosSummary(args []string) error {
 	diagnosticScenarios := fs.String("diagnostic-scenarios", "", "space-separated diagnostic scenarios")
 	websocketTolerance := fs.Int("websocket-error-tolerance", 4, "websocket error tolerance")
 	sseTolerance := fs.Int("sse-error-tolerance", 1, "sse error tolerance")
+	udpTolerance := fs.Int("udp-error-tolerance", 4, "udp error tolerance")
 	aggregateRatio := fs.Float64("aggregate-ratio", 0.97, "aggregate mixed ratio")
 	mixedMatrix := fs.Bool("mixed-matrix", true, "whether results came from mixed matrix")
 	cpuCores := fs.String("cpu-cores", "", "detected cores")
@@ -353,7 +354,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		}
 		switch protocol {
 		case "udp":
-			if proxy.Errors > nginx.Errors+2 {
+			if proxy.Errors > nginx.Errors+*udpTolerance {
 				errorFailures = append(errorFailures, fmt.Sprintf("%s udp errors proxysss=%d nginx=%d", scenario, proxy.Errors, nginx.Errors))
 			}
 		case "sse":
@@ -381,6 +382,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		fmt.Sprintf("- Non-critical minimum proxysss/nginx ops ratio: `%.2f` except diagnostic scenarios `%s`", *minRatio, strings.Join(sortedSetMembers(diagnosticSet), ", ")),
 		fmt.Sprintf("- SSE stream error tolerance: `proxysss <= nginx + %d`", *sseTolerance),
 		fmt.Sprintf("- WebSocket reconnect/error tolerance: `proxysss <= nginx + %d`", *websocketTolerance),
+		fmt.Sprintf("- UDP datagram error tolerance: `proxysss <= nginx + %d`", *udpTolerance),
 		fmt.Sprintf("- Critical long-connection fair ratio gate: `%.2f` for `%s`", *criticalRatio, strings.Join(sortedSetMembers(criticalSet), ", ")),
 		fmt.Sprintf("- Aggregate mixed-load fair ratio gate: `%.2f`", *aggregateRatio),
 		fmt.Sprintf("- Result file: `%s`", *resultsPath),

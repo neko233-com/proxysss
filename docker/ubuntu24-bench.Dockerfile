@@ -18,6 +18,7 @@ RUN apt-get update \
         zlib1g-dev \
         xz-utils \
         git \
+        golang-go \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal

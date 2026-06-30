@@ -5,13 +5,13 @@ proxysss already covers the core nginx-replacement surface. The next improvement
 ## Stability and reliability
 
 - Add chaos fixtures for upstream resets, slow response bodies, broken DNS, TLS renewal failure, UDP packet loss, log backpressure, and reload races.
-- Add long-running soak tests for HTTP, WebSocket, TCP, UDP/KCP-style traffic, MQTT, FTP, WebDAV, and AI streaming routes.
+- Add long-running soak tests for HTTP, WebSocket, TCP, UDP, KCP-style UDP, QCP UDP, MQTT, FTP, WebDAV, and AI streaming routes.
 - Add service-manager examples for systemd watchdog, Windows service recovery, restart backoff, file descriptor limits, and graceful drain before deploy.
 - Add HA deployment patterns for active-active edge nodes, shared certificate storage, config distribution, and health-check based failover.
 
 ## Performance
 
-- Extend benchmark gates beyond static HTTP: TLS, HTTP/2, HTTP/3, reverse proxy JSON, SSE/AI streaming, WebSocket, TCP, UDP/KCP, MQTT, FTP, WebDAV, cache, and compression.
+- Extend benchmark gates beyond static HTTP: TLS, HTTP/2, HTTP/3, reverse proxy JSON, SSE/AI streaming, WebSocket, TCP, UDP, KCP, QCP, MQTT, FTP, WebDAV, cache, and compression.
 - Keep a Linux benchmark profile with kernel settings documented: socket backlog, `somaxconn`, `ulimit -n`, ephemeral port range, TCP reuse, UDP receive/send buffers, and QUIC UDP buffers.
 - Add allocation and lock-contention profiles for hot paths: route matching, rate-limit zones, cache lookup, access logs, and upstream health state.
 - Add per-feature overhead reports so operators know what cache, compression, script hooks, debug logging, and admin metrics cost.
