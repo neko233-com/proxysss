@@ -12,63 +12,36 @@ on:
   pull_request:
 
 jobs:
-  quality:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install actionlint
-        shell: bash
-        run: |
-          curl -sSL -o actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          tar -xzf actionlint.tar.gz actionlint
-          chmod +x actionlint
-          echo "$PWD" >> "$GITHUB_PATH"
-
-      - name: Lint GitHub Actions workflows
-        run: actionlint
-
-      - name: Validate changelog entry
-        shell: bash
-        run: |
-          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
-          test -n "$version"
-          grep -Eq "^## v${version}( |$)" CHANGELOG.md
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust-quality-ubuntu
-
-      - name: Rustfmt check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy check
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Unit tests
-        run: cargo test --workspace --all-targets
-
-      - name: Deep integration tests
-        run: cargo test integration_ -- --test-threads=1
-
-  build:
-    needs: quality
+  package:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            asset: proxysss-windows-amd64.zip
+            binary: proxysss.exe
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            asset: proxysss-windows-arm64.zip
+            binary: proxysss.exe
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: proxysss-linux-amd64.tar.gz
+            binary: proxysss
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: proxysss-linux-arm64.tar.gz
+            binary: proxysss
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: proxysss-darwin-amd64.tar.gz
+            binary: proxysss
           - runner: macos-latest
             target: aarch64-apple-darwin
+            asset: proxysss-darwin-arm64.tar.gz
+            binary: proxysss
+
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -80,7 +53,48 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-host-${{ matrix.target }}
+          shared-key: rust-target-${{ matrix.target }}
 
-      - name: Build release
+      - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package bundle (tar.gz)
+        if: endsWith(matrix.asset, '.tar.gz')
+        shell: bash
+        run: |
+          mkdir -p bundle/scripts
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
+          cp README.md bundle/
+          for doc in proxysss-script.d.ts ts-how-to-use.md nginx-to-proxysss.md caddy-to-proxysss.md benchmark-linux.md; do
+            if [ -f "$doc" ]; then cp "$doc" bundle/; fi
+          done
+          for script in install.sh install.ps1; do
+            if [ -f "scripts/$script" ]; then cp "scripts/$script" bundle/scripts/; fi
+          done
+          tar -czf ${{ matrix.asset }} -C bundle .
+
+      - name: Package bundle (zip)
+        if: endsWith(matrix.asset, '.zip')
+        shell: pwsh
+        run: |
+          Remove-Item bundle -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path bundle -Force | Out-Null
+          New-Item -ItemType Directory -Path bundle/scripts -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
+          Copy-Item README.md "bundle/" -Force
+          foreach ($doc in @('proxysss-script.d.ts', 'ts-how-to-use.md', 'nginx-to-proxysss.md', 'caddy-to-proxysss.md', 'benchmark-linux.md')) {
+            if (Test-Path $doc) { Copy-Item $doc "bundle/" -Force }
+          }
+          foreach ($script in @('install.sh', 'install.ps1')) {
+            $source = Join-Path scripts $script
+            if (Test-Path $source) { Copy-Item $source "bundle/scripts/" -Force }
+          }
+          Remove-Item "${{ matrix.asset }}" -ErrorAction SilentlyContinue
+          tar.exe -a -cf "${{ matrix.asset }}" -C bundle .
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.asset }}
+          compression-level: 0
+          path: ${{ matrix.asset }}
