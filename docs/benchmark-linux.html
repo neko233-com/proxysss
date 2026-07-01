@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>proxysss Linux benchmark 与历史跑分</title>
+  <title>proxysss Linux benchmark 与 UDP 快路径结果</title>
   <style>
     :root {
       --bg: #f5efe6;
@@ -260,8 +260,8 @@
   <div class="shell">
     <section class="hero">
       <div class="eyebrow">Linux benchmark</div>
-      <h1>Linux benchmark 先看真实跑分，再看口径。</h1>
-      <p>这页不再只讲“官方 Linux 全协议 mixed-load benchmark 应该怎么跑”，还直接把你已经有的历史 nginx 对标跑分摆出来。先看真机 Ubuntu 24 与 Docker 校验基线，再看为什么发布口径必须坚持 all-protocol mixed-load。</p>
+      <h1>Linux benchmark 先看当前结果，再看历史基线。</h1>
+      <p>这页把 v1.3.5 UDP fast path 的新结果放在前面：Docker Ubuntu 24 官方脚本路径 `udp-stream` 跑到 4.045x。历史 mixed-load 数字继续保留，但不再让旧 UDP 行看起来像当前结论。</p>
       <div class="actions">
         <a class="button primary" href="index.html">回到 docs 首页</a>
         <a class="button warm" href="architecture.html">看架构与快路径边界</a>
@@ -271,42 +271,63 @@
 
     <section class="stats">
       <article class="card">
-        <div class="label">Ubuntu 24 真机聚合</div>
-        <div class="value">1.287x</div>
+        <div class="label">v1.3.5 UDP-only</div>
+        <div class="value">4.045x</div>
       </article>
       <article class="card">
-        <div class="label">Docker 校验聚合</div>
-        <div class="value">1.059x</div>
+        <div class="label">proxysss UDP ops/s</div>
+        <div class="value">127742.75</div>
       </article>
       <article class="card">
-        <div class="label">真机 new-api-sse</div>
-        <div class="value">0.849x</div>
+        <div class="label">nginx UDP ops/s</div>
+        <div class="value">31577.33</div>
       </article>
       <article class="card">
-        <div class="label">真机 game / tcp</div>
-        <div class="value">2.732x / 2.741x</div>
+        <div class="label">UDP errors</div>
+        <div class="value">0 / 0</div>
       </article>
     </section>
 
     <div class="layout">
       <section class="panel">
         <h2>这页到底在讲什么</h2>
-        <p>这是“官方 Linux 全协议 mixed-load benchmark”的人类可读解释页，但现在不只解释规则，也直接展示历史跑分基线。这样你打开页面时，先看到真实 Ubuntu 24 / Docker 对标 nginx 的结果，再去理解为什么后续优化必须按 mixed-load 口径继续压测。</p>
+        <p>这是 Linux benchmark 的人类可读解释页。v1.3.5 之后，页面先展示当前 UDP fast path 的专项结果，再展示旧 mixed-load 历史基线。这样打开页面时不会把历史 `udp-stream 0.855x` 误读成这次 UDP 优化后的性能。</p>
         <div class="two-up">
           <div class="note good">
             <strong>它适合回答：</strong>
-            <p>当前主干在 Linux 上，static、reverse proxy、New API/SSE、WebSocket、TCP、UDP 这些 nginx 可公平对标场景一起跑时，到底有没有一起站住，以及历史上到底跑到了什么水平。KCP/QCP 作为 proxysss 独立 UDP listener 能力单独验证。</p>
+            <p>当前 UDP fast path 是否已经明显超过 nginx，以及历史 mixed-load 基线里 static、reverse proxy、New API/SSE、WebSocket、TCP、UDP 这些 nginx 可公平对标场景整体跑到过什么水平。</p>
           </div>
           <div class="note warn">
             <strong>它不适合回答：</strong>
-            <p>不能只拿一个 static small 的快照，就说发布已经安全，或者说所有协议都自动跟着变快。</p>
+            <p>不能把旧 mixed-load 表里的单行历史数字，当成 v1.3.5 UDP fast path 的当前结果；也不能只拿一个单场景快照替代完整 mixed-load。</p>
           </div>
         </div>
       </section>
 
       <section class="panel">
-        <h2>历史跑分基线（直接对标 nginx）</h2>
-        <p>这些分数不是新编的结论，而是仓库里已经有的 mixed-load 历史结果。之前 benchmark 主页只解释口径，没有直接把数字展示出来；现在应该把它们摆到首页，让每次优化都有明确对照物。</p>
+        <h2>v1.3.5 UDP fast path 结果</h2>
+        <p>这次 UDP 优化验证的是 nginx 可公平转发的 `udp-stream`，不是 KCP/QCP 语义。命令口径是官方 Go helper + `scripts/benchmark-all-scenarios.sh`，用 `SCENARIO_FILTER=udp-stream` 缩小到 UDP 单项。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>场景</th>
+              <th>Ratio</th>
+              <th>proxysss ops/s</th>
+              <th>nginx ops/s</th>
+              <th>Errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>udp-stream</strong></td><td><strong>4.045x</strong></td><td>127742.75</td><td>31577.33</td><td>0 / 0</td></tr>
+          </tbody>
+        </table>
+        <p>这说明 `0.855x` / `0.861x` 那组旧数字不能再当成当前 UDP fast path 的结论。它们是 v1.3.0 附近 mixed-load 历史报告里的 UDP 行，当时 UDP 还没有现在的 sharded pending-session dedupe、池化 recv buffer、批量 response drain、policy-free single-upstream direct fast path。</p>
+        <p>KCP 和 QCP 仍然是两套独立 UDP listener 能力：KCP 用 `protocol: kcp`，neko233-com/QCP 用 `protocol: qcp`。它们不进入默认 nginx head-to-head，因为 nginx 没有原生 KCP/QCP 协议语义。</p>
+      </section>
+
+      <section class="panel">
+        <h2>历史 mixed-load 跑分基线（直接对标 nginx）</h2>
+        <p>这些分数不是新编的结论，而是仓库里已经有的 mixed-load 历史结果。它们应该作为“整体网关基线”保留，但旧 UDP 行不能代表 v1.3.5 UDP fast path 的当前性能。</p>
         <div class="two-up">
           <div class="note good">
             <strong>真机 Ubuntu 24.04 LTS：</strong>
@@ -342,7 +363,7 @@
             <tr><td><strong>websocket-long-connection</strong></td><td>1.319x</td><td>1303.67</td><td>988.42</td><td>0</td></tr>
           </tbody>
         </table>
-        <p>说明：KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。QCP 结论看 proxysss 自身协议服务验证，不拿 nginx 伪装成 QCP 对照组。</p>
+        <p>说明：KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。QCP 结论看 proxysss 自身协议服务验证，不拿 nginx 伪装成 QCP 对照组。上表里的 `udp-stream 0.855x` 是历史 mixed-load 行，不是 v1.3.5 UDP fast path 的当前结果。</p>
 
         <table>
           <thead>
@@ -403,15 +424,15 @@
       </section>
 
       <section class="panel">
-        <h2>GitHub Actions 工件现在应该长什么样</h2>
+        <h2>CI 和 benchmark 的边界</h2>
         <div class="two-up">
           <div class="note">
-            <strong>Linux 官方工件：</strong>
-            <p>`benchmark-results-linux` 应该打包 `.benchmark/runs/all-scenarios/results.json`、`summary.md`、`summary.html`，而不是只塞一个 static quick report。</p>
+            <strong>默认 CI：</strong>
+            <p>现在只做六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。</p>
           </div>
           <div class="note">
-            <strong>Windows smoke 工件：</strong>
-            <p>可以继续保留 throughput smoke，用来发现 bench 命令和构建链有没有炸，但它不是官方发布性能口径。</p>
+            <strong>手动 benchmark：</strong>
+            <p>`scripts/benchmark-all-scenarios.sh` 仍然是正式 Linux mixed-load 入口；`SCENARIO_FILTER=udp-stream` 用来定位 UDP fast path。</p>
           </div>
         </div>
         <p>团队约束很明确：性能优化必须是 <code>no-side-effect optimization</code>。如果某个局部路径更快了，但兄弟场景更慢、更脆、观测性更差，那不算成功。</p>
@@ -422,7 +443,7 @@
         <div class="two-up">
           <div class="note">
             <strong>GitHub-hosted runner：</strong>
-            <p>现在比较 nginx 可公平对标的主要网关协议；hosted runner 上的 UDP 噪声仍只适合看趋势，不替代专门 Linux 主机结论。</p>
+            <p>只适合手动诊断或临时验证，不再是默认 CI 发布门槛；hosted runner 上的 UDP 噪声仍只适合看趋势。</p>
           </div>
           <div class="note">
             <strong>专门调优过的 Linux 主机：</strong>
@@ -464,7 +485,7 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
     </div>
 
     <div class="footer">
-      正式发布请继续坚持这条线：先 Linux 调优，再 mixed-load benchmark，再看 CI / benchmark / deploy / release 全绿。历史真机基线已经摆在这里，后续优化必须整体对比，而不是拿单场景截图替代发布标准。
+      默认 CI 现在只负责打包；性能判断继续走 Linux mixed-load 和必要的单场景诊断。v1.3.5 的 UDP fast path 当前专项结果是 4.045x，历史 mixed-load 表只作为整体基线保留。
     </div>
   </div>
 </body>

@@ -1,5 +1,7 @@
 # proxysss vs nginx — Ubuntu 24 LTS 混合压测报告（v1.3.0）
 
+> 注意：本页是 v1.3.0 附近的历史 mixed-load 报告，用来做整体网关基线对照。v1.3.5 UDP fast path 已经有新的 UDP-only 结果：`udp-stream` Docker Ubuntu 24 官方脚本路径为 **`4.045x`**，`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。不要把本页历史 `udp-stream 0.855x / 0.861x` 当成当前 UDP 优化后的结论。
+
 > 面向超大规模游戏服务器（LOL / DNF 长连接 TCP + HTTP/2 SDK 服务）的极致性能 + 极致稳定性验证。
 > 架构原则：**性能 > 可维护性**。nginx 先跑、proxysss 同波次重放（`MIXED_MATRIX=1`）。
 > 本报告给出 **真机 Ubuntu 24.04 LTS（8.163.25.145）实测** 与本机 Docker `ubuntu:24.04` 验证两组数据，**真机为准**。
