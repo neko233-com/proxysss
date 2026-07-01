@@ -438,6 +438,14 @@ proxysss tune linux --apply
 scripts/benchmark-all-scenarios.sh
 ```
 
+Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles, and no longer runs tests, smoke benchmarks, or performance gates automatically. Performance evidence is collected manually on Linux hosts or benchmark containers.
+
+Current UDP fast-path evidence for v1.3.5:
+
+- Docker Ubuntu 24 UDP-only official script path: `4.045x`
+- `proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`
+- errors: `0 / 0`
+
 What that benchmark means:
 
 - it is Linux-only release evidence

@@ -6,6 +6,7 @@
 - Optimized the UDP data path for transparent high-throughput forwarding: pending-session dedupe now uses a sharded set, UDP association pruning is throttled under churn, listener/reader buffers come from the bounded reusable pool, upstream response readers drain ready datagrams in batches, and policy-free single-upstream UDP listeners use a direct fast path that avoids per-new-client script-routing task churn.
 - Added a faster per-worker UDP association cache and moved benchmark defaults back to nginx-comparable UDP only, while keeping KCP/QCP as proxysss-native capability validation instead of pretending nginx has native KCP/QCP protocol semantics.
 - Updated the Ubuntu 24 benchmark container and Go benchmark helper so Docker validation can run the official script path end to end; `SCENARIO_FILTER=udp-stream` now supports quick UDP-only release checks. Docker UDP-only validation passed at `4.045x` proxysss/nginx with 0 errors (`127742.75` vs `31577.33` ops/s).
+- Simplified default GitHub Actions CI to packaging-only six-platform binary builds; tests, smoke checks, and performance benchmark gates now remain manual/operator validation paths. Refreshed benchmark docs so v1.3.5 UDP fast-path results appear before older mixed-load UDP baselines.
 
 ## v1.3.4 - 2026-06-15
 

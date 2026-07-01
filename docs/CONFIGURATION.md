@@ -528,6 +528,8 @@ proxysss config reload-plan
 scripts/benchmark-all-scenarios.sh
 ```
 
+默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
+
 ### 5.2 只赢一条链路，不算赢
 
 对 proxysss 来说，合理的性能优化必须满足这些条件：

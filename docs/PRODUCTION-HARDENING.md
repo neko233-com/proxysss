@@ -4,7 +4,7 @@ This checklist is for high-importance gateway deployments where correctness, lat
 
 ## Release gate
 
-Run these before promoting a build:
+For local maintainer verification, these commands are still useful before promoting a build:
 
 ```bash
 cargo fmt --check
@@ -14,6 +14,10 @@ cargo build --release
 ```
 
 Performance promotion is Linux-only because proxysss production deployments are Linux gateways. Windows/macOS benchmark scripts are development diagnostics and must not be used as nginx-replacement release evidence.
+
+Default GitHub Actions CI is intentionally packaging-only: it builds and uploads the six release bundles and does not run tests, smoke benchmarks, or performance gates automatically. Treat the commands in this document as manual release/operator validation, not as the current default CI shape.
+
+The v1.3.5 UDP fast path has a current single-scenario diagnostic result on Docker Ubuntu 24: `udp-stream` reached `4.045x` proxysss/nginx with `proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`, both with 0 errors. Historical mixed-load UDP rows remain useful as old baselines, but they are not the current UDP fast-path result.
 
 Run the production nginx comparison matrix after Linux host tuning:
 

@@ -880,7 +880,7 @@ proxysss config capabilities
 proxysss config reload-plan
 scripts/benchmark-all-scenarios.sh</code></pre>
 
-          <p class="subtle">这套顺序的意思是：先把 Linux 环境调到位，再确认实例能力和 reload 边界，最后跑 mixed-load benchmark。单场景 benchmark 只适合定位问题，不适合写发布结论。</p>
+          <p class="subtle">这套顺序的意思是：先把 Linux 环境调到位，再确认实例能力和 reload 边界，最后手动跑 mixed-load benchmark。默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。单场景 benchmark 只适合定位问题；v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
         </section>
 
         <section id="config-map" class="panel">

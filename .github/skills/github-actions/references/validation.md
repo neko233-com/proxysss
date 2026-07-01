@@ -7,7 +7,9 @@ Run these from the repository root.
 - `gh run list --limit 10`
 - `gh run view <run-id> --log`
 
-## Rust Checks Used By CI
+## Optional Rust Checks
+Default CI is packaging-only. Use these locally when the change affects Rust behavior or when the user explicitly asks for tests:
+
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace --all-targets`
@@ -16,4 +18,4 @@ Run these from the repository root.
 - `act pull_request`
 - `act push`
 
-`act` requires a working Docker runtime. If Docker is unavailable, use `actionlint` plus the same `cargo` commands from CI.
+`act` requires a working Docker runtime. If Docker is unavailable, use `actionlint` plus the narrow cargo/build commands relevant to the edited workflow.
