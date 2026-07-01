@@ -295,7 +295,7 @@
         <div class="two-up">
           <div class="note good">
             <strong>它适合回答：</strong>
-            <p>当前 UDP fast path 是否已经明显超过 nginx，以及历史 mixed-load 基线里 static、reverse proxy、New API/SSE、WebSocket、TCP、UDP 这些 nginx 可公平对标场景整体跑到过什么水平。</p>
+            <p>当前 UDP fast path 是否已经明显超过 nginx，以及历史 mixed-load 基线里 static、reverse proxy、generic SSE、WebSocket、TCP、UDP 这些 nginx 可公平对标场景整体跑到过什么水平。</p>
           </div>
           <div class="note warn">
             <strong>它不适合回答：</strong>
@@ -322,20 +322,20 @@
           </tbody>
         </table>
         <p>这说明 `0.855x` / `0.861x` 那组旧数字不能再当成当前 UDP fast path 的结论。它们是 v1.3.0 附近 mixed-load 历史报告里的 UDP 行，当时 UDP 还没有现在的 sharded pending-session dedupe、池化 recv buffer、批量 response drain、policy-free single-upstream direct fast path。</p>
-        <p>KCP 和 QCP 仍然是两套独立 UDP listener 能力：KCP 用 `protocol: kcp`，neko233-com/QCP 用 `protocol: qcp`。它们不进入默认 nginx head-to-head，因为 nginx 没有原生 KCP/QCP 协议语义。</p>
+        <p>KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入当前性能 benchmark 矩阵。当前 benchmark 只覆盖普通 UDP 转发；KCP/QCP 的协议语义由各自上游服务和功能验证负责，不拿 nginx 做伪对照。</p>
       </section>
 
       <section class="panel">
-        <h2>历史 mixed-load 跑分基线（直接对标 nginx）</h2>
-        <p>这些分数不是新编的结论，而是仓库里已经有的 mixed-load 历史结果。它们应该作为“整体网关基线”保留，但旧 UDP 行不能代表 v1.3.5 UDP fast path 的当前性能。</p>
+        <h2>历史 mixed-load 跑分基线（旧矩阵，仅供对照）</h2>
+        <p>这些分数不是新编的结论，而是仓库里已经有的 mixed-load 历史结果。它们应该作为“整体网关基线”保留，但旧 UDP 行不能代表 v1.3.5 UDP fast path 的当前性能；表里的 `new-api-sse` 和 `kcp-style-udp` 也是旧场景名，不代表最新脚本仍然运行这些专项场景。</p>
         <div class="two-up">
           <div class="note good">
             <strong>真机 Ubuntu 24.04 LTS：</strong>
-            <p>聚合 <strong>1.287x</strong>，`game-long-connection` <strong>2.732x</strong>，`tcp-stream` <strong>2.741x</strong>，`websocket-long-connection` <strong>1.319x</strong>，`kcp-style-udp` 0 错误且接近持平。</p>
+            <p>聚合 <strong>1.287x</strong>，`game-long-connection` <strong>2.732x</strong>，`tcp-stream` <strong>2.741x</strong>，`websocket-long-connection` <strong>1.319x</strong>。旧矩阵里的 `kcp-style-udp` 0 错误且接近持平，但当前矩阵不再运行它。</p>
           </div>
           <div class="note">
             <strong>Docker `ubuntu:24.04` 校验：</strong>
-            <p>聚合 <strong>1.059x</strong>，`new-api-sse` 已到 <strong>1.014x</strong>。UDP 和 KCP 受容器 `rmem_max` 环境限制，生产判断仍以真机 Linux 主机为准。</p>
+            <p>聚合 <strong>1.059x</strong>，旧矩阵里的 `new-api-sse` 已到 <strong>1.014x</strong>。最新脚本改为通用 `generic-sse`；UDP 生产判断仍以真机 Linux 主机为准。</p>
           </div>
         </div>
 
@@ -363,7 +363,7 @@
             <tr><td><strong>websocket-long-connection</strong></td><td>1.319x</td><td>1303.67</td><td>988.42</td><td>0</td></tr>
           </tbody>
         </table>
-        <p>说明：KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。QCP 结论看 proxysss 自身协议服务验证，不拿 nginx 伪装成 QCP 对照组。上表里的 `udp-stream 0.855x` 是历史 mixed-load 行，不是 v1.3.5 UDP fast path 的当前结果。</p>
+        <p>说明：KCP 和 QCP 现在作为独立 UDP listener 能力维护，但默认 nginx 对标 benchmark 只比较 nginx 能公平转发的 `udp-stream`。当前性能矩阵不再包含 KCP/QCP 特殊 UDP 封装，也不拿 nginx 伪装成协议对照组。上表里的 `udp-stream 0.855x` 是历史 mixed-load 行，不是 v1.3.5 UDP fast path 的当前结果。</p>
 
         <table>
           <thead>
@@ -405,9 +405,9 @@
               <td>验证小文件热路径、批量传输、TLS 和 cache/sendfile 取舍是不是一起稳定。</td>
             </tr>
             <tr>
-              <td><strong>reverse-proxy / new-api-sse</strong></td>
-              <td>HTTP reverse proxy / AI streaming / SSE</td>
-              <td>验证 keepalive、flush、forward headers、AI metadata 和低分配快路径是不是一起正确。</td>
+              <td><strong>reverse-proxy / generic-sse</strong></td>
+              <td>HTTP reverse proxy / generic SSE streaming</td>
+              <td>验证 keepalive、flush、forward headers 和低分配快路径是不是一起正确。</td>
             </tr>
             <tr>
               <td><strong>websocket-long-connection / game-long-connection / tcp-stream</strong></td>
@@ -417,7 +417,7 @@
             <tr>
               <td><strong>udp-stream</strong></td>
               <td>UDP</td>
-              <td>验证会话 TTL、关联上限、缓冲、丢包和 realtime 稳定性；KCP 与 QCP 作为 proxysss 独立 UDP listener 能力单独验证，不进入默认 nginx head-to-head gate。</td>
+              <td>验证会话 TTL、关联上限、缓冲、丢包和 realtime 稳定性；KCP 与 QCP 作为 proxysss 独立 UDP listener 能力保留，不进入当前性能 benchmark 矩阵。</td>
             </tr>
           </tbody>
         </table>
@@ -447,7 +447,7 @@
           </div>
           <div class="note">
             <strong>专门调优过的 Linux 主机：</strong>
-            <p>这里才是 `realtime UDP` 的硬门槛环境。KCP/QCP 走 proxysss 独立 UDP listener 能力验证，不拿 nginx 做协议语义对照。</p>
+            <p>这里才是 `realtime UDP` 的硬门槛环境。KCP/QCP 走 proxysss 独立 UDP listener 能力验证，不进入当前 nginx 性能矩阵。</p>
           </div>
         </div>
         <p>Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`。</p>
@@ -459,7 +459,7 @@
         <div class="two-up">
           <div class="note">
             <strong>HTTP 族</strong>
-            <p>static-small、static-large、CDN hot-update、HTTP reverse proxy、New API/SSE、HTTPS static。</p>
+            <p>static-small、static-large、CDN hot-update、HTTP reverse proxy、generic SSE、HTTPS static。</p>
           </div>
           <div class="note">
             <strong>长连接 / 实时族</strong>

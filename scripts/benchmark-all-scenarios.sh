@@ -4,9 +4,10 @@
 # mixed multi-proxy load focused on game/WebSocket/TCP/UDP long-connection
 # paths. Critical realtime paths use a fairness floor by default because
 # proxysss carries built-in policy surfaces that nginx often needs modules or
-# extra config to match. Static, reverse proxy, and SSE still run together with
-# a soft floor; bulk/TLS static are diagnostic unless explicitly promoted to a
-# gate.
+# extra config to match. Static, reverse proxy, and generic SSE still run
+# together with a soft floor; bulk/TLS static are diagnostic unless explicitly
+# promoted to a gate. New API, KCP, and QCP protocol-specific wrappers are not
+# part of this nginx-comparable benchmark matrix.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -221,16 +222,10 @@ services:
         path_prefix: /ws
         upstream: ws://127.0.0.1:18192
         forward_headers: false
-  ai_proxy:
-    enabled: true
-    routes:
-      - name: new-api-sse
-        provider: new-api
-        path_prefix: /v1
+      - name: generic-sse
+        path_prefix: /sse
         upstream: http://127.0.0.1:18191
-        rewrite_base_path: /v1
         forward_headers: false
-        emit_metadata_headers: false
   static_sites:
     - name: bench
       path_prefix: /bench
@@ -272,7 +267,7 @@ http {
         server 127.0.0.1:18190;
         keepalive 128;
     }
-    upstream ai_sse {
+    upstream generic_sse {
         server 127.0.0.1:18191;
         keepalive 128;
     }
@@ -292,11 +287,11 @@ http {
             proxy_set_header Host \$host;
             proxy_pass http://http_echo/;
         }
-        location /v1/ {
+        location /sse {
             proxy_http_version 1.1;
             proxy_set_header Connection "";
             proxy_buffering off;
-            proxy_pass http://ai_sse/v1/;
+            proxy_pass http://generic_sse/sse;
         }
         location /ws/ {
             proxy_http_version 1.1;
@@ -320,11 +315,11 @@ http {
             proxy_set_header Host \$host;
             proxy_pass http://http_echo/;
         }
-        location /v1/ {
+        location /sse {
             proxy_http_version 1.1;
             proxy_set_header Connection "";
             proxy_buffering off;
-            proxy_pass http://ai_sse/v1/;
+            proxy_pass http://generic_sse/sse;
         }
         location /ws/ {
             proxy_http_version 1.1;
@@ -532,11 +527,11 @@ wait_http "http://127.0.0.1:18083/proxy/ping"
 wait_http "http://127.0.0.1:18081/proxy/ping"
 wait_http "https://127.0.0.1:18443/bench/small.html"
 wait_http "https://127.0.0.1:18441/bench/small.html"
-wait_http "http://127.0.0.1:18083/v1/chat/completions"
-wait_http "http://127.0.0.1:18081/v1/chat/completions"
+wait_http "http://127.0.0.1:18083/sse"
+wait_http "http://127.0.0.1:18081/sse"
 for _ in 1 2; do
-  timeout 8 curl -fsS --no-buffer "http://127.0.0.1:18083/v1/chat/completions" >/dev/null 2>&1 || true
-  timeout 8 curl -fsS --no-buffer "http://127.0.0.1:18081/v1/chat/completions" >/dev/null 2>&1 || true
+  timeout 8 curl -fsS --no-buffer "http://127.0.0.1:18083/sse" >/dev/null 2>&1 || true
+  timeout 8 curl -fsS --no-buffer "http://127.0.0.1:18081/sse" >/dev/null 2>&1 || true
 done
 warm_ws_gateway "ws://127.0.0.1:18083/ws/"
 warm_ws_gateway "ws://127.0.0.1:18081/ws/"
@@ -595,11 +590,11 @@ if [[ "$FAST_GATE" == "1" ]]; then
         QUICK_ROWS+=("$(run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html)")
         QUICK_ROWS+=("$(run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html)")
         ;;
-      new-api-sse)
-        QUICK_ROWS+=("$(run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions)")
+      generic-sse)
+        QUICK_ROWS+=("$(run_sse_bench generic-sse nginx http://127.0.0.1:18081/sse)")
         restart_sse_backend
-        warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
-        QUICK_ROWS+=("$(run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions)")
+        warm_sse_gateway "http://127.0.0.1:18083/sse"
+        QUICK_ROWS+=("$(run_sse_bench generic-sse proxysss http://127.0.0.1:18083/sse)")
         ;;
       websocket-long-connection)
         QUICK_ROWS+=("$(run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256)")
@@ -652,11 +647,11 @@ append_deep_matrix_serial() {
     RESULT_ROWS+=("$(run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping)")
     RESULT_ROWS+=("$(run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping)")
   fi
-  if scenario_enabled new-api-sse; then
-    RESULT_ROWS+=("$(run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions)")
+  if scenario_enabled generic-sse; then
+    RESULT_ROWS+=("$(run_sse_bench generic-sse nginx http://127.0.0.1:18081/sse)")
     restart_sse_backend
-    warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
-    RESULT_ROWS+=("$(run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions)")
+    warm_sse_gateway "http://127.0.0.1:18083/sse"
+    RESULT_ROWS+=("$(run_sse_bench generic-sse proxysss http://127.0.0.1:18083/sse)")
   fi
   if scenario_enabled websocket-long-connection; then
     RESULT_ROWS+=("$(run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256)")
@@ -687,7 +682,7 @@ append_deep_matrix_mixed() {
     cdn-hot-update-nginx cdn-hot-update-proxysss
     https-static-small-nginx https-static-small-proxysss
     reverse-proxy-nginx reverse-proxy-proxysss
-    new-api-sse-nginx new-api-sse-proxysss
+    generic-sse-nginx generic-sse-proxysss
     websocket-long-connection-nginx websocket-long-connection-proxysss
     game-long-connection-nginx game-long-connection-proxysss
     tcp-stream-nginx tcp-stream-proxysss
@@ -730,14 +725,14 @@ append_deep_matrix_mixed() {
   launch_scenario_bench cdn-hot-update cdn-hot-update-nginx run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat
   launch_scenario_bench https-static-small https-static-small-nginx run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html
   launch_scenario_bench reverse-proxy reverse-proxy-nginx run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping
-  launch_scenario_bench new-api-sse new-api-sse-nginx run_sse_bench new-api-sse nginx http://127.0.0.1:18081/v1/chat/completions
+  launch_scenario_bench generic-sse generic-sse-nginx run_sse_bench generic-sse nginx http://127.0.0.1:18081/sse
   launch_scenario_bench websocket-long-connection websocket-long-connection-nginx run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256
   launch_scenario_bench game-long-connection game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
   launch_scenario_bench tcp-stream tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
   launch_scenario_bench udp-stream udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
   wait_for_group
   restart_sse_backend
-  warm_sse_gateway "http://127.0.0.1:18083/v1/chat/completions"
+  warm_sse_gateway "http://127.0.0.1:18083/sse"
 
   echo "=== mixed matrix: proxysss scenarios running concurrently ===" >&2
   launch_scenario_bench static-small static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
@@ -745,7 +740,7 @@ append_deep_matrix_mixed() {
   launch_scenario_bench cdn-hot-update cdn-hot-update-proxysss run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat
   launch_scenario_bench https-static-small https-static-small-proxysss run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html
   launch_scenario_bench reverse-proxy reverse-proxy-proxysss run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping
-  launch_scenario_bench new-api-sse new-api-sse-proxysss run_sse_bench new-api-sse proxysss http://127.0.0.1:18083/v1/chat/completions
+  launch_scenario_bench generic-sse generic-sse-proxysss run_sse_bench generic-sse proxysss http://127.0.0.1:18083/sse
   launch_scenario_bench websocket-long-connection websocket-long-connection-proxysss run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256
   launch_scenario_bench game-long-connection game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
   launch_scenario_bench tcp-stream tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024

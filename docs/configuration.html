@@ -698,7 +698,7 @@ udp:
               <div class="kicker">Performance</div>
               <h2>性能结论必须看 mixed-load，不看单场景截图。</h2>
             </div>
-              <p class="subtle">proxysss 的性能优化必须是无副作用优化。SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 作为独立 UDP listener 能力单独验。</p>
+              <p class="subtle">proxysss 的性能优化必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。</p>
           </div>
 
           <div class="cards">

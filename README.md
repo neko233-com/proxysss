@@ -429,7 +429,7 @@ Performance work in `proxysss` follows two rules:
 - benchmark the path you changed
 - prove you did not make sibling paths worse
 
-That means a faster SSE path is not accepted if it makes static delivery, reverse proxy, WebSocket, TCP, UDP, KCP-style UDP, or QCP UDP slower or less stable without explicit approval.
+That means a faster SSE path is not accepted if it makes static delivery, reverse proxy, WebSocket, TCP, or nginx-comparable UDP slower or less stable without explicit approval. KCP/QCP stay supported as listener capabilities, but they are not part of the current performance benchmark matrix.
 
 Production validation flow:
 
@@ -450,8 +450,8 @@ What that benchmark means:
 
 - it is Linux-only release evidence
 - it runs a mixed matrix, not a cherry-picked single test
-- it compares nginx-comparable static, reverse proxy, AI SSE, WebSocket, game TCP, generic TCP, and UDP together
-- KCP-style UDP and QCP UDP stay supported as independent proxysss listener modes, but they are not default nginx head-to-head scenarios because nginx has no native KCP/QCP semantics
+- it compares nginx-comparable static, reverse proxy, generic SSE, WebSocket, game TCP, generic TCP, and UDP together
+- New API provider routes and KCP/QCP special UDP encapsulations stay supported as product capabilities, but they are excluded from the current performance benchmark matrix
 - it uses a fair default ratio floor instead of pretending every feature-rich gateway must win every micro-benchmark outright
 
 ## Docs Map

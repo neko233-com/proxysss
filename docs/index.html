@@ -731,7 +731,7 @@ proxysss token show</code></pre>
     </div>
 
     <footer class="footer">
-      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP/QCP 作为 proxysss 独立 UDP listener 能力单独验，不能出现“这个性能高了，那个性能差了”还当成成功的情况。
+      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
     </footer>
   </div>
 </body>

@@ -582,7 +582,7 @@ proxysss token show
 
 ### 7.2 拿单条 SSE benchmark 当发布结论
 
-项目要求已经明确：后续所有性能优化都要压测，而且要无副作用。SSE、静态、HTTP reverse proxy、TCP、UDP 都应该一起看；KCP-style 和 QCP 作为 proxysss 独立 UDP listener 能力单独验证，不默认拿 nginx 做协议语义对照。
+项目要求已经明确：后续所有性能优化都要压测，而且要无副作用。generic SSE、静态、HTTP reverse proxy、TCP、UDP 都应该一起看；KCP-style 和 QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵，也不默认拿 nginx 做协议语义对照。
 
 ### 7.3 管理面一上来就开公网写操作
 
