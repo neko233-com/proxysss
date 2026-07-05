@@ -4,6 +4,14 @@ certs/
 .ssh/
 .DS_Store
 Thumbs.db
+logs/
+
+# Local one-off benchmark, smoke-test, and gateway scratch files.
+.tmp-*/
+.tmp-*.exe
+tmp-*
+benchmark-helper.exe
+proxy-key.pem
 
 # Gateway benchmark + deep verify reports (vendor downloads, run artifacts, HTML/MD output)
 .benchmark/

@@ -667,7 +667,7 @@
             <article class="step">
               <span class="tag expert">Step 5</span>
               <h3>发往上游或本地能力面</h3>
-              <p class="subtle">最终不是去上游池，就是读静态文件、走 WebDAV、返回内建服务结果。</p>
+              <p class="subtle">最终不是去上游池，就是读静态文件、走 WebDAV、返回内建服务结果；静态文件支持 Range/206 断点续传，大文件区间会流式发送。</p>
             </article>
           </div>
 
@@ -821,7 +821,7 @@ plugins:
               <tr>
                 <td>
                   <strong>路由面</strong>
-                  `services.reverse_proxy.routes`、`static_sites`、`webdav`、FTP upstream
+                  `services.reverse_proxy.routes`、`services.service_discovery`、`static_sites`、`webdav`、FTP upstream
                 </td>
                 <td>
                   <strong>管理面与 TLS 关键边界</strong>
@@ -831,7 +831,7 @@ plugins:
               <tr>
                 <td>
                   <strong>Warm-up 会重跑</strong>
-                  热文件缓存、sendfile 准备、上游 keepalive 预拨、`/healthz` warm 状态
+                  注册中心映射读取、热文件缓存、sendfile 准备、上游 keepalive 预拨、`/healthz` warm 状态
                 </td>
                 <td>
                   <strong>日志核心设置</strong>
@@ -878,9 +878,11 @@ plugins:
 proxysss config explain
 proxysss config capabilities
 proxysss config reload-plan
+scripts/verify-docker-scenarios.sh
+.\scripts\verify-docker-scenarios.ps1
 scripts/benchmark-all-scenarios.sh</code></pre>
 
-          <p class="subtle">这套顺序的意思是：先把 Linux 环境调到位，再确认实例能力和 reload 边界，最后手动跑 mixed-load benchmark。默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。单场景 benchmark 只适合定位问题；v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
+          <p class="subtle">这套顺序的意思是：先把 Linux 环境调到位，再确认实例能力和 reload 边界，可用 Docker 验证全场景配置面，最后手动跑 mixed-load benchmark。默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。单场景 benchmark 只适合定位问题；v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
         </section>
 
         <section id="config-map" class="panel">

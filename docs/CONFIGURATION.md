@@ -121,7 +121,7 @@ services:
 
 ### 2.1 `services.reverse_proxy.routes` 适合什么
 
-适合：普通网站、API、后台系统、下载站、SSE、WebSocket。
+适合：普通网站、API、后台系统、下载站、SSE、WebSocket、HTTP/2 gRPC 透传。
 
 你会最常用到这些字段：
 
@@ -218,6 +218,50 @@ services:
 - 一切优化都要保持无副作用，不能让 SSE 快了却把静态、TCP、UDP 或 reload 打差。
 
 ### 2.4 静态站点
+
+适合：HTML、CSS、JS、图片、字体、音频、视频、安装包、CDN 回源静态对象。
+
+`services.static_sites` 会处理 `GET` / `HEAD`、index 文件、可选目录列表、小文件热缓存和大文件流式发送。下载类请求支持 `Range: bytes=...`，会返回 `206 Partial Content`、`Content-Range`、`Accept-Ranges: bytes`，无效区间返回 `416`，所以断点续传和播放器拖动进度条不需要额外业务服务。
+
+```yaml
+services:
+  static_sites:
+    - name: public-assets
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false
+```
+
+### 2.5 注册中心联动
+
+Consul、etcd、Nacos 这类注册中心属于控制面信息，不应该让普通 HTTP/TCP/UDP 热路径每次请求都去查网络。proxysss 用 `services.service_discovery` 声明 registry 和 mapping，自动化或管理面可以把发现结果刷新进同一份 `proxysss.yaml` 的 upstream pools，再热重载生效。
+
+```yaml
+services:
+  service_discovery:
+    enabled: true
+    interval_secs: 15
+    registries:
+      - name: consul-main
+        provider: consul
+        endpoint: http://consul.service.consul:8500
+      - name: etcd-main
+        provider: etcd
+        endpoint: http://etcd.default.svc.cluster.local:2379
+      - name: nacos-main
+        provider: nacos
+        endpoint: http://nacos.default.svc.cluster.local:8848
+    mappings:
+      - name: api-from-consul
+        registry: consul-main
+        service: spring-api
+        target: reverse_proxy_route
+        target_name: api
+        scheme: http
+```
+
+这能覆盖 Spring Cloud Gateway、Kong、APISIX 前面的统一入口，也能把 TCP/UDP listener 的后端池交给注册中心自动化维护。业务判定仍然放在插件或上游服务里，proxysss 保持通用网关身份。
 
 ```yaml
 runtime:
@@ -485,6 +529,7 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - 重新计算路由和能力面。
 - 预热热文件缓存或 sendfile 描述符。
 - 预拨反向代理 / AI proxy 上游 keepalive 池。
+- 重新读取 `services.service_discovery` 映射和注册中心目标池声明。
 - 更新 `/healthz` 的 `warm` 状态。
 
 这意味着：
@@ -529,6 +574,20 @@ scripts/benchmark-all-scenarios.sh
 ```
 
 默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
+
+如果要先在 Docker 里验证“全场景配置面没有退化”，运行：
+
+```bash
+scripts/verify-docker-scenarios.sh
+```
+
+Windows PowerShell：
+
+```powershell
+.\scripts\verify-docker-scenarios.ps1
+```
+
+它会在 Ubuntu 24 容器里检查 `examples/all-scenarios.example.yaml`、Range 下载、注册中心配置、能力矩阵和 nginx-parity 输出；这不是默认 GitHub CI，CI 仍然保持 packaging-only。
 
 ### 5.2 只赢一条链路，不算赢
 

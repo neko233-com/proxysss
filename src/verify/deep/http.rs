@@ -51,6 +51,43 @@ async fn integration_deep_static_site_serves_files() -> Result<()> {
 }
 
 #[tokio::test]
+async fn integration_deep_static_site_supports_range_downloads() -> Result<()> {
+    let root = temp_root("proxysss-deep-static-range");
+    let gateway_port = reserve_port().await?;
+    let static_root = root.join("downloads");
+    std::fs::create_dir_all(&static_root)?;
+    std::fs::write(static_root.join("movie.bin"), b"0123456789abcdef")?;
+    let static_fwd = static_root.display().to_string().replace('\\', "/");
+    let yaml = format!(
+        "{}\nservices:\n  static_sites:\n    - name: downloads\n      path_prefix: /dl\n      root: '{static_fwd}'\n      index_files: [index.html]\n      autoindex: false\n",
+        base_gateway_yaml(gateway_port)
+    );
+    let config_path = write_config(&root, &yaml)?;
+    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+
+    let url = format!("http://127.0.0.1:{gateway_port}/dl/movie.bin");
+    wait_http_ok(&url).await?;
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=4-9")
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 4-9/16")
+    );
+    assert_eq!(response.bytes().await?.as_ref(), b"456789");
+
+    cleanup(&root);
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_deep_webdav_put_get_delete() -> Result<()> {
     let root = temp_root("proxysss-deep-webdav");
     let gateway_port = reserve_port().await?;

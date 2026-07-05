@@ -492,7 +492,7 @@ services:
             <article class="recipe">
               <span class="tag beginner">Static + API</span>
               <h3>官网静态站点 + API 反向代理</h3>
-              <p class="subtle">官网直接从磁盘分发，API 单独走后端服务，便于缓存和排障。</p>
+              <p class="subtle">官网直接从磁盘分发，HTML/CSS/JS/图片/字体/音视频支持缓存、大文件流式发送和 Range 断点续传；API 单独走后端服务，便于缓存和排障。</p>
               <pre><code>services:
   static_sites:
     - name: homepage
@@ -508,6 +508,16 @@ services:
           path_prefix: "/"
         upstreams:
           - url: "http://127.0.0.1:8080"</code></pre>
+            </article>
+
+            <article class="recipe">
+              <span class="tag expert">All scenarios</span>
+              <h3>全场景样例 + Docker 验证</h3>
+              <p class="subtle">覆盖静态资源、HTTP/2 gRPC、WebSocket、API 限流/灰度/健康、ACME、WAF/防 CC、TCP/UDP stream、注册中心、Kubernetes ingress、CDN 回源和 IPv6。</p>
+              <pre><code>proxysss -config examples/all-scenarios.example.yaml check-config
+proxysss -config examples/all-scenarios.example.yaml config routes
+scripts/verify-docker-scenarios.sh
+.\scripts\verify-docker-scenarios.ps1</code></pre>
             </article>
 
             <article class="recipe">
@@ -650,6 +660,16 @@ tcp:
                 <td><strong>services.domain_routes</strong>站点级编排</td>
                 <td>按域名把静态、API、WebDAV 等能力拼成一个站点。</td>
                 <td>不要把它当成唯一实际执行面。</td>
+              </tr>
+              <tr>
+                <td><strong>services.static_sites</strong>静态资源 / CDN 回源</td>
+                <td>HTML、CSS、JS、图片、字体、音视频、大文件下载、Range 断点续传。</td>
+                <td>不要把业务鉴权写进静态文件层，复杂策略放脚本或上游。</td>
+              </tr>
+              <tr>
+                <td><strong>services.service_discovery</strong>Consul / etcd / Nacos</td>
+                <td>把注册中心服务映射到 HTTP、TCP、UDP 上游池的控制面声明。</td>
+                <td>不要让每个热路径请求临时查注册中心。</td>
               </tr>
               <tr>
                 <td><strong>tcp.listeners</strong>TCP 原生流量</td>

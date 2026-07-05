@@ -54,7 +54,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Run {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Update {
@@ -75,28 +75,28 @@ enum Commands {
         skip_init: bool,
     },
     Start {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Stop {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Restart {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Enable {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Disable,
     Status {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     CheckConfig {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Init {
@@ -130,13 +130,13 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigCommands,
-        #[arg(long, global = true)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Plugin {
         #[command(subcommand)]
         action: PluginCommands,
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
         #[arg(long)]
         admin_url: Option<String>,
@@ -148,13 +148,13 @@ enum Commands {
     Script {
         #[command(subcommand)]
         action: ScriptCommands,
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Token {
         #[command(subcommand)]
         action: TokenCommands,
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Tune {
@@ -212,7 +212,7 @@ enum ConfigTemplateKind {
 #[derive(Subcommand, Debug)]
 enum ServiceCommands {
     Install {
-        #[arg(long)]
+        #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
     },
     Uninstall,
@@ -298,7 +298,11 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "static files",
-        "built-in services.static_sites runtime for GET/HEAD, index files, and optional autoindex",
+        "built-in services.static_sites runtime for HTML/CSS/JS/images/fonts/audio/video, GET/HEAD, index files, optional autoindex, large-file streaming, and HTTP Range downloads",
+    ),
+    (
+        "large file range downloads",
+        "static sites advertise Accept-Ranges and serve byte ranges with 206/416 semantics for resumable HTML/CSS/JS/image/font/audio/video/download assets",
     ),
     (
         "ftp",
@@ -365,6 +369,14 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "security.ddos sliding-window connection limits with temporary bans, dynamic IP blacklist admin API, and stream/http access control lists",
     ),
     (
+        "waf hotlink crawler controls",
+        "core security rejects ambiguous HTTP/1 and SSRF targets, access_control/ddos/rate_limit handle generic edge defense, and TS/plugin hooks can enforce Referer, User-Agent, bot score, or custom WAF decisions without making proxysss business-aware",
+    ),
+    (
+        "api gateway policies",
+        "HTTP routes combine rate limits, access control, compression/cache policy, active/passive health, retries, weighted upstreams, and script/plugin hooks for canary and custom gateway decisions",
+    ),
+    (
         "active health checks",
         "load_balance.active_health performs periodic HTTP/TCP/UDP upstream probes and exposes results plus manual drain state in /v1/upstreams and the admin dashboard",
     ),
@@ -385,6 +397,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "HTTP/2 reverse proxy transparently forwards gRPC (application/grpc) when upstreams speak h2",
     ),
     (
+        "service discovery registries",
+        "services.service_discovery declares Consul, etcd, and Nacos registry mappings for HTTP/TCP/UDP upstream targets; admin automation can keep the single YAML upstream pools refreshed without turning proxysss into a business gateway",
+    ),
+    (
         "agent automation api",
         "password/bearer admin API upserts and deletes routes, provisions managed ACME and built-in wildcard DNS-01 TLS, atomically persists YAML",
     ),
@@ -394,7 +410,11 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "kubernetes ingress mode",
-        "kubernetes.enabled expands in-cluster service DNS mappings into domain routes",
+        "kubernetes.enabled expands in-cluster service DNS mappings into domain routes so proxysss can run as a Kubernetes ingress gateway surface",
+    ),
+    (
+        "cdn origin and ipv6 edge",
+        "static/reverse-proxy/filecloud routes support CDN origin use cases, and bind/access-control parsing accepts IPv4 and IPv6 addresses/CIDR rules",
     ),
     (
         "tcp tuning assistant",
@@ -464,7 +484,13 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "static file service",
         status: ParityStatus::Supported,
-        evidence: "services.static_sites supports GET/HEAD, index files, autoindex",
+        evidence: "services.static_sites supports GET/HEAD, index files, autoindex, bounded small-file cache, large-file streaming, and byte-range resumable downloads",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "large file range downloads",
+        status: ParityStatus::Supported,
+        evidence: "static file responses implement Range: bytes=... with 206 Partial Content, Content-Range, Accept-Ranges, and 416 for unsatisfiable ranges",
         next_gap: "",
     },
     NginxParityItem {
@@ -538,6 +564,12 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         capability: "rate limiting",
         status: ParityStatus::Supported,
         evidence: "services.rate_limit.http and services.rate_limit.stream provide fixed-window, token-bucket, or leaky-bucket shared-zone policies plus HTTP concurrent connection caps",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "api gateway policy chain",
+        status: ParityStatus::Supported,
+        evidence: "HTTP routes combine access control, rate limiting, active/passive health, retries, weighted upstreams, compression/cache, and TS plugin hooks for canary or custom routing",
         next_gap: "",
     },
     NginxParityItem {
@@ -1326,6 +1358,13 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.services.access_control.http.deny.len(),
         config.services.access_control.http.status
     );
+    println!(
+        "service discovery : enabled={}, registries={}, mappings={}, interval_secs={}",
+        config.services.service_discovery.enabled,
+        config.services.service_discovery.registries.len(),
+        config.services.service_discovery.mappings.len(),
+        config.services.service_discovery.interval_secs
+    );
     println!("static sites      : {}", config.services.static_sites.len());
     println!(
         "webdav            : enabled={}, prefix={}, root={}",
@@ -1417,6 +1456,33 @@ fn render_route_topology(config: &GatewayConfig) -> String {
                 ));
             }
         }
+    }
+
+    output.push_str("[service_discovery]\n");
+    output.push_str(&format!(
+        "enabled={} registries={} mappings={} interval_secs={}\n",
+        config.services.service_discovery.enabled,
+        config.services.service_discovery.registries.len(),
+        config.services.service_discovery.mappings.len(),
+        config.services.service_discovery.interval_secs
+    ));
+    for registry in &config.services.service_discovery.registries {
+        output.push_str(&format!(
+            "registry {} provider={:?} endpoint={}\n",
+            registry.name, registry.provider, registry.endpoint
+        ));
+    }
+    for mapping in &config.services.service_discovery.mappings {
+        output.push_str(&format!(
+            "mapping {} registry={} service={} target={:?} target_name={} scheme={} port_name={}\n",
+            mapping.name,
+            mapping.registry,
+            mapping.service,
+            mapping.target,
+            mapping.target_name,
+            blank_as_disabled(&mapping.scheme),
+            blank_as_disabled(&mapping.port_name)
+        ));
     }
 
     output.push_str("[rate_limit]\n");
@@ -2228,6 +2294,7 @@ mod tests {
             "tcp stream proxy",
             "udp stream proxy",
             "static files",
+            "large file range downloads",
             "ftp",
             "webdav",
             "single yaml config",
@@ -2244,8 +2311,12 @@ mod tests {
             "ip allow/deny blacklist",
             "domain stream proxy",
             "ddos protection",
+            "waf hotlink crawler controls",
+            "api gateway policies",
+            "service discovery registries",
             "admin api/console",
             "cluster automation api",
+            "cdn origin and ipv6 edge",
             "agent install skill",
         ];
 
@@ -2416,6 +2487,8 @@ mod tests {
             "IP allow/deny / blacklist",
             "cache/proxy cache",
             "rate limiting",
+            "large file range downloads",
+            "api gateway policy chain",
         ] {
             assert!(
                 NGINX_PARITY_MATRIX
@@ -2575,6 +2648,22 @@ mod tests {
         ]);
         assert_eq!(args[1], OsString::from("--config"));
         assert_eq!(args[2], OsString::from("custom.yaml"));
+    }
+
+    #[test]
+    fn global_config_flag_can_be_used_with_subcommands() {
+        let cli = Cli::try_parse_from([
+            "proxysss",
+            "check-config",
+            "--config",
+            "examples/all-scenarios.example.yaml",
+        ])
+        .expect("global config flag should parse after subcommand");
+
+        assert_eq!(
+            cli.config_file,
+            Some(PathBuf::from("examples/all-scenarios.example.yaml"))
+        );
     }
 
     #[test]

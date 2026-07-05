@@ -743,6 +743,8 @@ pub struct ServicesConfig {
     #[serde(default)]
     pub reverse_proxy: ReverseProxyConfig,
     #[serde(default)]
+    pub service_discovery: ServiceDiscoveryConfig,
+    #[serde(default)]
     pub response_policy: HttpResponsePolicyConfig,
     #[serde(default)]
     pub cache_zones: Vec<CacheZoneConfig>,
@@ -762,6 +764,88 @@ pub struct ServicesConfig {
     pub ftp: FtpConfig,
     #[serde(default)]
     pub ai_proxy: crate::ai_proxy::AiProxyConfig,
+}
+
+/// Control-plane service discovery declarations.
+///
+/// Discovery is intentionally modeled as configuration metadata instead of a
+/// data-plane lookup hook. Automation can poll Consul/etcd/Nacos, write the
+/// resolved upstreams back into the single YAML file or admin API, and let the
+/// hot reload path publish a fresh in-memory routing table.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceDiscoveryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_service_discovery_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub registries: Vec<ServiceRegistryConfig>,
+    #[serde(default)]
+    pub mappings: Vec<ServiceDiscoveryMappingConfig>,
+}
+
+/// A named registry endpoint that can be referenced by one or more mappings.
+///
+/// Credentials stay on this control-plane object so general config display
+/// paths can redact them consistently with other secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceRegistryConfig {
+    pub name: String,
+    #[serde(default)]
+    pub provider: ServiceRegistryProvider,
+    pub endpoint: String,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// Supported registry families for gateway automation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRegistryProvider {
+    #[default]
+    Consul,
+    Etcd,
+    Nacos,
+}
+
+/// Connects one discovered service name to one gateway upstream pool.
+///
+/// The mapping names the gateway object to refresh, but does not make request
+/// forwarding depend on the registry. That keeps HTTP/TCP/UDP hot paths
+/// deterministic and free of registry network I/O.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDiscoveryMappingConfig {
+    pub name: String,
+    pub registry: String,
+    pub service: String,
+    #[serde(default)]
+    pub target: ServiceDiscoveryTarget,
+    pub target_name: String,
+    #[serde(default)]
+    pub scheme: String,
+    #[serde(default)]
+    pub port_name: String,
+    #[serde(default)]
+    pub metadata_filter: BTreeMap<String, String>,
+}
+
+/// Gateway object kinds that can receive discovered upstreams.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceDiscoveryTarget {
+    #[default]
+    ReverseProxyRoute,
+    DomainRoute,
+    TcpListener,
+    UdpListener,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1347,6 +1431,10 @@ impl GatewayConfig {
                 "services.rate_limit.stream",
                 &mut errors,
             );
+        }
+
+        if self.services.service_discovery.enabled {
+            validate_service_discovery_config(&self.services.service_discovery, &mut errors);
         }
 
         if self.services.access_control.http.enabled {
@@ -3561,6 +3649,71 @@ fn validate_stream_rate_limit_config(
     }
 }
 
+/// Validate only the control-plane contract for service discovery.
+///
+/// This deliberately checks registry/mapping shape and references, not live
+/// registry reachability. A config check must stay offline-friendly and safe in
+/// Docker/CI where Consul, etcd, or Nacos may not be running.
+fn validate_service_discovery_config(config: &ServiceDiscoveryConfig, errors: &mut Vec<String>) {
+    if config.interval_secs == 0 {
+        errors.push("services.service_discovery.interval_secs must be greater than 0".to_string());
+    }
+    if config.registries.is_empty() {
+        errors
+            .push("services.service_discovery.registries cannot be empty when enabled".to_string());
+    }
+    if config.mappings.is_empty() {
+        errors.push("services.service_discovery.mappings cannot be empty when enabled".to_string());
+    }
+
+    let mut registry_names = HashSet::<String>::new();
+    for (index, registry) in config.registries.iter().enumerate() {
+        let name = registry.name.trim();
+        if name.is_empty() {
+            errors.push(format!(
+                "services.service_discovery.registries.{index}.name cannot be empty"
+            ));
+        } else if !registry_names.insert(name.to_string()) {
+            errors.push(format!(
+                "services.service_discovery.registries.{index}.name duplicates registry {name}"
+            ));
+        }
+        if !looks_like_url(&registry.endpoint) {
+            errors.push(format!(
+                "services.service_discovery.registries.{index}.endpoint must be an http/https URL"
+            ));
+        }
+    }
+
+    for (index, mapping) in config.mappings.iter().enumerate() {
+        if mapping.name.trim().is_empty() {
+            errors.push(format!(
+                "services.service_discovery.mappings.{index}.name cannot be empty"
+            ));
+        }
+        if mapping.registry.trim().is_empty() {
+            errors.push(format!(
+                "services.service_discovery.mappings.{index}.registry cannot be empty"
+            ));
+        } else if !registry_names.contains(mapping.registry.trim()) {
+            errors.push(format!(
+                "services.service_discovery.mappings.{index}.registry references unknown registry {}",
+                mapping.registry
+            ));
+        }
+        if mapping.service.trim().is_empty() {
+            errors.push(format!(
+                "services.service_discovery.mappings.{index}.service cannot be empty"
+            ));
+        }
+        if mapping.target_name.trim().is_empty() {
+            errors.push(format!(
+                "services.service_discovery.mappings.{index}.target_name cannot be empty"
+            ));
+        }
+    }
+}
+
 fn validate_active_health_override(
     config: &ActiveHealthOverrideConfig,
     prefix: &str,
@@ -3611,6 +3764,10 @@ fn looks_like_url(value: &str) -> bool {
 
 fn default_rate_limit_requests() -> u32 {
     60
+}
+
+fn default_service_discovery_interval_secs() -> u64 {
+    15
 }
 
 fn default_rate_limit_zone() -> String {
@@ -4036,6 +4193,72 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn service_discovery_accepts_registry_mappings() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-service-discovery-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "services:\n  service_discovery:\n    enabled: true\n    interval_secs: 15\n    registries:\n      - name: consul-main\n        provider: consul\n        endpoint: http://127.0.0.1:8500\n      - name: nacos-main\n        provider: nacos\n        endpoint: http://127.0.0.1:8848\n      - name: etcd-main\n        provider: etcd\n        endpoint: http://127.0.0.1:2379\n    mappings:\n      - name: api-from-consul\n        registry: consul-main\n        service: billing-api\n        target: reverse_proxy_route\n        target_name: api\n        scheme: http\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load config");
+        assert!(config.services.service_discovery.enabled);
+        assert_eq!(config.services.service_discovery.registries.len(), 3);
+        assert_eq!(
+            config.services.service_discovery.mappings[0].target,
+            ServiceDiscoveryTarget::ReverseProxyRoute
+        );
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_service_discovery_registry() {
+        let mut config = GatewayConfig::default();
+        config.services.service_discovery.enabled = true;
+        config
+            .services
+            .service_discovery
+            .registries
+            .push(ServiceRegistryConfig {
+                name: "consul-main".to_string(),
+                provider: ServiceRegistryProvider::Consul,
+                endpoint: "http://127.0.0.1:8500".to_string(),
+                namespace: String::new(),
+                group: String::new(),
+                token: String::new(),
+                username: String::new(),
+                password: String::new(),
+            });
+        config
+            .services
+            .service_discovery
+            .mappings
+            .push(ServiceDiscoveryMappingConfig {
+                name: "bad".to_string(),
+                registry: "missing".to_string(),
+                service: "billing-api".to_string(),
+                target: ServiceDiscoveryTarget::ReverseProxyRoute,
+                target_name: "api".to_string(),
+                scheme: "http".to_string(),
+                port_name: String::new(),
+                metadata_filter: BTreeMap::new(),
+            });
+
+        let error = config
+            .validate()
+            .expect_err("expected unknown registry validation error");
+        assert!(error
+            .to_string()
+            .contains("services.service_discovery.mappings.0.registry"));
     }
 
     #[test]

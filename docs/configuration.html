@@ -500,7 +500,7 @@ services:
             <article class="card">
               <span class="tag beginner">官网 + API</span>
               <h3>静态站点和 API 分开声明</h3>
-              <p class="subtle">静态文件适合单独走 `static_sites`，API 保持在 `reverse_proxy.routes`。这样排障、缓存和性能预热都更清楚。</p>
+              <p class="subtle">静态文件适合单独走 `static_sites`，API 保持在 `reverse_proxy.routes`。HTML/CSS/JS/图片/字体/音视频和大文件下载支持 Range 断点续传，这样排障、缓存和性能预热都更清楚。</p>
               <pre><code>services:
   static_sites:
     - name: homepage
@@ -540,7 +540,7 @@ services:
             <tbody>
               <tr>
                 <td><strong>services.reverse_proxy.routes</strong><br>最常用 HTTP 代理面</td>
-                <td>网站、API、后台系统、SSE、WebSocket、下载站。</td>
+                <td>网站、API、后台系统、SSE、WebSocket、HTTP/2 gRPC、下载站。</td>
                 <td>不要把所有业务逻辑都塞进脚本替代它。</td>
               </tr>
               <tr>
@@ -555,8 +555,13 @@ services:
               </tr>
               <tr>
                 <td><strong>services.static_sites</strong><br>静态文件分发</td>
-                <td>官网、文档站、资源分发、预热缓存、404 页面。</td>
+                <td>官网、文档站、资源分发、CDN 回源、预热缓存、404 页面、Range 下载。</td>
                 <td>不要为了分发静态资源先写一层脚本。</td>
+              </tr>
+              <tr>
+                <td><strong>services.service_discovery</strong><br>Consul / etcd / Nacos</td>
+                <td>把注册中心服务映射到 HTTP、TCP、UDP 上游池的控制面声明。</td>
+                <td>不要让热路径每个请求都查注册中心。</td>
               </tr>
               <tr>
                 <td><strong>tcp.listeners</strong><br>TCP 原生流量</td>
@@ -666,7 +671,7 @@ udp:
               <div class="kicker">Reload + warm-up</div>
               <h2>热重载不是“只会重新读 YAML”，还会做预热。</h2>
             </div>
-            <p class="subtle">proxysss 在配置加载和热重载后会重新计算路由，预热静态文件缓存或 sendfile 描述符，并为 reverse proxy / AI proxy 预拨 keepalive 池。</p>
+              <p class="subtle">proxysss 在配置加载和热重载后会重新计算路由，读取 service_discovery 映射，预热静态文件缓存或 sendfile 描述符，并为 reverse proxy / AI proxy 预拨 keepalive 池。</p>
           </div>
 
           <div class="cards">
@@ -676,7 +681,7 @@ udp:
                 <li>大部分合并后的配置值</li>
                 <li>`proxysss.yaml`</li>
                 <li>主脚本与自动加载插件脚本</li>
-                <li>`services.reverse_proxy.routes`、`static_sites`、`webdav`、FTP upstream</li>
+                <li>`services.reverse_proxy.routes`、`services.service_discovery`、`static_sites`、`webdav`、FTP upstream</li>
               </ul>
             </article>
 
@@ -708,8 +713,10 @@ udp:
 proxysss config explain
 proxysss config capabilities
 proxysss config reload-plan
+scripts/verify-docker-scenarios.sh
+.\scripts\verify-docker-scenarios.ps1
 scripts/benchmark-all-scenarios.sh</code></pre>
-              <p class="subtle">默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。这里的 benchmark 是手动/专机验证入口；v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`，`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。</p>
+              <p class="subtle">默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。Docker 场景验证是手动入口，用于检查全场景样例、Range、注册中心配置和能力矩阵；benchmark 是手动/专机性能验证入口。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`，`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。</p>
             </article>
 
             <article class="card">

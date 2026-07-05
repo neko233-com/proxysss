@@ -1,8 +1,8 @@
 # proxysss
 
-proxysss is a same-level replacement for nginx as a general-purpose edge gateway. It keeps HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, MQTT/IoT edge patterns, FTP, WebDAV, AI reverse proxy routes, TLS automation, logs, and reload behavior in one Rust binary and one YAML file.
+proxysss is a same-level replacement for nginx as a general-purpose edge gateway. It keeps HTTP, HTTPS, HTTP/2, HTTP/3, gRPC-over-HTTP/2, WebSocket, TCP, UDP, MQTT/IoT edge patterns, FTP, WebDAV, AI reverse proxy routes, TLS automation, logs, and reload behavior in one Rust binary and one YAML file.
 
-It also keeps practical gateway features like cache/proxy cache, compression, gRPC-over-HTTP/2, and rate limiting algorithms including fixed-window, token-bucket, and leaky-bucket in the same configuration surface.
+It also keeps practical gateway features like static asset serving with Range downloads, cache/proxy cache, compression, Consul/etcd/Nacos discovery configuration, Kubernetes ingress-style mappings, CDN origin routes, IPv6 CIDR access policy, and rate limiting algorithms including fixed-window, token-bucket, and leaky-bucket in the same configuration surface.
 
 If you only remember one thing, remember this: `proxysss` is for ordinary gateway work first, and optional TypeScript plugins second.
 
@@ -186,10 +186,12 @@ Why this is different from a normal reverse proxy:
 | path/host-based HTTP without domain-first grouping | `services.reverse_proxy.routes` | lower-level HTTP route model |
 | New API / sub2api / OpenAI-compatible traffic | `services.ai_proxy.routes` | native AI path rewrite and streaming-friendly behavior |
 | static files | `services.static_sites` | built-in file serving and welcome page fallback |
+| large downloads / CDN origin assets | `services.static_sites` + `services.response_policy.cache` | byte Range downloads, hot small-file cache, streaming large files |
 | WebDAV | `services.webdav` | built-in authoring file surface |
 | raw TCP | `tcp.listeners` | long-lived binary streams, games, tools, MQTT |
 | raw UDP, KCP-style UDP, or QCP UDP traffic | `udp.listeners` | realtime datagram traffic with TTL and cap control |
 | TLS SNI stream routing | `tcp.stream_routes` | Redis/MySQL/PostgreSQL/MongoDB-style passthrough |
+| Consul / etcd / Nacos linkage | `services.service_discovery` | registry metadata that automation can map into HTTP/TCP/UDP upstream pools |
 
 ### Reverse proxy with cache, rate limit, and health
 
@@ -218,8 +220,8 @@ services:
         - http://127.0.0.1:8080
         - http://127.0.0.1:8081
       upstream_weights:
-        http://127.0.0.1:8080: 1
-        http://127.0.0.1:8081: 3
+        "http://127.0.0.1:8080": 1
+        "http://127.0.0.1:8081": 3
       strip_prefix: true
       cache:
         enabled: true
@@ -240,6 +242,8 @@ What this does in practice:
 - actively probes `/healthz`
 - caches short-lived API responses
 - rate-limits the edge before bad traffic reaches the app
+
+For the broad production matrix, start from `examples/all-scenarios.example.yaml`. It covers static HTML/CSS/JS/image/font/audio/video assets, Range downloads, HTTP/1.1 and HTTP/2/gRPC reverse proxying, WebSocket, API gateway policy chains, ACME, WAF/anti-CC primitives, hotlink/crawler plugin hooks, TCP/UDP stream load balancing, Consul/etcd/Nacos discovery mappings, Kubernetes ingress-style service mapping, CDN origin routes, and IPv6 access rules.
 
 ### MQTT / IoT edge
 
@@ -370,6 +374,18 @@ proxysss -config ./proxysss.yaml config routes
 proxysss -config ./proxysss.yaml config reload-plan
 proxysss -config ./proxysss.yaml config capabilities
 proxysss -config ./proxysss.yaml config nginx-parity --format yaml
+```
+
+Validate the full scenario sample in Docker when you need Linux-grounded evidence:
+
+```bash
+scripts/verify-docker-scenarios.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\verify-docker-scenarios.ps1
 ```
 
 Manage the local automation token:

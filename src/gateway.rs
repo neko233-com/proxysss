@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -26,8 +26,9 @@ use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING,
-    CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE, TRANSFER_ENCODING, VARY,
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, HOST, LOCATION, RANGE,
+    SET_COOKIE, TRANSFER_ENCODING, VARY,
 };
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
@@ -59,8 +60,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{
-    copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-    BufReader as TokioBufReader,
+    copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite,
+    AsyncWriteExt, BufReader as TokioBufReader,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
@@ -6003,6 +6004,7 @@ impl Gateway {
             site,
             method,
             request.uri(),
+            request.headers(),
             &self.static_file_cache,
             &self.static_file_cache_bytes,
             &self.static_file_load_locks,
@@ -6227,6 +6229,7 @@ impl Gateway {
                 site,
                 &method,
                 &uri,
+                &headers,
                 &self.static_file_cache,
                 &self.static_file_cache_bytes,
                 &self.static_file_load_locks,
@@ -9923,7 +9926,10 @@ where
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
 }
 
-fn file_streaming_body(file: tokio::fs::File) -> GatewayBody {
+fn file_streaming_body<R>(file: R) -> GatewayBody
+where
+    R: AsyncRead + Send + 'static,
+{
     // 1MB buffer: large static files (game hot-update, CDN assets) benefit from
     // fewer read syscalls and better kernel readahead alignment on Linux.
     let stream = ReaderStream::with_capacity(file, 1024 * 1024)
@@ -11699,6 +11705,7 @@ fn response_allows_compression(response: &GatewayHttpResponse) -> bool {
         && response.stream_body.is_none()
         && response.status != StatusCode::NO_CONTENT
         && response.status != StatusCode::NOT_MODIFIED
+        && response.status != StatusCode::PARTIAL_CONTENT
         && !response_content_type_is(response, "text/event-stream")
         && !response
             .headers
@@ -15422,6 +15429,7 @@ async fn dispatch_static_site(
     site: &StaticSiteConfig,
     method: &Method,
     uri: &Uri,
+    headers: &HeaderMap,
     static_file_cache: &DashMap<String, CachedStaticFile>,
     static_file_cache_bytes: &AtomicU64,
     static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
@@ -15441,10 +15449,6 @@ async fn dispatch_static_site(
             "static path not found",
         ));
     };
-
-    if let Some(response) = fresh_cached_static_file_response(&target, method, static_file_cache) {
-        return Ok(response);
-    }
 
     let metadata = match tokio::fs::metadata(&target).await {
         Ok(value) => value,
@@ -15488,6 +15492,34 @@ async fn dispatch_static_site(
         metadata
     };
 
+    match parse_static_range_header(headers, Some(metadata.len())) {
+        StaticRangeDecision::NoRange => {}
+        StaticRangeDecision::Invalid | StaticRangeDecision::Unsatisfiable => {
+            let mut response = GatewayHttpResponse::bytes(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"range not satisfiable"),
+                "proxysss://static",
+            );
+            response
+                .headers
+                .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
+            response.headers.push((
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{}", metadata.len()))
+                    .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+            ));
+            return Ok(response);
+        }
+        StaticRangeDecision::Range(range) => {
+            return static_range_response(&target, &metadata, method, range).await;
+        }
+    }
+
+    if let Some(response) = fresh_cached_static_file_response(&target, method, static_file_cache) {
+        return Ok(response);
+    }
+
     let (body, stream_body) = if method == Method::HEAD {
         (Bytes::new(), None)
     } else if metadata.len() >= STATIC_STREAM_THRESHOLD_BYTES {
@@ -15519,6 +15551,151 @@ async fn dispatch_static_site(
         http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&metadata.len().to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    ));
+    response
+        .headers
+        .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
+    Ok(response)
+}
+
+/// Inclusive byte range selected from an HTTP `Range: bytes=...` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticByteRange {
+    start: u64,
+    end: u64,
+}
+
+/// Parsed Range outcome for static file serving.
+///
+/// Unsupported units are treated as `NoRange` so normal GET semantics still
+/// work. Malformed byte ranges and valid-but-outside-file ranges both produce
+/// `416`, matching the behavior clients expect for resumable downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticRangeDecision {
+    NoRange,
+    Range(StaticByteRange),
+    Invalid,
+    Unsatisfiable,
+}
+
+/// Parse a single HTTP byte range for static assets.
+///
+/// proxysss intentionally supports one range per response. Multipart range
+/// bodies add substantial response-building complexity and are rarely needed
+/// for CDN origin, media seek, or interrupted-download resume paths.
+fn parse_static_range_header(headers: &HeaderMap, file_len: Option<u64>) -> StaticRangeDecision {
+    let Some(value) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
+        return StaticRangeDecision::NoRange;
+    };
+    let value = value.trim();
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return StaticRangeDecision::NoRange;
+    };
+    if spec.contains(',') {
+        return StaticRangeDecision::Invalid;
+    }
+    let Some(file_len) = file_len else {
+        return StaticRangeDecision::NoRange;
+    };
+    if file_len == 0 {
+        return StaticRangeDecision::Unsatisfiable;
+    }
+
+    let Some((start_raw, end_raw)) = spec.split_once('-') else {
+        return StaticRangeDecision::Invalid;
+    };
+    let start_raw = start_raw.trim();
+    let end_raw = end_raw.trim();
+    if start_raw.is_empty() && end_raw.is_empty() {
+        return StaticRangeDecision::Invalid;
+    }
+
+    let (start, end) = if start_raw.is_empty() {
+        let Ok(suffix_len) = end_raw.parse::<u64>() else {
+            return StaticRangeDecision::Invalid;
+        };
+        if suffix_len == 0 {
+            return StaticRangeDecision::Unsatisfiable;
+        }
+        let length = suffix_len.min(file_len);
+        (file_len - length, file_len - 1)
+    } else {
+        let Ok(start) = start_raw.parse::<u64>() else {
+            return StaticRangeDecision::Invalid;
+        };
+        if start >= file_len {
+            return StaticRangeDecision::Unsatisfiable;
+        }
+        let end = if end_raw.is_empty() {
+            file_len - 1
+        } else {
+            let Ok(end) = end_raw.parse::<u64>() else {
+                return StaticRangeDecision::Invalid;
+            };
+            end.min(file_len - 1)
+        };
+        (start, end)
+    };
+
+    if start > end {
+        return StaticRangeDecision::Unsatisfiable;
+    }
+    StaticRangeDecision::Range(StaticByteRange { start, end })
+}
+
+/// Build the `206 Partial Content` response for a static file range.
+///
+/// Small ranges are read into memory like other small static objects. Large
+/// ranges seek once and stream only the requested bytes, preserving
+/// backpressure and avoiding whole-file buffering for media/download traffic.
+async fn static_range_response(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+    method: &Method,
+    range: StaticByteRange,
+) -> Result<GatewayHttpResponse> {
+    let len = range.end - range.start + 1;
+    let (body, stream_body) = if method == Method::HEAD {
+        (Bytes::new(), None)
+    } else if len >= STATIC_STREAM_THRESHOLD_BYTES {
+        let mut file = tokio::fs::File::open(target)
+            .await
+            .context("failed opening static range file")?;
+        file.seek(SeekFrom::Start(range.start))
+            .await
+            .context("failed seeking static range file")?;
+        (Bytes::new(), Some(file_streaming_body(file.take(len))))
+    } else {
+        let bytes = tokio::fs::read(target)
+            .await
+            .context("failed reading static range file")?;
+        let slice = bytes[range.start as usize..=range.end as usize].to_vec();
+        (Bytes::from(slice), None)
+    };
+
+    let mut response = GatewayHttpResponse::bytes(
+        StatusCode::PARTIAL_CONTENT,
+        static_content_type(target),
+        body,
+        "proxysss://static-range",
+    );
+    response.stream_body = stream_body;
+    response
+        .headers
+        .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
+    response.headers.push((
+        CONTENT_RANGE,
+        HeaderValue::from_str(&format!(
+            "bytes {}-{}/{}",
+            range.start,
+            range.end,
+            metadata.len()
+        ))
+        .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+    ));
+    response.headers.push((
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&len.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")),
     ));
     Ok(response)
 }
@@ -16900,8 +17077,17 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
           <article class="card">
             <span class="tag beginner">Static site</span>
             <h3>静态站点</h3>
-            <p class="subtle">适合官网、文档站、小型下载站。会参与配置加载后的 warm-up。</p>
+            <p class="subtle">适合官网、文档站、CDN 回源、小型下载站。HTML/CSS/JS/图片/字体/音视频会参与 warm-up，大文件支持 Range 断点续传。</p>
             <pre><code>{{STATIC_SITE}}</code></pre>
+          </article>
+
+          <article class="card">
+            <span class="tag expert">All scenarios</span>
+            <h3>全场景 Docker 验证</h3>
+            <p class="subtle">用 Ubuntu 24 容器检查静态 Range、注册中心配置、能力矩阵、nginx-parity 和全场景样例。</p>
+            <pre><code>proxysss -config examples/all-scenarios.example.yaml check-config
+scripts/verify-docker-scenarios.sh
+.\scripts\verify-docker-scenarios.ps1</code></pre>
           </article>
 
           <article class="card">
@@ -16975,7 +17161,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
           <tbody>
             <tr>
               <td><strong>services.reverse_proxy.routes</strong>普通 HTTP / API / WebSocket / SSE</td>
-              <td>网站、后台、长响应 API、缓存、限流、健康检查都从这里开始。</td>
+              <td>网站、后台、HTTP/2 gRPC、长响应 API、缓存、限流、健康检查都从这里开始。</td>
               <td>不要拿它去承载 TCP / UDP 原生协议。</td>
             </tr>
             <tr>
@@ -16987,6 +17173,16 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
               <td><strong>services.domain_routes</strong>站点级编排</td>
               <td>同一域名下把静态、API、WebDAV 等组合成统一入口。</td>
               <td>不要把它理解成唯一执行面。</td>
+            </tr>
+            <tr>
+              <td><strong>services.static_sites</strong>静态资源 / CDN 回源</td>
+              <td>HTML、CSS、JS、图片、字体、音视频、大文件下载、Range 断点续传。</td>
+              <td>不要把复杂业务鉴权写进静态文件层。</td>
+            </tr>
+            <tr>
+              <td><strong>services.service_discovery</strong>Consul / etcd / Nacos</td>
+              <td>把注册中心服务映射到 HTTP、TCP、UDP 上游池。</td>
+              <td>不要让每个数据面请求临时查注册中心。</td>
             </tr>
             <tr>
               <td><strong>tcp.listeners</strong>TCP 原生流量</td>
@@ -20956,11 +21152,21 @@ mod tests {
         site: &StaticSiteConfig,
         method: &Method,
         uri: &Uri,
+        headers: &HeaderMap,
     ) -> Result<GatewayHttpResponse> {
         let cache = DashMap::new();
         let cache_bytes = AtomicU64::new(0);
         let load_locks = DashMap::new();
-        dispatch_static_site(site, method, uri, &cache, &cache_bytes, &load_locks).await
+        dispatch_static_site(
+            site,
+            method,
+            uri,
+            headers,
+            &cache,
+            &cache_bytes,
+            &load_locks,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -20981,7 +21187,7 @@ mod tests {
             autoindex: false,
         };
         let uri: Uri = "/assets".parse().expect("valid uri");
-        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
             .await
             .expect("static response");
 
@@ -21012,12 +21218,87 @@ mod tests {
             autoindex: true,
         };
         let uri: Uri = "/test.txt".parse().expect("valid uri");
-        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
             .await
             .expect("static response");
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"hello"));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn static_site_serves_byte_ranges() {
+        let root =
+            std::env::temp_dir().join(format!("proxysss-static-range-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create static root");
+        tokio::fs::write(root.join("video.bin"), b"0123456789")
+            .await
+            .expect("write file");
+
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: root.clone(),
+            index_files: vec!["index.html".to_string()],
+            autoindex: false,
+        };
+        let uri: Uri = "/assets/video.bin".parse().expect("valid uri");
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=2-5"));
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &headers)
+            .await
+            .expect("static response");
+
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body, Bytes::from_static(b"2345"));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == CONTENT_RANGE && value == "bytes 2-5/10" }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == ACCEPT_RANGES && value == "bytes" }));
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn static_site_rejects_unsatisfiable_byte_range() {
+        let root = std::env::temp_dir().join(format!(
+            "proxysss-static-range-unsat-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create static root");
+        tokio::fs::write(root.join("asset.bin"), b"abc")
+            .await
+            .expect("write file");
+
+        let site = StaticSiteConfig {
+            name: "public".to_string(),
+            path_prefix: "/assets".to_string(),
+            root: root.clone(),
+            index_files: vec!["index.html".to_string()],
+            autoindex: false,
+        };
+        let uri: Uri = "/assets/asset.bin".parse().expect("valid uri");
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=99-100"));
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &headers)
+            .await
+            .expect("static response");
+
+        assert_eq!(response.status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == CONTENT_RANGE && value == "bytes */3" }));
 
         let _ = tokio::fs::remove_dir_all(root).await;
     }
@@ -21041,7 +21322,7 @@ mod tests {
             autoindex: true,
         };
         let uri: Uri = "/assets".parse().expect("valid uri");
-        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri)
+        let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
             .await
             .expect("static response");
 

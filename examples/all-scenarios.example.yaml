@@ -1,0 +1,242 @@
+config_version: 1
+
+http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+  h3_bind: 0.0.0.0:443
+  tls:
+    mode: acme_managed
+    auto_https:
+      enabled: true
+      email: ops@example.com
+    generate_self_signed_if_missing: true
+    acme:
+      email: ops@example.com
+      challenge: dns01
+      domains: [example.com, "*.example.com"]
+      directory_production: false
+      dns:
+        provider: cloudflare
+        credentials:
+          api_token: docker-validation-placeholder
+
+admin:
+  bind: 127.0.0.1:7777
+  enable_write_ops: false
+  expose_config: false
+
+script:
+  enabled: true
+  entry: examples/gateway.ts
+
+plugins:
+  enabled: true
+  auto_load_dir: examples/plugins
+
+security:
+  reject_ambiguous_http1: true
+  block_ssrf_targets: true
+  ddos:
+    enabled: true
+    max_connections: 20000
+    window_secs: 10
+    ban_secs: 60
+    burst: 5000
+
+load_balance:
+  algorithm: weighted
+  retries:
+    enabled: true
+    max_retries: 2
+  active_health:
+    enabled: true
+    http_enabled: true
+    tcp_enabled: true
+    udp_enabled: true
+    path: /healthz
+    interval_secs: 10
+    timeout_ms: 1000
+    expected_statuses: [200, 204]
+    udp_payload: proxysss-health
+    udp_expect_response: false
+  passive_health:
+    enabled: true
+    fail_threshold: 3
+    quarantine_secs: 30
+
+kubernetes:
+  enabled: true
+  namespace: default
+  mappings:
+    - name: spring-cloud-ingress
+      service: spring-gateway
+      port: 8080
+      domains: [spring.example.com]
+      path_prefix: /
+
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: balanced
+  watchdog:
+    enabled: true
+
+services:
+  service_discovery:
+    enabled: true
+    interval_secs: 15
+    registries:
+      - name: consul-main
+        provider: consul
+        endpoint: http://consul.service.consul:8500
+      - name: etcd-main
+        provider: etcd
+        endpoint: http://etcd.default.svc.cluster.local:2379
+      - name: nacos-main
+        provider: nacos
+        endpoint: http://nacos.default.svc.cluster.local:8848
+        namespace: public
+        group: DEFAULT_GROUP
+    mappings:
+      - name: api-from-consul
+        registry: consul-main
+        service: spring-api
+        target: reverse_proxy_route
+        target_name: api
+        scheme: http
+      - name: stream-from-etcd
+        registry: etcd-main
+        service: game-tcp
+        target: tcp_listener
+        target_name: game-tcp
+      - name: udp-from-nacos
+        registry: nacos-main
+        service: realtime-udp
+        target: udp_listener
+        target_name: realtime-udp
+
+  access_control:
+    http:
+      enabled: true
+      allow: ["0.0.0.0/0", "::/0"]
+      deny: ["203.0.113.0/24", "2001:db8:dead::/48"]
+      status: 403
+
+  rate_limit:
+    http:
+      enabled: true
+      algorithm: token_bucket
+      key: remote_addr
+      requests: 600
+      window_ms: 60000
+      burst: 1200
+      max_connections: 20000
+      status: 429
+    stream:
+      enabled: true
+      algorithm: token_bucket
+      connections: 50000
+      window_ms: 60000
+      burst: 10000
+
+  response_policy:
+    compression:
+      enabled: true
+      algorithms: [zstd, brotli, gzip]
+      min_length: 512
+    cache:
+      enabled: true
+      behavior: respect_origin
+      ttl_secs: 60
+      stale_while_revalidate_secs: 30
+      stale_if_error_secs: 300
+
+  static_sites:
+    - name: public-assets
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false
+
+  filecloud:
+    enabled: true
+    path_prefix: /files
+    root: ./downloads
+    password: docker-validation-password
+    require_auth_for_download: true
+
+  reverse_proxy:
+    routes:
+      - name: api
+        hosts: [api.example.com]
+        path_prefix: /api
+        upstream: http://127.0.0.1:8080
+        upstreams:
+          - http://127.0.0.1:8080
+          - http://127.0.0.1:8081
+        upstream_weights:
+          "http://127.0.0.1:8080": 90
+          "http://127.0.0.1:8081": 10
+        strip_prefix: true
+        active_health:
+          path: /actuator/health
+      - name: grpc
+        hosts: [grpc.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:50051
+        forward_headers: true
+      - name: websocket
+        hosts: [ws.example.com]
+        path_prefix: /ws
+        upstream: ws://127.0.0.1:9001
+      - name: cdn-origin
+        hosts: [origin.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:8088
+        cache:
+          enabled: true
+          behavior: override
+          ttl_secs: 120
+
+  domain_routes:
+    - name: main-site
+      domains: [example.com, www.example.com]
+      path_prefix: /
+      upstream: http://127.0.0.1:8080
+      ssl:
+        type: auto
+
+tcp:
+  listeners:
+    - name: spring-cloud-gateway-front
+      bind: 0.0.0.0:7000
+      protocol: tcp
+      upstreams: [127.0.0.1:17000, 127.0.0.1:17001]
+    - name: game-tcp
+      bind: 0.0.0.0:7001
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 3000
+      upstreams: [127.0.0.1:17010, 127.0.0.1:17011]
+  stream_routes:
+    - name: mqtt-sni
+      domains: [mqtt.example.com]
+      listen: 0.0.0.0:8883
+      upstream: 127.0.0.1:1883
+      protocol: mqtt
+      tls_mode: passthrough
+
+udp:
+  listeners:
+    - name: realtime-udp
+      bind: 0.0.0.0:7002
+      protocol: udp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams: [127.0.0.1:17020, 127.0.0.1:17021]
+    - name: qcp
+      bind: 0.0.0.0:7003
+      protocol: qcp
+      session_ttl_secs: 180
+      max_associations: 262144
+      upstreams: [127.0.0.1:17030]
