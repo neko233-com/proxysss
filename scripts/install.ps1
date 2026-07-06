@@ -147,13 +147,25 @@ function Test-ServiceTaskExists {
     if ($null -ne $getScheduledTask) {
         try {
             $task = Get-ScheduledTask -TaskName $BinaryName -ErrorAction SilentlyContinue
-            return ($null -ne $task)
+            if ($null -ne $task) {
+                return $true
+            }
         } catch {
         }
     }
 
     cmd /c "schtasks /Query /TN \"$BinaryName\" >nul 2>&1"
-    return ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -eq 0) {
+        return $true
+    }
+
+    try {
+        $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+        $runValue = (Get-ItemProperty -LiteralPath $runKey -Name $BinaryName -ErrorAction SilentlyContinue).$BinaryName
+        return -not [string]::IsNullOrWhiteSpace($runValue)
+    } catch {
+        return $false
+    }
 }
 
 function Stop-ServiceIfPresent([string]$ExePath) {
@@ -195,7 +207,7 @@ function Start-ServiceIfPresent([string]$ExePath) {
     }
 
     try {
-        & $ExePath service start | Out-Null
+        Start-Process -FilePath $ExePath -ArgumentList @("service", "start") -WorkingDirectory (Get-ProxysssConfigDir) -WindowStyle Hidden | Out-Null
     } catch {
         Write-Host "warning: failed to start service, run '$BinaryName service start' manually" -ForegroundColor Yellow
     }
@@ -267,6 +279,35 @@ function Test-ValidDownloadedFile([string]$Path) {
     }
 
     return $true
+}
+
+function Install-BinaryFile([string]$Source, [string]$Destination) {
+    if (!(Test-Path -LiteralPath $Source)) {
+        throw "source binary does not exist: $Source"
+    }
+
+    $backup = "$Destination.install-backup"
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+
+    $hasBackup = $false
+    if (Test-Path -LiteralPath $Destination) {
+        try {
+            Move-Item -LiteralPath $Destination -Destination $backup -Force
+            $hasBackup = $true
+        } catch {
+            throw "failed to replace existing $BinaryName.exe at $Destination. Stop running proxysss processes or services and retry. Details: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Move-Item -LiteralPath $Source -Destination $Destination -Force
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    } catch {
+        if ($hasBackup -and !(Test-Path -LiteralPath $Destination) -and (Test-Path -LiteralPath $backup)) {
+            Move-Item -LiteralPath $backup -Destination $Destination -Force
+        }
+        throw "failed to install new $BinaryName.exe to $Destination. Existing binary was restored if possible. Details: $($_.Exception.Message)"
+    }
 }
 
 $arch = Get-ArchName
@@ -346,7 +387,7 @@ if (!(Test-Path $bundleExe)) {
     throw "release bundle is missing $BinaryName.exe"
 }
 
-Move-Item -Force $bundleExe $Dest
+Install-BinaryFile -Source $bundleExe -Destination $Dest
 
 Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -404,3 +445,5 @@ if ($null -ne $targetVersion) {
 } else {
     Write-Host "Applied version: latest"
 }
+
+$global:LASTEXITCODE = 0

@@ -578,8 +578,14 @@ fn windows_proxysss_pids(current_pid: u32) -> Result<Vec<u32>> {
 
 fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
     let mut command = Command::new(executable);
-    command.args(["run", "--config", &config_path.display().to_string()]);
-    configure_hidden_windows_process(&mut command);
+    let working_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    command
+        .args(["run", "--config", &config_path.display().to_string()])
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_detached_process(&mut command);
     command
         .spawn()
         .with_context(|| format!("failed to start {}", executable.display()))?;
@@ -617,16 +623,6 @@ fn vbs_escape(value: &str) -> String {
 fn write_windows_hidden_launcher(_executable: &Path, _config_path: &Path) -> Result<PathBuf> {
     Err(anyhow!("windows launcher is only available on windows"))
 }
-
-#[cfg(windows)]
-fn configure_hidden_windows_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn configure_hidden_windows_process(_command: &mut Command) {}
 
 #[cfg(windows)]
 fn configure_detached_process(command: &mut Command) {
