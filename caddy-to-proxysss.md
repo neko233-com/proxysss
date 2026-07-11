@@ -142,9 +142,9 @@ services:
 - 文档站
 - 纯静态前端
 
-### 2.4 自动 HTTPS
+### 2.4 自动 HTTPS / WSS
 
-Caddy 很多人喜欢，就是因为自动 HTTPS 体验顺手。
+Caddy 很多人喜欢，就是因为自动 HTTPS 体验顺手。proxysss 的单域名 WSS 路径同样只需要给出域名。
 
 proxysss 里推荐这样写：
 
@@ -153,12 +153,11 @@ http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
-    mode: acme_managed
-    acme:
-      enabled: true
-      email: "ops@example.com"
-      challenge: http01
+    auto_https:
+      domains: [wss.example.com]
 ```
+
+这会使用内建 managed ACME 的正式 HTTP-01，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且 80/443 可公网访问。邮箱仍可通过 `http.tls.auto_https.email` 选填，以接收到期和安全通知。旧的显式 HTTP-01 / TLS-ALPN-01 / DNS-01 配置保持兼容。
 
 如果是泛域名：
 

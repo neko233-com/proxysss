@@ -1,5 +1,6 @@
 # Copy these keys into proxysss.yaml when you have a public domain.
-# Fully embedded ACME — no acme.sh, certbot, or external CLI required.
+# Fully embedded ACME — no acme.sh, certbot, cloud CLI, or account email required.
+# For a normal WSS hostname, `domains` is the only required ACME input.
 
 http:
   plain_bind: 0.0.0.0:80
@@ -7,23 +8,17 @@ http:
   h3_bind: 0.0.0.0:443
   tls:
     auto_https:
-      enabled: true
-      email: ops@example.com
       domains:
         - gateway.example.com
-      production: false
-    mode: acme_managed
-    cert_path: certs/proxysss-cert.pem
-    key_path: certs/proxysss-key.pem
-    generate_self_signed_if_missing: false
-    server_name: gateway.example.com
-    acme:
-      email: ops@example.com
-      domains:
-        - gateway.example.com
-      challenge: http01
-      directory_production: false
-      renew_interval_hours: 12
+      # Uses production HTTP-01 by default. Email is optional, for renewal notices only.
+      # email: ops@example.com
+# HTTP-01 compatibility override example: this explicit form remains supported.
+#    mode: acme_managed
+#    acme:
+#      email: ops@example.com
+#      domains: [gateway.example.com]
+#      challenge: http01
+#      directory_production: true
 
 # Wildcard (*.example.com) — built-in DNS-01 (configure via admin console or YAML):
 #

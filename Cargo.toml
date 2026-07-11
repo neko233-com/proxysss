@@ -44,7 +44,7 @@ serde_yaml = "0.9"
 socket2 = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = "0.1"
 tracing-appender = "0.2"

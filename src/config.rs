@@ -194,7 +194,7 @@ pub struct AutoHttpsConfig {
     pub domains: Vec<String>,
     #[serde(default)]
     pub email: String,
-    #[serde(default)]
+    #[serde(default = "default_acme_production")]
     pub production: bool,
     #[serde(default = "default_acme_client")]
     pub client: String,
@@ -259,8 +259,8 @@ pub struct TlsCertificateConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AcmeChallengeType {
     #[default]
-    TlsAlpn01,
     Http01,
+    TlsAlpn01,
     Dns01,
 }
 
@@ -1650,16 +1650,7 @@ impl GatewayConfig {
                         ));
                     }
                 }
-                DomainTlsMode::Auto => {
-                    if self.http.tls.auto_https.email.trim().is_empty()
-                        && route.ssl.email.trim().is_empty()
-                    {
-                        errors.push(format!(
-                            "services.domain_routes.{}.ssl.email or http.tls.auto_https.email is required when ssl.type=auto",
-                            route.name
-                        ));
-                    }
-                }
+                DomainTlsMode::Auto => {}
                 DomainTlsMode::Disabled | DomainTlsMode::Inherit => {}
             }
         }
@@ -1925,12 +1916,6 @@ impl GatewayConfig {
                                 .to_string(),
                         );
                     }
-                    if self.http.tls.auto_https.email.trim().is_empty() {
-                        errors.push(
-                            "http.tls.auto_https.email cannot be empty when auto_https.enabled=true"
-                                .to_string(),
-                        );
-                    }
                     if matches!(
                         self.http.tls.mode,
                         TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
@@ -1951,12 +1936,6 @@ impl GatewayConfig {
                 if self.http.tls.acme.domains.is_empty() {
                     errors.push(
                         "http.tls.acme.domains cannot be empty when mode is acme_managed/acme_external/acme_dns_external"
-                            .to_string(),
-                    );
-                }
-                if self.http.tls.acme.email.trim().is_empty() {
-                    errors.push(
-                        "http.tls.acme.email cannot be empty when mode is acme_managed/acme_external/acme_dns_external"
                             .to_string(),
                     );
                 }
@@ -2073,6 +2052,17 @@ impl GatewayConfig {
 
         if self.http.tls.mode == TlsMode::SelfSigned {
             warnings.push("tls.mode=self_signed is for development or internal environments; use acme_managed, acme_external, or acme_dns_external for public traffic".to_string());
+        }
+
+        if matches!(
+            self.http.tls.mode,
+            TlsMode::AcmeManaged | TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal
+        ) && self.http.tls.acme.email.trim().is_empty()
+        {
+            warnings.push(
+                "ACME account email is empty: certificate issuance and renewal work, but expiry and security notices cannot be delivered; set http.tls.auto_https.email (or http.tls.acme.email) to opt in"
+                    .to_string(),
+            );
         }
 
         if self.http.plain_bind.trim().is_empty() {
@@ -2304,10 +2294,14 @@ impl GatewayConfig {
     }
 
     fn apply_auto_https(&mut self) {
-        if !self.http.tls.auto_https.enabled {
+        if !self.http.tls.auto_https.enabled && self.http.tls.auto_https.domains.is_empty() {
             return;
         }
 
+        // A domain list is intentionally enough to opt in. This keeps the public WSS
+        // bootstrap to one piece of operator input while leaving `enabled: false` with
+        // an empty list as the explicit default-off state.
+        self.http.tls.auto_https.enabled = true;
         self.http.tls.mode = TlsMode::AcmeManaged;
         self.http.tls.acme.domains = self.http.tls.auto_https.domains.clone();
         self.http.tls.acme.email = self.http.tls.auto_https.email.clone();
@@ -2433,7 +2427,7 @@ impl Default for AutoHttpsConfig {
             enabled: false,
             domains: Vec::new(),
             email: String::new(),
-            production: false,
+            production: default_acme_production(),
             client: default_acme_client(),
             challenge: AcmeChallengeType::default(),
             renew_interval_hours: default_acme_renew_hours(),
@@ -3131,6 +3125,10 @@ fn default_server_name() -> String {
 
 fn default_acme_client() -> String {
     "acme.sh".to_string()
+}
+
+fn default_acme_production() -> bool {
+    true
 }
 
 fn default_acme_cache_dir() -> PathBuf {
@@ -4036,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_https_requires_domains_and_email() {
+    fn auto_https_requires_domains_but_not_email() {
         let mut config = GatewayConfig::default();
         config.http.tls.auto_https.enabled = true;
         config.apply_auto_https();
@@ -4044,7 +4042,34 @@ mod tests {
         let error = config.validate().expect_err("expected invalid auto_https");
         let message = error.to_string();
         assert!(message.contains("http.tls.auto_https.domains"));
-        assert!(message.contains("http.tls.auto_https.email"));
+    }
+
+    #[test]
+    fn domain_only_auto_https_enables_production_http01_without_contact_email() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "proxysss-domain-only-auto-https-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "http:\n  tls:\n    auto_https:\n      domains: [wss.example.com]\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load domain-only auto https config");
+        assert!(config.http.tls.auto_https.enabled);
+        assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
+        assert_eq!(config.http.tls.acme.challenge, AcmeChallengeType::Http01);
+        assert!(config.http.tls.acme.directory_production);
+        assert!(config.http.tls.acme.email.is_empty());
+        assert!(config
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("ACME account email is empty")));
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

@@ -48,43 +48,38 @@ services:
 - 域名没有解析到这台机器，浏览器永远打不到网关。
 - `match.hosts` 写的是 `example.com`，但你实际访问的是 `www.example.com`。
 
-### 1.2 给同一个站点加自动 HTTPS
+### 1.2 只填域名就给 WebSocket 加 WSS
 
-适用场景：你已经能跑 HTTP，现在要正式上 TLS。
+适用场景：你已经能跑 HTTP，现在要让浏览器通过 `wss://app.example.com` 连接同一条 WebSocket 路由。
 
 ```yaml
 http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
-    mode: acme_managed
-    acme:
-      enabled: true
-      email: "ops@example.com"
-      challenge: http01
+    auto_https:
+      domains: [app.example.com]
 
 services:
-  reverse_proxy:
-    routes:
-      - name: secure-app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:9000"
+  domain_routes:
+    - name: game-wss
+      domains: [app.example.com]
+      path_prefix: /ws
+      upstream: ws://127.0.0.1:9000
 ```
 
 这段配置做了什么：
 
-- `tls.mode: acme_managed` 表示证书由 proxysss 内建 ACME 自动管理。
-- `challenge: http01` 适合单域名、80/443 能直接暴露到公网的常见场景。
-- 你不用额外跑 `certbot` 或 `acme.sh`，只要域名能正确访问到这台机器即可。
+- 只要 `auto_https.domains` 非空，proxysss 就自动切到内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 HTTP-01。它保留了显式 `mode: acme_managed`、`challenge: http01`、`tls_alpn01` 和 DNS-01 的兼容入口。
+- 不用额外跑 `certbot`、`acme.sh` 或云厂商 CLI，也不必填写邮箱。邮箱是可选项：填写 `http.tls.auto_https.email` 才会收到到期和安全通知。
+- WebSocket upgrade 路由照常声明；签证完成后同一条 `/ws` 自动同时支持 `ws://` 与 `wss://`。
 
 上线前请确认：
 
 - 80 和 443 都已放行。
 - `app.example.com` 已解析到当前网关。
 - 这台机器没有别的程序先占用了 80 / 443。
+- 80 端口不能被 CDN、负载均衡器或另一台网关截断 `/.well-known/acme-challenge/`；需要泛域名、多入口或无法开放 80 时，改用内建 DNS-01。
 
 ### 1.3 一个站点放静态文件，另一个站点做代理
 

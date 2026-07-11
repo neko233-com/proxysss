@@ -106,24 +106,20 @@ http:
   h3_bind: 0.0.0.0:443
   tls:
     auto_https:
-      enabled: true
-      domains: [example.com, www.example.com]
-      email: admin@example.com
-      production: true
-      challenge: tls_alpn01
+      domains: [wss.example.com]
 
 services:
   domain_routes:
-    - name: app
-      domains: [example.com, www.example.com]
+    - name: game-wss
+      domains: [wss.example.com]
       path_prefix: /
       upstream: http://127.0.0.1:9000
 ```
 
 How to think about it:
 
-- `auto_https` is the easiest managed path for normal public domains.
-- `challenge: tls_alpn01` avoids needing a writable web root.
+- A non-empty `auto_https.domains` list enables built-in managed ACME automatically. Its production default uses HTTP-01, so this is enough for `wss://` without `certbot`, `acme.sh`, a DNS API, or an account email.
+- The domain's public A/AAAA record must reach this host and ports 80 and 443 must be reachable. `email` is optional; adding it enables certificate-expiry/security notices.
 - The route still lives in `domain_routes`; TLS automation does not change how you declare backends.
 
 ### 4. Serve a static site
@@ -469,6 +465,18 @@ What that benchmark means:
 - it compares nginx-comparable static, reverse proxy, generic SSE, WebSocket, game TCP, generic TCP, and UDP together
 - New API provider routes and KCP/QCP special UDP encapsulations stay supported as product capabilities, but they are excluded from the current performance benchmark matrix
 - it uses a fair default ratio floor instead of pretending every feature-rich gateway must win every micro-benchmark outright
+
+For WebSocket capacity, distinguish active-message `ops/s` from concurrent connections. The native hold mode opens and keeps sockets without converting every connection into an echo-rate workload:
+
+```bash
+proxysss bench websocket --url ws://gateway.example.com/gateway/ws \
+  --connections 20000 --hold-connections --connect-workers 128 \
+  --connect-timeout-ms 10000 --connect-retries 4 --duration-secs 30
+```
+
+Run 100k capacity from multiple client source IPs, and route WebSocket tunnels across multiple backend `IP:port` tuples (or a proxy source-IP pool). A single TCP source/destination tuple is limited by the Linux ephemeral-port space; this is a TCP constraint rather than a gateway implementation detail.
+
+For a production-style WSS gateway comparison with a fixed `4c/8GiB` gateway budget, run `bash scripts/benchmark-websocket-isolated.sh` on a Linux Docker host with enough separate CPU/RAM for four backends and multiple client containers. It compares nginx and proxysss with the same active WSS workload (ops/s, p50, p95) and a 100k idle-connection hold test. The Docker roles are cgroup/network-namespace isolated; repeat on separate gateway/backend/client hosts before making a physical-network latency claim.
 
 ## Docs Map
 

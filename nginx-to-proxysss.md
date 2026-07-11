@@ -243,12 +243,11 @@ http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
-    mode: acme_managed
-    acme:
-      enabled: true
-      email: "ops@example.com"
-      challenge: http01
+    auto_https:
+      domains: [wss.example.com]
 ```
+
+只给域名就会启用内建 managed ACME，默认正式环境 HTTP-01；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网可访问 80/443。`email` 是可选通知地址；保留的显式 `http.tls.mode: acme_managed`、`challenge: http01`、`tls_alpn01` 和 DNS-01 配置仍完全支持。
 
 如果你做的是泛域名：
 

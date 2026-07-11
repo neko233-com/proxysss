@@ -465,16 +465,14 @@ services:
 
             <article class="path">
               <span class="tag beginner">正式上线</span>
-              <h3>给站点加自动 HTTPS</h3>
-              <p class="subtle">当 80 / 443 能直连公网时，用内建 ACME 是默认首选，不需要额外起证书脚本。</p>
+              <h3>只填域名就给 WebSocket 加 WSS</h3>
+              <p class="subtle">当 80 / 443 能直连公网时，只填写域名即可自动签正式证书；不需要证书脚本、DNS API 或邮箱。</p>
               <pre><code>http:
+  plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
-    mode: acme_managed
-    acme:
-      enabled: true
-      email: "ops@example.com"
-      challenge: http01</code></pre>
+    auto_https:
+      domains: [wss.example.com]</code></pre>
             </article>
           </div>
         </section>

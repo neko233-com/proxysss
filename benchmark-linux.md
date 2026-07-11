@@ -83,6 +83,38 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 bench
 
 这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
 
+### 4.1 WebSocket 10 万连接容量与延迟要分开验证
+
+`ops/s` 是一条已建立 WebSocket 上的回显消息轮次，不是并发连接数。原生 benchmark 还提供只建连、保持、采样握手延迟的容量模式：
+
+```bash
+proxysss bench websocket \
+  --url ws://gateway.example.com/gateway/ws \
+  --connections 20000 \
+  --hold-connections \
+  --connect-workers 128 \
+  --connect-timeout-ms 10000 \
+  --connect-retries 4 \
+  --duration-secs 30
+```
+
+单个 IPv4 源地址到单个后端 `IP:port` 只有有限临时端口；默认 Linux 端口范围通常约 2.8 万。因此 10 万连接验证至少需要多个压测源地址，并且 WebSocket 反代到单一后端时还必须有多个不同后端 `IP:port`（或代理源 IP 池）。这是 TCP 四元组限制，nginx 和 proxysss 都不能绕过。`upstreams` 可配置这些后端；未启用玩家亲和时，proxysss 的 WebSocket 快路径会 round-robin 分流，启用 affinity 后才使用 Rendezvous 粘性。
+
+容量成功只说明可保持足够多连接；低延迟与消息吞吐仍要单独用普通 `proxysss bench websocket` 以及 mixed-load 矩阵验证。
+
+### 4.2 单网关 WSS 隔离 Docker 验证
+
+对 Rust 游戏网关，先跑下面的角色隔离测试。它会把 nginx/proxysss 网关固定在 `4 CPU / 8 GiB`，把 4 个回源和多个客户端放到独立 cgroup 与网络命名空间；每个候选都跑相同的 WSS 活跃回显吞吐、p50/p95 延迟与 10 万 idle WSS 容量，输出百分比表和网关容器的资源快照：
+
+```bash
+proxysss tune linux --apply
+bash scripts/benchmark-websocket-isolated.sh
+```
+
+默认 10 万容量使用 5 个客户端 IP、4 个后端 `IP:port`，避开 TCP 四元组误判。参考压测机至少要有 12 CPU / 32 GiB，才能让网关的 4c8g 配额不与客户端、回源争抢资源。该脚本刻意使用生成的自签名 WSS fixture，并仅在压测客户端加 `--insecure`；它验证 TLS/WSS 数据路径，不是证书信任测试。
+
+Docker 的 cgroup、网络命名空间和 CPU 集隔离能排除“同一进程/同一容器”干扰，但仍共享同一 Linux 内核；生产发布结论还必须在独立的网关、回源、压测主机上复跑，不能把单机 Docker 结果伪装成跨机网络延迟。
+
 ## 5. CI 和 benchmark 的边界
 
 默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。
@@ -90,6 +122,7 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 bench
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
+- `scripts/benchmark-websocket-isolated.sh`：4c8g 单网关 WSS active-latency + 10 万连接角色隔离入口
 - `SCENARIO_FILTER=udp-stream`：定位 UDP fast path 的专项入口
 - `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 输出
 
