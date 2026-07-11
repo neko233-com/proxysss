@@ -1,0 +1,8 @@
+.git
+.benchmark
+.ssh
+target
+logs
+certs
+runtime
+*.log

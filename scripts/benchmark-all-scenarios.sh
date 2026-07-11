@@ -251,9 +251,11 @@ YAML
 "$PROXY_BIN" -config "$PROXY_DIR/proxysss.yaml" check-config
 
 cat >"$RUN_DIR/nginx.conf" <<NGINX
-user root;
+user www-data;
 worker_processes  auto;
+worker_rlimit_nofile 1048576;
 events {
+    use epoll;
     worker_connections  65535;
     multi_accept on;
 }
@@ -276,7 +278,7 @@ http {
         keepalive 128;
     }
     server {
-        listen 127.0.0.1:18081;
+        listen 127.0.0.1:18081 backlog=65536 reuseport;
         location /bench/ {
             alias $WWW_DIR/;
             index small.html;
@@ -302,7 +304,8 @@ http {
         }
     }
     server {
-        listen 127.0.0.1:18441 ssl http2;
+        listen 127.0.0.1:18441 ssl backlog=65536 reuseport;
+        http2 on;
         ssl_certificate $RUN_DIR/certs/bench.crt;
         ssl_certificate_key $RUN_DIR/certs/bench.key;
         location /bench/ {
@@ -335,7 +338,7 @@ stream {
         server 127.0.0.1:18201;
     }
     server {
-        listen 127.0.0.1:18202;
+        listen 127.0.0.1:18202 backlog=65536 reuseport;
         proxy_pass tcp_echo;
         proxy_connect_timeout 1s;
         proxy_timeout 30s;

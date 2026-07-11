@@ -484,17 +484,21 @@ services:
 
             <article class="card">
               <span class="tag beginner">正式上线</span>
-              <h3>HTTP 升 HTTPS</h3>
-              <p class="subtle">如果 80/443 能直连公网，默认优先走内建 ACME。这样证书生命周期、reload 和管理面都还在同一套产品节奏里。</p>
+              <h3>只填域名就把 WebSocket 升为 WSS</h3>
+              <p class="subtle">如果 80/443 能直连公网，只填写域名即可启用内建 ACME：默认正式 Let's Encrypt + HTTP-01，不需要 certbot、acme.sh、DNS API 或账号邮箱。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
-    mode: acme_managed
-    acme:
-      enabled: true
-      email: "ops@example.com"
-      challenge: http01</code></pre>
+    auto_https:
+      domains: [wss.example.com]
+
+services:
+  domain_routes:
+    - name: game-wss
+      domains: [wss.example.com]
+      path_prefix: /ws
+      upstream: ws://127.0.0.1:9000</code></pre>
             </article>
 
             <article class="card">

@@ -121,18 +121,18 @@ curl -X POST https://ops.example.com/_proxysss/admin/v1/domain-routes/upsert \
 
 Plain HTTP to `admin.https.path_prefix` is rejected. HTTPS write operations require existing certificate/key material (`GET /v1/tls/summary` → `https_api.tls_ready: true`).
 
-### Managed HTTPS (HTTP-01 / TLS-ALPN-01)
+### Managed HTTPS（只给域名；HTTP-01 / TLS-ALPN-01）
 
 ```bash
 curl -X POST http://127.0.0.1:7777/v1/tls/auto-https/upsert \
   -u ops:change-me \
   -H "Content-Type: application/json" \
   -d '{
-    "domains": ["example.com", "www.example.com"],
-    "email": "admin@example.com",
-    "production": true
+    "domains": ["wss.example.com"]
   }'
 ```
+
+`email` 与 `production` 都可省略：API 默认使用 Let's Encrypt 正式环境的 HTTP-01；不填邮箱不会阻塞签发或续期，但不会收到到期/安全通知。域名 A/AAAA 必须指向该网关，80/443 必须能从公网访问。需要 DNS-01 泛域名时仍使用下一节的接口。
 
 ### Wildcard certificate via built-in DNS-01 (no external ACME client)
 

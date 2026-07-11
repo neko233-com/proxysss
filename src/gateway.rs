@@ -60,8 +60,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{
-    copy_bidirectional, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite,
-    AsyncWriteExt, BufReader as TokioBufReader,
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
+    BufReader as TokioBufReader, ReadBuf,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
@@ -263,6 +263,11 @@ impl std::ops::DerefMut for PooledBuffer {
 }
 
 const POOL_BUFFER_BYTES: usize = 64 * 1024;
+const LATENCY_RELAY_BUFFER_BYTES: usize = 16 * 1024;
+// A WebSocket game gateway must be able to keep 100k mostly-idle tunnels
+// resident on an 8GiB host. Four KiB covers the normal game frame while
+// avoiding a permanent 3.2GiB two-direction 16KiB allocation at that scale.
+const WEBSOCKET_RELAY_BUFFER_BYTES: usize = 4 * 1024;
 const HTTP2_STREAM_WINDOW_SIZE_BYTES: u32 = 4 * 1024 * 1024;
 const HTTP2_CONNECTION_WINDOW_SIZE_BYTES: u32 = 16 * 1024 * 1024;
 const HTTP2_MAX_SEND_BUF_BYTES: usize = 4 * 1024 * 1024;
@@ -272,6 +277,8 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
 const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 64 * 1024;
 
 static RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
+static LATENCY_RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
+static WEBSOCKET_RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 static UDP_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 
 fn pooled_buffer_capacity() -> usize {
@@ -286,6 +293,31 @@ fn pooled_buffer_capacity() -> usize {
 fn relay_buffer_pool() -> &'static ByteBufferPool {
     RELAY_BUFFER_POOL
         .get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
+}
+
+fn latency_relay_buffer_pool() -> &'static ByteBufferPool {
+    LATENCY_RELAY_BUFFER_POOL.get_or_init(|| {
+        // Long-lived game/WebSocket connections need a small bounded resident
+        // footprint. Retaining 16KiB buffers per CPU shard handles reconnect
+        // bursts while excess buffers are released when a surge drains.
+        let capacity = adaptive_data_plane_workers(1)
+            .saturating_mul(512)
+            .clamp(512, 8_192);
+        ByteBufferPool::new(capacity, LATENCY_RELAY_BUFFER_BYTES)
+    })
+}
+
+fn websocket_relay_buffer_pool() -> &'static ByteBufferPool {
+    WEBSOCKET_RELAY_BUFFER_POOL.get_or_init(|| {
+        // Keep retained memory bounded during reconnect waves. Buffers are
+        // borrowed per full-duplex direction and released once the tunnel
+        // closes; 4KiB is deliberately tuned for game/WebSocket frames rather
+        // than bulk transfer payloads.
+        let capacity = adaptive_data_plane_workers(1)
+            .saturating_mul(512)
+            .clamp(512, 8_192);
+        ByteBufferPool::new(capacity, WEBSOCKET_RELAY_BUFFER_BYTES)
+    })
 }
 
 fn udp_buffer_pool() -> &'static ByteBufferPool {
@@ -419,16 +451,316 @@ fn request_body_declared_empty(method: &Method, headers: &HeaderMap) -> bool {
         || method == Method::TRACE
 }
 
+/// Copy a full-duplex stream with two buffers borrowed from a bounded lock-free
+/// pool. This mirrors Tokio's single-future `copy_bidirectional` state machine
+/// instead of splitting each socket into two nested async pumps. The latter is
+/// correct, but costs enough extra wakeups to show up at thousands of active
+/// WebSocket game sessions.
+///
+/// EOF is propagated as a half-close, matching `copy_bidirectional`: the other
+/// direction continues draining until it reaches EOF too.
+async fn copy_bidirectional_with_pooled_buffers<A, B>(
+    left: &mut A,
+    right: &mut B,
+    buffer_pool: &'static ByteBufferPool,
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    copy_bidirectional_with_pooled_buffers_limit(
+        left,
+        right,
+        buffer_pool,
+        MAX_POOLED_RELAY_POLL_STEPS,
+    )
+    .await
+}
+
+/// A browser/client may tear down a WSS socket without sending TLS
+/// `close_notify`. Rustls reports that as `UnexpectedEof` after the WebSocket
+/// tunnel has otherwise completed. Treat that and normal peer-reset variants
+/// as an expected session close so high reconnect churn does not flood the
+/// production error log or obscure actual upstream failures.
+fn is_expected_websocket_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+            .unwrap_or(false)
+    }) || error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("without sending TLS close_notify")
+    })
+}
+
+async fn copy_bidirectional_with_pooled_buffers_limit<A, B>(
+    left: &mut A,
+    right: &mut B,
+    buffer_pool: &'static ByteBufferPool,
+    max_poll_steps: usize,
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut left_to_right = RelayTransferState::Running(PooledRelayCopyBuffer::new(
+        buffer_pool.acquire(),
+        max_poll_steps,
+    ));
+    let mut right_to_left = RelayTransferState::Running(PooledRelayCopyBuffer::new(
+        buffer_pool.acquire(),
+        max_poll_steps,
+    ));
+
+    std::future::poll_fn(|cx| {
+        let left_result = poll_relay_transfer(cx, &mut left_to_right, left, right);
+        let right_result = poll_relay_transfer(cx, &mut right_to_left, right, left);
+        match (left_result, right_result) {
+            (Poll::Ready(Ok(left_bytes)), Poll::Ready(Ok(right_bytes))) => {
+                Poll::Ready(Ok((left_bytes, right_bytes)))
+            }
+            (Poll::Ready(Err(error)), _) | (_, Poll::Ready(Err(error))) => Poll::Ready(Err(error)),
+            _ => Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Keep each polling turn bounded so a continuously writable bulk connection
+/// cannot monopolize the runtime that also services game/WebSocket sessions.
+const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
+// A WebSocket frame fanout can make one readable socket continuously ready.
+// Restrict each direction to one read/write batch per runtime turn so thousands
+// of game sessions do not accumulate scheduler tail latency behind one peer.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = 2;
+
+struct PooledRelayCopyBuffer {
+    read_done: bool,
+    need_flush: bool,
+    pos: usize,
+    cap: usize,
+    copied: u64,
+    max_poll_steps: usize,
+    buffer: PooledBuffer,
+}
+
+impl PooledRelayCopyBuffer {
+    fn new(buffer: PooledBuffer, max_poll_steps: usize) -> Self {
+        Self {
+            read_done: false,
+            need_flush: false,
+            pos: 0,
+            cap: 0,
+            copied: 0,
+            max_poll_steps: max_poll_steps.max(1),
+            buffer,
+        }
+    }
+
+    fn poll_fill<R>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        mut reader: Pin<&mut R>,
+    ) -> Poll<std::io::Result<()>>
+    where
+        R: AsyncRead + ?Sized,
+    {
+        let mut read_buffer = ReadBuf::new(&mut self.buffer);
+        read_buffer.set_filled(self.cap);
+        match reader.as_mut().poll_read(cx, &mut read_buffer) {
+            Poll::Ready(Ok(())) => {
+                let filled = read_buffer.filled().len();
+                self.read_done = self.cap == filled;
+                self.cap = filled;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write<R, W>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<std::io::Result<usize>>
+    where
+        R: AsyncRead + ?Sized,
+        W: AsyncWrite + ?Sized,
+    {
+        match writer
+            .as_mut()
+            .poll_write(cx, &self.buffer[self.pos..self.cap])
+        {
+            Poll::Pending => {
+                // Top up on a temporarily blocked write. This preserves large
+                // writes for bulk peers without delaying a ready small frame.
+                if !self.read_done && self.cap < self.buffer.len() {
+                    match self.poll_fill(cx, reader.as_mut()) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    }
+                }
+                Poll::Pending
+            }
+            result => result,
+        }
+    }
+
+    fn poll_copy<R, W>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<std::io::Result<u64>>
+    where
+        R: AsyncRead + ?Sized,
+        W: AsyncWrite + ?Sized,
+    {
+        // Match Tokio's cooperative accounting. This custom pooled relay
+        // otherwise bypasses the scheduler budget used by Tokio's own copy
+        // utility and can let a hot WebSocket occupy a worker for too long.
+        let coop = match tokio::task::coop::poll_proceed(cx) {
+            Poll::Ready(coop) => coop,
+            Poll::Pending => return Poll::Pending,
+        };
+        let mut steps = 0_usize;
+        loop {
+            if steps >= self.max_poll_steps {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            if self.cap < self.buffer.len() && !self.read_done {
+                match self.poll_fill(cx, reader.as_mut()) {
+                    Poll::Ready(Ok(())) => {
+                        steps += 1;
+                        coop.made_progress();
+                    }
+                    Poll::Ready(Err(error)) => {
+                        coop.made_progress();
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Pending if self.pos == self.cap => {
+                        if self.need_flush {
+                            match writer.as_mut().poll_flush(cx) {
+                                Poll::Ready(Ok(())) => {
+                                    self.need_flush = false;
+                                    coop.made_progress();
+                                }
+                                Poll::Ready(Err(error)) => {
+                                    coop.made_progress();
+                                    return Poll::Ready(Err(error));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                        return Poll::Pending;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            while self.pos < self.cap {
+                let written = match self.poll_write(cx, reader.as_mut(), writer.as_mut()) {
+                    Poll::Ready(Ok(written)) => written,
+                    Poll::Ready(Err(error)) => {
+                        coop.made_progress();
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                };
+                steps += 1;
+                coop.made_progress();
+                if written == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "relay writer accepted zero bytes",
+                    )));
+                }
+                self.pos += written;
+                self.copied = self.copied.saturating_add(written as u64);
+                self.need_flush = true;
+            }
+
+            debug_assert!(self.pos <= self.cap, "relay writer exceeded buffer length");
+            self.pos = 0;
+            self.cap = 0;
+            if self.read_done {
+                match writer.as_mut().poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        coop.made_progress();
+                        return Poll::Ready(Ok(self.copied));
+                    }
+                    Poll::Ready(Err(error)) => {
+                        coop.made_progress();
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+enum RelayTransferState {
+    Running(PooledRelayCopyBuffer),
+    ShuttingDown(u64),
+    Done(u64),
+}
+
+fn poll_relay_transfer<R, W>(
+    cx: &mut TaskContext<'_>,
+    state: &mut RelayTransferState,
+    reader: &mut R,
+    writer: &mut W,
+) -> Poll<std::io::Result<u64>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    loop {
+        match state {
+            RelayTransferState::Running(buffer) => {
+                let copied =
+                    match buffer.poll_copy(cx, Pin::new(&mut *reader), Pin::new(&mut *writer)) {
+                        Poll::Ready(Ok(copied)) => copied,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => return Poll::Pending,
+                    };
+                *state = RelayTransferState::ShuttingDown(copied);
+            }
+            RelayTransferState::ShuttingDown(copied) => {
+                match Pin::new(&mut *writer).poll_shutdown(cx) {
+                    Poll::Ready(Ok(())) => *state = RelayTransferState::Done(*copied),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            RelayTransferState::Done(copied) => return Poll::Ready(Ok(*copied)),
+        }
+    }
+}
+
 async fn copy_tcp_bidirectional_parallel(
     mut left: TcpStream,
     mut right: TcpStream,
-    _left_to_right_buffer: usize,
-    _right_to_left_buffer: usize,
+    buffer_pool: &'static ByteBufferPool,
 ) -> Result<(u64, u64)> {
-    let (left_bytes, right_bytes) = tokio::io::copy_bidirectional(&mut left, &mut right)
+    copy_bidirectional_with_pooled_buffers(&mut left, &mut right, buffer_pool)
         .await
-        .context("tcp bidirectional copy failed")?;
-    Ok((left_bytes, right_bytes))
+        .context("tcp bidirectional copy failed")
 }
 
 async fn copy_tcp_bidirectional_adaptive(
@@ -447,7 +779,7 @@ async fn copy_tcp_bidirectional_adaptive(
     match profile {
         TcpRelayProfile::Latency => copy_tcp_bidirectional_latency(left, right).await,
         TcpRelayProfile::Bulk => {
-            copy_tcp_bidirectional_parallel(left, right, 64 * 1024, 64 * 1024).await
+            copy_tcp_bidirectional_parallel(left, right, relay_buffer_pool()).await
         }
     }
 }
@@ -546,7 +878,7 @@ fn tcp_relay_profile(protocol: &str, first_payload_len: usize) -> TcpRelayProfil
 }
 
 async fn copy_tcp_bidirectional_latency(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
-    copy_tcp_bidirectional_parallel(left, right, 16 * 1024, 16 * 1024)
+    copy_tcp_bidirectional_parallel(left, right, latency_relay_buffer_pool())
         .await
         .context("tcp latency relay failed")
 }
@@ -584,7 +916,7 @@ async fn copy_tcp_bidirectional_splice(left: TcpStream, right: TcpStream) -> Res
 
 #[cfg(not(target_os = "linux"))]
 async fn copy_tcp_bidirectional_splice(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
-    copy_tcp_bidirectional_parallel(left, right, 64 * 1024, 64 * 1024).await
+    copy_tcp_bidirectional_parallel(left, right, relay_buffer_pool()).await
 }
 
 #[cfg(target_os = "linux")]
@@ -741,12 +1073,13 @@ fn tune_tcp_stream_for_gateway(stream: &TcpStream) {
 }
 
 fn tune_tcp_stream_for_latency(stream: &TcpStream) {
-    tune_tcp_stream_for_gateway(stream);
+    tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
+    Realtime,
 }
 
 #[cfg(target_os = "linux")]
@@ -792,6 +1125,15 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
         ) => 8 * 1024 * 1024,
         (TcpSocketTuneProfile::Gateway, _) => 2 * 1024 * 1024,
+        // Realtime streams prioritize bounded queueing and quick small-frame
+        // dispatch over filling multi-megabyte kernel queues. This applies to
+        // game TCP, WebSocket upstreams, and other latency relay paths.
+        (
+            TcpSocketTuneProfile::Realtime,
+            linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
+            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
+        ) => 1024 * 1024,
+        (TcpSocketTuneProfile::Realtime, _) => 512 * 1024,
     };
     unsafe {
         let _ = libc::setsockopt(
@@ -821,6 +1163,10 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
                 linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
             ) => 8 * 1024 * 1024,
             (TcpSocketTuneProfile::Gateway, _) => 4 * 1024 * 1024,
+            // Keep a small write-ready threshold for long-lived game/tool
+            // sockets so an application cannot accumulate multi-megabyte
+            // unsent queues behind a temporarily slow peer.
+            (TcpSocketTuneProfile::Realtime, _) => 16 * 1024,
         };
         unsafe {
             let _ = libc::setsockopt(
@@ -3486,9 +3832,6 @@ impl Gateway {
         if payload.domains.is_empty() {
             return Err(anyhow!("domains cannot be empty"));
         }
-        if payload.email.trim().is_empty() {
-            return Err(anyhow!("email is required for managed ACME"));
-        }
         security::validate_domains(&payload.domains)?;
 
         let domains = payload.domains.clone();
@@ -3992,7 +4335,6 @@ impl Gateway {
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
             }
-            tune_tcp_stream_for_gateway(&stream);
             let gateway = self.clone();
 
             tokio::spawn(async move {
@@ -4330,7 +4672,6 @@ impl Gateway {
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on tls http connection");
             }
-            tune_tcp_stream_for_gateway(&stream);
             let gateway = self.clone();
             let acceptor = tls_acceptor.clone();
 
@@ -5205,6 +5546,12 @@ impl Gateway {
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
         let mut next_local_prune_epoch = cached_now_secs.saturating_add(local_prune_interval_secs);
         let mut direct_udp_cache = DirectUdpRouteCache::new();
+        // A policy-free listener's upstream identity only changes after a
+        // control-plane reload. Do not acquire the dynamic config RwLock for
+        // every game datagram; refresh the worker-local snapshot once a second
+        // together with the association clock.
+        let mut direct_udp_state = self.current_state().await;
+        let mut direct_udp_state_refreshed = Instant::now();
 
         let mut buffer = udp_buffer_pool().acquire();
         loop {
@@ -5225,6 +5572,10 @@ impl Gateway {
             if cached_now_refreshed.elapsed() >= Duration::from_secs(1) {
                 cached_now_secs = now_unix_secs();
                 cached_now_refreshed = Instant::now();
+            }
+            if direct_udp_state_refreshed.elapsed() >= Duration::from_secs(1) {
+                direct_udp_state = self.current_state().await;
+                direct_udp_state_refreshed = Instant::now();
             }
             let now = cached_now_secs;
             if now >= next_local_prune_epoch {
@@ -5307,7 +5658,7 @@ impl Gateway {
             let prune_state = prune_state.clone();
             let protocol_hint = protocol_hint.clone();
             if let Some(upstream_addr) =
-                direct_udp_cache.get_or_refresh(self.current_state().await, &listener_config.name)
+                direct_udp_cache.get_or_refresh(direct_udp_state.clone(), &listener_config.name)
             {
                 if !pending_sessions.insert(client_addr) {
                     continue;
@@ -7231,7 +7582,7 @@ impl Gateway {
         config: &GatewayConfig,
         downstream: &mut TcpStream,
         request: &PlainWebSocketFastLaneRequest,
-        _remote_addr: SocketAddr,
+        remote_addr: SocketAddr,
     ) -> Result<bool> {
         let host = request.host.as_deref().unwrap_or("localhost");
         let Some(route) = config
@@ -7245,8 +7596,32 @@ impl Gateway {
         else {
             return Ok(false);
         };
+        let route_decision = RouteDecision {
+            upstream: route.upstream.clone(),
+            upstreams: route.upstreams.clone(),
+            upstream_weights: route.upstream_weights.clone(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
+        };
+        let remote_addr = remote_addr.to_string();
+        let selected_upstream = self
+            .select_upstream_plan(
+                config,
+                &route_decision,
+                "websocket",
+                Some(&route.name),
+                None,
+                Some(&remote_addr),
+            )
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| route.upstream.clone());
         let Some((_, upstream_host, upstream_port)) =
-            raw_websocket_pool_parts_from_upstream(&route.upstream)?
+            raw_websocket_pool_parts_from_upstream(&selected_upstream)?
         else {
             return Ok(false);
         };
@@ -7257,11 +7632,10 @@ impl Gateway {
             .with_context(|| {
                 format!(
                     "failed connecting plain raw websocket upstream {}",
-                    route.upstream
+                    selected_upstream
                 )
             })?;
         let _ = upstream_io.set_nodelay(true);
-        tune_tcp_stream_for_gateway(&upstream_io);
 
         let request_bytes =
             serialize_raw_websocket_fast_lane_request(request, path_and_query.as_ref(), host);
@@ -7271,7 +7645,7 @@ impl Gateway {
             .with_context(|| {
                 format!(
                     "failed sending plain raw websocket handshake to {}",
-                    route.upstream
+                    selected_upstream
                 )
             })?;
 
@@ -7280,7 +7654,7 @@ impl Gateway {
             .with_context(|| {
                 format!(
                     "failed reading plain raw websocket response from {}",
-                    route.upstream
+                    selected_upstream
                 )
             })?;
         downstream
@@ -7299,9 +7673,14 @@ impl Gateway {
             return Ok(true);
         }
 
-        copy_bidirectional(downstream, &mut upstream_io)
-            .await
-            .context("raw websocket tunnel relay failed")?;
+        copy_bidirectional_with_pooled_buffers_limit(
+            downstream,
+            &mut upstream_io,
+            websocket_relay_buffer_pool(),
+            WEBSOCKET_RELAY_POLL_STEPS,
+        )
+        .await
+        .context("raw websocket tunnel relay failed")?;
         Ok(true)
     }
 
@@ -7320,7 +7699,20 @@ impl Gateway {
         on_upgrade: OnUpgrade,
     ) -> Result<GatewayHttpResponse> {
         let state = self.current_state().await;
-        let upstream_url = build_upstream_url(&route.upstream, route, &uri)?;
+        let remote_addr_text = remote_addr.to_string();
+        let selected_upstream = self
+            .select_upstream_plan(
+                &state.config,
+                route,
+                "websocket",
+                Some("http"),
+                route.affinity_key.as_deref(),
+                Some(&remote_addr_text),
+            )
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| route.upstream.clone());
+        let upstream_url = build_upstream_url(&selected_upstream, route, &uri)?;
         let upstream_host = upstream_host_header(&upstream_url)?;
         let upstream_headers = build_websocket_upstream_headers(
             &headers,
@@ -7373,15 +7765,24 @@ impl Gateway {
                             .context("failed flushing upstream websocket prelude")?;
                     }
                 }
-                copy_bidirectional(&mut client, &mut *upstream_io)
-                    .await
-                    .context("websocket tunnel relay failed")?;
+                copy_bidirectional_with_pooled_buffers_limit(
+                    &mut client,
+                    &mut *upstream_io,
+                    websocket_relay_buffer_pool(),
+                    WEBSOCKET_RELAY_POLL_STEPS,
+                )
+                .await
+                .context("websocket tunnel relay failed")?;
                 Ok::<_, anyhow::Error>(())
             }
             .await;
 
             if let Err(error) = result {
-                tracing::warn!(?error, upstream = %tunnel_upstream, "websocket tunnel failed");
+                if is_expected_websocket_disconnect(&error) {
+                    tracing::debug!(upstream = %tunnel_upstream, "websocket tunnel closed by peer");
+                } else {
+                    tracing::warn!(?error, upstream = %tunnel_upstream, "websocket tunnel failed");
+                }
             }
         });
 
@@ -7893,6 +8294,14 @@ impl Gateway {
             }
             LoadBalanceAlgorithm::SourceHash => {
                 self.select_source_hash_plan(selected_key.as_deref(), candidates)
+            }
+            // Rendezvous is sticky only when there is an affinity key. Without
+            // one, ranking against the static listener scope would select the
+            // same first upstream for every WebSocket/HTTP/TCP connection and
+            // silently defeat an upstream pool. Fall back to lock-free
+            // round-robin distribution in that case.
+            LoadBalanceAlgorithm::Rendezvous if selected_key.is_none() => {
+                self.select_round_robin_plan(&scope_base, candidates)
             }
             LoadBalanceAlgorithm::Rendezvous => self.select_rendezvous_plan(
                 config,
@@ -9837,12 +10246,11 @@ fn adaptive_stream_runtime_workers() -> usize {
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
-    let cores = cores.max(1);
-    if cores <= 4 {
-        1
-    } else {
-        cores.div_ceil(2)
-    }
+    // TCP streams are first-class, but HTTP/WebSocket/UDP must retain CPU on a
+    // mixed gateway. One quarter of detected cores keeps four-core nodes from
+    // letting a synthetic TCP flood monopolize the host, while a 24-core
+    // deployment still receives six independent stream runtime workers.
+    cores.max(1).div_ceil(4)
 }
 
 fn direct_tcp_listener_upstream(config: &GatewayConfig, listener_name: &str) -> Option<String> {
@@ -11007,8 +11415,17 @@ async fn issue_managed_acme_certificate(
             .await
             .context("failed to restore managed acme account")?
     } else {
-        let contact = format!("mailto:{}", tls.acme.email);
-        let contacts = [contact.as_str()];
+        let contact = (!tls.acme.email.trim().is_empty())
+            .then(|| format!("mailto:{}", tls.acme.email.trim()));
+        let contacts = contact
+            .as_deref()
+            .map(|value| vec![value])
+            .unwrap_or_default();
+        if contacts.is_empty() {
+            tracing::warn!(
+                "creating managed ACME account without a contact email; certificate issuance remains automatic but expiry/security notices cannot be delivered"
+            );
+        }
         let (account, credentials) = Account::builder()
             .context("failed to build managed acme account client")?
             .create(
@@ -12223,9 +12640,13 @@ fn spawn_ftp_passive_bridge(
             let mut upstream_data = TcpStream::connect(upstream_addr).await.with_context(|| {
                 format!("failed connecting ftp passive upstream {upstream_addr}")
             })?;
-            copy_bidirectional(&mut downstream_data, &mut upstream_data)
-                .await
-                .context("ftp passive data relay failed")?;
+            copy_bidirectional_with_pooled_buffers(
+                &mut downstream_data,
+                &mut upstream_data,
+                relay_buffer_pool(),
+            )
+            .await
+            .context("ftp passive data relay failed")?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -12255,9 +12676,13 @@ fn spawn_ftp_active_bridge(
             let mut client_data = TcpStream::connect(client_target).await.with_context(|| {
                 format!("failed connecting ftp active client target {client_target}")
             })?;
-            copy_bidirectional(&mut server_data, &mut client_data)
-                .await
-                .context("ftp active data relay failed")?;
+            copy_bidirectional_with_pooled_buffers(
+                &mut server_data,
+                &mut client_data,
+                relay_buffer_pool(),
+            )
+            .await
+            .context("ftp active data relay failed")?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -13062,8 +13487,9 @@ struct NamedDeleteRequest {
 #[derive(Debug, Deserialize)]
 struct AutoHttpsUpsertRequest {
     domains: Vec<String>,
-    email: String,
     #[serde(default)]
+    email: String,
+    #[serde(default = "default_true")]
     production: bool,
 }
 
@@ -14453,8 +14879,22 @@ fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bo
 }
 
 fn websocket_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
-    reverse_proxy_route_fast_path_eligible(route)
-        && raw_websocket_pool_key_from_upstream(&route.upstream).is_some()
+    route.set_headers.is_empty()
+        && route.strip_headers.is_empty()
+        && !route.compression.enabled
+        && !route.cache.enabled
+        && !route.rate_limit.enabled
+        && {
+            let candidates = if route.upstreams.is_empty() {
+                std::slice::from_ref(&route.upstream)
+            } else {
+                route.upstreams.as_slice()
+            };
+            !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|upstream| raw_websocket_pool_key_from_upstream(upstream).is_some())
+        }
 }
 
 fn ai_proxy_route_fast_path_eligible(route: &crate::ai_proxy::AiProxyRouteConfig) -> bool {
@@ -17057,8 +17497,8 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
 
           <article class="path">
             <span class="tag beginner">正式上线</span>
-            <h3>给站点加自动 HTTPS</h3>
-            <p class="subtle">做单域名上线时，内建 ACME 是默认首选；做泛域名时再切到 DNS-01。</p>
+            <h3>只填域名就给 WebSocket 加 WSS</h3>
+            <p class="subtle">单域名只填域名即可走正式 HTTP-01；无需证书脚本、DNS API 或邮箱。泛域名或不能开放 80 时再切到 DNS-01。</p>
             <pre><code>{{ACME_DNS}}</code></pre>
           </article>
         </div>
@@ -17276,7 +17716,7 @@ fn docs_template_ftp() -> &'static str {
 }
 
 fn docs_template_acme_dns() -> &'static str {
-    "http:\n  tls:\n    mode: acme_managed\n    cert_path: certs/proxysss-cert.pem\n    key_path: certs/proxysss-key.pem\n    generate_self_signed_if_missing: false\n    server_name: example.com\n    acme:\n      email: admin@example.com\n      challenge: dns01\n      domains: [example.com, \"*.example.com\"]\n      directory_production: true\n      renew_interval_hours: 12\n      dns:\n        provider: cloudflare\n        credentials:\n          api_token: your-cloudflare-api-token\n"
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用内建 ACME：正式 Let's Encrypt + HTTP-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
 }
 
 fn docs_template_health() -> &'static str {
@@ -17892,7 +18332,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <div class="surface-head"><div><h3>Auto HTTPS (HTTP-01 / TLS-ALPN-01)</h3><p class="muted">No DNS API key required.</p></div></div>
                 <div class="tls-grid">
                     <div class="filter full"><label for="auto-domains">Domains (one per line)</label><textarea id="auto-domains" placeholder="example.com&#10;www.example.com"></textarea></div>
-                    <div class="filter"><label for="auto-email">ACME Email</label><input id="auto-email" placeholder="admin@example.com" /></div>
+                    <div class="filter"><label for="auto-email">ACME Email（可选）</label><input id="auto-email" placeholder="admin@example.com（留空也可自动签发；不会收到到期提醒）" /></div>
                     <div class="filter"><label for="auto-production">Production</label><select id="auto-production"><option value="true">Let's Encrypt Production</option><option value="false">Staging</option></select></div>
                     <div class="filter full"><button id="save-auto-https" class="primary">Save Auto HTTPS</button><span class="hint" id="auto-https-result"></span></div>
                 </div>
@@ -19193,7 +19633,6 @@ async fn connect_upgrade_upstream(url: &Url, allow_insecure: bool) -> Result<Box
         .ok_or_else(|| anyhow!("upstream URL missing port"))?;
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
     let _ = tcp.set_nodelay(true);
-    tune_tcp_stream_for_gateway(&tcp);
 
     if matches!(url.scheme(), "https" | "wss") {
         let client_config = if allow_insecure {
@@ -19982,6 +20421,77 @@ mod tests {
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
 
+    #[tokio::test]
+    async fn pooled_bidirectional_copy_preserves_game_session_half_close() {
+        let (mut client, mut proxy_client) = tokio::io::duplex(1024);
+        let (mut proxy_upstream, mut upstream) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_pooled_buffers(
+                &mut proxy_client,
+                &mut proxy_upstream,
+                latency_relay_buffer_pool(),
+            )
+            .await
+        });
+
+        client
+            .write_all(b"player-input")
+            .await
+            .expect("write client");
+        client.shutdown().await.expect("half-close client");
+
+        let mut upstream_input = Vec::new();
+        upstream
+            .read_to_end(&mut upstream_input)
+            .await
+            .expect("read client input upstream");
+        assert_eq!(upstream_input, b"player-input");
+
+        upstream
+            .write_all(b"server-reply")
+            .await
+            .expect("write server reply");
+        upstream.shutdown().await.expect("half-close upstream");
+
+        let mut client_reply = Vec::new();
+        client
+            .read_to_end(&mut client_reply)
+            .await
+            .expect("read server reply client");
+        assert_eq!(client_reply, b"server-reply");
+        assert_eq!(
+            relay.await.expect("relay task").expect("relay result"),
+            (12, 12)
+        );
+    }
+
+    #[test]
+    fn expected_websocket_disconnects_do_not_escalate_to_warning_logs() {
+        let unexpected_eof =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .context("websocket tunnel relay failed");
+        assert!(is_expected_websocket_disconnect(&unexpected_eof));
+
+        let upstream_timeout = anyhow!("websocket upstream handshake timed out");
+        assert!(!is_expected_websocket_disconnect(&upstream_timeout));
+    }
+
+    #[test]
+    fn websocket_fast_lane_supports_multi_upstream_pool() {
+        let route = ReverseProxyRouteConfig {
+            upstream: "ws://10.0.0.1:60102".to_string(),
+            upstreams: vec![
+                "ws://10.0.0.1:60102".to_string(),
+                "ws://10.0.0.2:60102".to_string(),
+                "ws://10.0.0.3:60102".to_string(),
+                "ws://10.0.0.4:60102".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(websocket_route_fast_path_eligible(&route));
+    }
+
     #[test]
     fn runtime_scope_key_contains_protocol_listener_and_upstream() {
         let key = runtime_scope_key("tcp", Some("tcp-affinity-demo"), "127.0.0.1:7001");
@@ -20067,6 +20577,39 @@ mod tests {
         .expect("render sni cert");
         assert!(updated.contains("api.example.com"));
         assert!(updated.contains("certs/api.crt"));
+    }
+
+    #[test]
+    fn domain_only_auto_https_admin_payload_defaults_to_production() {
+        let payload: AutoHttpsUpsertRequest =
+            serde_json::from_str(r#"{"domains":["wss.example.com"]}"#)
+                .expect("decode domain-only auto https payload");
+        assert!(payload.email.is_empty());
+        assert!(payload.production);
+
+        let rendered = render_config_with_auto_https("plugins:\n  enabled: false\n", &payload)
+            .expect("render domain-only auto https config");
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&rendered).expect("decode rendered domain-only config");
+        let auto_https = value
+            .get("http")
+            .and_then(|http| http.get("tls"))
+            .and_then(|tls| tls.get("auto_https"))
+            .expect("rendered auto https config");
+        assert_eq!(
+            auto_https
+                .get("domains")
+                .and_then(serde_yaml::Value::as_sequence),
+            Some(&vec![serde_yaml::Value::String(
+                "wss.example.com".to_string()
+            )])
+        );
+        assert_eq!(
+            auto_https
+                .get("production")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -20658,7 +21201,7 @@ mod tests {
 
         let workers = tcp_stream_accept_worker_count_for(&config, &listener, 4);
         if cfg!(target_os = "linux") {
-            assert_eq!(workers, 1);
+            assert_eq!(workers, 2);
             assert_eq!(
                 tcp_stream_accept_worker_count_for(&config, &listener, 96),
                 48
@@ -20946,6 +21489,43 @@ mod tests {
             .filter(|item| **item == "http://127.0.0.1:9001")
             .count();
         assert!(heavy_first >= 1);
+
+        let mut config = GatewayConfig::default();
+        config.load_balance.algorithm = LoadBalanceAlgorithm::Rendezvous;
+        config.load_balance.active_health.enabled = false;
+        config.load_balance.passive_health.enabled = false;
+        config.affinity.enabled = false;
+        let route = RouteDecision {
+            upstream: "ws://127.0.0.1:9000".to_string(),
+            upstreams: vec![
+                "ws://127.0.0.1:9000".to_string(),
+                "ws://127.0.0.1:9001".to_string(),
+            ],
+            upstream_weights: BTreeMap::new(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
+        };
+        let first = gateway.select_upstream_plan(
+            &config,
+            &route,
+            "websocket",
+            Some("ws-capacity"),
+            None,
+            Some("203.0.113.10:50000"),
+        );
+        let second = gateway.select_upstream_plan(
+            &config,
+            &route,
+            "websocket",
+            Some("ws-capacity"),
+            None,
+            Some("203.0.113.11:50000"),
+        );
+        assert_ne!(first[0], second[0]);
     }
 
     #[test]
