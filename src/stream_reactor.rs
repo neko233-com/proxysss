@@ -14,7 +14,6 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 use rustc_hash::FxHashMap;
@@ -24,17 +23,11 @@ const REGISTRATION_QUEUE_CAPACITY: usize = 131_072;
 const EVENT_BATCH: usize = 1_024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
-// After forwarding an active game frame, briefly poll without sleeping so the
-// corresponding upstream reply can be collected without a scheduler round
-// trip. The budget expires in microseconds; idle reactors block indefinitely.
-const ACTIVE_SPIN_POLLS: usize = 64;
-const DENSE_ACTIVE_SPIN_POLLS: usize = 64;
-const DENSE_ACTIVE_SPIN_MIN_QUIET: Duration = Duration::from_micros(50);
-// Low-density realtime traffic gets the full short spin. Medium density only
-// spins after a quiet interval; saturated/high-density traffic relies on epoll
-// batching and does not take CPU from HTTP/TLS/UDP siblings.
+// Low-density realtime traffic gets a very short reply spin. Once each worker
+// owns more than four pairs, rely entirely on epoll batching: spinning after
+// every event at mixed-load density steals CPU from HTTP/TLS/UDP siblings.
+const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 16;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -199,7 +192,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut active_spin_polls = 0_usize;
-    let mut last_ready_at = Instant::now();
 
     loop {
         let timeout = if active_spin_polls > 0 { 0 } else { -1 };
@@ -217,11 +209,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
             std::hint::spin_loop();
             continue;
         }
-        let ready_at = Instant::now();
-        let reactor_was_quiet =
-            ready_at.duration_since(last_ready_at) >= DENSE_ACTIVE_SPIN_MIN_QUIET;
-        last_ready_at = ready_at;
-
         for event in events.iter().take(ready as usize) {
             let token = event.u64;
             if token == WAKE_TOKEN {
@@ -239,8 +226,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
             let pair_count = sockets.len() / 2;
             active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
                 ACTIVE_SPIN_POLLS
-            } else if pair_count <= DENSE_ACTIVE_SPIN_MAX_PAIRS_PER_WORKER && reactor_was_quiet {
-                DENSE_ACTIVE_SPIN_POLLS
             } else {
                 0
             };
