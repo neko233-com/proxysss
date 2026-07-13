@@ -92,7 +92,7 @@ jobs:
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
             proxysss-ubuntu24-bench \
-            bash -lc 'test "$(uname -m)" = x86_64 && scripts/benchmark-all-scenarios.sh' \
+            bash -lc 'test "$(uname -m)" = x86_64 && bash scripts/benchmark-all-scenarios.sh' \
             2>&1 | tee .benchmark/performance-run.log
 
       - name: Publish benchmark summary
@@ -111,7 +111,7 @@ jobs:
         with:
           name: ubuntu24-amd64-docker-performance
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
           path: |
             .benchmark/performance-run.log
             .benchmark/runs/all-scenarios/results.json
