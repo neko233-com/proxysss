@@ -67,6 +67,9 @@ jobs:
           test "$VERSION_ID" = "24.04"
           docker version
 
+      - name: Validate Linux runtime tests
+        run: cargo test --locked --workspace --all-targets
+
       - name: Build optimized proxysss binary
         run: cargo build --locked --release
 
@@ -94,7 +97,9 @@ jobs:
           stream_connections="$((cores * STREAM_CONNECTIONS_PER_CORE * LOAD_SCALE))"
           http_concurrency="$((cores * HTTP_CONCURRENCY_PER_CORE * LOAD_SCALE))"
           https_concurrency="$((cores * 4 * LOAD_SCALE))"
-          static_large_concurrency="$((cores * LOAD_SCALE))"
+          # Keep at least two bulk flows per reuseport shard. One flow per core
+          # is a hash-placement diagnostic, not a stable saturated bulk gate.
+          static_large_concurrency="$((cores * 2 * LOAD_SCALE))"
           sse_concurrency="$((cores * LOAD_SCALE))"
           mkdir -p .benchmark
           docker run --rm \

@@ -1529,6 +1529,8 @@ static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
+static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
+#[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1679,6 +1681,13 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 ),
             Ordering::Relaxed,
         );
+        let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
+            RuntimePerformanceTrafficProfile::Small => 2,
+            RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => {
+                4
+            }
+        };
+        REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
             RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_CHUNK_BYTES,
             RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_CHUNK_BYTES,
@@ -11701,12 +11710,13 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
+fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
-    // running a permanently-ready reactor alongside every HTTP shard. One
-    // owner per two CPUs preserves stream scale while leaving mixed HTTP/TLS/
-    // UDP work enough scheduler capacity; HTTP still keeps full per-core fanout.
-    cores.max(1).div_ceil(2)
+    // running a permanently-ready reactor alongside every HTTP shard. The
+    // realtime-first profile uses one owner per two CPUs; balanced/bulk use one
+    // per four so mixed HTTP/TLS/UDP retains scheduler capacity. Both remain
+    // proportional on high-core hosts; HTTP accept fanout stays fully per-core.
+    cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
@@ -11715,7 +11725,10 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(target_os = "linux")]
 fn realtime_stream_reactor_workers() -> usize {
-    realtime_stream_reactor_workers_for(adaptive_data_plane_workers(1))
+    realtime_stream_reactor_workers_for(
+        adaptive_data_plane_workers(1),
+        REALTIME_STREAM_REACTOR_CPU_DIVISOR.load(Ordering::Relaxed),
+    )
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
@@ -23103,10 +23116,12 @@ mod tests {
     }
 
     #[test]
-    fn linux_http_and_realtime_shards_partition_all_detected_cores() {
-        assert_eq!(realtime_stream_reactor_workers_for(1), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(4), 2);
-        assert_eq!(realtime_stream_reactor_workers_for(96), 48);
+    fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
+        assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
+        assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
+        assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
+        assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
+        assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
     }
