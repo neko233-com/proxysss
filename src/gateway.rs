@@ -1494,7 +1494,8 @@ const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 8;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
-const LINUX_STREAM_REACTOR_ENABLED: bool = false;
+#[cfg(target_os = "linux")]
+const LINUX_STREAM_REACTOR_ENABLED: bool = true;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
 // With the Linux fair scheduler enabled, a hot listen backlog can keep
 // `accept()` immediately ready long enough to queue hundreds of TLS tasks
@@ -11572,22 +11573,17 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
         .max(min_workers.max(1))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
-    if cores >= 4 {
-        cores.div_ceil(4)
-    } else {
-        1
-    }
+    // One epoll relay owner per allowed CPU avoids turning high-tick game,
+    // generic TCP, and plain WebSocket traffic into a single-reactor funnel as
+    // connection counts grow. The threads sleep in epoll when no stream is
+    // ready, so HTTP keeps its own complete per-core accept/runtime fanout.
+    cores.max(1)
 }
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
-    if cfg!(target_os = "linux") && LINUX_STREAM_REACTOR_ENABLED && cores >= 4 {
-        cores
-            .saturating_sub(realtime_stream_reactor_workers_for(cores))
-            .max(1)
-    } else {
-        cores.max(1)
-    }
+    cores.max(1)
 }
 
 #[cfg(target_os = "linux")]
@@ -22982,8 +22978,8 @@ mod tests {
     #[test]
     fn linux_http_and_realtime_shards_partition_all_detected_cores() {
         assert_eq!(realtime_stream_reactor_workers_for(1), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(4), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(96), 24);
+        assert_eq!(realtime_stream_reactor_workers_for(4), 4);
+        assert_eq!(realtime_stream_reactor_workers_for(96), 96);
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
     }

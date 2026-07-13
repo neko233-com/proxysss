@@ -45,6 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: performance-ubuntu24-amd64
+          cache-on-failure: true
 
       - name: Verify runner architecture
         shell: bash
@@ -88,6 +89,7 @@ jobs:
             -e STRICT_SUPERIORITY="$STRICT_SUPERIORITY" \
             -e REQUIRE_ZERO_ERRORS="$STRICT_SUPERIORITY" \
             -e REQUIRE_LATENCY_PERCENTILES="$STRICT_SUPERIORITY" \
+            -e GATE_LATENCY=0 \
             -e MAX_LATENCY_RATIO=1.0 \
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \

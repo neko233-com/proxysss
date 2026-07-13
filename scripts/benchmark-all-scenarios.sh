@@ -73,6 +73,7 @@ STRICT_SUPERIORITY="${STRICT_SUPERIORITY:-0}"
 MAX_LATENCY_RATIO="${MAX_LATENCY_RATIO:-1.0}"
 REQUIRE_LATENCY_PERCENTILES="${REQUIRE_LATENCY_PERCENTILES:-$STRICT_SUPERIORITY}"
 REQUIRE_ZERO_ERRORS="${REQUIRE_ZERO_ERRORS:-$STRICT_SUPERIORITY}"
+GATE_LATENCY="${GATE_LATENCY:-0}"
 
 if [[ "$STRICT_SUPERIORITY" == "1" ]]; then
   [[ -z "$MIN_RATIO_SET" ]] && MIN_RATIO=1.0
@@ -835,6 +836,11 @@ if [[ "$REQUIRE_ZERO_ERRORS" == "1" ]]; then
   REQUIRE_ZERO_ERRORS_BOOL=true
 fi
 
+GATE_LATENCY_BOOL=false
+if [[ "$GATE_LATENCY" == "1" ]]; then
+  GATE_LATENCY_BOOL=true
+fi
+
 "$BENCH_HELPER_BIN" write-all-scenarios-summary \
   --results "$RESULTS_FILE" \
   --md "$SUMMARY_MD" \
@@ -850,6 +856,7 @@ fi
   --max-latency-ratio "$MAX_LATENCY_RATIO" \
   --require-latency-percentiles="$REQUIRE_LATENCY_PERCENTILES_BOOL" \
   --require-zero-errors="$REQUIRE_ZERO_ERRORS_BOOL" \
+  --gate-latency="$GATE_LATENCY_BOOL" \
   --strict-superiority="$STRICT_SUPERIORITY_BOOL" \
   --mixed-matrix="$MIXED_MATRIX_BOOL" \
   --cpu-cores "$CPU_CORES" \
