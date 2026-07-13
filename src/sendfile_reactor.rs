@@ -51,7 +51,7 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
-    worker_cpu_ids: Vec<Option<usize>>,
+    worker_by_cpu: FxHashMap<usize, usize>,
     next: AtomicUsize,
 }
 
@@ -99,8 +99,9 @@ impl Reactors {
     fn start(requested_workers: usize) -> Self {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = allowed_cpu_ids();
+        let worker_cpu_groups = build_worker_cpu_groups(&allowed_cpus, worker_count);
         let mut workers = Vec::with_capacity(worker_count);
-        let mut worker_cpu_ids = Vec::with_capacity(worker_count);
+        let mut worker_by_cpu = FxHashMap::default();
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
@@ -109,24 +110,28 @@ impl Reactors {
                 wake_fd,
             });
             let reactor_worker = worker.clone();
-            let cpu = allowed_cpus.get(index % allowed_cpus.len()).copied();
+            let cpu_group = worker_cpu_groups[index].clone();
+            for cpu in &cpu_group {
+                worker_by_cpu.insert(*cpu, index);
+            }
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu))
+                .spawn(move || run_reactor(reactor_worker, &cpu_group))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
-            worker_cpu_ids.push(cpu);
         }
         Self {
             workers,
-            worker_cpu_ids,
+            worker_by_cpu,
             next: AtomicUsize::new(0),
         }
     }
 
     fn select_worker(&self) -> usize {
-        if let Some(index) = cpu_local_worker_index(&self.worker_cpu_ids, current_cpu_id()) {
-            return index;
+        if let Some(cpu) = current_cpu_id() {
+            if let Some(index) = self.worker_by_cpu.get(&cpu) {
+                return *index;
+            }
         }
         self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len()
     }
@@ -137,14 +142,24 @@ fn current_cpu_id() -> Option<usize> {
     (cpu >= 0).then_some(cpu as usize)
 }
 
-fn cpu_local_worker_index(
-    worker_cpu_ids: &[Option<usize>],
-    current_cpu: Option<usize>,
-) -> Option<usize> {
-    let current_cpu = current_cpu?;
-    worker_cpu_ids
-        .iter()
-        .position(|worker_cpu| *worker_cpu == Some(current_cpu))
+fn build_worker_cpu_groups(allowed_cpus: &[usize], worker_count: usize) -> Vec<Vec<usize>> {
+    let worker_count = worker_count.max(1);
+    let mut groups = vec![Vec::new(); worker_count];
+    for (position, cpu) in allowed_cpus.iter().copied().enumerate() {
+        let worker = position.saturating_mul(worker_count) / allowed_cpus.len().max(1);
+        groups[worker.min(worker_count - 1)].push(cpu);
+    }
+    for (index, group) in groups.iter_mut().enumerate() {
+        if group.is_empty() {
+            group.push(
+                allowed_cpus
+                    .get(index % allowed_cpus.len().max(1))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+    }
+    groups
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -173,9 +188,9 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
-    if let Some(cpu) = cpu {
-        pin_current_thread(cpu);
+fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
+    if !cpu_group.is_empty() {
+        pin_current_thread(cpu_group);
     }
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating sendfile epoll instance");
@@ -370,10 +385,12 @@ fn allowed_cpu_ids() -> Vec<usize> {
     cpus
 }
 
-fn pin_current_thread(cpu: usize) {
+fn pin_current_thread(cpus: &[usize]) {
     let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
     unsafe {
-        libc::CPU_SET(cpu, &mut set);
+        for cpu in cpus {
+            libc::CPU_SET(*cpu, &mut set);
+        }
         let _ = libc::sched_setaffinity(
             0,
             mem::size_of::<libc::cpu_set_t>(),
@@ -427,10 +444,14 @@ mod tests {
     }
 
     #[test]
-    fn sendfile_handoff_prefers_the_current_cpu_worker() {
-        let worker_cpu_ids = [Some(2), Some(7), Some(11), Some(19)];
-        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, Some(11)), Some(2));
-        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, Some(3)), None);
-        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, None), None);
+    fn sendfile_handoff_groups_allowed_cpus_stably() {
+        assert_eq!(
+            build_worker_cpu_groups(&[2, 7, 11, 19], 2),
+            vec![vec![2, 7], vec![11, 19]]
+        );
+        assert_eq!(
+            build_worker_cpu_groups(&[2, 7, 11, 19], 4),
+            vec![vec![2], vec![7], vec![11], vec![19]]
+        );
     }
 }
