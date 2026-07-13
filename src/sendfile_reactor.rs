@@ -51,6 +51,7 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
+    worker_cpu_ids: Vec<Option<usize>>,
     next: AtomicUsize,
 }
 
@@ -84,7 +85,7 @@ pub(crate) fn dispatch(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
-    let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let index = reactors.select_worker();
     let worker = &reactors.workers[index];
     worker
         .registrations
@@ -99,6 +100,7 @@ impl Reactors {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
+        let mut worker_cpu_ids = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
@@ -113,12 +115,36 @@ impl Reactors {
                 .spawn(move || run_reactor(reactor_worker, cpu))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
+            worker_cpu_ids.push(cpu);
         }
         Self {
             workers,
+            worker_cpu_ids,
             next: AtomicUsize::new(0),
         }
     }
+
+    fn select_worker(&self) -> usize {
+        if let Some(index) = cpu_local_worker_index(&self.worker_cpu_ids, current_cpu_id()) {
+            return index;
+        }
+        self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+    }
+}
+
+fn current_cpu_id() -> Option<usize> {
+    let cpu = unsafe { libc::sched_getcpu() };
+    (cpu >= 0).then_some(cpu as usize)
+}
+
+fn cpu_local_worker_index(
+    worker_cpu_ids: &[Option<usize>],
+    current_cpu: Option<usize>,
+) -> Option<usize> {
+    let current_cpu = current_cpu?;
+    worker_cpu_ids
+        .iter()
+        .position(|worker_cpu| *worker_cpu == Some(current_cpu))
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -398,5 +424,13 @@ mod tests {
         });
         assert_eq!(completion.blocking_recv().unwrap().unwrap(), 64 * 1024);
         assert_eq!(reader.join().unwrap(), vec![0x5a_u8; 64 * 1024]);
+    }
+
+    #[test]
+    fn sendfile_handoff_prefers_the_current_cpu_worker() {
+        let worker_cpu_ids = [Some(2), Some(7), Some(11), Some(19)];
+        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, Some(11)), Some(2));
+        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, Some(3)), None);
+        assert_eq!(cpu_local_worker_index(&worker_cpu_ids, None), None);
     }
 }
