@@ -25,7 +25,6 @@ use tokio::sync::oneshot;
 const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const WAKE_TOKEN: u64 = u64::MAX;
-const HIGH_CONTENTION_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
 struct SendfileJob {
     socket: TcpStream,
@@ -53,7 +52,7 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
-    worker_by_cpu: FxHashMap<usize, usize>,
+    workers_by_cpu: FxHashMap<usize, Vec<usize>>,
     next: AtomicUsize,
 }
 
@@ -105,7 +104,7 @@ impl Reactors {
         let allowed_cpus = allowed_cpu_ids();
         let worker_cpu_groups = build_worker_cpu_groups(&allowed_cpus, worker_count);
         let mut workers = Vec::with_capacity(worker_count);
-        let mut worker_by_cpu = FxHashMap::default();
+        let mut workers_by_cpu = FxHashMap::<usize, Vec<usize>>::default();
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
@@ -116,7 +115,7 @@ impl Reactors {
             let reactor_worker = worker.clone();
             let cpu_group = worker_cpu_groups[index].clone();
             for cpu in &cpu_group {
-                worker_by_cpu.insert(*cpu, index);
+                workers_by_cpu.entry(*cpu).or_default().push(index);
             }
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
@@ -126,18 +125,19 @@ impl Reactors {
         }
         Self {
             workers,
-            worker_by_cpu,
+            workers_by_cpu,
             next: AtomicUsize::new(0),
         }
     }
 
     fn select_worker(&self) -> usize {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
         if let Some(cpu) = current_cpu_id() {
-            if let Some(index) = self.worker_by_cpu.get(&cpu) {
-                return *index;
+            if let Some(indices) = self.workers_by_cpu.get(&cpu) {
+                return indices[ticket % indices.len()];
             }
         }
-        self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+        ticket % self.workers.len()
     }
 }
 
@@ -148,20 +148,20 @@ fn current_cpu_id() -> Option<usize> {
 
 fn build_worker_cpu_groups(allowed_cpus: &[usize], worker_count: usize) -> Vec<Vec<usize>> {
     let worker_count = worker_count.max(1);
+    if worker_count >= allowed_cpus.len().max(1) {
+        return (0..worker_count)
+            .map(|index| {
+                vec![allowed_cpus
+                    .get(index % allowed_cpus.len().max(1))
+                    .copied()
+                    .unwrap_or(0)]
+            })
+            .collect();
+    }
     let mut groups = vec![Vec::new(); worker_count];
     for (position, cpu) in allowed_cpus.iter().copied().enumerate() {
         let worker = position.saturating_mul(worker_count) / allowed_cpus.len().max(1);
         groups[worker.min(worker_count - 1)].push(cpu);
-    }
-    for (index, group) in groups.iter_mut().enumerate() {
-        if group.is_empty() {
-            group.push(
-                allowed_cpus
-                    .get(index % allowed_cpus.len().max(1))
-                    .copied()
-                    .unwrap_or(0),
-            );
-        }
     }
     groups
 }
@@ -291,17 +291,13 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
 }
 
 fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
-    let active_jobs = jobs.len();
     let Some(state) = jobs.get_mut(&fd) else {
         return DriveResult::Complete(Err(io::Error::new(
             io::ErrorKind::NotFound,
             "sendfile reactor job disappeared",
         )));
     };
-    let event_budget = (state.len - state.sent).min(sendfile_event_chunk_bytes(
-        state.max_chunk_bytes,
-        active_jobs,
-    ));
+    let event_budget = (state.len - state.sent).min(state.max_chunk_bytes);
     let event_start = state.sent;
     while state.sent - event_start < event_budget {
         let remaining_budget = event_budget - (state.sent - event_start);
@@ -333,14 +329,6 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
         return DriveResult::Complete(Err(error));
     }
     DriveResult::Pending
-}
-
-fn sendfile_event_chunk_bytes(configured_max: u64, active_jobs: usize) -> u64 {
-    match active_jobs {
-        0..=3 => configured_max,
-        _ => configured_max.min(HIGH_CONTENTION_CHUNK_BYTES),
-    }
-    .max(1)
 }
 
 fn complete_job(
@@ -482,26 +470,18 @@ mod tests {
             build_worker_cpu_groups(&[2, 7, 11, 19], 4),
             vec![vec![2], vec![7], vec![11], vec![19]]
         );
-    }
-
-    #[test]
-    fn sendfile_event_budget_preserves_single_flow_and_bounds_contended_flows() {
         assert_eq!(
-            sendfile_event_chunk_bytes(16 * 1024 * 1024, 1),
-            16 * 1024 * 1024
+            build_worker_cpu_groups(&[2, 7, 11, 19], 8),
+            vec![
+                vec![2],
+                vec![7],
+                vec![11],
+                vec![19],
+                vec![2],
+                vec![7],
+                vec![11],
+                vec![19],
+            ]
         );
-        assert_eq!(
-            sendfile_event_chunk_bytes(16 * 1024 * 1024, 2),
-            16 * 1024 * 1024
-        );
-        assert_eq!(
-            sendfile_event_chunk_bytes(16 * 1024 * 1024, 3),
-            16 * 1024 * 1024
-        );
-        assert_eq!(
-            sendfile_event_chunk_bytes(16 * 1024 * 1024, 4),
-            2 * 1024 * 1024
-        );
-        assert_eq!(sendfile_event_chunk_bytes(1024 * 1024, 8), 1024 * 1024);
     }
 }

@@ -11548,7 +11548,7 @@ async fn sendfile_all_async(
             offset as u64,
             len - sent,
             max_chunk_bytes,
-            adaptive_data_plane_workers(1),
+            sendfile_reactor_workers_for(adaptive_data_plane_workers(1)),
         ) {
             Ok(completion) => {
                 let reactor_sent = completion.await.map_err(|_| {
@@ -11762,6 +11762,14 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_workers_for(cores: usize) -> usize {
+    // Two CPU-local owners keep bulk transfers independently runnable under
+    // reuseport shard skew without shrinking each writable event's sendfile
+    // batch. The count remains proportional to the process cpuset.
+    cores.max(1).saturating_mul(2)
 }
 
 #[cfg(target_os = "linux")]
@@ -23184,6 +23192,8 @@ mod tests {
         ));
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert_eq!(sendfile_reactor_workers_for(4), 8);
+        assert_eq!(sendfile_reactor_workers_for(96), 192);
     }
 
     #[test]
