@@ -896,7 +896,7 @@ scripts/benchmark-all-scenarios.sh
 scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
-          <p class="subtle">`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
+          <p class="subtle">`benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次共享 runner 抖动决定结论。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
         </section>
 
         <section id="config-map" class="panel">

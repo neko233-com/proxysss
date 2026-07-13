@@ -75,6 +75,8 @@ REQUIRE_LATENCY_PERCENTILES="${REQUIRE_LATENCY_PERCENTILES:-$STRICT_SUPERIORITY}
 REQUIRE_ZERO_ERRORS="${REQUIRE_ZERO_ERRORS:-$STRICT_SUPERIORITY}"
 GATE_LATENCY="${GATE_LATENCY:-0}"
 TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-small}"
+BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
+RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 
 case "$TRAFFIC_PROFILE" in
   small|balanced|bulk) ;;
@@ -83,6 +85,14 @@ case "$TRAFFIC_PROFILE" in
     exit 1
     ;;
 esac
+if ! [[ "$BENCHMARK_REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "BENCHMARK_REPETITIONS must be a positive integer" >&2
+  exit 1
+fi
+if [[ "$RUN_ORDER" != "nginx proxysss" && "$RUN_ORDER" != "proxysss nginx" ]]; then
+  echo "RUN_ORDER must be 'nginx proxysss' or 'proxysss nginx'" >&2
+  exit 1
+fi
 
 if [[ "$STRICT_SUPERIORITY" == "1" ]]; then
   [[ -z "$MIN_RATIO_SET" ]] && MIN_RATIO=1.0
@@ -732,7 +742,8 @@ append_deep_matrix_serial() {
 }
 
 append_deep_matrix_mixed() {
-  local row_dir="$RUN_DIR/mixed-rows"
+  local repetition="$1" run_order="$2"
+  local row_dir="$RUN_DIR/mixed-rows-$repetition"
   rm -rf "$row_dir"
   mkdir -p "$row_dir"
   local pids=()
@@ -779,33 +790,48 @@ append_deep_matrix_mixed() {
     fi
   }
 
-  echo "=== mixed matrix: nginx scenarios running concurrently ===" >&2
-  launch_scenario_bench static-small static-small-nginx run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html
-  launch_scenario_bench static-large static-large-nginx run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin
-  launch_scenario_bench cdn-hot-update cdn-hot-update-nginx run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat
-  launch_scenario_bench https-static-small https-static-small-nginx run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html
-  launch_scenario_bench reverse-proxy reverse-proxy-nginx run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping
-  launch_scenario_bench generic-sse generic-sse-nginx run_sse_bench generic-sse nginx http://127.0.0.1:18081/sse
-  launch_scenario_bench websocket-long-connection websocket-long-connection-nginx run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256
-  launch_scenario_bench game-long-connection game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
-  launch_scenario_bench tcp-stream tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
-  launch_scenario_bench udp-stream udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
-  wait_for_group
-  restart_sse_backend
-  warm_sse_gateway "http://127.0.0.1:18083/sse"
+  launch_gateway_group() {
+    local gateway="$1"
+    echo "=== mixed matrix repetition $repetition: $gateway scenarios running concurrently ===" >&2
+    if [[ "$gateway" == "nginx" ]]; then
+      launch_scenario_bench static-small static-small-nginx run_http_bench static-small nginx http://127.0.0.1:18081/bench/small.html
+      launch_scenario_bench static-large static-large-nginx run_http_bench static-large nginx http://127.0.0.1:18081/bench/large.bin
+      launch_scenario_bench cdn-hot-update cdn-hot-update-nginx run_http_bench cdn-hot-update nginx http://127.0.0.1:18081/bench/hot.dat
+      launch_scenario_bench https-static-small https-static-small-nginx run_http_bench https-static-small nginx https://127.0.0.1:18441/bench/small.html
+      launch_scenario_bench reverse-proxy reverse-proxy-nginx run_http_bench reverse-proxy nginx http://127.0.0.1:18081/proxy/ping
+      launch_scenario_bench generic-sse generic-sse-nginx run_sse_bench generic-sse nginx http://127.0.0.1:18081/sse
+      launch_scenario_bench websocket-long-connection websocket-long-connection-nginx run_websocket_bench websocket-long-connection nginx ws://127.0.0.1:18081/ws/ 256
+      launch_scenario_bench game-long-connection game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
+      launch_scenario_bench tcp-stream tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
+      launch_scenario_bench udp-stream udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
+    else
+      launch_scenario_bench static-small static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
+      launch_scenario_bench static-large static-large-proxysss run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin
+      launch_scenario_bench cdn-hot-update cdn-hot-update-proxysss run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat
+      launch_scenario_bench https-static-small https-static-small-proxysss run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html
+      launch_scenario_bench reverse-proxy reverse-proxy-proxysss run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping
+      launch_scenario_bench generic-sse generic-sse-proxysss run_sse_bench generic-sse proxysss http://127.0.0.1:18083/sse
+      launch_scenario_bench websocket-long-connection websocket-long-connection-proxysss run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256
+      launch_scenario_bench game-long-connection game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
+      launch_scenario_bench tcp-stream tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024
+      launch_scenario_bench udp-stream udp-stream-proxysss run_udp_bench udp-stream proxysss 127.0.0.1:18300
+    fi
+    wait_for_group
+  }
 
-  echo "=== mixed matrix: proxysss scenarios running concurrently ===" >&2
-  launch_scenario_bench static-small static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
-  launch_scenario_bench static-large static-large-proxysss run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin
-  launch_scenario_bench cdn-hot-update cdn-hot-update-proxysss run_http_bench cdn-hot-update proxysss http://127.0.0.1:18083/bench/hot.dat
-  launch_scenario_bench https-static-small https-static-small-proxysss run_http_bench https-static-small proxysss https://127.0.0.1:18443/bench/small.html
-  launch_scenario_bench reverse-proxy reverse-proxy-proxysss run_http_bench reverse-proxy proxysss http://127.0.0.1:18083/proxy/ping
-  launch_scenario_bench generic-sse generic-sse-proxysss run_sse_bench generic-sse proxysss http://127.0.0.1:18083/sse
-  launch_scenario_bench websocket-long-connection websocket-long-connection-proxysss run_websocket_bench websocket-long-connection proxysss ws://127.0.0.1:18083/ws/ 256
-  launch_scenario_bench game-long-connection game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
-  launch_scenario_bench tcp-stream tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024
-  launch_scenario_bench udp-stream udp-stream-proxysss run_udp_bench udp-stream proxysss 127.0.0.1:18300
-  wait_for_group
+  local gateway group_index=0
+  for gateway in $run_order; do
+    if (( group_index > 0 )); then
+      restart_sse_backend
+      if [[ "$gateway" == "nginx" ]]; then
+        warm_sse_gateway "http://127.0.0.1:18081/sse"
+      else
+        warm_sse_gateway "http://127.0.0.1:18083/sse"
+      fi
+    fi
+    launch_gateway_group "$gateway"
+    group_index=$((group_index + 1))
+  done
 
   local name
   for name in "${ordered[@]}"; do
@@ -815,15 +841,32 @@ append_deep_matrix_mixed() {
   done
 }
 
+order_for_repetition() {
+  local repetition="$1"
+  if (( repetition % 2 == 1 )); then
+    printf '%s\n' "$RUN_ORDER"
+  elif [[ "$RUN_ORDER" == "nginx proxysss" ]]; then
+    printf '%s\n' "proxysss nginx"
+  else
+    printf '%s\n' "nginx proxysss"
+  fi
+}
+
 if [[ "$MIXED_MATRIX" == "1" ]]; then
-  append_deep_matrix_mixed
+  for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+    append_deep_matrix_mixed "$repetition" "$(order_for_repetition "$repetition")"
+  done
 else
   append_deep_matrix_serial
 fi
 
 RESULT_ROWS_FILE="$RUN_DIR/results.jsonl"
 printf '%s\n' "${RESULT_ROWS[@]}" >"$RESULT_ROWS_FILE"
-"$BENCH_HELPER_BIN" write-json-array --in "$RESULT_ROWS_FILE" --out "$RESULTS_FILE"
+if (( BENCHMARK_REPETITIONS > 1 )); then
+  "$BENCH_HELPER_BIN" aggregate-bench-medians --in "$RESULT_ROWS_FILE" --out "$RESULTS_FILE"
+else
+  "$BENCH_HELPER_BIN" write-json-array --in "$RESULT_ROWS_FILE" --out "$RESULTS_FILE"
+fi
 
 MIXED_MATRIX_BOOL=false
 if [[ "$MIXED_MATRIX" == "1" ]]; then
@@ -870,6 +913,7 @@ fi
   --mixed-matrix="$MIXED_MATRIX_BOOL" \
   --cpu-cores "$CPU_CORES" \
   --traffic-profile "$TRAFFIC_PROFILE" \
+  --samples-per-gateway "$BENCHMARK_REPETITIONS" \
   --http-concurrency "$CONCURRENCY" \
   --https-concurrency "$HTTPS_CONCURRENCY" \
   --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
