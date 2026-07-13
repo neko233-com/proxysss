@@ -1489,7 +1489,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_HANDOFF_PREFIX_BYTES: u64 = 512 * 1024;
+const STATIC_SENDFILE_HANDOFF_PREFIX_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -11513,16 +11513,17 @@ async fn sendfile_all_async(
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
-        // Put a bounded prefix behind the already-corked response head on the
-        // CPU-local HTTP shard. This starts the wire transfer immediately like
-        // nginx's same-event sendfile path, while the reactor owns the large
-        // writable drain so sibling HTTP/stream work keeps scheduler time.
-        let prefix_count = len.min(STATIC_SENDFILE_HANDOFF_PREFIX_BYTES) as usize;
-        loop {
+        // Fill the initial nonblocking socket window behind the already-corked
+        // response head on the CPU-local HTTP shard. The 2 MiB budget matches
+        // nginx's modern sendfile_max_chunk default; only the backpressured
+        // remainder pays cross-thread handoff costs.
+        let prefix_budget = len.min(STATIC_SENDFILE_HANDOFF_PREFIX_BYTES);
+        while sent < prefix_budget {
+            let prefix_count = (prefix_budget - sent) as usize;
             let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, prefix_count) };
             if written > 0 {
-                sent = written as u64;
-                break;
+                sent = sent.saturating_add(written as u64);
+                continue;
             }
             if written == 0 {
                 return Err(std::io::Error::new(
@@ -11548,7 +11549,7 @@ async fn sendfile_all_async(
             offset as u64,
             len - sent,
             max_chunk_bytes,
-            sendfile_reactor_workers_for(adaptive_data_plane_workers(1)),
+            adaptive_data_plane_workers(1),
         ) {
             Ok(completion) => {
                 let reactor_sent = completion.await.map_err(|_| {
@@ -11762,14 +11763,6 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn sendfile_reactor_workers_for(cores: usize) -> usize {
-    // Two CPU-local owners keep bulk transfers independently runnable under
-    // reuseport shard skew without shrinking each writable event's sendfile
-    // batch. The count remains proportional to the process cpuset.
-    cores.max(1).saturating_mul(2)
 }
 
 #[cfg(target_os = "linux")]
@@ -23192,8 +23185,6 @@ mod tests {
         ));
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
-        assert_eq!(sendfile_reactor_workers_for(4), 8);
-        assert_eq!(sendfile_reactor_workers_for(96), 192);
     }
 
     #[test]
