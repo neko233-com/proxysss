@@ -48,7 +48,6 @@ struct SendfileState {
 struct ReactorWorker {
     registrations: ArrayQueue<SendfileJob>,
     wake_fd: RawFd,
-    in_flight: AtomicUsize,
 }
 
 struct Reactors {
@@ -88,14 +87,10 @@ pub(crate) fn dispatch(
     };
     let index = reactors.select_worker();
     let worker = &reactors.workers[index];
-    worker.in_flight.fetch_add(1, Ordering::Relaxed);
-    if worker.registrations.push(job).is_err() {
-        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "sendfile reactor queue full",
-        ));
-    }
+    worker
+        .registrations
+        .push(job)
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "sendfile reactor queue full"))?;
     wake(worker.wake_fd);
     Ok(receiver)
 }
@@ -113,7 +108,6 @@ impl Reactors {
             let worker = Arc::new(ReactorWorker {
                 registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
                 wake_fd,
-                in_flight: AtomicUsize::new(0),
             });
             let reactor_worker = worker.clone();
             let cpu_group = worker_cpu_groups[index].clone();
@@ -122,7 +116,7 @@ impl Reactors {
             }
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, &cpu_group))
+                .spawn(move || run_reactor(reactor_worker))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
         }
@@ -134,31 +128,12 @@ impl Reactors {
     }
 
     fn select_worker(&self) -> usize {
-        let fallback = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         if let Some(cpu) = current_cpu_id() {
-            if let Some(&local) = self.worker_by_cpu.get(&cpu) {
-                let local_load = self.workers[local].in_flight.load(Ordering::Relaxed);
-                let fallback_load = self.workers[fallback].in_flight.load(Ordering::Relaxed);
-                return select_affine_or_fallback(local, local_load, fallback, fallback_load);
+            if let Some(index) = self.worker_by_cpu.get(&cpu) {
+                return *index;
             }
         }
-        fallback
-    }
-}
-
-fn select_affine_or_fallback(
-    local: usize,
-    local_load: usize,
-    fallback: usize,
-    fallback_load: usize,
-) -> usize {
-    // Preserve CPU-local handoff while the imbalance is only one job. Once a
-    // reuseport shard is two or more transfers ahead, spill to a rotating
-    // second choice so a hash-heavy shard cannot strand idle sendfile CPUs.
-    if fallback_load.saturating_add(1) < local_load {
-        fallback
-    } else {
-        local
+        self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len()
     }
 }
 
@@ -208,10 +183,7 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
-    if !cpu_group.is_empty() {
-        pin_current_thread(cpu_group);
-    }
+fn run_reactor(worker: Arc<ReactorWorker>) {
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating sendfile epoll instance");
     let mut wake_event = libc::epoll_event {
@@ -237,9 +209,8 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            fail_all_jobs(epoll_fd, &worker, &mut jobs, "sendfile epoll_wait failed");
+            fail_all_jobs(epoll_fd, &mut jobs, "sendfile epoll_wait failed");
             while let Some(job) = worker.registrations.pop() {
-                worker.in_flight.fetch_sub(1, Ordering::Relaxed);
                 let _ = job
                     .completion
                     .send(Err(io::Error::other("sendfile epoll_wait failed")));
@@ -252,7 +223,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
             if token == WAKE_TOKEN {
                 drain_wake(worker.wake_fd);
                 while let Some(job) = worker.registrations.pop() {
-                    register_job(epoll_fd, &worker, &mut jobs, job);
+                    register_job(epoll_fd, &mut jobs, job);
                 }
                 continue;
             }
@@ -273,7 +244,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
                 DriveResult::Pending
             };
             if let DriveResult::Complete(result) = result {
-                complete_job(epoll_fd, &worker, &mut jobs, fd, result);
+                complete_job(epoll_fd, &mut jobs, fd, result);
             }
         }
     }
@@ -283,19 +254,13 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
     }
 }
 
-fn register_job(
-    epoll_fd: RawFd,
-    worker: &ReactorWorker,
-    jobs: &mut FxHashMap<RawFd, SendfileState>,
-    job: SendfileJob,
-) {
+fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
     let mut event = libc::epoll_event {
         events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
         u64: fd as u64,
     };
     if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
         let _ = job.completion.send(Err(io::Error::last_os_error()));
         return;
     }
@@ -356,7 +321,6 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
 
 fn complete_job(
     epoll_fd: RawFd,
-    worker: &ReactorWorker,
     jobs: &mut FxHashMap<RawFd, SendfileState>,
     fd: RawFd,
     result: io::Result<u64>,
@@ -365,24 +329,17 @@ fn complete_job(
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
     }
     if let Some(mut state) = jobs.remove(&fd) {
-        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
     }
 }
 
-fn fail_all_jobs(
-    epoll_fd: RawFd,
-    worker: &ReactorWorker,
-    jobs: &mut FxHashMap<RawFd, SendfileState>,
-    message: &str,
-) {
+fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, message: &str) {
     let fds = jobs.keys().copied().collect::<Vec<_>>();
     for fd in fds {
         complete_job(
             epoll_fd,
-            worker,
             jobs,
             fd,
             Err(io::Error::other(message.to_string())),
@@ -423,20 +380,6 @@ fn allowed_cpu_ids() -> Vec<usize> {
         cpus.push(0);
     }
     cpus
-}
-
-fn pin_current_thread(cpus: &[usize]) {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    unsafe {
-        for cpu in cpus {
-            libc::CPU_SET(*cpu, &mut set);
-        }
-        let _ = libc::sched_setaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -496,13 +439,5 @@ mod tests {
             build_worker_cpu_groups(&[2, 7, 11, 19], 4),
             vec![vec![2], vec![7], vec![11], vec![19]]
         );
-    }
-
-    #[test]
-    fn sendfile_handoff_spills_only_when_affine_worker_is_two_jobs_ahead() {
-        assert_eq!(select_affine_or_fallback(2, 0, 1, 0), 2);
-        assert_eq!(select_affine_or_fallback(2, 1, 1, 0), 2);
-        assert_eq!(select_affine_or_fallback(2, 2, 1, 0), 1);
-        assert_eq!(select_affine_or_fallback(2, 8, 2, 0), 2);
     }
 }
