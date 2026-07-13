@@ -25,6 +25,8 @@ use tokio::sync::oneshot;
 const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const WAKE_TOKEN: u64 = u64::MAX;
+const MODERATE_CONTENTION_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const HIGH_CONTENTION_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
 struct SendfileJob {
     socket: TcpStream,
@@ -290,13 +292,17 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
 }
 
 fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
+    let active_jobs = jobs.len();
     let Some(state) = jobs.get_mut(&fd) else {
         return DriveResult::Complete(Err(io::Error::new(
             io::ErrorKind::NotFound,
             "sendfile reactor job disappeared",
         )));
     };
-    let event_budget = (state.len - state.sent).min(state.max_chunk_bytes);
+    let event_budget = (state.len - state.sent).min(sendfile_event_chunk_bytes(
+        state.max_chunk_bytes,
+        active_jobs,
+    ));
     let event_start = state.sent;
     while state.sent - event_start < event_budget {
         let remaining_budget = event_budget - (state.sent - event_start);
@@ -328,6 +334,15 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
         return DriveResult::Complete(Err(error));
     }
     DriveResult::Pending
+}
+
+fn sendfile_event_chunk_bytes(configured_max: u64, active_jobs: usize) -> u64 {
+    match active_jobs {
+        0 | 1 => configured_max,
+        2 => configured_max.min(MODERATE_CONTENTION_CHUNK_BYTES),
+        _ => configured_max.min(HIGH_CONTENTION_CHUNK_BYTES),
+    }
+    .max(1)
 }
 
 fn complete_job(
@@ -469,5 +484,22 @@ mod tests {
             build_worker_cpu_groups(&[2, 7, 11, 19], 4),
             vec![vec![2], vec![7], vec![11], vec![19]]
         );
+    }
+
+    #[test]
+    fn sendfile_event_budget_preserves_single_flow_and_bounds_contended_flows() {
+        assert_eq!(
+            sendfile_event_chunk_bytes(16 * 1024 * 1024, 1),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            sendfile_event_chunk_bytes(16 * 1024 * 1024, 2),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            sendfile_event_chunk_bytes(16 * 1024 * 1024, 3),
+            2 * 1024 * 1024
+        );
+        assert_eq!(sendfile_event_chunk_bytes(1024 * 1024, 8), 1024 * 1024);
     }
 }
