@@ -455,7 +455,7 @@ PROXY_BIN=target/release/proxysss \
 
 The role-isolated gate pins the 4c/8GiB gateway, backend, and clients to disjoint CPU sets/cgroups (the default allocation needs a 16-core Linux host), compares against nginx 1.31.2 mainline, and keeps three measurements separate: mixed aggregate saturation, per-scenario isolated saturation, and equal-offered-load p50/p95/p99. Mixed/equal-load phases default to four order-balanced samples; isolated saturation uses three. Metrics use medians while retaining the maximum observed error count. Fixed-load rows must complete at least 98% of the declared target; reports include both ratios and percentage improvements. The scale driver repeats the complete gate at 1x/2x/4x workload.
 
-For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, records host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
+For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, then uses a remote systemd cgroup to enforce `AllowedCPUs=0-3`, `MemoryMax=8G`, and `LimitNOFILE=300000` for both nginx and proxysss. It records cgroup memory samples/peaks, host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
 
 ```bash
 GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \

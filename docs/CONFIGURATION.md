@@ -568,7 +568,7 @@ proxysss config reload-plan
 scripts/benchmark-all-scenarios.sh
 ```
 
-默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口；role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠，物理网络 WSS 结论还要从独立 client 主机运行 `scripts/benchmark-cross-host-wss.sh`，保存同 SHA、`nginx -V`、主机指纹和原始样本。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
+默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口；role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠，物理网络 WSS 结论还要从独立 client 主机运行 `scripts/benchmark-cross-host-wss.sh`：它会检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制网关 `4 CPU / 8 GiB / 300k nofile`，保存同 SHA、`nginx -V`、cgroup memory peak、主机指纹和原始样本。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
 
 如果要先在 Docker 里验证“全场景配置面没有退化”，运行：
 

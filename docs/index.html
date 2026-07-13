@@ -700,7 +700,7 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 proxysss token show</code></pre>
 
-          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后跑带 cpuset 预检的 mixed-load benchmark；涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh` 保存原始证据，而不是只截一张单场景好看的图。</p>
+          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后跑带 cpuset 预检的 mixed-load benchmark；涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh`，由 systemd cgroup 强制 4 CPU / 8 GiB / 300k nofile 后保存原始证据，而不是只截一张单场景好看的图。</p>
         </section>
 
         <section id="more" class="panel">
