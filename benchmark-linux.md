@@ -147,13 +147,13 @@ bash scripts/benchmark-cross-host-wss.sh
 
 ## 5. CI 和 benchmark 的边界
 
-默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。
+默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
 
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
-- `scripts/benchmark-all-scenarios-isolated.sh`：4c8g role-isolated saturation + equal-offered-load 严格对照入口
-- `scripts/benchmark-websocket-production-gate.sh`：4c8g 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口
+- `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
+- `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
 - `scripts/benchmark-cross-host-wss.sh`：三台独立 Linux 主机 WSS 严格吞吐、p50/p95/p99 与 20k 容量证据入口
 - `SCENARIO_FILTER=udp-stream`：定位 UDP fast path 的专项入口
 - `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 输出
@@ -179,6 +179,8 @@ bash scripts/benchmark-cross-host-wss.sh
 原因不是“把差结果藏起来”，而是 GitHub-hosted runner 的 UDP / realtime 噪声太大，且 nginx 没有 KCP/QCP 语义；默认 benchmark 不把错误环境或错误对照组包装成最终裁判。
 
 ## 8. 正式 Linux 发布怎么跑
+
+先完成 1x/2x/4x 的全场景 role-isolated 与三机 WSS 原始运行。为对应 tag 写入 `performance-evidence/vX.Y.Z.json`：每个 kind/scale 都必须记录严格吞吐胜出、等负载 p50/p95/p99 胜出、容量胜出、零错误、角色隔离、内存 current/peak/每连接成本/无持续增长，以及 saturation/equal-load/capacity 原始工件的 URI 和 SHA-256；其中跨机 WSS 还必须记录三个不同的 machine-id hash。`release.yml` 会校验清单的 tag 和 commit，并把它随 release assets 发布；它防止缺少真实证据时误发版本，不能替代对原始工件的人工审计。
 
 ```bash
 proxysss tune linux --apply --profile latency --max-connections 200000

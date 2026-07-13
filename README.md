@@ -463,7 +463,7 @@ GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
 bash scripts/benchmark-cross-host-wss.sh
 ```
 
-Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles, and no longer runs tests, smoke benchmarks, or performance gates automatically. Performance evidence is collected manually on Linux hosts or benchmark containers.
+Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles, and no longer runs tests, smoke benchmarks, or performance gates automatically. Performance evidence is collected manually on Linux hosts or benchmark containers. A release tag additionally requires `performance-evidence/vX.Y.Z.json`: strict 1x/2x/4x role-isolated plus cross-host evidence, raw-artifact hashes, role fingerprints, and memory observations; the release workflow validates and publishes that manifest with the assets.
 
 Current UDP fast-path evidence for v1.3.5:
 

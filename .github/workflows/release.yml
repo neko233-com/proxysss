@@ -13,6 +13,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  verify-production-evidence:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Verify versioned Linux performance evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          # workflow_dispatch remains useful for package rehearsals; only a tag
+          # may publish, and every tag must carry strict benchmark evidence.
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "not a tag build; evidence publication gate is not applicable"
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME}"
+          manifest="performance-evidence/${tag}.json"
+          test -f "$manifest"
+          go run scripts/verify-production-evidence.go \
+            --manifest "$manifest" --tag "$tag" --commit "${GITHUB_SHA}"
+
   build:
     strategy:
       fail-fast: false
@@ -108,7 +134,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, verify-production-evidence]
     runs-on: ubuntu-latest
 
     steps:
@@ -140,4 +166,6 @@ jobs:
         uses: softprops/action-gh-release@v3.0.0
         with:
           body_path: RELEASE_NOTES.md
-          files: dist/**/*
+          files: |
+            dist/**/*
+            performance-evidence/${{ github.ref_name }}.json
