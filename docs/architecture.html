@@ -882,7 +882,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次 chunk 随 traffic profile 自适应为 `small=2 MiB`、`balanced=8 MiB`、`bulk=16 MiB`。balanced/bulk 将 duplicated fd 交给有界、每核分片、round-robin 的原生 epoll sendfile reactor；HTTP shard 保留 keep-alive 所有权并等待 completion，bulk drain 不再占住通用 HTTP scheduler。同一次 EPOLLOUT 内 drain 到 chunk 预算、EOF 或 `EAGAIN`，handoff 失败则回退 Tokio readiness。默认 small 仍做 125µs pacing；balanced 在完整响应后 yield 一次。Range 与 backpressure 语义保持不变，同轮仍必须重新通过全部混合场景。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次 chunk 随 traffic profile 自适应为 `small=2 MiB`、`balanced=8 MiB`、`bulk=16 MiB`。默认 balanced 由当前 CPU-adaptive HTTP connection owner 直接在 Tokio writable readiness 上连续 drain partial writes，直到 chunk 预算、EOF 或 `EAGAIN`，避免每响应 duplicate fd、eventfd、epoll add/del 与 oneshot 往返；完整响应后、读取下一条 keep-alive 请求前 cooperative yield 一次。明确选择 bulk 时才将 duplicated fd 交给有界、每核分片、round-robin 的原生 epoll sendfile reactor，隔离长时间 writable drain；`sendfile(2)` 使用每响应独立的显式 offset，handoff 失败则从当前 offset 回退 Tokio readiness。默认 small 仍做 125µs pacing。Range 与 backpressure 语义保持不变，同轮仍必须重新通过全部混合场景。</p>
             </article>
           </div>
 

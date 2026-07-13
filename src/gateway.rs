@@ -1673,10 +1673,7 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         );
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
-                && !matches!(
-                    config.runtime.performance.traffic_profile,
-                    RuntimePerformanceTrafficProfile::Small
-                ),
+                && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
@@ -11715,6 +11712,11 @@ fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
 }
 
 #[cfg(target_os = "linux")]
@@ -23113,6 +23115,15 @@ mod tests {
         assert_eq!(realtime_stream_reactor_workers_for(96), 48);
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert!(!sendfile_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(!sendfile_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(sendfile_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
     }
 
     #[test]
