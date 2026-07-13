@@ -11575,11 +11575,11 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
-    // One epoll relay owner per allowed CPU avoids turning high-tick game,
-    // generic TCP, and plain WebSocket traffic into a single-reactor funnel as
-    // connection counts grow. The threads sleep in epoll when no stream is
-    // ready, so HTTP keeps its own complete per-core accept/runtime fanout.
-    cores.max(1)
+    // Keep native relay ownership proportional to the allowed cpuset without
+    // running a permanently-ready reactor alongside every HTTP shard. One
+    // owner per two CPUs preserves stream scale while leaving mixed HTTP/TLS/
+    // UDP work enough scheduler capacity; HTTP still keeps full per-core fanout.
+    cores.max(1).div_ceil(2)
 }
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
@@ -22978,8 +22978,8 @@ mod tests {
     #[test]
     fn linux_http_and_realtime_shards_partition_all_detected_cores() {
         assert_eq!(realtime_stream_reactor_workers_for(1), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(4), 4);
-        assert_eq!(realtime_stream_reactor_workers_for(96), 96);
+        assert_eq!(realtime_stream_reactor_workers_for(4), 2);
+        assert_eq!(realtime_stream_reactor_workers_for(96), 48);
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
     }

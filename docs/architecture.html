@@ -738,7 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
-          <p class="subtle">Linux 性能模式下，listener 按 `sched_getaffinity` 检测到的 cpuset 建立 `SO_REUSEPORT` accept worker。plain `ws://`、游戏小帧 TCP 与通用 1 KiB TCP 默认进入同样按 cpuset 线性扩展的原生 `epoll` relay，每条连接由单一 reactor owner 维护 backpressure 与 half-close；每 worker 不超过 4 对低密度连接时只做极短 reply spin，中高密度完全依赖 `epoll` batch，避免抢占 HTTP/TLS/UDP。无法 handoff 时回退到有界 Tokio relay。HTTP 仍保留完整 per-core shard，bulk/file profile 使用 `splice`，WSS 因 rustls 语义使用多核 Tokio 有界 relay。TLS 低密度连接复用 HTTP shard，达到每 base shard 64 条活跃连接后才弹性启动额外 TLS shard。</p>
+          <p class="subtle">Linux 性能模式下，listener 按 `sched_getaffinity` 检测到的 cpuset 建立 `SO_REUSEPORT` accept worker。plain `ws://`、游戏小帧 TCP 与通用 1 KiB TCP 默认进入按 cpuset 线性扩展（每 2 个可用 CPU 一个 owner）的原生 `epoll` relay，每条连接由单一 reactor owner 维护 backpressure 与 half-close；每 worker 不超过 4 对低密度连接时只做极短 reply spin，中高密度完全依赖 `epoll` batch，避免抢占 HTTP/TLS/UDP。无法 handoff 时回退到有界 Tokio relay。HTTP 仍保留完整 per-core shard，bulk/file profile 使用 `splice`，WSS 因 rustls 语义使用多核 Tokio 有界 relay。TLS 低密度连接复用 HTTP shard，达到每 base shard 64 条活跃连接后才弹性启动额外 TLS shard。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用 CPU 自适应 `SO_REUSEPORT` worker、复用有界 UDP buffer pool；无 policy 的 worker 本地缓存 upstream/config 快照，只在每秒或 reload 后刷新，普通数据报不会抢动态配置锁。新会话 pending 去重是分片集合，association prune 按时间、创建数量和容量压力节流，避免重连风暴每建一条会话就扫全表。</p>
         </section>
 
