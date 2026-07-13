@@ -143,6 +143,14 @@ GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
 bash scripts/benchmark-cross-host-wss.sh
 ```
 
+正式证据需要 1x/2x/4x 时，直接运行下面的编排入口。默认把 active WSS 从 4096 扩到 8192、16384，而 idle 容量始终保持 20k；这验证规模增长，又不会为了凑数字把容量硬推到 100k。
+
+```bash
+GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
+GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
+bash scripts/benchmark-cross-host-scale-matrix.sh
+```
+
 默认使用可跨同架构 Linux 主机运行的 release-fast 二进制。只有三台机器 CPU 特性一致时，才可显式 `BUILD_NATIVE=1` 以 `target-cpu=native` 编译；否则不得以优化名义引入非法指令风险。
 
 ## 5. CI 和 benchmark 的边界
@@ -155,6 +163,7 @@ bash scripts/benchmark-cross-host-wss.sh
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
 - `scripts/benchmark-cross-host-wss.sh`：三台独立 Linux 主机 WSS 严格吞吐、p50/p95/p99 与 20k 容量证据入口
+- `scripts/benchmark-cross-host-scale-matrix.sh`：三机 WSS 1x/2x/4x 严格复跑入口，默认只扩 active 负载
 - `SCENARIO_FILTER=udp-stream`：定位 UDP fast path 的专项入口
 - `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 输出
 
