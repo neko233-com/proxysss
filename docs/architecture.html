@@ -877,7 +877,7 @@ plugins:
             <article class="card">
               <span class="tag expert">WebSocket relay</span>
               <h3>游戏重连不会反复打分配器</h3>
-              <p class="subtle">plain WebSocket 与 WSS 在握手后使用多核 Tokio relay；只有出现 pending 数据时才从有界 `ByteBufferPool` 借 buffer，空闲长连接不会预占每方向固定大块内存。4c/8GiB 生产门禁默认验证 20k idle WSS 容量和最多 4096 条活跃消息连接，并分别比较握手/消息的 p50、p95、p99。</p>
+              <p class="subtle">plain WebSocket 与 WSS 在握手后使用多核 Tokio relay；只有出现 pending 数据时才从有界 `ByteBufferPool` 借 buffer，空闲长连接不会预占每方向固定大块内存。4c 生产参考包络默认验证 20k idle WSS 容量和最多 4096 条活跃消息连接，并分别比较握手/消息的 p50、p95、p99，记录内存 current/peak 和每连接成本；它不是任意固定 RAM 准入门槛。</p>
             </article>
             <article class="card">
               <span class="tag expert">Static sendfile</span>

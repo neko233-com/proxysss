@@ -303,7 +303,7 @@
           </div>
         </div>
         <h3>单网关 WSS 隔离 Docker 验证</h3>
-        <p>Rust 游戏网关先跑 <code>scripts/benchmark-websocket-production-gate.sh</code>：nginx 和 proxysss 都固定为 4 CPU / 8 GiB 网关容器，4 个回源和多个客户端处在独立 cgroup 与网络命名空间。每个候选都跑相同的 WSS 活跃回显吞吐、p50/p95/p99 延迟，以及 20k idle WSS 容量，脚本自动写出百分比对比和网关资源快照。</p>
+        <p>Rust 游戏网关先跑 <code>scripts/benchmark-websocket-production-gate.sh</code>：nginx 和 proxysss 都固定为同一组 4 CPU 网关容器，4 个回源和多个客户端处在独立 cgroup 与网络命名空间。每个候选都跑相同的 WSS 活跃回显吞吐、p50/p95/p99 延迟，以及 20k idle WSS 容量，脚本自动写出百分比对比和网关资源快照；内存默认记录而不是用任意阈值淘汰，只有声明真实生产预算时才传 Docker/systemd 内存上限。</p>
         <pre><code>proxysss tune linux --apply
 bash scripts/benchmark-websocket-production-gate.sh</code></pre>
         <p>默认容量用 5 个客户端 IP、4 个后端 <code>IP:port</code> 避免 TCP 四元组上限；推荐压测机至少 16 CPU / 32 GiB，脚本会拒绝 cpuset 重叠或默认包络之外的主机。WSS 使用生成的自签名 fixture，只有压测客户端使用 <code>--insecure</code>，因此验证的是 TLS/WSS 数据路径而不是证书信任。Docker 隔离可以排除同容器/同进程干扰，但仍共享一个 Linux 内核；生产发布必须再用 <code>scripts/benchmark-cross-host-wss.sh</code> 在独立网关、回源、压测主机复跑：它验证 machine-id 角色独立，并用 systemd cgroup 强制 4 CPU / 300k nofile，保存 SHA、cgroup memory current/peak、每连接成本、主机指纹、nginx 构建信息与原始结果。只有声明实际生产内存预算时才设置 <code>GATEWAY_MEMORY_MAX</code>。</p>

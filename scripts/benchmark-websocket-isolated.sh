@@ -101,8 +101,8 @@ validate_role_cpusets() {
   done
 }
 
-# The gateway is the unit under test: exactly four CPUs and 8GiB. Backends and
-# clients use disjoint CPU sets so an echo loop or connection opener cannot be
+# The gateway is the unit under test: exactly four CPUs. Backends and clients
+# use disjoint CPU sets so an echo loop or connection opener cannot be
 # mistaken for gateway capacity. Clients deliberately receive more CPU than
 # the 4c unit under test: a saturated load generator invalidates a gateway
 # result. A 16-core / 32GiB+ benchmark host is advised.
@@ -111,9 +111,12 @@ NGINX_WORKERS="${NGINX_WORKERS:-$(cpuset_cpu_count "$GATEWAY_CPUSET")}"
 BACKEND_CPUSET="${BACKEND_CPUSET:-4-7}"
 CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 CAPACITY_CLIENT_CPUSET="${CAPACITY_CLIENT_CPUSET:-$CLIENT_CPUSET}"
-GATEWAY_MEMORY="${GATEWAY_MEMORY:-8g}"
-BACKEND_MEMORY="${BACKEND_MEMORY:-2g}"
-CLIENT_MEMORY="${CLIENT_MEMORY:-2g}"
+# Memory is deliberately uncapped by default. The run records container RSS
+# and connection costs; callers can set a limit for a declared production
+# envelope without making a fixed RAM number a release admission gate.
+GATEWAY_MEMORY="${GATEWAY_MEMORY:-}"
+BACKEND_MEMORY="${BACKEND_MEMORY:-}"
+CLIENT_MEMORY="${CLIENT_MEMORY:-}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-300000}"
 ACTIVE_CONNECTIONS="${ACTIVE_CONNECTIONS:-4096}"
 ACTIVE_DURATION_SECS="${ACTIVE_DURATION_SECS:-30}"
@@ -319,8 +322,14 @@ http {
 }
 NGINX
 
+memory_limit_enabled() {
+  [[ -n "$1" && "$1" != "0" && "$1" != "infinity" && "$1" != "unlimited" ]]
+}
+
 start_backends() {
   local kind="$1" backend_base
+  local memory_args=()
+  memory_limit_enabled "$BACKEND_MEMORY" && memory_args=(--memory "$BACKEND_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then
     backend_base="$PROXYSSS_BACKEND_BASE_IP"
   else
@@ -329,7 +338,7 @@ start_backends() {
   for index in 1 2 3 4; do
     docker run -d --name "$PREFIX-backend-$index" \
       --network "$NETWORK" --ip "${backend_base}.${index}" \
-      --cpuset-cpus "$BACKEND_CPUSET" --memory "$BACKEND_MEMORY" \
+      --cpuset-cpus "$BACKEND_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       "$IMAGE" proxysss demo ws-echo --listen 0.0.0.0:18192 >/dev/null
   done
@@ -343,6 +352,8 @@ stop_backends() {
 
 create_gateway() {
   local kind="$1" name="$PREFIX-gateway-$kind"
+  local memory_args=()
+  memory_limit_enabled "$GATEWAY_MEMORY" && memory_args=(--memory "$GATEWAY_MEMORY")
   local gateway_ip
   if [[ "$kind" == "proxysss" ]]; then
     gateway_ip="$PROXYSSS_GATEWAY_IP"
@@ -351,7 +362,7 @@ create_gateway() {
   fi
   if [[ "$kind" == "proxysss" ]]; then
     docker create --name "$name" --network "$NETWORK" --ip "$gateway_ip" \
-      --cpuset-cpus "$GATEWAY_CPUSET" --memory "$GATEWAY_MEMORY" \
+      --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       --sysctl net.core.somaxconn=65535 \
       --env "TLS_KEY_TYPE=$TLS_KEY_TYPE" \
@@ -373,7 +384,7 @@ create_gateway() {
     docker cp "$RUN_DIR/proxysss.yaml" "$name:/etc/proxysss.yaml"
   else
     docker create --name "$name" --network "$NETWORK" --ip "$gateway_ip" \
-      --cpuset-cpus "$GATEWAY_CPUSET" --memory "$GATEWAY_MEMORY" \
+      --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       --sysctl net.core.somaxconn=65535 \
       --env "TLS_KEY_TYPE=$TLS_KEY_TYPE" \
@@ -431,6 +442,8 @@ run_active() {
   local kind="$1" port="$2" output="$RUN_DIR/${kind}-active.txt"
   local name="$PREFIX-${kind}-active"
   local gateway_ip client_base_ip
+  local memory_args=()
+  memory_limit_enabled "$CLIENT_MEMORY" && memory_args=(--memory "$CLIENT_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then
     gateway_ip="$PROXYSSS_GATEWAY_IP"
     client_base_ip="$PROXYSSS_CLIENT_BASE_IP"
@@ -449,7 +462,7 @@ run_active() {
     bench_args+=(--message-interval-micros "$ACTIVE_MESSAGE_INTERVAL_MICROS")
   fi
   docker run -d --name "$name" --network "$NETWORK" --ip "${client_base_ip}.10" \
-    --cpuset-cpus "$CLIENT_CPUSET" --memory "$CLIENT_MEMORY" \
+    --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" proxysss bench websocket "${bench_args[@]}" >/dev/null
   sleep "$ACTIVE_SAMPLE_AFTER_SECS"
@@ -463,6 +476,8 @@ run_active() {
 run_capacity() {
   local kind="$1" port="$2" per_client=$((CAPACITY_CONNECTIONS / CAPACITY_CLIENTS))
   local gateway_ip client_base_ip
+  local memory_args=()
+  memory_limit_enabled "$CLIENT_MEMORY" && memory_args=(--memory "$CLIENT_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then
     gateway_ip="$PROXYSSS_GATEWAY_IP"
     client_base_ip="$PROXYSSS_CLIENT_BASE_IP"
@@ -476,7 +491,7 @@ run_capacity() {
     local client_ip="${client_base_ip}.$((100 + index))"
     ids+=("$name")
     docker run -d --name "$name" --network "$NETWORK" --ip "$client_ip" \
-      --cpuset-cpus "$CAPACITY_CLIENT_CPUSET" --memory "$CLIENT_MEMORY" \
+      --cpuset-cpus "$CAPACITY_CLIENT_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       "$IMAGE" proxysss bench websocket \
         --url "wss://${gateway_ip}:${port}/ws/" \
@@ -556,12 +571,13 @@ done
 
 cat >"$RUN_DIR/run-metadata.txt" <<EOF
 gateway_cpuset=$GATEWAY_CPUSET
-gateway_memory=$GATEWAY_MEMORY
+gateway_memory=${GATEWAY_MEMORY:-unlimited}
 nginx_workers=$NGINX_WORKERS
 backend_count=4
 backend_cpuset=$BACKEND_CPUSET
-backend_memory_each=$BACKEND_MEMORY
+backend_memory_each=${BACKEND_MEMORY:-unlimited}
 client_cpuset=$CLIENT_CPUSET
+client_memory_each=${CLIENT_MEMORY:-unlimited}
 capacity_client_cpuset=$CAPACITY_CLIENT_CPUSET
 capacity_sample_after_secs=$CAPACITY_SAMPLE_AFTER_SECS
 capacity_clients=$CAPACITY_CLIENTS
