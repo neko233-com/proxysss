@@ -11490,17 +11490,32 @@ async fn sendfile_all_async(
         let remaining = len - sent;
         let count = remaining.min(max_chunk_bytes) as usize;
         let written = stream
-            .async_io(tokio::io::Interest::WRITABLE, || loop {
-                let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
-                if written >= 0 {
-                    return Ok(written as usize);
-                }
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                let mut batch_written = 0_usize;
+                loop {
+                    let written = unsafe {
+                        libc::sendfile(out_fd, in_fd, &mut offset, count - batch_written)
+                    };
+                    if written > 0 {
+                        batch_written = batch_written.saturating_add(written as usize);
+                        if batch_written >= count {
+                            return Ok(batch_written);
+                        }
+                        continue;
+                    }
+                    if written == 0 {
+                        return Ok(batch_written);
+                    }
 
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.kind() == std::io::ErrorKind::WouldBlock && batch_written > 0 {
+                        return Ok(batch_written);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             })
             .await?;
         if written == 0 {
