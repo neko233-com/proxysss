@@ -1483,7 +1483,11 @@ impl HyperBody for GatewayBody {
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1519,6 +1523,9 @@ static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
+    AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
@@ -1662,6 +1669,12 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 ),
             Ordering::Relaxed,
         );
+        let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
+            RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_CHUNK_BYTES,
+            RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_CHUNK_BYTES,
+            RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
+        };
+        STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
     }
     plan
 }
@@ -11459,10 +11472,11 @@ async fn sendfile_all_async(
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
+    let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
 
     while sent < len {
         let remaining = len - sent;
-        let count = remaining.min(STATIC_SENDFILE_MAX_CHUNK_BYTES) as usize;
+        let count = remaining.min(max_chunk_bytes) as usize;
         let written = stream
             .async_io(tokio::io::Interest::WRITABLE, || loop {
                 let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
