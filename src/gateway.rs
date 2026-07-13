@@ -1516,7 +1516,6 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static STATIC_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -1526,6 +1525,8 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
@@ -1565,36 +1566,6 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 
 fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_http_connection_runtimes();
-    &runtimes[worker_index % runtimes.len()]
-}
-
-fn dedicated_static_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
-    STATIC_CONNECTION_RUNTIMES.get_or_init(|| {
-        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
-        tracing::info!(
-            runtime_shards = shard_count,
-            "starting sharded static sendfile runtimes"
-        );
-        (0..shard_count)
-            .map(|shard_index| {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder
-                    .worker_threads(1)
-                    .thread_name(format!("proxysss-sendfile-{shard_index}"))
-                    .global_queue_interval(2)
-                    .event_interval(3)
-                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
-                    .enable_all();
-                builder
-                    .build()
-                    .expect("failed to build proxysss static sendfile runtime shard")
-            })
-            .collect()
-    })
-}
-
-fn dedicated_static_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    let runtimes = dedicated_static_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
 }
 
@@ -1707,6 +1678,13 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED.store(
+            config.runtime.performance.enabled
+                && sendfile_cooperative_yield_profile_enabled(
+                    config.runtime.performance.traffic_profile,
+                ),
             Ordering::Relaxed,
         );
         let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
@@ -4703,76 +4681,6 @@ impl Gateway {
     }
 
     async fn serve_plain_http_connection(
-        self: Arc<Self>,
-        stream: TcpStream,
-        remote_addr: SocketAddr,
-        worker_index: usize,
-        mut initial_prefix: Bytes,
-    ) {
-        let mut stream = stream;
-        if cfg!(target_os = "linux")
-            && static_connection_runtime_profile_enabled(
-                self.bootstrap_config.runtime.performance.enabled,
-                self.bootstrap_config.runtime.performance.traffic_profile,
-            )
-        {
-            let mut probe = BytesMut::with_capacity(4096.max(initial_prefix.len()));
-            probe.extend_from_slice(&initial_prefix);
-            if let Err(error) = read_fast_lane_http_prefix(&mut stream, &mut probe).await {
-                tracing::debug!(?error, %remote_addr, "failed probing plain HTTP connection for static runtime");
-                return;
-            }
-            let should_migrate = memmem::find(&probe, b"\r\n\r\n")
-                .map(|head_end| &probe[..head_end + 4])
-                .and_then(peek_static_fast_path_path)
-                .and_then(|path| {
-                    self.static_route_cache
-                        .get(path)
-                        .map(|target| target.clone())
-                })
-                .is_some_and(|target| {
-                    self.static_file_cache
-                        .get(target.to_string_lossy().as_ref())
-                        .is_some_and(|cached| cached.sendfile.is_some())
-                });
-            initial_prefix = probe.freeze();
-            if should_migrate {
-                let stream = match stream.into_std() {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        tracing::debug!(?error, %remote_addr, "failed detaching static connection from HTTP runtime");
-                        return;
-                    }
-                };
-                let gateway = self.clone();
-                std::mem::drop(dedicated_static_connection_runtime(worker_index).spawn(async move {
-                    let stream = match TcpStream::from_std(stream) {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            tracing::debug!(?error, %remote_addr, "failed registering static connection on sendfile runtime");
-                            return;
-                        }
-                    };
-                    gateway
-                        .serve_plain_http_connection_on_owner(
-                            stream, remote_addr, worker_index, initial_prefix,
-                        )
-                        .await;
-                }));
-                return;
-            }
-        }
-
-        self.serve_plain_http_connection_on_owner(
-            stream,
-            remote_addr,
-            worker_index,
-            initial_prefix,
-        )
-        .await;
-    }
-
-    async fn serve_plain_http_connection_on_owner(
         self: Arc<Self>,
         stream: TcpStream,
         remote_addr: SocketAddr,
@@ -11662,8 +11570,12 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
-        if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
-            tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+        if sent < len {
+            if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
+                tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+            } else if STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -11830,11 +11742,9 @@ fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -
     matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
 }
 
-fn static_connection_runtime_profile_enabled(
-    performance_enabled: bool,
-    profile: RuntimePerformanceTrafficProfile,
-) -> bool {
-    performance_enabled && matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_cooperative_yield_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(target_os = "linux")]
@@ -23247,16 +23157,10 @@ mod tests {
         assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
-        assert!(static_connection_runtime_profile_enabled(
-            true,
+        assert!(sendfile_cooperative_yield_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
-        assert!(!static_connection_runtime_profile_enabled(
-            false,
-            RuntimePerformanceTrafficProfile::Balanced
-        ));
-        assert!(!static_connection_runtime_profile_enabled(
-            true,
+        assert!(!sendfile_cooperative_yield_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
     }
