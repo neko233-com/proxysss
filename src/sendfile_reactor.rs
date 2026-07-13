@@ -338,8 +338,8 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
 
 fn sendfile_event_chunk_bytes(configured_max: u64, active_jobs: usize) -> u64 {
     match active_jobs {
-        0 | 1 => configured_max,
-        2 => configured_max.min(MODERATE_CONTENTION_CHUNK_BYTES),
+        0..=2 => configured_max,
+        3 => configured_max.min(MODERATE_CONTENTION_CHUNK_BYTES),
         _ => configured_max.min(HIGH_CONTENTION_CHUNK_BYTES),
     }
     .max(1)
@@ -494,10 +494,14 @@ mod tests {
         );
         assert_eq!(
             sendfile_event_chunk_bytes(16 * 1024 * 1024, 2),
-            8 * 1024 * 1024
+            16 * 1024 * 1024
         );
         assert_eq!(
             sendfile_event_chunk_bytes(16 * 1024 * 1024, 3),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            sendfile_event_chunk_bytes(16 * 1024 * 1024, 4),
             2 * 1024 * 1024
         );
         assert_eq!(sendfile_event_chunk_bytes(1024 * 1024, 8), 1024 * 1024);
