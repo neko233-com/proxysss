@@ -28,7 +28,7 @@ const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SendfileJob {
     socket: TcpStream,
-    file: File,
+    file: Arc<File>,
     len: u64,
     max_chunk_bytes: u64,
     completion: oneshot::Sender<io::Result<u64>>,
@@ -36,7 +36,7 @@ struct SendfileJob {
 
 struct SendfileState {
     _socket: TcpStream,
-    file: File,
+    file: Arc<File>,
     offset: libc::off_t,
     sent: u64,
     len: u64,
@@ -64,7 +64,7 @@ static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
 pub(crate) fn dispatch(
     socket_fd: RawFd,
-    file_fd: RawFd,
+    file: Arc<File>,
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
@@ -76,7 +76,6 @@ pub(crate) fn dispatch(
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
     let socket = duplicate_stream(socket_fd)?;
-    let file = duplicate_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
         socket,
@@ -169,11 +168,6 @@ fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-fn duplicate_file(fd: RawFd) -> io::Result<File> {
-    let duplicated = duplicate_fd(fd)?;
-    Ok(unsafe { File::from_raw_fd(duplicated) })
-}
-
 fn duplicate_fd(fd: RawFd) -> io::Result<RawFd> {
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
@@ -259,14 +253,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
 
 fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
-    let mut event = libc::epoll_event {
-        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
-        u64: fd as u64,
-    };
-    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-        let _ = job.completion.send(Err(io::Error::last_os_error()));
-        return;
-    }
     jobs.insert(
         fd,
         SendfileState {
@@ -279,6 +265,23 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
             completion: Some(job.completion),
         },
     );
+
+    // The HTTP shard has just completed the response head write, so the socket
+    // is commonly writable already. Drain once before EPOLL_CTL_ADD to avoid a
+    // redundant readiness round-trip for every keep-alive response. A bounded
+    // chunk or EAGAIN still enters the normal level-triggered epoll path.
+    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
+        complete_job(epoll_fd, jobs, fd, result);
+        return;
+    }
+
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+        u64: fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+        complete_job(epoll_fd, jobs, fd, Err(io::Error::last_os_error()));
+    }
 }
 
 fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
@@ -425,14 +428,13 @@ mod tests {
 
         let completion = dispatch(
             server.as_raw_fd(),
-            file.as_raw_fd(),
+            Arc::new(file),
             expected.len() as u64,
             16 * 1024,
             1,
         )
         .unwrap();
         drop(server);
-        drop(file);
 
         let reader = thread::spawn(move || {
             let mut received = vec![0_u8; expected.len()];
