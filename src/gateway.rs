@@ -1492,7 +1492,10 @@ const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 8;
+// Socket reads/writes already yield when the peer is not ready. Amortize the
+// explicit cooperative yield over a larger batch so tiny cached objects and
+// raw reverse-proxy responses do not pay scheduler overhead every 8 requests.
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
