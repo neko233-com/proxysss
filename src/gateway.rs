@@ -1524,8 +1524,6 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
-static STATIC_SENDFILE_COOPERATIVE_YIELD: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
@@ -1668,14 +1666,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 && matches!(
                     config.runtime.performance.traffic_profile,
                     RuntimePerformanceTrafficProfile::Small
-                ),
-            Ordering::Relaxed,
-        );
-        STATIC_SENDFILE_COOPERATIVE_YIELD.store(
-            config.runtime.performance.enabled
-                && matches!(
-                    config.runtime.performance.traffic_profile,
-                    RuntimePerformanceTrafficProfile::Balanced
                 ),
             Ordering::Relaxed,
         );
@@ -4745,6 +4735,11 @@ impl Gateway {
                 prefix: initial_prefix,
             });
         }
+        let yield_after_sendfile_response = config.runtime.performance.enabled
+            && matches!(
+                config.runtime.performance.traffic_profile,
+                RuntimePerformanceTrafficProfile::Balanced
+            );
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
         let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
@@ -4778,11 +4773,12 @@ impl Gateway {
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 send_connection_static_fast_path(&mut stream, cached).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -4933,11 +4929,12 @@ impl Gateway {
                 .as_ref()
                 .filter(|cached| cached.matches(&request))
             {
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 send_connection_static_fast_path(&mut stream, cached).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -4985,11 +4982,12 @@ impl Gateway {
                 // Keep the already-serialized response instead of making all
                 // keep-alive connections rebuild it on the same TTL boundary.
                 cached.checked_at = Instant::now();
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 send_connection_static_fast_path(&mut stream, cached).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5036,12 +5034,13 @@ impl Gateway {
                     len: candidate.len,
                     sendfile: candidate.sendfile.clone(),
                 };
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 send_connection_static_fast_path(&mut stream, &cached).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -11482,9 +11481,7 @@ async fn sendfile_all_async(
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
-    let mut sent_since_yield = 0_u64;
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
-    let cooperative_yield = STATIC_SENDFILE_COOPERATIVE_YIELD.load(Ordering::Relaxed);
 
     while sent < len {
         let remaining = len - sent;
@@ -11522,12 +11519,8 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
-        sent_since_yield = sent_since_yield.saturating_add(written as u64);
         if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
             tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
-        } else if sent < len && cooperative_yield && sent_since_yield >= max_chunk_bytes {
-            sent_since_yield = 0;
-            tokio::task::yield_now().await;
         }
     }
 
