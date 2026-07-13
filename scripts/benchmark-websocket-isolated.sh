@@ -148,6 +148,7 @@ REFRESH_BASE_IMAGE="${REFRESH_BASE_IMAGE:-0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 RUN_DIR="${BENCH_ROOT:-$ROOT/.benchmark}/runs/isolated-websocket/$RUN_ID"
+ROLE_MACHINE_ID_HASH="$(sha256sum /etc/machine-id | awk '{print $1}')"
 CONTEXT_DIR="$RUN_DIR/image-context"
 BENCH_HELPER_BIN="$RUN_DIR/benchmark-helper"
 NETWORK="proxysss-ws-isolated-$RUN_ID"
@@ -351,7 +352,8 @@ stop_backends() {
 }
 
 create_gateway() {
-  local kind="$1" name="$PREFIX-gateway-$kind"
+  local kind="$1"
+  local name="$PREFIX-gateway-$kind"
   local memory_args=()
   memory_limit_enabled "$GATEWAY_MEMORY" && memory_args=(--memory "$GATEWAY_MEMORY")
   local gateway_ip
@@ -438,8 +440,22 @@ wait_wss() {
   return 1
 }
 
+# A point-in-time `docker stats` report cannot prove the memory envelope.
+# Record cgroup-v2 current and peak while the gateway is still alive so the
+# 2x-nginx release comparison has machine-readable, per-run inputs.
+capture_gateway_memory() {
+  local kind="$1" phase="$2"
+  docker exec "$PREFIX-gateway-$kind" sh -ec '
+    test -r /sys/fs/cgroup/memory.current
+    test -r /sys/fs/cgroup/memory.peak
+    printf "memory_current_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.current)"
+    printf "memory_peak_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.peak)"
+  ' >"$RUN_DIR/${kind}-${phase}-gateway-memory.txt"
+}
+
 run_active() {
-  local kind="$1" port="$2" output="$RUN_DIR/${kind}-active.txt"
+  local kind="$1" port="$2"
+  local output="$RUN_DIR/${kind}-active.txt"
   local name="$PREFIX-${kind}-active"
   local gateway_ip client_base_ip
   local memory_args=()
@@ -468,9 +484,11 @@ run_active() {
   sleep "$ACTIVE_SAMPLE_AFTER_SECS"
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
     "$PREFIX-gateway-$kind" "$name" | tee "$RUN_DIR/${kind}-active-stats.txt" || true
+  capture_gateway_memory "$kind" active-sample
   docker wait "$name" >/dev/null
   docker logs "$name" | tee "$output"
   docker rm "$name" >/dev/null
+  capture_gateway_memory "$kind" active-final
 }
 
 run_capacity() {
@@ -509,6 +527,7 @@ run_capacity() {
     docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
       "$PREFIX-gateway-$kind" "${ids[@]}" \
       | tee "$RUN_DIR/${kind}-capacity-ramp-stats.txt" || true
+    capture_gateway_memory "$kind" capacity-ramp
   fi
   local remaining_settle=$((CAPACITY_SETTLE_SECS - sample_after))
   if (( remaining_settle > 0 )); then
@@ -525,6 +544,7 @@ run_capacity() {
     outputs+=("$output")
     docker rm "$name" >/dev/null
   done
+  capture_gateway_memory "$kind" capacity-final
   local aggregate_args=(aggregate-isolated-wss-capacity --expected "$CAPACITY_CONNECTIONS")
   for output in "${outputs[@]}"; do
     aggregate_args+=(--input "$output")
@@ -591,6 +611,8 @@ tls_key_type=$TLS_KEY_TYPE
 nginx_version=$NGINX_VERSION
 run_order=$RUN_ORDER
 role_isolation=docker-cgroup-cpuset-network-namespace
+role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
+gateway_memory_samples=cgroup-v2-current-and-peak
 nginx_ip_tuple=$NGINX_BACKEND_BASE_IP/$NGINX_GATEWAY_IP/$NGINX_CLIENT_BASE_IP
 proxysss_ip_tuple=$PROXYSSS_BACKEND_BASE_IP/$PROXYSSS_GATEWAY_IP/$PROXYSSS_CLIENT_BASE_IP
 run_active=$RUN_ACTIVE

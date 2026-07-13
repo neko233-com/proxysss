@@ -326,7 +326,8 @@ start_backend() {
 }
 
 start_gateway() {
-  local kind="$1" name="$PREFIX-gateway-$kind"
+  local kind="$1"
+  local name="$PREFIX-gateway-$kind"
   local memory_args=()
   memory_limit_enabled "$GATEWAY_MEMORY" && memory_args=(--memory "$GATEWAY_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then

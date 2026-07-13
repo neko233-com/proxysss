@@ -264,7 +264,8 @@ sample_gateway_resources() {
 }
 
 record_capacity_memory_cost() {
-  local iteration="$1" kind="$2" sample="$RUN_DIR/capacity-r${iteration}-final-${kind}-cgroup.txt"
+  local iteration="$1" kind="$2"
+  local sample="$RUN_DIR/capacity-r${iteration}-final-${kind}-cgroup.txt"
   local current peak measured
   current="$(awk -F= '$1 == "MemoryCurrent" {print $2}' "$sample")"
   peak="$(awk -F= '$1 == "MemoryPeak" {print $2}' "$sample")"
@@ -292,7 +293,8 @@ run_active() {
 }
 
 run_capacity() {
-  local kind="$1" iteration="$2" output="$RUN_DIR/capacity-r${iteration}-${kind}.txt"
+  local kind="$1" iteration="$2"
+  local output="$RUN_DIR/capacity-r${iteration}-${kind}.txt"
   start_gateway "$kind"
   "$PROXY_BIN" bench websocket --url "wss://${GATEWAY_ADDR}:${GATEWAY_PORT}/ws/" --connections "$CAPACITY_CONNECTIONS" --hold-connections --connect-workers "$CAPACITY_CONNECT_WORKERS" --duration-secs "$CAPACITY_HOLD_SECS" --insecure >"$output" 2>&1 &
   local client_pid=$!
