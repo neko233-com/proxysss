@@ -3,8 +3,9 @@
 //! HTTP parsing and keep-alive ownership remain on the CPU-adaptive Tokio HTTP
 //! shards. Large response bodies are handed to a bounded set of native epoll
 //! workers so a writable socket cannot monopolize the HTTP scheduler while
-//! repeatedly draining `sendfile(2)`. Each job owns duplicated descriptors and
-//! reports completion before the HTTP task reads the next request.
+//! repeatedly draining `sendfile(2)`. Each job owns a duplicated socket and a
+//! shared cached file handle, then reports completion before the HTTP task reads
+//! the next request.
 
 use std::fs::File;
 use std::io;
@@ -28,7 +29,7 @@ const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SendfileJob {
     socket: TcpStream,
-    file: File,
+    file: Arc<File>,
     len: u64,
     max_chunk_bytes: u64,
     completion: oneshot::Sender<io::Result<u64>>,
@@ -36,7 +37,7 @@ struct SendfileJob {
 
 struct SendfileState {
     _socket: TcpStream,
-    file: File,
+    file: Arc<File>,
     offset: libc::off_t,
     sent: u64,
     len: u64,
@@ -47,6 +48,7 @@ struct SendfileState {
 struct ReactorWorker {
     registrations: ArrayQueue<SendfileJob>,
     wake_fd: RawFd,
+    in_flight: AtomicUsize,
 }
 
 struct Reactors {
@@ -64,7 +66,7 @@ static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
 pub(crate) fn dispatch(
     socket_fd: RawFd,
-    file_fd: RawFd,
+    file: Arc<File>,
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
@@ -76,7 +78,6 @@ pub(crate) fn dispatch(
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
     let socket = duplicate_stream(socket_fd)?;
-    let file = reopen_independent_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
         socket,
@@ -87,10 +88,14 @@ pub(crate) fn dispatch(
     };
     let index = reactors.select_worker();
     let worker = &reactors.workers[index];
-    worker
-        .registrations
-        .push(job)
-        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "sendfile reactor queue full"))?;
+    worker.in_flight.fetch_add(1, Ordering::Relaxed);
+    if worker.registrations.push(job).is_err() {
+        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "sendfile reactor queue full",
+        ));
+    }
     wake(worker.wake_fd);
     Ok(receiver)
 }
@@ -108,6 +113,7 @@ impl Reactors {
             let worker = Arc::new(ReactorWorker {
                 registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
                 wake_fd,
+                in_flight: AtomicUsize::new(0),
             });
             let reactor_worker = worker.clone();
             let cpu_group = worker_cpu_groups[index].clone();
@@ -128,12 +134,31 @@ impl Reactors {
     }
 
     fn select_worker(&self) -> usize {
+        let fallback = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         if let Some(cpu) = current_cpu_id() {
-            if let Some(index) = self.worker_by_cpu.get(&cpu) {
-                return *index;
+            if let Some(&local) = self.worker_by_cpu.get(&cpu) {
+                let local_load = self.workers[local].in_flight.load(Ordering::Relaxed);
+                let fallback_load = self.workers[fallback].in_flight.load(Ordering::Relaxed);
+                return select_affine_or_fallback(local, local_load, fallback, fallback_load);
             }
         }
-        self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+        fallback
+    }
+}
+
+fn select_affine_or_fallback(
+    local: usize,
+    local_load: usize,
+    fallback: usize,
+    fallback_load: usize,
+) -> usize {
+    // Preserve CPU-local handoff while the imbalance is only one job. Once a
+    // reuseport shard is two or more transfers ahead, spill to a rotating
+    // second choice so a hash-heavy shard cannot strand idle sendfile CPUs.
+    if fallback_load.saturating_add(1) < local_load {
+        fallback
+    } else {
+        local
     }
 }
 
@@ -167,13 +192,6 @@ fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
     let stream = unsafe { TcpStream::from_raw_fd(duplicated) };
     stream.set_nonblocking(true)?;
     Ok(stream)
-}
-
-fn reopen_independent_file(fd: RawFd) -> io::Result<File> {
-    // F_DUPFD would keep the same open file description and shared readahead
-    // state across all CPU-local workers. Reopening through procfs creates an
-    // independent description without repeating the configured path lookup.
-    File::open(format!("/proc/self/fd/{fd}"))
 }
 
 fn duplicate_fd(fd: RawFd) -> io::Result<RawFd> {
@@ -219,7 +237,13 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            fail_all_jobs(epoll_fd, &mut jobs, "sendfile epoll_wait failed");
+            fail_all_jobs(epoll_fd, &worker, &mut jobs, "sendfile epoll_wait failed");
+            while let Some(job) = worker.registrations.pop() {
+                worker.in_flight.fetch_sub(1, Ordering::Relaxed);
+                let _ = job
+                    .completion
+                    .send(Err(io::Error::other("sendfile epoll_wait failed")));
+            }
             break;
         }
 
@@ -228,7 +252,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
             if token == WAKE_TOKEN {
                 drain_wake(worker.wake_fd);
                 while let Some(job) = worker.registrations.pop() {
-                    register_job(epoll_fd, &mut jobs, job);
+                    register_job(epoll_fd, &worker, &mut jobs, job);
                 }
                 continue;
             }
@@ -249,7 +273,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
                 DriveResult::Pending
             };
             if let DriveResult::Complete(result) = result {
-                complete_job(epoll_fd, &mut jobs, fd, result);
+                complete_job(epoll_fd, &worker, &mut jobs, fd, result);
             }
         }
     }
@@ -259,13 +283,19 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
     }
 }
 
-fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
+fn register_job(
+    epoll_fd: RawFd,
+    worker: &ReactorWorker,
+    jobs: &mut FxHashMap<RawFd, SendfileState>,
+    job: SendfileJob,
+) {
     let fd = job.socket.as_raw_fd();
     let mut event = libc::epoll_event {
         events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
         u64: fd as u64,
     };
     if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
         let _ = job.completion.send(Err(io::Error::last_os_error()));
         return;
     }
@@ -326,6 +356,7 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
 
 fn complete_job(
     epoll_fd: RawFd,
+    worker: &ReactorWorker,
     jobs: &mut FxHashMap<RawFd, SendfileState>,
     fd: RawFd,
     result: io::Result<u64>,
@@ -334,17 +365,24 @@ fn complete_job(
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
     }
     if let Some(mut state) = jobs.remove(&fd) {
+        worker.in_flight.fetch_sub(1, Ordering::Relaxed);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
     }
 }
 
-fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, message: &str) {
+fn fail_all_jobs(
+    epoll_fd: RawFd,
+    worker: &ReactorWorker,
+    jobs: &mut FxHashMap<RawFd, SendfileState>,
+    message: &str,
+) {
     let fds = jobs.keys().copied().collect::<Vec<_>>();
     for fd in fds {
         complete_job(
             epoll_fd,
+            worker,
             jobs,
             fd,
             Err(io::Error::other(message.to_string())),
@@ -405,7 +443,7 @@ fn pin_current_thread(cpus: &[usize]) {
 mod tests {
     use super::*;
     use std::ffi::CString;
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -414,9 +452,12 @@ mod tests {
         let name = CString::new("proxysss-sendfile-test").unwrap();
         let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(file_fd >= 0);
-        let mut file = unsafe { File::from_raw_fd(file_fd) };
+        let mut file = Arc::new(unsafe { File::from_raw_fd(file_fd) });
         let expected = vec![0x5a_u8; 64 * 1024];
-        file.write_all(&expected).unwrap();
+        Arc::get_mut(&mut file)
+            .unwrap()
+            .write_all(&expected)
+            .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -427,7 +468,7 @@ mod tests {
 
         let completion = dispatch(
             server.as_raw_fd(),
-            file.as_raw_fd(),
+            file.clone(),
             expected.len() as u64,
             16 * 1024,
             1,
@@ -458,15 +499,10 @@ mod tests {
     }
 
     #[test]
-    fn sendfile_reopen_has_an_independent_file_position() {
-        let name = CString::new("proxysss-sendfile-reopen-test").unwrap();
-        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(file_fd >= 0);
-        let mut source = unsafe { File::from_raw_fd(file_fd) };
-        source.write_all(b"independent-open-description").unwrap();
-        source.seek(SeekFrom::Start(7)).unwrap();
-        let mut reopened = reopen_independent_file(source.as_raw_fd()).unwrap();
-        assert_eq!(source.stream_position().unwrap(), 7);
-        assert_eq!(reopened.stream_position().unwrap(), 0);
+    fn sendfile_handoff_spills_only_when_affine_worker_is_two_jobs_ahead() {
+        assert_eq!(select_affine_or_fallback(2, 0, 1, 0), 2);
+        assert_eq!(select_affine_or_fallback(2, 1, 1, 0), 2);
+        assert_eq!(select_affine_or_fallback(2, 2, 1, 0), 1);
+        assert_eq!(select_affine_or_fallback(2, 8, 2, 0), 2);
     }
 }
