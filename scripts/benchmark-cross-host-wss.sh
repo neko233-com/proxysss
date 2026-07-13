@@ -38,10 +38,10 @@ CAPACITY_HOLD_SECS="${CAPACITY_HOLD_SECS:-60}"
 CAPACITY_CONNECT_WORKERS="${CAPACITY_CONNECT_WORKERS:-256}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-300000}"
 GATEWAY_CPUSET="${GATEWAY_CPUSET:-0-3}"
-GATEWAY_MEMORY_MAX="${GATEWAY_MEMORY_MAX:-8G}"
-# Firmware reservations mean an otherwise-8-GiB host reports slightly less in
-# MemTotal. This still rejects the 4-core/7-GiB VPS class from 4c/8GiB claims.
-GATEWAY_MIN_MEM_KIB="${GATEWAY_MIN_MEM_KIB:-7600000}"
+# Memory is evidence, not an arbitrary admission test. The default retains
+# cgroup accounting without a cap; set 8G (or another validated envelope) when
+# the release under test has an explicit memory budget.
+GATEWAY_MEMORY_MAX="${GATEWAY_MEMORY_MAX:-infinity}"
 RESOURCE_SAMPLE_AFTER_SECS="${RESOURCE_SAMPLE_AFTER_SECS:-5}"
 NGINX_WORKERS="${NGINX_WORKERS:-4}"
 NGINX_BIN="${NGINX_BIN:-/usr/local/nginx/sbin/nginx}"
@@ -67,7 +67,7 @@ BACKEND_PORT="${BACKEND_PORT:-18192}"
   echo "REPETITIONS must be an even integer >= 4 to balance gateway order" >&2
   exit 1
 }
-for value in CONNECTIONS CAPACITY_CONNECTIONS DURATION_SECS CAPACITY_HOLD_SECS CAPACITY_CONNECT_WORKERS NOFILE_LIMIT NGINX_WORKERS GATEWAY_PORT BACKEND_PORT GATEWAY_MIN_MEM_KIB RESOURCE_SAMPLE_AFTER_SECS; do
+for value in CONNECTIONS CAPACITY_CONNECTIONS DURATION_SECS CAPACITY_HOLD_SECS CAPACITY_CONNECT_WORKERS NOFILE_LIMIT NGINX_WORKERS GATEWAY_PORT BACKEND_PORT RESOURCE_SAMPLE_AFTER_SECS; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || { echo "$value must be positive" >&2; exit 1; }
 done
 if [[ "$BUILD_NATIVE" != "0" && "$BUILD_NATIVE" != "1" ]]; then
@@ -113,7 +113,7 @@ machine_id_hash() { sha256sum /etc/machine-id | awk '{print $1}'; }
 for host in "$GATEWAY_HOST" "$BACKEND_HOST"; do
   ssh_run "$host" "test \"\$(uname -s)\" = Linux && command -v openssl >/dev/null && command -v sha256sum >/dev/null && test \"\$(ulimit -Hn)\" -ge '$NOFILE_LIMIT'"
 done
-ssh_run "$GATEWAY_HOST" "command -v systemd-run >/dev/null && systemctl show-environment >/dev/null && test \"\$(nproc)\" -ge '$GATEWAY_CPU_COUNT' && test \"\$(awk '/MemTotal/ {print \$2}' /proc/meminfo)\" -ge '$GATEWAY_MIN_MEM_KIB'"
+ssh_run "$GATEWAY_HOST" "command -v systemd-run >/dev/null && systemctl show-environment >/dev/null && test \"\$(nproc)\" -ge '$GATEWAY_CPU_COUNT'"
 CLIENT_MACHINE_ID_HASH="$(machine_id_hash)"
 GATEWAY_MACHINE_ID_HASH="$(ssh_run "$GATEWAY_HOST" "sha256sum /etc/machine-id | awk '{print \$1}'")"
 BACKEND_MACHINE_ID_HASH="$(ssh_run "$BACKEND_HOST" "sha256sum /etc/machine-id | awk '{print \$1}'")"
@@ -263,6 +263,19 @@ sample_gateway_resources() {
   ssh_run "$GATEWAY_HOST" "systemctl show '$gateway_unit' --property MainPID --property MemoryCurrent --property MemoryPeak --property CPUUsageNSec --property AllowedCPUs --property MemoryMax" >"$RUN_DIR/${phase}-${kind}-cgroup.txt"
 }
 
+record_capacity_memory_cost() {
+  local iteration="$1" kind="$2" sample="$RUN_DIR/capacity-r${iteration}-final-${kind}-cgroup.txt"
+  local current peak measured
+  current="$(awk -F= '$1 == "MemoryCurrent" {print $2}' "$sample")"
+  peak="$(awk -F= '$1 == "MemoryPeak" {print $2}' "$sample")"
+  measured="$peak"
+  [[ "$measured" =~ ^[0-9]+$ ]] || measured="$current"
+  [[ "$measured" =~ ^[0-9]+$ ]] || return 0
+  printf 'repetition=%s gateway=%s memory_bytes=%s bytes_per_connection=%s requested_connections=%s\n' \
+    "$iteration" "$kind" "$measured" "$((measured / CAPACITY_CONNECTIONS))" "$CAPACITY_CONNECTIONS" \
+    >>"$RUN_DIR/capacity-memory-per-connection.txt"
+}
+
 run_active() {
   local phase="$1" kind="$2" interval="${3:-}"
   start_gateway "$kind"
@@ -286,6 +299,8 @@ run_capacity() {
   sleep "$RESOURCE_SAMPLE_AFTER_SECS"
   sample_gateway_resources "capacity-r${iteration}" "$kind"
   wait "$client_pid"
+  sample_gateway_resources "capacity-r${iteration}-final" "$kind"
+  record_capacity_memory_cost "$iteration" "$kind"
   cat "$output"
   stop_gateway
   local requested opened failed
@@ -380,7 +395,7 @@ nofile_limit=$NOFILE_LIMIT
 gateway_cpuset=$GATEWAY_CPUSET
 gateway_cpu_count=$GATEWAY_CPU_COUNT
 gateway_memory_max=$GATEWAY_MEMORY_MAX
-gateway_min_mem_kib=$GATEWAY_MIN_MEM_KIB
+memory_gate=report-current-peak-and-per-connection-cost
 client_machine_id_hash=$CLIENT_MACHINE_ID_HASH
 gateway_machine_id_hash=$GATEWAY_MACHINE_ID_HASH
 backend_machine_id_hash=$BACKEND_MACHINE_ID_HASH

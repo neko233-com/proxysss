@@ -135,7 +135,7 @@ Docker 的 cgroup、网络命名空间和 CPU 集隔离能排除“同一进程/
 
 ### 4.4 三台独立主机 WSS 严格复跑
 
-从独立的 Linux 压测机运行下面的入口。它把同一个 SHA-256 的 proxysss 二进制复制到 gateway 和 backend，并在 gateway 用 `systemd-run` cgroup 强制 `AllowedCPUs=0-3`、`MemoryMax=8G`、`LimitNOFILE=300000`；内存不足、CPU 不足、无 systemd cgroup 或角色主机不独立都会明确失败。它保存三台主机的 `uname`/`lscpu`、gateway `nginx -V`、cgroup memory current/peak、每一轮原始输出与中位数报告；顺序交错四轮，饱和吞吐和 equal-offered-load 的 p50/p95/p99 都必须严格优于 nginx，20k 容量每轮必须零失败。`GATEWAY_ADDR` 是压测机可访问的网关地址，`BACKEND_ADDR` 是网关可访问的回源地址。
+从独立的 Linux 压测机运行下面的入口。它把同一个 SHA-256 的 proxysss 二进制复制到 gateway 和 backend，并在 gateway 用 `systemd-run` cgroup 强制 `AllowedCPUs=0-3`、`LimitNOFILE=300000`；CPU 不足、无 systemd cgroup 或角色主机不独立都会明确失败。内存不使用任意物理 RAM 阈值卡死，而是保存 cgroup memory current/peak 与每连接成本；若发布有明确预算，再显式传 `GATEWAY_MEMORY_MAX=8G`（或实际预算）。它保存三台主机的 `uname`/`lscpu`、gateway `nginx -V`、每一轮原始输出与中位数报告；顺序交错四轮，饱和吞吐和 equal-offered-load 的 p50/p95/p99 都必须严格优于 nginx，20k 容量每轮必须零失败。`GATEWAY_ADDR` 是压测机可访问的网关地址，`BACKEND_ADDR` 是网关可访问的回源地址。
 
 ```bash
 GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
