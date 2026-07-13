@@ -1568,24 +1568,34 @@ fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::run
     &runtimes[worker_index % runtimes.len()]
 }
 
-fn dedicated_static_connection_runtime() -> &'static tokio::runtime::Runtime {
-    &STATIC_CONNECTION_RUNTIMES.get_or_init(|| {
-        let worker_count = adaptive_data_plane_workers(1);
+fn dedicated_static_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+    STATIC_CONNECTION_RUNTIMES.get_or_init(|| {
+        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
         tracing::info!(
-            runtime_workers = worker_count,
-            "starting work-stealing static sendfile runtime"
+            runtime_shards = shard_count,
+            "starting sharded static sendfile runtimes"
         );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(worker_count)
-            .thread_name("proxysss-sendfile")
-            .global_queue_interval(2)
-            .event_interval(3)
-            .enable_all();
-        vec![builder
-            .build()
-            .expect("failed to build proxysss static sendfile runtime")]
-    })[0]
+        (0..shard_count)
+            .map(|shard_index| {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
+                    .worker_threads(1)
+                    .thread_name(format!("proxysss-sendfile-{shard_index}"))
+                    .global_queue_interval(2)
+                    .event_interval(3)
+                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
+                    .enable_all();
+                builder
+                    .build()
+                    .expect("failed to build proxysss static sendfile runtime shard")
+            })
+            .collect()
+    })
+}
+
+fn dedicated_static_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    let runtimes = dedicated_static_connection_runtimes();
+    &runtimes[worker_index % runtimes.len()]
 }
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -4735,7 +4745,7 @@ impl Gateway {
                     }
                 };
                 let gateway = self.clone();
-                std::mem::drop(dedicated_static_connection_runtime().spawn(async move {
+                std::mem::drop(dedicated_static_connection_runtime(worker_index).spawn(async move {
                     let stream = match TcpStream::from_std(stream) {
                         Ok(stream) => stream,
                         Err(error) => {
