@@ -1489,6 +1489,8 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const STATIC_SENDFILE_HANDOFF_PREFIX_BYTES: u64 = 512 * 1024;
+#[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -11477,7 +11479,7 @@ async fn send_static_file_fast(
                 std::fs::File::open(path).context("failed opening static file for sendfile")?,
             ),
         };
-        sendfile_all_async(stream, file, _len)
+        sendfile_all_async(stream, file.as_raw_fd(), _len)
             .await
             .context("sendfile static response failed")?;
         Ok(())
@@ -11499,27 +11501,60 @@ async fn send_static_file_fast(
 #[cfg(target_os = "linux")]
 async fn sendfile_all_async(
     stream: &TcpStream,
-    file: Arc<std::fs::File>,
+    in_fd: std::os::fd::RawFd,
     len: u64,
 ) -> std::io::Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
     let out_fd = stream.as_raw_fd();
-    let in_fd = file.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+        // Put a bounded prefix behind the already-corked response head on the
+        // CPU-local HTTP shard. This starts the wire transfer immediately like
+        // nginx's same-event sendfile path, while the reactor owns the large
+        // writable drain so sibling HTTP/stream work keeps scheduler time.
+        let prefix_count = len.min(STATIC_SENDFILE_HANDOFF_PREFIX_BYTES) as usize;
+        loop {
+            let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, prefix_count) };
+            if written > 0 {
+                sent = written as u64;
+                break;
+            }
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "sendfile source ended before configured length",
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                break;
+            }
+            return Err(error);
+        }
+        if sent >= len {
+            return Ok(sent);
+        }
         match crate::sendfile_reactor::dispatch(
             out_fd,
-            file.clone(),
-            len,
+            in_fd,
+            offset as u64,
+            len - sent,
             max_chunk_bytes,
             adaptive_data_plane_workers(1),
         ) {
             Ok(completion) => {
-                return completion.await.map_err(|_| {
+                let reactor_sent = completion.await.map_err(|_| {
                     std::io::Error::other("sendfile reactor stopped before job completion")
-                })?;
+                })??;
+                return Ok(sent.saturating_add(reactor_sent));
             }
             Err(error) => {
                 tracing::debug!(

@@ -3,9 +3,8 @@
 //! HTTP parsing and keep-alive ownership remain on the CPU-adaptive Tokio HTTP
 //! shards. Large response bodies are handed to a bounded set of native epoll
 //! workers so a writable socket cannot monopolize the HTTP scheduler while
-//! repeatedly draining `sendfile(2)`. Each job owns a duplicated socket and a
-//! shared cached file handle, then reports completion before the HTTP task reads
-//! the next request.
+//! repeatedly draining `sendfile(2)`. Each job owns duplicated descriptors and
+//! reports completion before the HTTP task reads the next request.
 
 use std::fs::File;
 use std::io;
@@ -29,7 +28,8 @@ const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SendfileJob {
     socket: TcpStream,
-    file: Arc<File>,
+    file: File,
+    offset: u64,
     len: u64,
     max_chunk_bytes: u64,
     completion: oneshot::Sender<io::Result<u64>>,
@@ -37,7 +37,7 @@ struct SendfileJob {
 
 struct SendfileState {
     _socket: TcpStream,
-    file: Arc<File>,
+    file: File,
     offset: libc::off_t,
     sent: u64,
     len: u64,
@@ -65,7 +65,8 @@ static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
 pub(crate) fn dispatch(
     socket_fd: RawFd,
-    file: Arc<File>,
+    file_fd: RawFd,
+    offset: u64,
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
@@ -77,10 +78,12 @@ pub(crate) fn dispatch(
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
     let socket = duplicate_stream(socket_fd)?;
+    let file = duplicate_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
         socket,
         file,
+        offset,
         len,
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
@@ -116,7 +119,7 @@ impl Reactors {
             }
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker))
+                .spawn(move || run_reactor(reactor_worker, &cpu_group))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
         }
@@ -169,6 +172,11 @@ fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
+fn duplicate_file(fd: RawFd) -> io::Result<File> {
+    let duplicated = duplicate_fd(fd)?;
+    Ok(unsafe { File::from_raw_fd(duplicated) })
+}
+
 fn duplicate_fd(fd: RawFd) -> io::Result<RawFd> {
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
@@ -183,7 +191,10 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>) {
+fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
+    if !cpu_group.is_empty() {
+        pin_current_thread(cpu_group);
+    }
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating sendfile epoll instance");
     let mut wake_event = libc::epoll_event {
@@ -269,7 +280,7 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
         SendfileState {
             _socket: job.socket,
             file: job.file,
-            offset: 0,
+            offset: job.offset as libc::off_t,
             sent: 0,
             len: job.len,
             max_chunk_bytes: job.max_chunk_bytes,
@@ -382,6 +393,20 @@ fn allowed_cpu_ids() -> Vec<usize> {
     cpus
 }
 
+fn pin_current_thread(cpus: &[usize]) {
+    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        for cpu in cpus {
+            libc::CPU_SET(*cpu, &mut set);
+        }
+        let _ = libc::sched_setaffinity(
+            0,
+            mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,12 +420,11 @@ mod tests {
         let name = CString::new("proxysss-sendfile-test").unwrap();
         let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(file_fd >= 0);
-        let mut file = Arc::new(unsafe { File::from_raw_fd(file_fd) });
-        let expected = vec![0x5a_u8; 64 * 1024];
-        Arc::get_mut(&mut file)
-            .unwrap()
-            .write_all(&expected)
-            .unwrap();
+        let mut file = unsafe { File::from_raw_fd(file_fd) };
+        let expected = (0..64 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        file.write_all(&expected).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -409,10 +433,12 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
 
+        let start = 1024_usize;
         let completion = dispatch(
             server.as_raw_fd(),
-            file.clone(),
-            expected.len() as u64,
+            file.as_raw_fd(),
+            start as u64,
+            (expected.len() - start) as u64,
             16 * 1024,
             1,
         )
@@ -421,12 +447,16 @@ mod tests {
         drop(file);
 
         let reader = thread::spawn(move || {
-            let mut received = vec![0_u8; expected.len()];
+            let mut received = vec![0_u8; expected.len() - start];
             client.read_exact(&mut received).unwrap();
-            received
+            (received, expected[start..].to_vec())
         });
-        assert_eq!(completion.blocking_recv().unwrap().unwrap(), 64 * 1024);
-        assert_eq!(reader.join().unwrap(), vec![0x5a_u8; 64 * 1024]);
+        assert_eq!(
+            completion.blocking_recv().unwrap().unwrap(),
+            (64 * 1024 - start) as u64
+        );
+        let (received, expected) = reader.join().unwrap();
+        assert_eq!(received, expected);
     }
 
     #[test]
