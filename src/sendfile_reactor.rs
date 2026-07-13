@@ -28,7 +28,7 @@ const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SendfileJob {
     socket: TcpStream,
-    file: Arc<File>,
+    file: File,
     len: u64,
     max_chunk_bytes: u64,
     completion: oneshot::Sender<io::Result<u64>>,
@@ -36,7 +36,7 @@ struct SendfileJob {
 
 struct SendfileState {
     _socket: TcpStream,
-    file: Arc<File>,
+    file: File,
     offset: libc::off_t,
     sent: u64,
     len: u64,
@@ -64,7 +64,7 @@ static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
 pub(crate) fn dispatch(
     socket_fd: RawFd,
-    file: Arc<File>,
+    file_fd: RawFd,
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
@@ -76,6 +76,7 @@ pub(crate) fn dispatch(
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
     let socket = duplicate_stream(socket_fd)?;
+    let file = reopen_independent_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
         socket,
@@ -168,6 +169,13 @@ fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
+fn reopen_independent_file(fd: RawFd) -> io::Result<File> {
+    // F_DUPFD would keep the same open file description and shared readahead
+    // state across all CPU-local workers. Reopening through procfs creates an
+    // independent description without repeating the configured path lookup.
+    File::open(format!("/proc/self/fd/{fd}"))
+}
+
 fn duplicate_fd(fd: RawFd) -> io::Result<RawFd> {
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
@@ -253,6 +261,14 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu_group: &[usize]) {
 
 fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+        u64: fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+        let _ = job.completion.send(Err(io::Error::last_os_error()));
+        return;
+    }
     jobs.insert(
         fd,
         SendfileState {
@@ -265,23 +281,6 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
             completion: Some(job.completion),
         },
     );
-
-    // The HTTP shard has just completed the response head write, so the socket
-    // is commonly writable already. Drain once before EPOLL_CTL_ADD to avoid a
-    // redundant readiness round-trip for every keep-alive response. A bounded
-    // chunk or EAGAIN still enters the normal level-triggered epoll path.
-    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
-        complete_job(epoll_fd, jobs, fd, result);
-        return;
-    }
-
-    let mut event = libc::epoll_event {
-        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
-        u64: fd as u64,
-    };
-    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-        complete_job(epoll_fd, jobs, fd, Err(io::Error::last_os_error()));
-    }
 }
 
 fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
@@ -406,7 +405,7 @@ fn pin_current_thread(cpus: &[usize]) {
 mod tests {
     use super::*;
     use std::ffi::CString;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -428,13 +427,14 @@ mod tests {
 
         let completion = dispatch(
             server.as_raw_fd(),
-            Arc::new(file),
+            file.as_raw_fd(),
             expected.len() as u64,
             16 * 1024,
             1,
         )
         .unwrap();
         drop(server);
+        drop(file);
 
         let reader = thread::spawn(move || {
             let mut received = vec![0_u8; expected.len()];
@@ -455,5 +455,18 @@ mod tests {
             build_worker_cpu_groups(&[2, 7, 11, 19], 4),
             vec![vec![2], vec![7], vec![11], vec![19]]
         );
+    }
+
+    #[test]
+    fn sendfile_reopen_has_an_independent_file_position() {
+        let name = CString::new("proxysss-sendfile-reopen-test").unwrap();
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut source = unsafe { File::from_raw_fd(file_fd) };
+        source.write_all(b"independent-open-description").unwrap();
+        source.seek(SeekFrom::Start(7)).unwrap();
+        let mut reopened = reopen_independent_file(source.as_raw_fd()).unwrap();
+        assert_eq!(source.stream_position().unwrap(), 7);
+        assert_eq!(reopened.stream_position().unwrap(), 0);
     }
 }

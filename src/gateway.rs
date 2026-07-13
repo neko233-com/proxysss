@@ -11477,7 +11477,7 @@ async fn send_static_file_fast(
                 std::fs::File::open(path).context("failed opening static file for sendfile")?,
             ),
         };
-        sendfile_all_async(stream, file, _len)
+        sendfile_all_async(stream, file.as_raw_fd(), _len)
             .await
             .context("sendfile static response failed")?;
         Ok(())
@@ -11499,11 +11499,10 @@ async fn send_static_file_fast(
 #[cfg(target_os = "linux")]
 async fn sendfile_all_async(
     stream: &TcpStream,
-    file: Arc<std::fs::File>,
+    in_fd: std::os::fd::RawFd,
     len: u64,
 ) -> std::io::Result<u64> {
     let out_fd = stream.as_raw_fd();
-    let in_fd = file.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
@@ -11511,7 +11510,7 @@ async fn sendfile_all_async(
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
         match crate::sendfile_reactor::dispatch(
             out_fd,
-            file.clone(),
+            in_fd,
             len,
             max_chunk_bytes,
             adaptive_data_plane_workers(1),
