@@ -85,7 +85,7 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 bench
 
 ### 4.1 三阶段公平判定，不能混用吞吐与延迟口径
 
-`scripts/benchmark-all-scenarios-isolated.sh` 把 4c/8GiB gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。
+`scripts/benchmark-all-scenarios-isolated.sh` 把 4c gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。
 
 它分三阶段输出 JSON、Markdown、HTML 与百分比表。mixed saturation 与 equal offered load 默认交错运行 4 次，serial isolated saturation 默认 3 次，并对 ops/s、p50、p95、p99 取中位数；任一轮出现错误时聚合结果保留最大错误数，不能用中位数掩盖不稳定：
 
@@ -116,13 +116,13 @@ proxysss bench websocket \
   --duration-secs 30
 ```
 
-4c/8GiB 的默认生产目标是 20k idle WSS 与最多 4096 条活跃消息连接。单个 IPv4 源地址到单个后端 `IP:port` 仍只有有限临时端口；若主动把目标提高到单源端口范围以上，必须增加压测源 IP 和后端 `IP:port`（或代理源 IP 池）。这是 TCP 四元组限制，nginx 和 proxysss 都不能绕过。
+4c 的默认生产参考目标是 20k idle WSS 与最多 4096 条活跃消息连接。它不是固定 RAM 准入门槛：报告内存 current/peak 和每连接成本，以无 OOM、无持续增长、缓冲池有界为判据；只有部署方已声明内存预算才启用上限。单个 IPv4 源地址到单个后端 `IP:port` 仍只有有限临时端口；若主动把目标提高到单源端口范围以上，必须增加压测源 IP 和后端 `IP:port`（或代理源 IP 池）。这是 TCP 四元组限制，nginx 和 proxysss 都不能绕过。
 
 容量成功只说明可保持足够多连接；低延迟与消息吞吐仍要单独用普通 `proxysss bench websocket` 以及 mixed-load 矩阵验证。
 
 ### 4.3 单网关 WSS 隔离 Docker 验证
 
-对 Rust 游戏网关，先跑下面的生产门禁。它会把 nginx/proxysss 网关固定在 `4 CPU / 8 GiB`，把 4 个回源和多个客户端放到独立 cgroup 与网络命名空间；默认按 256/1024/4096 active WSS 和 5k/10k/20k idle WSS 逐级验证，四轮 Latin-square 平衡候选顺序与地址哈希，并比较吞吐、p50/p95/p99、握手延迟、错误和 RSS：
+对 Rust 游戏网关，先跑下面的生产门禁。它会把 nginx/proxysss 网关固定在同一组 `4 CPU`，把 4 个回源和多个客户端放到独立 cgroup 与网络命名空间；默认按 256/1024/4096 active WSS 和 5k/10k/20k idle WSS 逐级验证，四轮 Latin-square 平衡候选顺序与地址哈希，并比较吞吐、p50/p95/p99、握手延迟、错误、RSS/cgroup peak 和每连接成本。内存上限仅在声明实际生产预算时启用：
 
 ```bash
 proxysss tune linux --apply

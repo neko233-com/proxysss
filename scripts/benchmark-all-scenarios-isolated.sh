@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Role-isolated Linux mixed gateway benchmark. The 4c/8GiB gateway under test,
+# Role-isolated Linux mixed gateway benchmark. The 4c gateway under test,
 # protocol backends, and load generators use disjoint cgroups/CPU sets and
 # network namespaces. This removes the closed-loop client CPU confounder from
 # benchmark-all-scenarios.sh while preserving its native Go fixtures/parser.
