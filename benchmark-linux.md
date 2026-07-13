@@ -189,7 +189,7 @@ bash scripts/benchmark-cross-host-scale-matrix.sh
 
 ## 8. 正式 Linux 发布怎么跑
 
-先完成 1x/2x/4x 的全场景 role-isolated 与三机 WSS 原始运行。为对应 tag 写入 `performance-evidence/vX.Y.Z.json`：每个 kind/scale 都必须记录严格吞吐胜出、等负载 p50/p95/p99 胜出、容量胜出、零错误、角色隔离、内存 current/peak/每连接成本/无持续增长，以及 saturation/equal-load/capacity 原始工件的 URI 和 SHA-256；其中跨机 WSS 还必须记录三个不同的 machine-id hash。`release.yml` 会校验清单的 tag 和 commit，并把它随 release assets 发布；它防止缺少真实证据时误发版本，不能替代对原始工件的人工审计。
+先完成 1x/2x/4x 的全场景 role-isolated 与三机 WSS 原始运行。为对应 tag 写入 `performance-evidence/vX.Y.Z.json`：schema v2 不接受“已胜出”的布尔声明，而是逐场景固化两边的 ops/s、p50/p95/p99 和 errors；验证器要求 proxysss 吞吐严格更高、三个百分位严格更低、两边 0 错误。全场景证据必须列全 static-small、static-large、CDN hot-update、HTTPS static、reverse proxy、generic SSE、WebSocket、game TCP、TCP、UDP；容量还必须记录两边 opened/failed、open rate 和三项握手百分位，限定为 1k-50k 的可复现连接包络。每轮另记录角色隔离、proxysss/nginx 各自的内存 current/peak/每连接成本及无持续增长；proxysss 任何一项均不得超过 nginx 2 倍，并且要带 saturation/equal-load/capacity 原始工件的 URI 和 SHA-256；跨机 WSS 必须记录三个不同的 machine-id hash。`release.yml` 会校验清单的 tag 和 commit，并把它随 release assets 发布；它防止缺少真实证据时误发版本，不能替代对原始工件的人工审计。
 
 ```bash
 proxysss tune linux --apply --profile latency --max-connections 200000

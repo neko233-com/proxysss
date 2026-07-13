@@ -1,8 +1,8 @@
 // Verifies the versioned Linux benchmark evidence required for a release tag.
 //
-// The manifest deliberately contains hashes and locations of raw benchmark
-// artifacts rather than benchmark payloads themselves: .benchmark is local
-// operator evidence and remains ignored by git.
+// The manifest is deliberately a compact, reviewable index of immutable raw
+// artifacts. It records the measured values as well as their artifact hashes,
+// so a release cannot be approved by setting a collection of "passed" flags.
 package main
 
 import (
@@ -12,12 +12,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
 )
 
-const evidenceSchemaVersion = 1
+const evidenceSchemaVersion = 2
+
+var roleIsolatedScenarios = []string{
+	"static-small", "static-large", "cdn-hot-update", "https-static-small",
+	"reverse-proxy", "generic-sse", "websocket-long-connection",
+	"game-long-connection", "tcp-stream", "udp-stream",
+}
 
 type evidenceManifest struct {
 	SchemaVersion int           `json:"schema_version"`
@@ -27,17 +34,15 @@ type evidenceManifest struct {
 }
 
 type evidenceRun struct {
-	Kind                            string              `json:"kind"`
-	Scale                           int                 `json:"scale"`
-	StrictSuperiority               bool                `json:"strict_superiority"`
-	ZeroErrors                      bool                `json:"zero_errors"`
-	SaturationOpsStrictlyWon        bool                `json:"saturation_ops_strictly_won"`
-	EqualLoadPercentilesStrictlyWon bool                `json:"equal_load_percentiles_strictly_won"`
-	CapacityStrictlyWon             bool                `json:"capacity_strictly_won"`
-	RoleIsolationProven             bool                `json:"role_isolation_proven"`
-	RoleMachineIDHashes             roleMachineIDHashes `json:"role_machine_id_hashes"`
-	Memory                          memoryEvidence      `json:"memory"`
-	Artifacts                       []evidenceArtifact  `json:"artifacts"`
+	Kind                string              `json:"kind"`
+	Scale               int                 `json:"scale"`
+	RoleIsolationProven bool                `json:"role_isolation_proven"`
+	RoleMachineIDHashes roleMachineIDHashes `json:"role_machine_id_hashes"`
+	Workload            workloadEvidence    `json:"workload"`
+	Memory              memoryEvidence      `json:"memory"`
+	Scenarios           []scenarioEvidence  `json:"scenarios"`
+	Capacity            capacityEvidence    `json:"capacity"`
+	Artifacts           []evidenceArtifact  `json:"artifacts"`
 }
 
 type roleMachineIDHashes struct {
@@ -46,10 +51,50 @@ type roleMachineIDHashes struct {
 	Backend string `json:"backend"`
 }
 
+type workloadEvidence struct {
+	ActiveConnections   int `json:"active_connections"`
+	CapacityConnections int `json:"capacity_connections"`
+	Repetitions         int `json:"repetitions"`
+}
+
 type memoryEvidence struct {
-	CurrentAndPeakRecorded bool `json:"current_and_peak_recorded"`
-	PerConnectionRecorded  bool `json:"per_connection_recorded"`
-	NoRunawayGrowth        bool `json:"no_runaway_growth"`
+	Proxysss        memoryMetrics `json:"proxysss"`
+	Nginx           memoryMetrics `json:"nginx"`
+	NoRunawayGrowth bool          `json:"no_runaway_growth"`
+}
+
+type memoryMetrics struct {
+	CurrentBytes       uint64 `json:"current_bytes"`
+	PeakBytes          uint64 `json:"peak_bytes"`
+	BytesPerConnection uint64 `json:"bytes_per_connection"`
+}
+
+type scenarioEvidence struct {
+	Name     string     `json:"name"`
+	Proxysss runMetrics `json:"proxysss"`
+	Nginx    runMetrics `json:"nginx"`
+}
+
+type runMetrics struct {
+	OpsPerSec float64 `json:"ops_per_sec"`
+	P50MS     float64 `json:"p50_ms"`
+	P95MS     float64 `json:"p95_ms"`
+	P99MS     float64 `json:"p99_ms"`
+	Errors    int     `json:"errors"`
+}
+
+type capacityEvidence struct {
+	Proxysss capacityMetrics `json:"proxysss"`
+	Nginx    capacityMetrics `json:"nginx"`
+}
+
+type capacityMetrics struct {
+	Opened         int     `json:"opened"`
+	Failed         int     `json:"failed"`
+	OpenRatePerSec float64 `json:"open_rate_per_sec"`
+	HandshakeP50MS float64 `json:"handshake_p50_ms"`
+	HandshakeP95MS float64 `json:"handshake_p95_ms"`
+	HandshakeP99MS float64 `json:"handshake_p99_ms"`
 }
 
 type evidenceArtifact struct {
@@ -138,8 +183,8 @@ func validateEvidenceRun(run evidenceRun) error {
 	if run.Scale <= 0 {
 		return errors.New("scale must be positive")
 	}
-	if !run.StrictSuperiority || !run.ZeroErrors || !run.SaturationOpsStrictlyWon || !run.EqualLoadPercentilesStrictlyWon || !run.CapacityStrictlyWon {
-		return errors.New("strict superiority, zero errors, saturation, equal-load latency, and capacity wins are all required")
+	if !run.RoleIsolationProven {
+		return errors.New("role isolation evidence is required")
 	}
 	roles := []string{run.RoleMachineIDHashes.Client, run.RoleMachineIDHashes.Gateway, run.RoleMachineIDHashes.Backend}
 	for _, hash := range roles {
@@ -147,14 +192,26 @@ func validateEvidenceRun(run evidenceRun) error {
 			return fmt.Errorf("role machine-id hash %q is not a SHA-256 digest", hash)
 		}
 	}
-	if !run.RoleIsolationProven {
-		return errors.New("role isolation evidence is required")
-	}
 	if run.Kind == "cross-host-wss" && (roles[0] == roles[1] || roles[0] == roles[2] || roles[1] == roles[2]) {
 		return errors.New("cross-host client, gateway, and backend machine-id hashes must be distinct")
 	}
-	if !run.Memory.CurrentAndPeakRecorded || !run.Memory.PerConnectionRecorded || !run.Memory.NoRunawayGrowth {
+	if run.Workload.ActiveConnections <= 0 || run.Workload.CapacityConnections < 1_000 || run.Workload.CapacityConnections > 50_000 {
+		return errors.New("workload needs active connections and a 1k-50k capacity envelope")
+	}
+	if run.Workload.Repetitions < 4 || run.Workload.Repetitions%2 != 0 {
+		return errors.New("workload repetitions must be even and at least four")
+	}
+	if err := validateMemory(run.Memory); err != nil {
+		return err
+	}
+	if !run.Memory.NoRunawayGrowth {
 		return errors.New("memory current/peak, per-connection cost, and no-runaway-growth evidence are required")
+	}
+	if err := validateScenarios(run.Kind, run.Scenarios); err != nil {
+		return err
+	}
+	if err := validateCapacity(run.Capacity, run.Workload.CapacityConnections); err != nil {
+		return err
 	}
 	if len(run.Artifacts) < 3 {
 		return errors.New("at least saturation, equal-load, and capacity raw artifacts are required")
@@ -177,6 +234,99 @@ func validateEvidenceRun(run evidenceRun) error {
 		return fmt.Errorf("missing raw artifacts: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func validateMemory(memory memoryEvidence) error {
+	for _, item := range []struct {
+		name  string
+		proxy uint64
+		nginx uint64
+	}{
+		{"current_bytes", memory.Proxysss.CurrentBytes, memory.Nginx.CurrentBytes},
+		{"peak_bytes", memory.Proxysss.PeakBytes, memory.Nginx.PeakBytes},
+		{"bytes_per_connection", memory.Proxysss.BytesPerConnection, memory.Nginx.BytesPerConnection},
+	} {
+		if item.proxy == 0 || item.nginx == 0 {
+			return fmt.Errorf("memory %s needs values for both gateways", item.name)
+		}
+		// Cross multiplication avoids float rounding and makes the declared
+		// 2x production envelope exact for all uint64 values.
+		if item.proxy > item.nginx && item.proxy-item.nginx > item.nginx {
+			return fmt.Errorf("memory %s exceeds the 2x nginx envelope (proxysss=%d nginx=%d)", item.name, item.proxy, item.nginx)
+		}
+	}
+	return nil
+}
+
+func validateScenarios(kind string, scenarios []scenarioEvidence) error {
+	required := map[string]bool{"websocket-long-connection": true}
+	if kind == "role-isolated-all-scenarios" {
+		required = make(map[string]bool, len(roleIsolatedScenarios))
+		for _, scenario := range roleIsolatedScenarios {
+			required[scenario] = true
+		}
+	}
+	seen := make(map[string]bool, len(scenarios))
+	for _, scenario := range scenarios {
+		if !required[scenario.Name] {
+			return fmt.Errorf("unexpected scenario %q", scenario.Name)
+		}
+		if seen[scenario.Name] {
+			return fmt.Errorf("duplicate scenario %q", scenario.Name)
+		}
+		seen[scenario.Name] = true
+		if err := validateScenarioMetrics(scenario); err != nil {
+			return fmt.Errorf("scenario %s: %w", scenario.Name, err)
+		}
+	}
+	for scenario := range required {
+		if !seen[scenario] {
+			return fmt.Errorf("missing required scenario %q", scenario)
+		}
+	}
+	return nil
+}
+
+func validateScenarioMetrics(scenario scenarioEvidence) error {
+	if scenario.Proxysss.Errors != 0 || scenario.Nginx.Errors != 0 {
+		return fmt.Errorf("zero errors required (proxysss=%d nginx=%d)", scenario.Proxysss.Errors, scenario.Nginx.Errors)
+	}
+	for _, item := range []struct {
+		name         string
+		proxy, nginx float64
+		lowerBetter  bool
+	}{
+		{"ops_per_sec", scenario.Proxysss.OpsPerSec, scenario.Nginx.OpsPerSec, false},
+		{"p50_ms", scenario.Proxysss.P50MS, scenario.Nginx.P50MS, true},
+		{"p95_ms", scenario.Proxysss.P95MS, scenario.Nginx.P95MS, true},
+		{"p99_ms", scenario.Proxysss.P99MS, scenario.Nginx.P99MS, true},
+	} {
+		if !positiveFinite(item.proxy) || !positiveFinite(item.nginx) {
+			return fmt.Errorf("%s needs positive finite values", item.name)
+		}
+		if item.lowerBetter && item.proxy >= item.nginx {
+			return fmt.Errorf("%s must be strictly lower (proxysss=%g nginx=%g)", item.name, item.proxy, item.nginx)
+		}
+		if !item.lowerBetter && item.proxy <= item.nginx {
+			return fmt.Errorf("%s must be strictly higher (proxysss=%g nginx=%g)", item.name, item.proxy, item.nginx)
+		}
+	}
+	return nil
+}
+
+func validateCapacity(capacity capacityEvidence, requested int) error {
+	if capacity.Proxysss.Opened != requested || capacity.Nginx.Opened != requested || capacity.Proxysss.Failed != 0 || capacity.Nginx.Failed != 0 {
+		return errors.New("capacity requires both gateways to open every requested connection with zero failures")
+	}
+	return validateScenarioMetrics(scenarioEvidence{
+		Name:     "capacity",
+		Proxysss: runMetrics{OpsPerSec: capacity.Proxysss.OpenRatePerSec, P50MS: capacity.Proxysss.HandshakeP50MS, P95MS: capacity.Proxysss.HandshakeP95MS, P99MS: capacity.Proxysss.HandshakeP99MS},
+		Nginx:    runMetrics{OpsPerSec: capacity.Nginx.OpenRatePerSec, P50MS: capacity.Nginx.HandshakeP50MS, P95MS: capacity.Nginx.HandshakeP95MS, P99MS: capacity.Nginx.HandshakeP99MS},
+	})
+}
+
+func positiveFinite(value float64) bool {
+	return value > 0 && !math.IsInf(value, 0) && !math.IsNaN(value)
 }
 
 func validSHA256(value string) bool {

@@ -79,6 +79,7 @@ ISOLATED_SUMMARY_MD="$RUN_DIR/isolated-saturation-summary.md"
 ISOLATED_SUMMARY_HTML="$RUN_DIR/isolated-saturation-summary.html"
 LATENCY_SUMMARY_MD="$RUN_DIR/equal-load-summary.md"
 LATENCY_SUMMARY_HTML="$RUN_DIR/equal-load-summary.html"
+ROLE_MACHINE_ID_HASH="$(sha256sum /etc/machine-id | awk '{print $1}')"
 
 [[ -x "$PROXY_BIN" ]] || {
   echo "missing Linux proxysss binary: $PROXY_BIN" >&2
@@ -413,6 +414,20 @@ scenario_requested() {
   fi
 }
 
+# Docker stats only reports a momentary value. The release evidence uses the
+# cgroup-v2 peak as well, so capture both while the candidate container still
+# exists. Ubuntu 24 production hosts use unified cgroups; failing here is
+# intentional because a run without current/peak evidence is not releasable.
+capture_gateway_memory() {
+  local label="$1" kind="$2" suffix="$3"
+  docker exec "$PREFIX-gateway-$kind" sh -ec '
+    test -r /sys/fs/cgroup/memory.current
+    test -r /sys/fs/cgroup/memory.peak
+    printf "memory_current_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.current)"
+    printf "memory_peak_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.peak)"
+  ' >"$RUN_DIR/${label}-${kind}-gateway-memory-${suffix}.txt"
+}
+
 launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
@@ -465,6 +480,7 @@ run_candidate() {
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
     "${stat_targets[@]}" | tee "$RUN_DIR/$stats_name-stats.txt"
+  capture_gateway_memory "$stats_name" "$kind" sample
 
   while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase; do
     local exit_code output
@@ -489,6 +505,8 @@ run_candidate() {
     fi
     docker rm "$name" >/dev/null
   done <"$RUN_DIR/clients.meta"
+
+  capture_gateway_memory "$stats_name" "$kind" final
 
   docker rm -f "$PREFIX-gateway-$kind" "$PREFIX-backend" >/dev/null
 }
@@ -628,6 +646,8 @@ backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
 nginx_workers=$NGINX_WORKERS
 role_isolation=docker-cgroup-cpuset-network-namespace
+role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
+gateway_memory_samples=cgroup-v2-current-and-peak
 nginx_version=1.31.2-mainline-O3-fno-plt
 proxy_binary_sha256=$(sha256sum "$PROXY_BIN" | awk '{print $1}')
 EOF
