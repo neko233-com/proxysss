@@ -16,12 +16,10 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
-for command in docker go; do
-  command -v "$command" >/dev/null 2>&1 || {
-    echo "missing required command: $command" >&2
-    exit 1
-  }
-done
+command -v docker >/dev/null 2>&1 || {
+  echo "missing required command: docker" >&2
+  exit 1
+}
 
 REPETITIONS="${REPETITIONS:-4}"
 ACTIVE_SCALES="${ACTIVE_SCALES:-256 1024 4096}"
@@ -47,8 +45,26 @@ RUN_CAPACITY_MATRIX="${RUN_CAPACITY_MATRIX:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 PROXY_BIN="${PROXY_BIN:-$ROOT/target/release-fast/proxysss}"
 BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
+BENCH_SUBNET="${BENCH_SUBNET:-172.30.0.0/16}"
+# benchmark-websocket-isolated.sh assigns fixed role addresses within a /16.
+# Keep every Latin-square tuple inside the caller-selected subnet rather than
+# silently retaining 172.30.* when BENCH_SUBNET is overridden to avoid a
+# stale Docker network collision.
+[[ "$BENCH_SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.0\.0/16$ ]] || {
+  echo "BENCH_SUBNET must be an IPv4 /16 such as 172.30.0.0/16" >&2
+  exit 1
+}
+BENCH_IP_PREFIX="${BENCH_IP_PREFIX:-${BENCH_SUBNET%%.0.0/16}}"
+[[ "$BENCH_IP_PREFIX" =~ ^[0-9]{1,3}\.[0-9]{1,3}$ ]] || {
+  echo "BENCH_IP_PREFIX must contain the first two IPv4 octets" >&2
+  exit 1
+}
 OUTPUT_DIR="$BENCH_ROOT/runs/isolated-websocket-production/$RUN_ID"
 HELPER="$OUTPUT_DIR/benchmark-helper"
+PREBUILT_BENCH_HELPER="${PREBUILT_BENCH_HELPER:-}"
+if [[ -n "$PREBUILT_BENCH_HELPER" ]]; then
+  HELPER="$PREBUILT_BENCH_HELPER"
+fi
 
 if (( REPETITIONS < 4 || REPETITIONS % 4 != 0 )); then
   echo "REPETITIONS must be a multiple of four for a balanced order/address Latin square" >&2
@@ -68,7 +84,19 @@ if [[ ! -x "$PROXY_BIN" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
-go build -o "$HELPER" "$ROOT/scripts/benchmark-helper.go"
+if [[ -n "$PREBUILT_BENCH_HELPER" ]]; then
+  [[ -x "$PREBUILT_BENCH_HELPER" ]] || {
+    echo "PREBUILT_BENCH_HELPER must be an executable Linux benchmark-helper binary" >&2
+    exit 1
+  }
+else
+  command -v go >/dev/null 2>&1 || {
+    echo "missing required command: go (or set PREBUILT_BENCH_HELPER)" >&2
+    exit 1
+  }
+  go build -o "$HELPER" "$ROOT/scripts/benchmark-helper.go"
+fi
+export PREBUILT_BENCH_HELPER="$HELPER"
 
 run_order_for_iteration() {
   local iteration="$1"
@@ -86,19 +114,19 @@ run_order_for_iteration() {
 set_address_assignment_for_iteration() {
   local iteration="$1"
   if (( ((iteration - 1) / 2) % 2 == 0 )); then
-    NGINX_BACKEND_BASE_IP="172.30.10"
-    NGINX_GATEWAY_IP="172.30.20.20"
-    NGINX_CLIENT_BASE_IP="172.30.30"
-    PROXYSSS_BACKEND_BASE_IP="172.30.110"
-    PROXYSSS_GATEWAY_IP="172.30.120.20"
-    PROXYSSS_CLIENT_BASE_IP="172.30.130"
+    NGINX_BACKEND_BASE_IP="$BENCH_IP_PREFIX.10"
+    NGINX_GATEWAY_IP="$BENCH_IP_PREFIX.20.20"
+    NGINX_CLIENT_BASE_IP="$BENCH_IP_PREFIX.30"
+    PROXYSSS_BACKEND_BASE_IP="$BENCH_IP_PREFIX.110"
+    PROXYSSS_GATEWAY_IP="$BENCH_IP_PREFIX.120.20"
+    PROXYSSS_CLIENT_BASE_IP="$BENCH_IP_PREFIX.130"
   else
-    NGINX_BACKEND_BASE_IP="172.30.110"
-    NGINX_GATEWAY_IP="172.30.120.20"
-    NGINX_CLIENT_BASE_IP="172.30.130"
-    PROXYSSS_BACKEND_BASE_IP="172.30.10"
-    PROXYSSS_GATEWAY_IP="172.30.20.20"
-    PROXYSSS_CLIENT_BASE_IP="172.30.30"
+    NGINX_BACKEND_BASE_IP="$BENCH_IP_PREFIX.110"
+    NGINX_GATEWAY_IP="$BENCH_IP_PREFIX.120.20"
+    NGINX_CLIENT_BASE_IP="$BENCH_IP_PREFIX.130"
+    PROXYSSS_BACKEND_BASE_IP="$BENCH_IP_PREFIX.10"
+    PROXYSSS_GATEWAY_IP="$BENCH_IP_PREFIX.20.20"
+    PROXYSSS_CLIENT_BASE_IP="$BENCH_IP_PREFIX.30"
   fi
 }
 

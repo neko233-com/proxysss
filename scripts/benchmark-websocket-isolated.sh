@@ -24,7 +24,6 @@ require_cmd() {
 }
 
 require_cmd docker
-require_cmd go
 require_cmd grep
 
 cpuset_cpu_count() {
@@ -133,12 +132,21 @@ STRICT_GATE="${STRICT_GATE:-1}"
 RUN_ACTIVE="${RUN_ACTIVE:-1}"
 RUN_CAPACITY="${RUN_CAPACITY:-1}"
 BENCH_SUBNET="${BENCH_SUBNET:-172.30.0.0/16}"
-NGINX_BACKEND_BASE_IP="${NGINX_BACKEND_BASE_IP:-172.30.10}"
-NGINX_GATEWAY_IP="${NGINX_GATEWAY_IP:-172.30.20.20}"
-NGINX_CLIENT_BASE_IP="${NGINX_CLIENT_BASE_IP:-172.30.30}"
-PROXYSSS_BACKEND_BASE_IP="${PROXYSSS_BACKEND_BASE_IP:-172.30.110}"
-PROXYSSS_GATEWAY_IP="${PROXYSSS_GATEWAY_IP:-172.30.120.20}"
-PROXYSSS_CLIENT_BASE_IP="${PROXYSSS_CLIENT_BASE_IP:-172.30.130}"
+[[ "$BENCH_SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.0\.0/16$ ]] || {
+  echo "BENCH_SUBNET must be an IPv4 /16 such as 172.30.0.0/16" >&2
+  exit 1
+}
+BENCH_IP_PREFIX="${BENCH_IP_PREFIX:-${BENCH_SUBNET%%.0.0/16}}"
+[[ "$BENCH_IP_PREFIX" =~ ^[0-9]{1,3}\.[0-9]{1,3}$ ]] || {
+  echo "BENCH_IP_PREFIX must contain the first two IPv4 octets" >&2
+  exit 1
+}
+NGINX_BACKEND_BASE_IP="${NGINX_BACKEND_BASE_IP:-$BENCH_IP_PREFIX.10}"
+NGINX_GATEWAY_IP="${NGINX_GATEWAY_IP:-$BENCH_IP_PREFIX.20.20}"
+NGINX_CLIENT_BASE_IP="${NGINX_CLIENT_BASE_IP:-$BENCH_IP_PREFIX.30}"
+PROXYSSS_BACKEND_BASE_IP="${PROXYSSS_BACKEND_BASE_IP:-$BENCH_IP_PREFIX.110}"
+PROXYSSS_GATEWAY_IP="${PROXYSSS_GATEWAY_IP:-$BENCH_IP_PREFIX.120.20}"
+PROXYSSS_CLIENT_BASE_IP="${PROXYSSS_CLIENT_BASE_IP:-$BENCH_IP_PREFIX.130}"
 BUILD_PROFILE="${BUILD_PROFILE:-release-fast}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
 IMAGE="${IMAGE:-proxysss-isolated-ws-bench:local}"
@@ -150,7 +158,8 @@ RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 RUN_DIR="${BENCH_ROOT:-$ROOT/.benchmark}/runs/isolated-websocket/$RUN_ID"
 ROLE_MACHINE_ID_HASH="$(sha256sum /etc/machine-id | awk '{print $1}')"
 CONTEXT_DIR="$RUN_DIR/image-context"
-BENCH_HELPER_BIN="$RUN_DIR/benchmark-helper"
+PREBUILT_BENCH_HELPER="${PREBUILT_BENCH_HELPER:-}"
+BENCH_HELPER_BIN="${PREBUILT_BENCH_HELPER:-$RUN_DIR/benchmark-helper}"
 NETWORK="proxysss-ws-isolated-$RUN_ID"
 PREFIX="proxysss-ws-isolated-$RUN_ID"
 PROXY_BIN="${PROXY_BIN:-$ROOT/target/$BUILD_PROFILE/proxysss}"
@@ -186,7 +195,15 @@ if [[ "$FORCE_BUILD" == "1" || ! -x "$PROXY_BIN" ]]; then
 fi
 
 mkdir -p "$RUN_DIR" "$CONTEXT_DIR"
-go build -o "$BENCH_HELPER_BIN" "$ROOT/scripts/benchmark-helper.go"
+if [[ -n "$PREBUILT_BENCH_HELPER" ]]; then
+  [[ -x "$PREBUILT_BENCH_HELPER" ]] || {
+    echo "PREBUILT_BENCH_HELPER must be an executable Linux benchmark-helper binary" >&2
+    exit 1
+  }
+else
+  require_cmd go
+  go build -o "$BENCH_HELPER_BIN" "$ROOT/scripts/benchmark-helper.go"
+fi
 cp "$PROXY_BIN" "$CONTEXT_DIR/proxysss"
 cp "$ROOT/docker/isolated-websocket-bench.Dockerfile" "$CONTEXT_DIR/Dockerfile"
 docker_build_args=(--build-arg "NGINX_VERSION=$NGINX_VERSION" -t "$IMAGE")

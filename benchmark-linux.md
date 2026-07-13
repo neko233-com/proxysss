@@ -153,6 +153,20 @@ bash scripts/benchmark-cross-host-scale-matrix.sh
 
 默认使用可跨同架构 Linux 主机运行的 release-fast 二进制。只有三台机器 CPU 特性一致时，才可显式 `BUILD_NATIVE=1` 以 `target-cpu=native` 编译；否则不得以优化名义引入非法指令风险。
 
+如果宿主已有残留 benchmark Docker network，可传未占用的 `/16`，脚本会把 nginx/proxysss/backend/client 的 Latin-square 地址一并派生到新子网，不能只改网络却继续使用旧 `172.30.*` 地址：
+
+```bash
+BENCH_SUBNET=172.31.0.0/16 bash scripts/benchmark-websocket-production-gate.sh
+```
+
+基准 helper 始终是本仓库的 Go 原生程序。受限控制器缺少可用 Go 工具链时，可以在可信构建机交叉编译同架构 Linux helper 后传入 `PREBUILT_BENCH_HELPER`；脚本会校验它可执行而不会下载或使用 Python/Node 运行时：
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o /opt/benchmark-helper scripts/benchmark-helper.go
+PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
+  bash scripts/benchmark-websocket-production-gate.sh
+```
+
 ## 5. CI 和 benchmark 的边界
 
 默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
