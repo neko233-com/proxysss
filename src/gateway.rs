@@ -11993,7 +11993,7 @@ fn current_process_cpu_sample() -> Option<ProcessMetricsSample> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn current_process_memory_bytes() -> Option<u64> {
     let statm = fs::read_to_string("/proc/self/statm").ok()?;
     let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
@@ -12002,6 +12002,17 @@ fn current_process_memory_bytes() -> Option<u64> {
         return None;
     }
     Some(resident_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_memory_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let resident_bytes = unsafe { usage.assume_init() }.ru_maxrss;
+    (resident_bytes > 0).then_some(resident_bytes as u64)
 }
 
 #[cfg(windows)]
@@ -12054,7 +12065,7 @@ fn current_process_memory_bytes() -> Option<u64> {
     Some(counters.working_set_size as u64)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn current_process_memory_bytes() -> Option<u64> {
     None
 }
@@ -12068,7 +12079,7 @@ fn current_process_memory_percent() -> Option<f64> {
     Some(memory / total * 100.0)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn total_system_memory_bytes() -> Option<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -12078,6 +12089,26 @@ fn total_system_memory_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn total_system_memory_bytes() -> Option<u64> {
+    let name = b"hw.memsize\0";
+    let mut memory_bytes = 0_u64;
+    let mut size = std::mem::size_of::<u64>();
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            (&mut memory_bytes as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != std::mem::size_of::<u64>() || memory_bytes == 0 {
+        return None;
+    }
+    Some(memory_bytes)
 }
 
 #[cfg(windows)]
@@ -12117,7 +12148,7 @@ fn total_system_memory_bytes() -> Option<u64> {
     Some(status.total_phys)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn total_system_memory_bytes() -> Option<u64> {
     None
 }
