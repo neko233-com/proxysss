@@ -4774,6 +4774,7 @@ impl Gateway {
         let mut static_response_cache: Option<ConnectionStaticFastPathCache> = None;
         let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
         let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
+        let mut raw_reverse_response_buffer = Vec::with_capacity(4096);
         let outcome = 'fast_lane: loop {
             read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -4876,6 +4877,13 @@ impl Gateway {
                     && raw_reverse_request_cache
                         .as_ref()
                         .is_some_and(|cached| cached.request_head.as_ref() == request_head);
+                let cached_upstream_request = reverse_request_cache_hit.then(|| {
+                    raw_reverse_request_cache
+                        .as_ref()
+                        .expect("raw reverse request cache hit checked")
+                        .upstream_request
+                        .clone()
+                });
                 let request = if reverse_request_cache_hit {
                     &raw_reverse_request_cache
                         .as_ref()
@@ -4910,13 +4918,19 @@ impl Gateway {
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
                 if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, request) {
+                    let mut serialized_upstream_request = None;
                     if self
                         .try_serve_plain_raw_reverse_fast_lane(
                             config,
                             &mut stream,
                             request,
-                            remote_addr,
-                            &mut raw_reverse_upstream,
+                            RawReverseFastLaneOptions {
+                                remote_addr,
+                                cached_upstream_request: cached_upstream_request.as_ref(),
+                                serialized_upstream_request: &mut serialized_upstream_request,
+                                response_buffer: &mut raw_reverse_response_buffer,
+                                lane_upstream: &mut raw_reverse_upstream,
+                            },
                         )
                         .await?
                     {
@@ -4931,6 +4945,9 @@ impl Gateway {
                             raw_reverse_request_cache = Some(RawReverseParsedRequestCache {
                                 request_head: Bytes::copy_from_slice(request_head),
                                 request,
+                                upstream_request: serialized_upstream_request.expect(
+                                    "raw reverse cache miss serialized a successful upstream request",
+                                ),
                             });
                         }
                         discard_fast_lane_http_head(&mut prefix, head_end);
@@ -8546,9 +8563,15 @@ impl Gateway {
         config: &GatewayConfig,
         downstream: &mut TcpStream,
         request: &PlainFastLaneRequest,
-        remote_addr: SocketAddr,
-        lane_upstream: &mut Option<RawReverseLaneUpstream>,
+        options: RawReverseFastLaneOptions<'_>,
     ) -> Result<bool> {
+        let RawReverseFastLaneOptions {
+            remote_addr,
+            cached_upstream_request,
+            serialized_upstream_request,
+            response_buffer,
+            lane_upstream,
+        } = options;
         let host = request.host.as_deref().unwrap_or("localhost");
         let Some(route) = config
             .services
@@ -8567,8 +8590,6 @@ impl Gateway {
         let Some((pool_key, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
             return Ok(false);
         };
-        let path_and_query =
-            reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
         let mut upstream_io = if lane_upstream
             .as_ref()
             .map(|upstream| upstream.key == pool_key)
@@ -8589,20 +8610,29 @@ impl Gateway {
                 )
             })?
         };
-        let request_bytes = serialize_raw_fast_lane_request(
-            request,
-            path_and_query.as_ref(),
-            host,
-            RawFastLaneSerializeOptions {
-                connection: None,
-                remote_addr,
-                scheme: "http",
-                forward_headers: route.forward_headers,
-                extra_headers: &[],
-            },
-        );
+        let request_bytes = if let Some(cached) = cached_upstream_request {
+            cached
+        } else {
+            let path_and_query =
+                reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
+            *serialized_upstream_request = Some(Bytes::from(serialize_raw_fast_lane_request(
+                request,
+                path_and_query.as_ref(),
+                host,
+                RawFastLaneSerializeOptions {
+                    connection: None,
+                    remote_addr,
+                    scheme: "http",
+                    forward_headers: route.forward_headers,
+                    extra_headers: &[],
+                },
+            )));
+            serialized_upstream_request
+                .as_ref()
+                .expect("raw reverse request serialized")
+        };
         upstream_io
-            .write_all(&request_bytes)
+            .write_all(request_bytes)
             .await
             .with_context(|| {
                 format!(
@@ -8639,12 +8669,12 @@ impl Gateway {
             let reusable = if let Some(leftover) = response_head.leftover {
                 let leftover_len = leftover.len() as u64;
                 if leftover_len >= len {
-                    let mut response_bytes =
-                        Vec::with_capacity(response_head_bytes.len() + len as usize);
-                    response_bytes.extend_from_slice(&response_head_bytes);
-                    response_bytes.extend_from_slice(&leftover[..len as usize]);
+                    response_buffer.clear();
+                    response_buffer.reserve(response_head_bytes.len() + len as usize);
+                    response_buffer.extend_from_slice(&response_head_bytes);
+                    response_buffer.extend_from_slice(&leftover[..len as usize]);
                     downstream
-                        .write_all(&response_bytes)
+                        .write_all(response_buffer)
                         .await
                         .context("failed writing raw HTTP response head/body")?;
                     leftover_len == len
@@ -10925,6 +10955,15 @@ struct RawReverseLaneUpstream {
 struct RawReverseParsedRequestCache {
     request_head: Bytes,
     request: PlainFastLaneRequest,
+    upstream_request: Bytes,
+}
+
+struct RawReverseFastLaneOptions<'a> {
+    remote_addr: SocketAddr,
+    cached_upstream_request: Option<&'a Bytes>,
+    serialized_upstream_request: &'a mut Option<Bytes>,
+    response_buffer: &'a mut Vec<u8>,
+    lane_upstream: &'a mut Option<RawReverseLaneUpstream>,
 }
 
 fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
@@ -21431,7 +21470,7 @@ async fn read_raw_fast_http_response_head(
             } else {
                 Some(buffer.freeze())
             };
-            return parse_raw_fast_http_response_head(&head, leftover, filter_hop_headers);
+            return parse_raw_fast_http_response_head(head, leftover, filter_hop_headers);
         }
 
         if buffer.len() > 64 * 1024 {
@@ -21448,14 +21487,14 @@ async fn read_raw_fast_http_response_head(
 }
 
 fn parse_raw_fast_http_response_head(
-    head: &[u8],
+    head: Bytes,
     leftover: Option<Bytes>,
     filter_hop_headers: bool,
 ) -> Result<RawFastHttpResponseHead> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut headers);
     let status = response
-        .parse(head)
+        .parse(&head)
         .context("failed parsing upstream raw fast response")?;
     if !matches!(status, httparse::Status::Complete(_)) {
         return Err(anyhow!("incomplete upstream raw fast response"));
@@ -21507,7 +21546,7 @@ fn parse_raw_fast_http_response_head(
 
     Ok(RawFastHttpResponseHead {
         status,
-        raw_head: Bytes::copy_from_slice(head),
+        raw_head: head,
         headers: filtered,
         content_length,
         transfer_chunked,
