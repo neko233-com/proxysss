@@ -5,6 +5,9 @@ certs/
 .DS_Store
 Thumbs.db
 logs/
+runtime/
+.cache/
+*.pid
 
 # Local one-off benchmark, smoke-test, and gateway scratch files.
 .tmp-*/

@@ -9,6 +9,8 @@ mod install;
 mod linux_tune;
 mod script;
 mod security;
+#[cfg(target_os = "linux")]
+mod stream_reactor;
 mod stream_routes;
 mod ts_transpile;
 
@@ -666,7 +668,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
     let global_config = cli.config_file.clone();
 

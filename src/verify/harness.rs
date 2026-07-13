@@ -25,7 +25,7 @@ static RUSTLS_PROVIDER_INIT: std::sync::Once = std::sync::Once::new();
 
 pub fn ensure_rustls_crypto_provider() {
     RUSTLS_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 

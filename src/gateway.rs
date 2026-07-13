@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,7 @@ use http::{
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Body as HyperBody, SizeHint};
 use hyper::body::{Frame, Incoming};
+use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -139,6 +140,7 @@ struct DynamicState {
 #[derive(Clone, Debug, Default)]
 struct FastLaneState {
     plain_http_static_sendfile: bool,
+    hyper_static_success: bool,
     simple_http_proxy: bool,
     raw_sse_proxy: bool,
     raw_reverse_proxy: bool,
@@ -153,6 +155,8 @@ impl FastLaneState {
             plain_http_static_sendfile: performance_enabled
                 && cfg!(target_os = "linux")
                 && plain_static_fast_path_allowed(config),
+            hyper_static_success: performance_enabled
+                && hyper_static_success_fast_path_globally_allowed(config),
             simple_http_proxy,
             raw_sse_proxy: simple_http_proxy,
             raw_reverse_proxy: simple_http_proxy,
@@ -263,6 +267,7 @@ impl std::ops::DerefMut for PooledBuffer {
 }
 
 const POOL_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const LATENCY_RELAY_BUFFER_BYTES: usize = 16 * 1024;
 // A WebSocket game gateway must be able to keep 100k mostly-idle tunnels
 // resident on an 8GiB host. Four KiB covers the normal game frame while
@@ -277,6 +282,7 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1024;
 const HTTP2_MAX_FRAME_SIZE_BYTES: u32 = 64 * 1024;
 
 static RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
+#[cfg(test)]
 static LATENCY_RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 static WEBSOCKET_RELAY_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
 static UDP_BUFFER_POOL: OnceLock<ByteBufferPool> = OnceLock::new();
@@ -295,6 +301,7 @@ fn relay_buffer_pool() -> &'static ByteBufferPool {
         .get_or_init(|| ByteBufferPool::new(pooled_buffer_capacity(), POOL_BUFFER_BYTES))
 }
 
+#[cfg(test)]
 fn latency_relay_buffer_pool() -> &'static ByteBufferPool {
     LATENCY_RELAY_BUFFER_POOL.get_or_init(|| {
         // Long-lived game/WebSocket connections need a small bounded resident
@@ -468,11 +475,10 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    copy_bidirectional_with_pooled_buffers_limit(
+    copy_bidirectional_with_pooled_buffers_limit::<_, _, MAX_POOLED_RELAY_POLL_STEPS, false, false>(
         left,
         right,
         buffer_pool,
-        MAX_POOLED_RELAY_POLL_STEPS,
     )
     .await
 }
@@ -503,24 +509,31 @@ fn is_expected_websocket_disconnect(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn copy_bidirectional_with_pooled_buffers_limit<A, B>(
+async fn copy_bidirectional_with_pooled_buffers_limit<
+    A,
+    B,
+    const MAX_POLL_STEPS: usize,
+    const FLUSH_EACH_BATCH: bool,
+    const FLUSH_REQUIRED: bool,
+>(
     left: &mut A,
     right: &mut B,
     buffer_pool: &'static ByteBufferPool,
-    max_poll_steps: usize,
 ) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let mut left_to_right = RelayTransferState::Running(PooledRelayCopyBuffer::new(
-        buffer_pool.acquire(),
-        max_poll_steps,
-    ));
-    let mut right_to_left = RelayTransferState::Running(PooledRelayCopyBuffer::new(
-        buffer_pool.acquire(),
-        max_poll_steps,
-    ));
+    let mut left_to_right = RelayTransferState::Running(PooledRelayCopyBuffer::<
+        MAX_POLL_STEPS,
+        FLUSH_EACH_BATCH,
+        FLUSH_REQUIRED,
+    >::new(buffer_pool.acquire()));
+    let mut right_to_left = RelayTransferState::Running(PooledRelayCopyBuffer::<
+        MAX_POLL_STEPS,
+        FLUSH_EACH_BATCH,
+        FLUSH_REQUIRED,
+    >::new(buffer_pool.acquire()));
 
     std::future::poll_fn(|cx| {
         let left_result = poll_relay_transfer(cx, &mut left_to_right, left, right);
@@ -539,30 +552,36 @@ where
 /// Keep each polling turn bounded so a continuously writable bulk connection
 /// cannot monopolize the runtime that also services game/WebSocket sessions.
 const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
-// A WebSocket frame fanout can make one readable socket continuously ready.
-// Restrict each direction to one read/write batch per runtime turn so thousands
-// of game sessions do not accumulate scheduler tail latency behind one peer.
-const WEBSOCKET_RELAY_POLL_STEPS: usize = 2;
+// A normal WebSocket echo frame needs one read and one write. A budget of two
+// forced a self-wake immediately after every frame, before the relay could poll
+// the next read and naturally park on Pending. Three removes that redundant
+// runnable task while still bounding a continuously readable peer to at most
+// two frame batches per runtime turn.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = 3;
 
-struct PooledRelayCopyBuffer {
+struct PooledRelayCopyBuffer<
+    const MAX_POLL_STEPS: usize,
+    const FLUSH_EACH_BATCH: bool,
+    const FLUSH_REQUIRED: bool,
+> {
     read_done: bool,
     need_flush: bool,
     pos: usize,
     cap: usize,
     copied: u64,
-    max_poll_steps: usize,
     buffer: PooledBuffer,
 }
 
-impl PooledRelayCopyBuffer {
-    fn new(buffer: PooledBuffer, max_poll_steps: usize) -> Self {
+impl<const MAX_POLL_STEPS: usize, const FLUSH_EACH_BATCH: bool, const FLUSH_REQUIRED: bool>
+    PooledRelayCopyBuffer<MAX_POLL_STEPS, FLUSH_EACH_BATCH, FLUSH_REQUIRED>
+{
+    fn new(buffer: PooledBuffer) -> Self {
         Self {
             read_done: false,
             need_flush: false,
             pos: 0,
             cap: 0,
             copied: 0,
-            max_poll_steps: max_poll_steps.max(1),
             buffer,
         }
     }
@@ -628,16 +647,14 @@ impl PooledRelayCopyBuffer {
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
     {
-        // Match Tokio's cooperative accounting. This custom pooled relay
-        // otherwise bypasses the scheduler budget used by Tokio's own copy
-        // utility and can let a hot WebSocket occupy a worker for too long.
-        let coop = match tokio::task::coop::poll_proceed(cx) {
-            Poll::Ready(coop) => coop,
-            Poll::Pending => return Poll::Pending,
-        };
+        // Tokio's registered socket I/O already consumes cooperative budget on
+        // every readiness poll. The explicit max-step limit below also bounds
+        // non-socket AsyncRead/AsyncWrite implementations. Charging another
+        // budget unit here duplicated scheduler bookkeeping for every relay
+        // direction and every game frame.
         let mut steps = 0_usize;
         loop {
-            if steps >= self.max_poll_steps {
+            if steps >= MAX_POLL_STEPS.max(1) {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -646,10 +663,8 @@ impl PooledRelayCopyBuffer {
                 match self.poll_fill(cx, reader.as_mut()) {
                     Poll::Ready(Ok(())) => {
                         steps += 1;
-                        coop.made_progress();
                     }
                     Poll::Ready(Err(error)) => {
-                        coop.made_progress();
                         return Poll::Ready(Err(error));
                     }
                     Poll::Pending if self.pos == self.cap => {
@@ -657,10 +672,8 @@ impl PooledRelayCopyBuffer {
                             match writer.as_mut().poll_flush(cx) {
                                 Poll::Ready(Ok(())) => {
                                     self.need_flush = false;
-                                    coop.made_progress();
                                 }
                                 Poll::Ready(Err(error)) => {
-                                    coop.made_progress();
                                     return Poll::Ready(Err(error));
                                 }
                                 Poll::Pending => return Poll::Pending,
@@ -676,13 +689,11 @@ impl PooledRelayCopyBuffer {
                 let written = match self.poll_write(cx, reader.as_mut(), writer.as_mut()) {
                     Poll::Ready(Ok(written)) => written,
                     Poll::Ready(Err(error)) => {
-                        coop.made_progress();
                         return Poll::Ready(Err(error));
                     }
                     Poll::Pending => return Poll::Pending,
                 };
                 steps += 1;
-                coop.made_progress();
                 if written == 0 {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -691,38 +702,60 @@ impl PooledRelayCopyBuffer {
                 }
                 self.pos += written;
                 self.copied = self.copied.saturating_add(written as u64);
-                self.need_flush = true;
+                self.need_flush = FLUSH_REQUIRED;
             }
 
             debug_assert!(self.pos <= self.cap, "relay writer exceeded buffer length");
             self.pos = 0;
             self.cap = 0;
-            if self.read_done {
+            if self.need_flush && FLUSH_EACH_BATCH {
                 match writer.as_mut().poll_flush(cx) {
                     Poll::Ready(Ok(())) => {
-                        coop.made_progress();
-                        return Poll::Ready(Ok(self.copied));
+                        self.need_flush = false;
                     }
                     Poll::Ready(Err(error)) => {
-                        coop.made_progress();
                         return Poll::Ready(Err(error));
                     }
                     Poll::Pending => return Poll::Pending,
                 }
             }
+            if self.read_done {
+                if self.need_flush {
+                    match writer.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            self.need_flush = false;
+                        }
+                        Poll::Ready(Err(error)) => {
+                            return Poll::Ready(Err(error));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                return Poll::Ready(Ok(self.copied));
+            }
         }
     }
 }
 
-enum RelayTransferState {
-    Running(PooledRelayCopyBuffer),
+enum RelayTransferState<
+    const MAX_POLL_STEPS: usize,
+    const FLUSH_EACH_BATCH: bool,
+    const FLUSH_REQUIRED: bool,
+> {
+    Running(PooledRelayCopyBuffer<MAX_POLL_STEPS, FLUSH_EACH_BATCH, FLUSH_REQUIRED>),
     ShuttingDown(u64),
     Done(u64),
 }
 
-fn poll_relay_transfer<R, W>(
+fn poll_relay_transfer<
+    R,
+    W,
+    const MAX_POLL_STEPS: usize,
+    const FLUSH_EACH_BATCH: bool,
+    const FLUSH_REQUIRED: bool,
+>(
     cx: &mut TaskContext<'_>,
-    state: &mut RelayTransferState,
+    state: &mut RelayTransferState<MAX_POLL_STEPS, FLUSH_EACH_BATCH, FLUSH_REQUIRED>,
     reader: &mut R,
     writer: &mut W,
 ) -> Poll<std::io::Result<u64>>
@@ -769,6 +802,36 @@ async fn copy_tcp_bidirectional_adaptive(
     performance_enabled: bool,
     profile: TcpRelayProfile,
 ) -> Result<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    if LINUX_STREAM_REACTOR_ENABLED
+        && performance_enabled
+        && matches!(profile, TcpRelayProfile::RealtimeSmall)
+    {
+        match crate::stream_reactor::dispatch_with_completion(
+            left.as_raw_fd(),
+            right.as_raw_fd(),
+            realtime_stream_reactor_workers(),
+        ) {
+            Ok(completion) => {
+                // The reactor owns duplicated descriptors now. Dropping the
+                // Tokio registrations (without shutdown) leaves exactly one
+                // descriptor per side and frees their runtime tasks/reactors.
+                drop(left);
+                drop(right);
+                completion
+                    .await
+                    .context("Linux stream reactor stopped before TCP session close")?;
+                return Ok((0, 0));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "Linux stream reactor handoff unavailable; using async TCP relay"
+                );
+            }
+        }
+    }
+
     if performance_enabled
         && matches!(profile, TcpRelayProfile::Bulk)
         && tcp_splice_fast_path_enabled()
@@ -777,7 +840,9 @@ async fn copy_tcp_bidirectional_adaptive(
     }
 
     match profile {
-        TcpRelayProfile::Latency => copy_tcp_bidirectional_latency(left, right).await,
+        TcpRelayProfile::RealtimeSmall | TcpRelayProfile::Latency => {
+            copy_tcp_bidirectional_latency(left, right).await
+        }
         TcpRelayProfile::Bulk => {
             copy_tcp_bidirectional_parallel(left, right, relay_buffer_pool()).await
         }
@@ -860,6 +925,7 @@ async fn relay_direct_tcp_fast_path(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpRelayProfile {
+    RealtimeSmall,
     Latency,
     Bulk,
 }
@@ -872,13 +938,17 @@ fn tcp_relay_profile(protocol: &str, first_payload_len: usize) -> TcpRelayProfil
         || protocol.contains("backup")
     {
         TcpRelayProfile::Bulk
+    } else if first_payload_len <= 1024 {
+        TcpRelayProfile::RealtimeSmall
     } else {
         TcpRelayProfile::Latency
     }
 }
 
 async fn copy_tcp_bidirectional_latency(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
-    copy_tcp_bidirectional_parallel(left, right, latency_relay_buffer_pool())
+    let mut left = left;
+    let mut right = right;
+    tokio::io::copy_bidirectional(&mut left, &mut right)
         .await
         .context("tcp latency relay failed")
 }
@@ -902,11 +972,24 @@ fn tcp_splice_supported() -> bool {
 
 #[cfg(target_os = "linux")]
 async fn copy_tcp_bidirectional_splice(left: TcpStream, right: TcpStream) -> Result<(u64, u64)> {
+    copy_tcp_bidirectional_splice_with_mode(left, right, true).await
+}
+
+#[cfg(target_os = "linux")]
+async fn copy_tcp_bidirectional_splice_with_mode(
+    left: TcpStream,
+    right: TcpStream,
+    coalesce_more: bool,
+) -> Result<(u64, u64)> {
     let left = Arc::new(left);
     let right = Arc::new(right);
 
-    let left_to_right = tokio::spawn(splice_tcp_one_direction(left.clone(), right.clone()));
-    let right_to_left = tokio::spawn(splice_tcp_one_direction(right, left));
+    let left_to_right = tokio::spawn(splice_tcp_one_direction(
+        left.clone(),
+        right.clone(),
+        coalesce_more,
+    ));
+    let right_to_left = tokio::spawn(splice_tcp_one_direction(right, left, coalesce_more));
 
     let (left_result, right_result) = tokio::join!(left_to_right, right_to_left);
     let left_bytes = left_result.context("left-to-right tcp splice task failed")??;
@@ -963,21 +1046,24 @@ impl Drop for TcpSplicePipe {
 async fn splice_tcp_one_direction(
     reader: Arc<TcpStream>,
     writer: Arc<TcpStream>,
+    coalesce_more: bool,
 ) -> std::io::Result<u64> {
     let pipe = TcpSplicePipe::new()?;
     let reader_fd = reader.as_raw_fd();
     let writer_fd = writer.as_raw_fd();
     let mut copied = 0_u64;
+    let splice_flags = libc::SPLICE_F_MOVE
+        | libc::SPLICE_F_NONBLOCK
+        | if coalesce_more {
+            libc::SPLICE_F_MORE
+        } else {
+            0
+        };
 
     loop {
         let read = reader
             .async_io(tokio::io::Interest::READABLE, || {
-                splice_fd_to_fd(
-                    reader_fd,
-                    pipe.write_fd,
-                    256 * 1024,
-                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
-                )
+                splice_fd_to_fd(reader_fd, pipe.write_fd, 256 * 1024, splice_flags)
             })
             .await?;
 
@@ -990,12 +1076,7 @@ async fn splice_tcp_one_direction(
         while remaining > 0 {
             let written = writer
                 .async_io(tokio::io::Interest::WRITABLE, || {
-                    splice_fd_to_fd(
-                        pipe.read_fd,
-                        writer_fd,
-                        remaining,
-                        libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
-                    )
+                    splice_fd_to_fd(pipe.read_fd, writer_fd, remaining, splice_flags)
                 })
                 .await?;
             if written == 0 {
@@ -1047,25 +1128,12 @@ fn shutdown_fd_write(fd: std::os::fd::RawFd) {
     }
 }
 
-fn dedicated_stream_runtime() -> &'static tokio::runtime::Runtime {
-    STREAM_RUNTIME.get_or_init(|| {
-        let worker_threads = dedicated_stream_worker_threads();
-        tracing::info!(
-            worker_threads,
-            "starting dedicated stream runtime for TCP listeners"
-        );
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name("proxysss-stream")
-            .enable_all()
-            .build()
-            .expect("failed to start proxysss stream runtime");
-        Box::leak(Box::new(runtime))
-    })
+fn dedicated_tcp_stream_runtimes() -> &'static [tokio::runtime::Runtime] {
+    dedicated_http_connection_runtimes()
 }
 
-fn dedicated_stream_worker_threads() -> usize {
-    adaptive_stream_runtime_workers()
+fn dedicated_tcp_stream_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    dedicated_http_connection_runtime(worker_index)
 }
 
 fn tune_tcp_stream_for_gateway(stream: &TcpStream) {
@@ -1118,38 +1186,32 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
         );
     }
 
-    let buf_size: libc::c_int = match (profile, level) {
-        (
-            TcpSocketTuneProfile::Gateway,
+    // Large request/response gateway sockets benefit from deep queues. Keep
+    // realtime game/MQTT/tool streams on Linux autotuning: forcing 1 MiB per
+    // direction wastes kernel memory at 100k connections and can add queueing
+    // without helping one-frame-at-a-time traffic.
+    if matches!(profile, TcpSocketTuneProfile::Gateway) {
+        let buf_size: libc::c_int = match level {
             linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
-            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
-        ) => 8 * 1024 * 1024,
-        (TcpSocketTuneProfile::Gateway, _) => 2 * 1024 * 1024,
-        // Realtime streams prioritize bounded queueing and quick small-frame
-        // dispatch over filling multi-megabyte kernel queues. This applies to
-        // game TCP, WebSocket upstreams, and other latency relay paths.
-        (
-            TcpSocketTuneProfile::Realtime,
-            linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
-            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
-        ) => 1024 * 1024,
-        (TcpSocketTuneProfile::Realtime, _) => 512 * 1024,
-    };
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&buf_size) as libc::socklen_t,
-        );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&buf_size) as libc::socklen_t,
-        );
+            | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
+            _ => 2 * 1024 * 1024,
+        };
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+        }
     }
 
     if matches!(
@@ -1157,25 +1219,20 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
         linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme
     ) {
-        let lowat: libc::c_int = match (profile, level) {
-            (
-                TcpSocketTuneProfile::Gateway,
-                linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme,
-            ) => 8 * 1024 * 1024,
-            (TcpSocketTuneProfile::Gateway, _) => 4 * 1024 * 1024,
-            // Keep a small write-ready threshold for long-lived game/tool
-            // sockets so an application cannot accumulate multi-megabyte
-            // unsent queues behind a temporarily slow peer.
-            (TcpSocketTuneProfile::Realtime, _) => 16 * 1024,
-        };
-        unsafe {
-            let _ = libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &lowat as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&lowat) as libc::socklen_t,
-            );
+        if matches!(profile, TcpSocketTuneProfile::Gateway) {
+            let lowat: libc::c_int = match level {
+                linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
+                _ => 4 * 1024 * 1024,
+            };
+            unsafe {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NOTSENT_LOWAT,
+                    &lowat as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&lowat) as libc::socklen_t,
+                );
+            }
         }
 
         // TCP_USER_TIMEOUT: fail stalled upstream/downstream sockets promptly
@@ -1425,18 +1482,158 @@ impl HyperBody for GatewayBody {
 }
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 8;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
+const LINUX_STREAM_REACTOR_ENABLED: bool = false;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
+// With the Linux fair scheduler enabled, a hot listen backlog can keep
+// `accept()` immediately ready long enough to queue hundreds of TLS tasks
+// before any handshake runs. Yield in small batches: enough multi_accept-style
+// amortization for throughput, but bounded queue delay for connection p95/p99.
+const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
+const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
+const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
+const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
-static STREAM_RUNTIME: OnceLock<&'static tokio::runtime::Runtime> = OnceLock::new();
+static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "linux")]
+static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
+
+fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+    HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
+        // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
+        // one reactor thread. This avoids work-stealing and global-queue costs
+        // under sustained static/reverse-proxy load. TLS connections remain on
+        // the accepting shard so rustls sockets are never migrated mid-flight.
+        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        tracing::info!(
+            runtime_shards = shard_count,
+            "starting sharded plain HTTP data runtimes"
+        );
+        (0..shard_count)
+            .map(|shard_index| {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
+                    .worker_threads(1)
+                    .thread_name(format!("proxysss-http-{shard_index}"))
+                    .global_queue_interval(2)
+                    .event_interval(3)
+                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
+                    .enable_all();
+                builder
+                    .build()
+                    .expect("failed to build proxysss HTTP runtime shard")
+            })
+            .collect()
+    })
+}
+
+fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    let runtimes = dedicated_http_connection_runtimes();
+    &runtimes[worker_index % runtimes.len()]
+}
+
+fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+    TLS_CONNECTION_RUNTIMES.get_or_init(|| {
+        let worker_count = adaptive_data_plane_workers(1);
+        tracing::info!(
+            runtime_workers = worker_count,
+            "starting work-stealing TLS HTTP data runtime"
+        );
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(worker_count)
+            .thread_name("proxysss-tls")
+            .global_queue_interval(2)
+            .event_interval(3)
+            .enable_all();
+        vec![builder
+            .build()
+            .expect("failed to build proxysss TLS data runtime")]
+    })
+}
+
+fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    let runtimes = dedicated_tls_connection_runtimes();
+    &runtimes[worker_index % runtimes.len()]
+}
+
+#[cfg(target_os = "linux")]
+fn data_plane_cpu_ids() -> &'static [usize] {
+    DATA_PLANE_CPU_IDS.get_or_init(|| {
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        let result = unsafe {
+            libc::sched_getaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mut set as *mut libc::cpu_set_t,
+            )
+        };
+        let mut cpus = Vec::new();
+        if result == 0 {
+            for cpu in 0..libc::CPU_SETSIZE as usize {
+                if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                    cpus.push(cpu);
+                }
+            }
+        }
+        if cpus.is_empty() {
+            cpus.push(0);
+        }
+        cpus
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_data_plane_thread(worker_index: usize) {
+    let cpus = data_plane_cpu_ids();
+    let cpu = cpus[worker_index % cpus.len()];
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_data_plane_thread(_worker_index: usize) {}
+
+fn spawn_http_connection<Connection>(
+    performance_enabled: bool,
+    worker_index: usize,
+    connection: Connection,
+) where
+    Connection: Future<Output = ()> + Send + 'static,
+{
+    if cfg!(target_os = "linux") && performance_enabled {
+        std::mem::drop(dedicated_http_connection_runtime(worker_index).spawn(connection));
+    } else {
+        std::mem::drop(tokio::spawn(connection));
+    }
+}
 
 pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tune::RuntimeTunePlan {
     let profile = match config.runtime.performance.profile {
@@ -1453,6 +1650,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
+        STATIC_SENDFILE_QOS_ENABLED.store(
+            config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Small
+                ),
+            Ordering::Relaxed,
+        );
     }
     plan
 }
@@ -1512,7 +1717,10 @@ struct CachedStaticFile {
     modified: Option<SystemTime>,
     body: Bytes,
     sendfile: Option<Arc<std::fs::File>>,
+    content_type: HeaderValue,
+    content_length: HeaderValue,
     checked_at: Instant,
+    revalidating: bool,
 }
 
 struct HttpCacheRevalidateRequest<'a> {
@@ -1639,6 +1847,29 @@ struct HttpRateLimitLease {
     key: String,
 }
 
+struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ActivePlainHyperConnectionGuard;
+
+impl ActivePlainHyperConnectionGuard {
+    fn enter() -> Self {
+        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActivePlainHyperConnectionGuard {
+    fn drop(&mut self) {
+        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AutoLoadPluginMetadata {
     #[serde(default)]
@@ -1711,7 +1942,7 @@ impl ServerCertVerifier for InsecureUpstreamVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -2363,7 +2594,7 @@ impl Gateway {
                 let handle = if matches!(spec, ListenerSpec::Tcp(_))
                     && state.config.runtime.performance.enabled
                 {
-                    dedicated_stream_runtime()
+                    dedicated_tcp_stream_runtime(0)
                         .spawn(async move { gateway.run_listener_spec(spec).await })
                 } else {
                     tokio::spawn(async move { gateway.run_listener_spec(spec).await })
@@ -3178,6 +3409,7 @@ impl Gateway {
                     ));
                 }
             };
+            let challenge = payload.challenge;
             match self
                 .persist_auto_https_and_reload(&state.config, payload)
                 .await
@@ -3185,7 +3417,7 @@ impl Gateway {
                 Ok(domains) => {
                     return Ok(json_response(
                         StatusCode::OK,
-                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_managed"}),
+                        serde_json::json!({"ok": true, "domains": domains, "mode": "acme_managed", "challenge": challenge}),
                     ));
                 }
                 Err(error) => {
@@ -3840,6 +4072,7 @@ impl Gateway {
         candidate.http.tls.auto_https.domains = domains.clone();
         candidate.http.tls.auto_https.email = payload.email.clone();
         candidate.http.tls.auto_https.production = payload.production;
+        candidate.http.tls.auto_https.challenge = payload.challenge;
         candidate.http.tls.mode = TlsMode::AcmeManaged;
         candidate.validate()?;
 
@@ -4295,6 +4528,9 @@ impl Gateway {
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.plain_bind address")?;
         let worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+            let _ = dedicated_http_connection_runtimes();
+        }
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
             let listener = bind_tcp_listener(bind_addr, "plain http listener").await?;
@@ -4305,11 +4541,34 @@ impl Gateway {
                 "plain http listener ready"
             );
             let gateway = self.clone();
-            workers.spawn(async move {
-                gateway
-                    .run_plain_http_accept_loop(listener, bind_addr, worker_index)
-                    .await
-            });
+            if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+                // Keep accept and connection I/O on the same reactor. Moving
+                // every accepted fd through into_std/from_std made high-rate
+                // TLS/WebSocket connection ramps pay two registrations and a
+                // global cross-runtime queue hop per socket.
+                let listener = listener
+                    .into_std()
+                    .context("failed detaching plain HTTP listener for data runtime")?;
+                let accept_task =
+                    dedicated_http_connection_runtime(worker_index).spawn(async move {
+                        let listener = TcpListener::from_std(listener)
+                            .context("failed registering plain HTTP listener on data runtime")?;
+                        gateway
+                            .run_plain_http_accept_loop(listener, bind_addr, worker_index, true)
+                            .await
+                    });
+                workers.spawn(async move {
+                    accept_task
+                        .await
+                        .context("plain HTTP data-runtime accept task failed")?
+                });
+            } else {
+                workers.spawn(async move {
+                    gateway
+                        .run_plain_http_accept_loop(listener, bind_addr, worker_index, false)
+                        .await
+                });
+            }
         }
 
         while let Some(result) = workers.join_next().await {
@@ -4326,57 +4585,119 @@ impl Gateway {
         listener: TcpListener,
         _bind_addr: SocketAddr,
         worker_index: usize,
+        accept_on_data_runtime: bool,
     ) -> Result<()> {
         loop {
             let (stream, remote_addr) = listener
                 .accept()
                 .await
                 .context("plain http accept failed")?;
+            tune_tcp_stream_for_latency(&stream);
+            if accept_on_data_runtime {
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
+                }
+                let gateway = self.clone();
+                std::mem::drop(tokio::spawn(async move {
+                    gateway
+                        .serve_plain_http_connection(
+                            stream,
+                            remote_addr,
+                            worker_index,
+                            Bytes::new(),
+                        )
+                        .await;
+                }));
+                continue;
+            }
+            let stream = match stream.into_std() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(?error, %remote_addr, "failed detaching plain HTTP socket for worker shard");
+                    continue;
+                }
+            };
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
             }
             let gateway = self.clone();
+            let performance_enabled = self.bootstrap_config.runtime.performance.enabled;
 
-            tokio::spawn(async move {
-                let mut stream = stream;
-                if gateway.plain_http_data_fast_lane_enabled().await {
-                    match gateway
-                        .try_plain_http_large_static_fast_path(&mut stream, remote_addr)
-                        .await
-                    {
-                        Ok(true) => return,
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::debug!(?error, %remote_addr, "plain http static fast path skipped");
-                        }
+            spawn_http_connection(performance_enabled, worker_index, async move {
+                let stream = match TcpStream::from_std(stream) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!(?error, %remote_addr, worker = worker_index, "failed registering plain HTTP socket on worker shard");
+                        return;
                     }
-                }
-
-                let service = service_fn(move |request| {
-                    let gateway = gateway.clone();
-                    async move {
-                        gateway
-                            .handle_hyper_request(request, remote_addr, "http")
-                            .await
-                    }
-                });
-
-                let result = optimized_http_server_builder()
-                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                };
+                gateway
+                    .serve_plain_http_connection(stream, remote_addr, worker_index, Bytes::new())
                     .await;
-
-                if let Err(error) = result {
-                    tracing::warn!(?error, %remote_addr, worker = worker_index, "plain http connection failed");
-                }
             });
+        }
+    }
+
+    async fn serve_plain_http_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+        worker_index: usize,
+        initial_prefix: Bytes,
+    ) {
+        let (stream, prefix) = if self.plain_http_data_fast_lane_enabled().await {
+            match self
+                .try_plain_http_large_static_fast_path(stream, remote_addr, initial_prefix)
+                .await
+            {
+                Ok(PlainHttpFastLaneAttempt::Served) => return,
+                Ok(PlainHttpFastLaneAttempt::Fallback { stream, prefix }) => (stream, prefix),
+                Err(error) => {
+                    tracing::debug!(?error, %remote_addr, "plain http data fast path failed");
+                    return;
+                }
+            }
+        } else {
+            (stream, initial_prefix)
+        };
+
+        self.serve_plain_hyper_connection(stream, prefix, remote_addr, worker_index)
+            .await;
+    }
+
+    async fn serve_plain_hyper_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        prefix: Bytes,
+        remote_addr: SocketAddr,
+        worker_index: usize,
+    ) {
+        let _active_plain_hyper = ActivePlainHyperConnectionGuard::enter();
+        let gateway = self.clone();
+        let service = service_fn(move |request| {
+            let gateway = gateway.clone();
+            async move {
+                gateway
+                    .handle_hyper_request(request, remote_addr, "http")
+                    .await
+            }
+        });
+
+        let result = optimized_http_server_builder()
+            .serve_connection_with_upgrades(TokioIo::new(PrefixedIo::new(stream, prefix)), service)
+            .await;
+
+        if let Err(error) = result {
+            tracing::warn!(?error, %remote_addr, worker = worker_index, "plain http connection failed");
         }
     }
 
     async fn try_plain_http_large_static_fast_path(
         &self,
-        stream: &mut TcpStream,
+        mut stream: TcpStream,
         remote_addr: SocketAddr,
-    ) -> Result<bool> {
+        initial_prefix: Bytes,
+    ) -> Result<PlainHttpFastLaneAttempt> {
         let dynamic_state;
         let (config, fast_lane) = if self.bootstrap_config.runtime.hot_reload.enabled
             || self.bootstrap_config.admin.enabled
@@ -4392,22 +4713,39 @@ impl Gateway {
             && !fast_lane.raw_websocket_proxy
         {
             tracing::debug!(%remote_addr, "plain http static fast path disabled by config");
-            return Ok(false);
+            return Ok(PlainHttpFastLaneAttempt::Fallback {
+                stream,
+                prefix: initial_prefix,
+            });
         }
-
         let mut served_any = false;
+        let mut served_since_yield = 0_usize;
+        let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
+        prefix.extend_from_slice(&initial_prefix);
+        let mut static_header = String::with_capacity(160);
+        let mut small_static_response = Vec::with_capacity(4096);
+        let mut static_response_cache: Option<ConnectionStaticFastPathCache> = None;
         let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
-        loop {
-            let mut peeked = [0_u8; 4096];
-            let read = peek_http_head(stream, &mut peeked)
+        let outcome = 'fast_lane: loop {
+            read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
-                .context("failed peeking plain http request")?;
-            if read == 0 {
-                break;
+                .context("failed reading plain http fast-lane request")?;
+            if prefix.is_empty() {
+                break if served_any {
+                    PlainHttpFastLaneDecision::Served
+                } else {
+                    PlainHttpFastLaneDecision::Fallback(prefix.freeze())
+                };
             }
-            let Some(path_hint) = peek_static_fast_path_path(&peeked[..read]) else {
-                tracing::debug!(%remote_addr, bytes = read, "plain http static fast path request-line miss");
-                return Ok(served_any);
+            let Some(head_end) = memmem::find(&prefix, b"\r\n\r\n").map(|index| index + 4) else {
+                tracing::debug!(%remote_addr, bytes = prefix.len(), "plain http fast path header incomplete");
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+            };
+            let request_head = &prefix[..head_end];
+            let leftover = &prefix[head_end..];
+            let Some(path_hint) = peek_static_fast_path_path(request_head) else {
+                tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http static fast path request-line miss");
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
             let static_prefix_hit = config
                 .services
@@ -4426,60 +4764,76 @@ impl Gateway {
                 && !raw_websocket_prefix_hit
             {
                 tracing::debug!(%remote_addr, path = %path_hint, "plain http static fast path prefix miss");
-                return Ok(served_any);
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             }
 
             if !static_prefix_hit
                 && (raw_sse_prefix_hit || raw_reverse_prefix_hit || raw_websocket_prefix_hit)
             {
                 if raw_websocket_prefix_hit {
-                    let Some(request) = parse_plain_websocket_fast_lane_request(&peeked[..read])
+                    let Some(request) = parse_plain_websocket_fast_lane_request(request_head)
                     else {
-                        tracing::debug!(%remote_addr, bytes = read, "plain http websocket fast lane parse miss");
-                        return Ok(served_any);
+                        tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http websocket fast lane parse miss");
+                        break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                     };
-                    if !consume_http_head_len(stream, request.head_len).await? {
-                        return Ok(served_any);
+                    let mut downstream_started = false;
+                    let mut downstream_detached = false;
+                    #[cfg(target_os = "linux")]
+                    let plain_downstream_fd = stream.as_raw_fd();
+                    if self
+                        .try_serve_raw_websocket_fast_lane(
+                            config,
+                            &mut stream,
+                            &request,
+                            RawWebSocketFastLaneOptions {
+                                remote_addr,
+                                scheme: "http",
+                                downstream_leftover: leftover,
+                                downstream_started: &mut downstream_started,
+                                downstream_detached: &mut downstream_detached,
+                                #[cfg(target_os = "linux")]
+                                plain_downstream_fd: Some(plain_downstream_fd),
+                            },
+                        )
+                        .await?
+                    {
+                        break 'fast_lane if downstream_detached {
+                            PlainHttpFastLaneDecision::Detached
+                        } else {
+                            PlainHttpFastLaneDecision::Served
+                        };
+                    }
+                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                }
+                let Some(request) = parse_plain_fast_lane_request(request_head) else {
+                    tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http raw fast lane parse miss");
+                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                };
+                if raw_sse_prefix_hit && plain_raw_sse_fast_lane_matches(config, &request) {
+                    // SSE owns the HTTP connection for the lifetime of the
+                    // stream. Preserve an unusual pipelined request by handing
+                    // the untouched bytes to Hyper instead of dropping it.
+                    if !leftover.is_empty() {
+                        break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                     }
                     if self
-                        .try_serve_plain_raw_websocket_fast_lane(
+                        .try_serve_plain_raw_sse_fast_lane(
                             config,
-                            stream,
+                            &mut stream,
                             &request,
                             remote_addr,
                         )
                         .await?
                     {
-                        served_any = true;
-                        break;
+                        break 'fast_lane PlainHttpFastLaneDecision::Served;
                     }
-                    return Ok(served_any);
-                }
-                let Some(request) = parse_plain_fast_lane_request(&peeked[..read]) else {
-                    tracing::debug!(%remote_addr, bytes = read, "plain http raw fast lane parse miss");
-                    return Ok(served_any);
-                };
-                if raw_sse_prefix_hit && plain_raw_sse_fast_lane_matches(config, &request) {
-                    if !consume_http_head_len(stream, request.head_len).await? {
-                        return Ok(served_any);
-                    }
-                    if self
-                        .try_serve_plain_raw_sse_fast_lane(config, stream, &request, remote_addr)
-                        .await?
-                    {
-                        served_any = true;
-                        break;
-                    }
-                    return Ok(served_any);
+                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
                 if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, &request) {
-                    if !consume_http_head_len(stream, request.head_len).await? {
-                        return Ok(served_any);
-                    }
                     if self
                         .try_serve_plain_raw_reverse_fast_lane(
                             config,
-                            stream,
+                            &mut stream,
                             &request,
                             remote_addr,
                             &mut raw_reverse_upstream,
@@ -4488,35 +4842,90 @@ impl Gateway {
                     {
                         served_any = true;
                         if !request.keep_alive {
-                            break;
+                            break 'fast_lane PlainHttpFastLaneDecision::Served;
+                        }
+                        discard_fast_lane_http_head(&mut prefix, head_end);
+                        served_since_yield = served_since_yield.saturating_add(1);
+                        if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                            served_since_yield = 0;
+                            tokio::task::yield_now().await;
                         }
                         continue;
                     }
-                    return Ok(served_any);
+                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
-                return Ok(served_any);
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             }
 
-            let Some(request) = parse_static_fast_path_request(&peeked[..read]) else {
-                tracing::debug!(%remote_addr, bytes = read, "plain http static fast path parse miss");
-                return Ok(served_any);
+            let Some(request) = parse_static_fast_path_request(request_head) else {
+                tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http static fast path parse miss");
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
-            let Some(candidate) = resolve_large_static_fast_path_candidate(
-                config,
-                &request,
-                &self.static_route_cache,
-                &self.static_file_cache,
-                &self.static_file_cache_bytes,
-                &self.static_file_load_locks,
-            )
-            .await?
-            else {
+            if let Some(cached) = static_response_cache
+                .as_ref()
+                .filter(|cached| cached.matches(&request))
+            {
+                send_connection_static_fast_path(&mut stream, cached).await?;
+                served_any = true;
+                discard_fast_lane_http_head(&mut prefix, head_end);
+                served_since_yield = served_since_yield.saturating_add(1);
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                    served_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+            let cached_candidate = self
+                .static_route_cache
+                .get(request.path)
+                .map(|target| target.clone())
+                .and_then(|target| {
+                    stale_cached_static_file_candidate(
+                        &target,
+                        request.method,
+                        &self.static_file_cache,
+                        static_sendfile_fast_path_threshold_bytes(config),
+                    )
+                    .map(|(candidate, revalidate)| {
+                        if revalidate {
+                            self.spawn_static_cache_revalidation(target);
+                        }
+                        candidate
+                    })
+                });
+            let candidate = if let Some(candidate) = cached_candidate {
+                Some(candidate)
+            } else {
+                resolve_large_static_fast_path_candidate(
+                    config,
+                    &request,
+                    &self.static_route_cache,
+                    &self.static_file_cache,
+                    &self.static_file_cache_bytes,
+                    &self.static_file_load_locks,
+                )
+                .await?
+            };
+            let Some(candidate) = candidate else {
                 tracing::debug!(%remote_addr, path = %request.path, "plain http static fast path candidate miss");
-                return Ok(served_any);
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
-
-            if !consume_http_head_len(stream, request.head_len).await? {
-                return Ok(served_any);
+            if let Some(cached) = static_response_cache.as_mut().filter(|cached| {
+                cached.identity_matches(&request) && cached.same_payload(&candidate)
+            }) {
+                // Revalidation confirmed the same immutable Bytes/file Arc.
+                // Keep the already-serialized response instead of making all
+                // keep-alive connections rebuild it on the same TTL boundary.
+                cached.checked_at = Instant::now();
+                send_connection_static_fast_path(&mut stream, cached).await?;
+                served_any = true;
+                discard_fast_lane_http_head(&mut prefix, head_end);
+                served_since_yield = served_since_yield.saturating_add(1);
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                    served_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
             }
 
             let connection = if request.keep_alive {
@@ -4524,12 +4933,51 @@ impl Gateway {
             } else {
                 "close"
             };
-            let header = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n",
-                candidate.content_type,
-                candidate.len,
-                connection
-            );
+            static_header.clear();
+            std::fmt::Write::write_fmt(
+                &mut static_header,
+                format_args!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n",
+                    candidate.content_type, candidate.len, connection
+                ),
+            )
+            .expect("writing static response header to String cannot fail");
+
+            if request.method == "GET"
+                && request.keep_alive
+                && (candidate.cached_body.is_some() || candidate.sendfile.is_some())
+            {
+                let combined_response = candidate.cached_body.as_ref().and_then(|body| {
+                    (static_header.len() + body.len() <= POOL_BUFFER_BYTES).then(|| {
+                        small_static_response.clear();
+                        small_static_response.reserve(static_header.len() + body.len());
+                        small_static_response.extend_from_slice(static_header.as_bytes());
+                        small_static_response.extend_from_slice(body);
+                        Bytes::copy_from_slice(&small_static_response)
+                    })
+                });
+                let cached = ConnectionStaticFastPathCache {
+                    target: request.target.to_string(),
+                    host: request.host.map(str::to_string),
+                    checked_at: Instant::now(),
+                    header: Bytes::copy_from_slice(static_header.as_bytes()),
+                    combined_response,
+                    body: candidate.cached_body.clone(),
+                    file_path: candidate.path.clone(),
+                    len: candidate.len,
+                    sendfile: candidate.sendfile.clone(),
+                };
+                send_connection_static_fast_path(&mut stream, &cached).await?;
+                static_response_cache = Some(cached);
+                served_any = true;
+                discard_fast_lane_http_head(&mut prefix, head_end);
+                served_since_yield = served_since_yield.saturating_add(1);
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                    served_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
 
             // Fast path for small cached static bodies: copy head + body into a
             // single pooled buffer and issue ONE write syscall. This matches
@@ -4537,35 +4985,33 @@ impl Gateway {
             // syscalls of TCP_CORK on/off plus a separate header/body write.
             let small_single_write = request.method == "GET"
                 && candidate.cached_body.is_some()
-                && header.len() + candidate.len as usize <= POOL_BUFFER_BYTES;
+                && static_header.len() + candidate.len as usize <= POOL_BUFFER_BYTES;
 
             let send_result = if small_single_write {
                 let body = candidate
                     .cached_body
                     .as_ref()
                     .expect("cached body present for single-write static");
-                let total = header.len() + body.len();
-                let mut buf = relay_buffer_pool().acquire();
-                buf[..header.len()].copy_from_slice(header.as_bytes());
-                buf[header.len()..total].copy_from_slice(body);
+                small_static_response.clear();
+                small_static_response.reserve(static_header.len() + body.len());
+                small_static_response.extend_from_slice(static_header.as_bytes());
+                small_static_response.extend_from_slice(body);
                 stream
-                    .write_all(&buf[..total])
+                    .write_all(&small_static_response)
                     .await
                     .context("failed writing combined static fast path response")
             } else {
                 // Coalesce head + body into a single TCP segment (nginx
                 // `tcp_nopush`/TCP_CORK) for sendfile and larger cached bodies.
                 #[cfg(target_os = "linux")]
-                let cork_static = request.method == "GET"
-                    && candidate.len > 0
-                    && (candidate.sendfile.is_some() || candidate.cached_body.is_some());
+                let cork_static = request.method == "GET" && candidate.len > 0;
                 #[cfg(target_os = "linux")]
                 if cork_static {
-                    set_tcp_cork(stream, true);
+                    set_tcp_cork(&stream, true);
                 }
 
                 let header_result = stream
-                    .write_all(header.as_bytes())
+                    .write_all(static_header.as_bytes())
                     .await
                     .context("failed writing plain http fast path response head");
 
@@ -4578,7 +5024,7 @@ impl Gateway {
                                 .context("failed writing cached static fast path body")
                         } else {
                             send_static_file_fast(
-                                stream,
+                                &mut stream,
                                 &candidate.path,
                                 candidate.len,
                                 candidate.sendfile.clone(),
@@ -4591,7 +5037,7 @@ impl Gateway {
                     };
                 #[cfg(target_os = "linux")]
                 if cork_static {
-                    set_tcp_cork(stream, false);
+                    set_tcp_cork(&stream, false);
                 }
                 header_result.and(body_result)
             };
@@ -4611,15 +5057,199 @@ impl Gateway {
 
             served_any = true;
             if !request.keep_alive {
-                break;
+                break PlainHttpFastLaneDecision::Served;
             }
-        }
+            discard_fast_lane_http_head(&mut prefix, head_end);
+            served_since_yield = served_since_yield.saturating_add(1);
+            if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                served_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
+        };
 
         if let Some(upstream) = raw_reverse_upstream.take() {
             upstream.pool.checkin(upstream.stream);
         }
-        let _ = stream.shutdown().await;
-        Ok(served_any)
+        Ok(match outcome {
+            PlainHttpFastLaneDecision::Served => {
+                let _ = stream.shutdown().await;
+                PlainHttpFastLaneAttempt::Served
+            }
+            PlainHttpFastLaneDecision::Detached => PlainHttpFastLaneAttempt::Served,
+            PlainHttpFastLaneDecision::Fallback(prefix) => {
+                PlainHttpFastLaneAttempt::Fallback { stream, prefix }
+            }
+        })
+    }
+
+    async fn try_tls_raw_websocket_fast_lane<Stream>(
+        &self,
+        downstream: &mut Stream,
+        remote_addr: SocketAddr,
+        prefix: Bytes,
+    ) -> Result<TlsRawWebSocketAttempt>
+    where
+        Stream: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    {
+        let dynamic_state;
+        let (config, fast_lane) = if self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+        {
+            dynamic_state = self.current_state().await;
+            (&dynamic_state.config, &dynamic_state.fast_lane)
+        } else {
+            (&self.bootstrap_config, &self.bootstrap_fast_lane)
+        };
+        if !fast_lane.raw_websocket_proxy {
+            return Ok(TlsRawWebSocketAttempt::Fallback(prefix));
+        }
+
+        let Some(head_end) = memmem::find(&prefix, b"\r\n\r\n").map(|index| index + 4) else {
+            return Ok(TlsRawWebSocketAttempt::Fallback(prefix));
+        };
+        let Some(request) = parse_plain_websocket_fast_lane_request(&prefix[..head_end]) else {
+            return Ok(TlsRawWebSocketAttempt::Fallback(prefix));
+        };
+
+        let mut downstream_started = false;
+        let mut downstream_detached = false;
+        match self
+            .try_serve_raw_websocket_fast_lane(
+                config,
+                downstream,
+                &request,
+                RawWebSocketFastLaneOptions {
+                    remote_addr,
+                    scheme: "https",
+                    downstream_leftover: &prefix[head_end..],
+                    downstream_started: &mut downstream_started,
+                    downstream_detached: &mut downstream_detached,
+                    #[cfg(target_os = "linux")]
+                    plain_downstream_fd: None,
+                },
+            )
+            .await
+        {
+            Ok(true) => Ok(TlsRawWebSocketAttempt::Served),
+            Ok(false) => Ok(TlsRawWebSocketAttempt::Fallback(prefix)),
+            Err(error) if !downstream_started => {
+                tracing::debug!(?error, %remote_addr, "TLS raw WebSocket fast lane fell back before response");
+                Ok(TlsRawWebSocketAttempt::Fallback(prefix))
+            }
+            Err(error) => Err(error.context("TLS raw WebSocket fast lane failed after response")),
+        }
+    }
+
+    async fn try_tls_small_static_fast_lane(
+        &self,
+        downstream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+        remote_addr: SocketAddr,
+        initial_prefix: Bytes,
+    ) -> Result<TlsStaticFastLaneAttempt> {
+        let dynamic_state;
+        let (config, fast_lane) = if self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+        {
+            dynamic_state = self.current_state().await;
+            (&dynamic_state.config, &dynamic_state.fast_lane)
+        } else {
+            (&self.bootstrap_config, &self.bootstrap_fast_lane)
+        };
+        if !fast_lane.hyper_static_success {
+            return Ok(TlsStaticFastLaneAttempt::Fallback(initial_prefix));
+        }
+
+        let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
+        prefix.extend_from_slice(&initial_prefix);
+        let mut header = String::with_capacity(160);
+        let mut response = Vec::with_capacity(4096);
+        let mut served = 0_usize;
+        loop {
+            read_fast_lane_http_prefix(downstream, &mut prefix)
+                .await
+                .context("failed reading TLS static fast-lane request")?;
+            if prefix.is_empty() {
+                return Ok(if served > 0 {
+                    TlsStaticFastLaneAttempt::Served
+                } else {
+                    TlsStaticFastLaneAttempt::Fallback(Bytes::new())
+                });
+            }
+            let Some(head_end) = memmem::find(&prefix, b"\r\n\r\n").map(|index| index + 4) else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
+            let Some(request) = parse_static_fast_path_request(&prefix[..head_end]) else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
+            let Some(target) = self
+                .static_route_cache
+                .get(request.path)
+                .map(|target| target.clone())
+            else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
+            let Some((candidate, revalidate)) = stale_cached_static_file_candidate(
+                &target,
+                request.method,
+                &self.static_file_cache,
+                u64::MAX,
+            ) else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
+            let Some(body) = candidate.cached_body.as_ref() else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
+            if revalidate {
+                self.spawn_static_cache_revalidation(target);
+            }
+
+            let connection = if request.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            };
+            let keep_alive = request.keep_alive;
+            header.clear();
+            std::fmt::Write::write_fmt(
+                &mut header,
+                format_args!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n\r\n",
+                    candidate.content_type, candidate.len, connection
+                ),
+            )
+            .expect("writing TLS static response header cannot fail");
+            response.clear();
+            response.extend_from_slice(header.as_bytes());
+            if request.method == "GET" {
+                response.extend_from_slice(body);
+            }
+            downstream
+                .write_all(&response)
+                .await
+                .context("failed writing TLS static fast-lane response")?;
+            self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+            if config.logging.access_log {
+                tracing::info!(
+                    target: "access",
+                    method = %request.method,
+                    path = %request.path,
+                    status = 200,
+                    upstream = "proxysss://tls-static-cache",
+                    remote_addr = %remote_addr,
+                    "access"
+                );
+            }
+
+            discard_fast_lane_http_head(&mut prefix, head_end);
+            served = served.saturating_add(1);
+            if !keep_alive {
+                let _ = downstream.shutdown().await;
+                return Ok(TlsStaticFastLaneAttempt::Served);
+            }
+            if served.is_multiple_of(PLAIN_FAST_LANE_FAIRNESS_BATCH) {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     async fn run_tls_http(self: Arc<Self>, bind: String) -> Result<()> {
@@ -4632,22 +5262,108 @@ impl Gateway {
             self.on_demand_trigger.clone(),
             vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
         )?));
-        let worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let base_worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let max_worker_count =
+            if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+                adaptive_data_plane_workers(1)
+            } else {
+                1
+            };
+        if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+            let _ = dedicated_tls_connection_runtimes();
+        }
+        let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
-        for worker_index in 0..worker_count {
+        for worker_index in 0..base_worker_count {
             let listener = bind_tcp_listener(bind_addr, "tls http listener").await?;
             tracing::info!(
                 bind = %bind_addr,
                 worker = worker_index,
-                workers = worker_count,
+                workers = base_worker_count,
+                max_workers = max_worker_count,
                 "tls http listener ready"
             );
             let gateway = self.clone();
             let acceptor = tls_acceptor.clone();
+            let active_connections = active_connections.clone();
+            if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+                let listener = listener
+                    .into_std()
+                    .context("failed detaching TLS HTTP listener for data runtime")?;
+                let accept_task =
+                    dedicated_tls_connection_runtime(worker_index).spawn(async move {
+                        let listener = TcpListener::from_std(listener)
+                            .context("failed registering TLS HTTP listener on data runtime")?;
+                        gateway
+                            .run_tls_http_accept_loop(
+                                listener,
+                                acceptor,
+                                worker_index,
+                                true,
+                                active_connections,
+                            )
+                            .await
+                    });
+                workers.spawn(async move {
+                    accept_task
+                        .await
+                        .context("TLS HTTP data-runtime accept task failed")?
+                });
+            } else {
+                workers.spawn(async move {
+                    gateway
+                        .run_tls_http_accept_loop(
+                            listener,
+                            acceptor,
+                            worker_index,
+                            false,
+                            active_connections,
+                        )
+                        .await
+                });
+            }
+        }
+
+        let elastic_threshold = base_worker_count
+            .saturating_mul(TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD)
+            .max(TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD);
+        for worker_index in base_worker_count..max_worker_count {
+            let gateway = self.clone();
+            let acceptor = tls_acceptor.clone();
+            let active_connections = active_connections.clone();
             workers.spawn(async move {
-                gateway
-                    .run_tls_http_accept_loop(listener, acceptor, worker_index)
+                while active_connections.load(Ordering::Relaxed) < elastic_threshold {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let listener = bind_tcp_listener(bind_addr, "elastic tls http listener").await?;
+                tracing::info!(
+                    bind = %bind_addr,
+                    worker = worker_index,
+                    threshold = elastic_threshold,
+                    "elastic TLS HTTP listener activated"
+                );
+                let listener = listener
+                    .into_std()
+                    .context("failed detaching elastic TLS listener for data runtime")?;
+                let accept_task = dedicated_tls_connection_runtime(worker_index).spawn({
+                    let active_connections = active_connections.clone();
+                    async move {
+                        let listener = TcpListener::from_std(listener)
+                            .context("failed registering elastic TLS listener")?;
+                        gateway
+                            .run_tls_http_accept_loop(
+                                listener,
+                                acceptor,
+                                worker_index,
+                                true,
+                                active_connections,
+                            )
+                            .await
+                    }
+                });
+                accept_task
                     .await
+                    .context("elastic TLS data-runtime accept task failed")?
             });
         }
 
@@ -4665,42 +5381,185 @@ impl Gateway {
         listener: TcpListener,
         tls_acceptor: TlsAcceptor,
         worker_index: usize,
+        accept_on_data_runtime: bool,
+        active_connections: Arc<AtomicUsize>,
     ) -> Result<()> {
+        let mut accepted_since_yield = 0_usize;
         loop {
             let (stream, remote_addr) =
                 listener.accept().await.context("tls http accept failed")?;
+            if accept_on_data_runtime {
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on tls http connection");
+                }
+                tune_tcp_stream_for_latency(&stream);
+                let gateway = self.clone();
+                let acceptor = tls_acceptor.clone();
+                let active_connection_count = active_connections
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                let connection_guard = ActiveConnectionGuard(active_connections.clone());
+                std::mem::drop(tokio::spawn(async move {
+                    let _connection_guard = connection_guard;
+                    gateway
+                        .serve_tls_http_connection(stream, acceptor, remote_addr, worker_index)
+                        .await;
+                }));
+                accepted_since_yield += 1;
+                let handshake_batch = if active_connection_count > TLS_ACCEPT_HIGH_DENSITY_PER_SHARD
+                {
+                    TLS_ACCEPT_HIGH_DENSITY_BATCH
+                } else {
+                    TLS_ACCEPT_LOW_DENSITY_BATCH
+                };
+                if accepted_since_yield >= handshake_batch {
+                    accepted_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+            let stream = match stream.into_std() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(?error, %remote_addr, "failed detaching TLS HTTP socket for worker shard");
+                    continue;
+                }
+            };
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on tls http connection");
             }
             let gateway = self.clone();
             let acceptor = tls_acceptor.clone();
+            let performance_enabled = self.bootstrap_config.runtime.performance.enabled;
 
-            tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(stream).await {
+            spawn_http_connection(performance_enabled, worker_index, async move {
+                let stream = match TcpStream::from_std(stream) {
                     Ok(stream) => stream,
                     Err(error) => {
-                        tracing::warn!(?error, %remote_addr, "tls handshake failed");
+                        tracing::warn!(?error, %remote_addr, worker = worker_index, "failed registering TLS HTTP socket on worker shard");
                         return;
                     }
                 };
-
-                let service = service_fn(move |request| {
-                    let gateway = gateway.clone();
-                    async move {
-                        gateway
-                            .handle_hyper_request(request, remote_addr, "https")
-                            .await
-                    }
-                });
-
-                let result = optimized_http_server_builder()
-                    .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
+                tune_tcp_stream_for_latency(&stream);
+                gateway
+                    .serve_tls_http_connection(stream, acceptor, remote_addr, worker_index)
                     .await;
-
-                if let Err(error) = result {
-                    tracing::warn!(?error, %remote_addr, worker = worker_index, "tls http connection failed");
-                }
             });
+        }
+    }
+
+    async fn serve_tls_http_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        acceptor: TlsAcceptor,
+        remote_addr: SocketAddr,
+        worker_index: usize,
+    ) {
+        let mut tls_stream = match acceptor.accept(stream).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(?error, %remote_addr, "tls handshake failed");
+                return;
+            }
+        };
+
+        let is_http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let prefix = if is_http2 {
+            Bytes::new()
+        } else {
+            match read_tls_fast_lane_http_prefix(&mut tls_stream).await {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    tracing::debug!(?error, %remote_addr, "failed reading TLS HTTP request head");
+                    return;
+                }
+            }
+        };
+
+        self.serve_tls_http_after_handshake(
+            tls_stream,
+            prefix,
+            remote_addr,
+            worker_index,
+            !is_http2,
+            is_http2,
+        )
+        .await;
+    }
+
+    async fn serve_tls_http_after_handshake(
+        self: Arc<Self>,
+        mut tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+        prefix: Bytes,
+        remote_addr: SocketAddr,
+        worker_index: usize,
+        try_websocket: bool,
+        is_http2: bool,
+    ) {
+        let prefix = if try_websocket {
+            match self
+                .try_tls_raw_websocket_fast_lane(&mut tls_stream, remote_addr, prefix)
+                .await
+            {
+                Ok(TlsRawWebSocketAttempt::Served) => return,
+                Ok(TlsRawWebSocketAttempt::Fallback(prefix)) => prefix,
+                Err(error) => {
+                    if is_expected_websocket_disconnect(&error) {
+                        tracing::debug!(?error, %remote_addr, "TLS raw WebSocket tunnel closed by peer");
+                    } else {
+                        tracing::warn!(?error, %remote_addr, "TLS raw WebSocket tunnel failed");
+                    }
+                    return;
+                }
+            }
+        } else {
+            prefix
+        };
+
+        let prefix = if !is_http2 {
+            match self
+                .try_tls_small_static_fast_lane(&mut tls_stream, remote_addr, prefix)
+                .await
+            {
+                Ok(TlsStaticFastLaneAttempt::Served) => return,
+                Ok(TlsStaticFastLaneAttempt::Fallback(prefix)) => prefix,
+                Err(error) => {
+                    tracing::debug!(?error, %remote_addr, "TLS static fast lane failed");
+                    return;
+                }
+            }
+        } else {
+            prefix
+        };
+
+        let gateway = self.clone();
+        let service = service_fn(move |request| {
+            let gateway = gateway.clone();
+            async move {
+                if is_http2 {
+                    apply_h2_mixed_fairness().await;
+                }
+                gateway
+                    .handle_hyper_request(request, remote_addr, "https")
+                    .await
+            }
+        });
+
+        let io = TokioIo::new(PrefixedIo::new(tls_stream, prefix));
+        let result = if is_http2 {
+            optimized_http2_server_builder()
+                .serve_connection(io, service)
+                .await
+                .map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
+        } else {
+            optimized_http_server_builder()
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .map_err(|error| anyhow!("TLS HTTP connection failed: {error}"))
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(?error, %remote_addr, worker = worker_index, "tls http connection failed");
         }
     }
 
@@ -4881,6 +5740,11 @@ impl Gateway {
             .with_context(|| format!("invalid tcp bind {}", listener_config.bind))?;
         let state = self.current_state().await;
         let worker_count = tcp_stream_accept_worker_count(&state.config, &listener_config);
+        let sharded_runtime_enabled =
+            cfg!(target_os = "linux") && state.config.runtime.performance.enabled;
+        if sharded_runtime_enabled {
+            let _ = dedicated_tcp_stream_runtimes();
+        }
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
             let listener = match bind_tcp_listener(bind_addr, "tcp listener").await {
@@ -4907,11 +5771,29 @@ impl Gateway {
             );
             let gateway = self.clone();
             let listener_config = listener_config.clone();
-            workers.spawn(async move {
-                gateway
-                    .run_tcp_listener_accept_loop(listener, listener_config, worker_index)
-                    .await
-            });
+            if sharded_runtime_enabled {
+                let listener = listener
+                    .into_std()
+                    .context("failed detaching TCP listener for stream runtime shard")?;
+                let accept_task = dedicated_tcp_stream_runtime(worker_index).spawn(async move {
+                    let listener = TcpListener::from_std(listener)
+                        .context("failed registering TCP listener on stream runtime shard")?;
+                    gateway
+                        .run_tcp_listener_accept_loop(listener, listener_config, worker_index)
+                        .await
+                });
+                workers.spawn(async move {
+                    accept_task
+                        .await
+                        .context("TCP stream runtime accept task failed")?
+                });
+            } else {
+                workers.spawn(async move {
+                    gateway
+                        .run_tcp_listener_accept_loop(listener, listener_config, worker_index)
+                        .await
+                });
+            }
         }
 
         while let Some(result) = workers.join_next().await {
@@ -4930,8 +5812,8 @@ impl Gateway {
         worker_index: usize,
     ) -> Result<()> {
         loop {
-            let (mut inbound, remote_addr) =
-                listener.accept().await.context("tcp accept failed")?;
+            let (inbound, remote_addr) = listener.accept().await.context("tcp accept failed")?;
+            let connection_worker = worker_index;
             if listener_config.nodelay {
                 inbound
                     .set_nodelay(true)
@@ -4974,8 +5856,10 @@ impl Gateway {
             self.stats
                 .tcp_sessions_active
                 .fetch_add(1, Ordering::Relaxed);
+            TCP_STREAMS_ACTIVE.fetch_add(1, Ordering::Relaxed);
 
-            tokio::spawn(async move {
+            let session = async move {
+                let mut inbound = inbound;
                 let request_id = Uuid::new_v4().to_string();
                 if let Err(error) = async {
                     let state = gateway.current_state().await;
@@ -5007,7 +5891,7 @@ impl Gateway {
                                     connect_timeout_ms: listener_connect_timeout_ms,
                                     first_payload: BytesMut::new(),
                                     remote_addr,
-                                    worker_index,
+                                    worker_index: connection_worker,
                                 },
                             )
                             .await?;
@@ -5145,7 +6029,7 @@ impl Gateway {
                                     connect_timeout_ms: listener_connect_timeout_ms,
                                     first_payload,
                                     remote_addr,
-                                    worker_index,
+                                    worker_index: connection_worker,
                                 },
                             )
                             .await?;
@@ -5290,14 +6174,16 @@ impl Gateway {
                 }
                 .await
                 {
-                    tracing::warn!(?error, request_id, listener = %listener_name, worker = worker_index, %remote_addr, "tcp session failed");
+                    tracing::warn!(?error, request_id, listener = %listener_name, worker = connection_worker, %remote_addr, "tcp session failed");
                 }
 
                 gateway
                     .stats
                     .tcp_sessions_active
                     .fetch_sub(1, Ordering::Relaxed);
-            });
+                TCP_STREAMS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+            };
+            std::mem::drop(tokio::spawn(session));
         }
     }
 
@@ -6050,12 +6936,11 @@ impl Gateway {
     ) -> Result<GatewayResponse, Infallible> {
         self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
 
-        let started = Instant::now();
         match self
             .try_http_static_success_fast_path(&request, scheme)
             .await
         {
-            Ok(Some(response)) => return Ok(response.into_hyper()),
+            Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(error) => {
                 self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
@@ -6067,6 +6952,7 @@ impl Gateway {
             }
         }
 
+        let started = Instant::now();
         let method = request.method().clone();
         let uri = request.uri().clone();
         let version = version_label(request.version());
@@ -6311,16 +7197,67 @@ impl Gateway {
         &self,
         request: &Request<Incoming>,
         scheme: &'static str,
-    ) -> Result<Option<GatewayHttpResponse>> {
+    ) -> Result<Option<GatewayResponse>> {
         let method = request.method();
         if method != Method::GET && method != Method::HEAD {
             return Ok(None);
         }
+
+        // HTTP/2 cannot carry HTTP/1 Upgrade/Transfer-Encoding ambiguity. For
+        // an already-ended GET stream, take the immutable precompiled static
+        // lane before any HTTP/1-oriented header scans.
+        if request.version() == Version::HTTP_2
+            && method == Method::GET
+            && request.body().is_end_stream()
+            && !request.headers().contains_key(RANGE)
+            && !self.bootstrap_config.runtime.hot_reload.enabled
+            && !self.bootstrap_config.admin.enabled
+            && self.bootstrap_fast_lane.hyper_static_success
+            && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
+        {
+            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
+                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
+                    target.as_path(),
+                    method,
+                    &self.static_file_cache,
+                ) {
+                    if cached.revalidate {
+                        self.spawn_static_cache_revalidation(target.clone());
+                    }
+                    return Ok(Some(cached.response));
+                }
+            }
+        }
+
         if !request_body_declared_empty(method, request.headers()) {
             return Ok(None);
         }
         if websocket_upgrade_requested(request.headers()) {
             return Ok(None);
+        }
+
+        // Immutable startup config can take the precompiled H2/static lane
+        // before repeated policy scans, path normalization, and site lookup.
+        // An exact warmed route-cache hit is already a validated static path;
+        // hot-reload/admin configurations use the complete path below.
+        if !self.bootstrap_config.runtime.hot_reload.enabled
+            && !self.bootstrap_config.admin.enabled
+            && self.bootstrap_fast_lane.hyper_static_success
+            && !request.headers().contains_key(RANGE)
+            && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
+        {
+            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
+                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
+                    target.as_path(),
+                    method,
+                    &self.static_file_cache,
+                ) {
+                    if cached.revalidate {
+                        self.spawn_static_cache_revalidation(target.clone());
+                    }
+                    return Ok(Some(cached.response));
+                }
+            }
         }
 
         let dynamic_state;
@@ -6351,6 +7288,39 @@ impl Gateway {
             return Ok(None);
         };
 
+        // HTTP/2 and TLS cannot use the plain-text sendfile lane, but hot
+        // static objects are already immutable `Bytes` in the bounded cache.
+        // Resolve the path without touching the filesystem and serve a fresh
+        // cache entry directly. Falling through once per revalidation window
+        // preserves hot-update correctness while removing a metadata syscall
+        // from every ordinary H2 request.
+        if !request.headers().contains_key(RANGE) {
+            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
+                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
+                    target.as_path(),
+                    method,
+                    &self.static_file_cache,
+                ) {
+                    if cached.revalidate {
+                        self.spawn_static_cache_revalidation(target.clone());
+                    }
+                    return Ok(Some(cached.response));
+                }
+            }
+            if let Some(target) = static_site_filesystem_path(site, request.uri().path())? {
+                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
+                    &target,
+                    method,
+                    &self.static_file_cache,
+                ) {
+                    if cached.revalidate {
+                        self.spawn_static_cache_revalidation(target);
+                    }
+                    return Ok(Some(cached.response));
+                }
+            }
+        }
+
         let response = dispatch_static_site(
             site,
             method,
@@ -6363,10 +7333,59 @@ impl Gateway {
         .await?;
 
         if response.status.is_success() {
-            Ok(Some(response))
+            Ok(Some(response.into_hyper()))
         } else {
             Ok(None)
         }
+    }
+
+    fn spawn_static_cache_revalidation(&self, target: PathBuf) {
+        let static_file_cache = self.static_file_cache.clone();
+        let static_file_cache_bytes = self.static_file_cache_bytes.clone();
+        let static_file_load_locks = self.static_file_load_locks.clone();
+        std::mem::drop(tokio::spawn(async move {
+            let key = target.to_string_lossy().to_string();
+            match tokio::fs::metadata(&target).await {
+                Ok(metadata) if metadata.is_file() => {
+                    let sendfile_entry = static_file_cache
+                        .get(&key)
+                        .is_some_and(|entry| entry.sendfile.is_some() && entry.body.is_empty());
+                    let result = if sendfile_entry {
+                        cached_static_sendfile(&target, &metadata, &static_file_cache).map(|_| ())
+                    } else {
+                        cached_static_file_body(
+                            &target,
+                            &metadata,
+                            &static_file_cache,
+                            &static_file_cache_bytes,
+                            &static_file_load_locks,
+                        )
+                        .await
+                        .map(|_| ())
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(?error, path = %target.display(), "background static cache revalidation failed");
+                        finish_failed_static_revalidation(&key, &static_file_cache);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some((_, stale)) = static_file_cache.remove(&key) {
+                        static_file_cache_bytes
+                            .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                Ok(_) => {
+                    if let Some((_, stale)) = static_file_cache.remove(&key) {
+                        static_file_cache_bytes
+                            .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(?error, path = %target.display(), "background static metadata revalidation failed");
+                    finish_failed_static_revalidation(&key, &static_file_cache);
+                }
+            }
+        }));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7094,18 +8113,26 @@ impl Gateway {
 
         let upstream_headers =
             build_empty_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
-        let mut upstream_request = Request::builder()
-            .method(method.clone())
-            .uri(upstream_uri)
-            .body(Full::new(body.clone()))
-            .context("failed building upstream request")?;
-        *upstream_request.headers_mut() = upstream_headers;
+        let retry_transport = body.is_empty() && matches!(*method, Method::GET | Method::HEAD);
+        let mut attempt = 0_u8;
+        let upstream_response = loop {
+            let mut upstream_request = Request::builder()
+                .method(method.clone())
+                .uri(upstream_uri.clone())
+                .body(Full::new(body.clone()))
+                .context("failed building upstream request")?;
+            *upstream_request.headers_mut() = upstream_headers.clone();
 
-        let upstream_response = state
-            .http_fast_client
-            .request(upstream_request)
-            .await
-            .context("upstream request failed")?;
+            match state.http_fast_client.request(upstream_request).await {
+                Ok(response) => break response,
+                Err(error) if retry_transport && attempt == 0 => {
+                    attempt = 1;
+                    tracing::debug!(?error, %upstream, "retrying idempotent upstream transport failure");
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error).context("upstream request failed"),
+            }
+        };
         let (mut parts, upstream_body) = upstream_response.into_parts();
         remove_hop_headers_from_map(&mut parts.headers);
 
@@ -7577,13 +8604,27 @@ impl Gateway {
         Ok(true)
     }
 
-    async fn try_serve_plain_raw_websocket_fast_lane(
+    async fn try_serve_raw_websocket_fast_lane<Downstream>(
         &self,
         config: &GatewayConfig,
-        downstream: &mut TcpStream,
+        downstream: &mut Downstream,
         request: &PlainWebSocketFastLaneRequest,
-        remote_addr: SocketAddr,
-    ) -> Result<bool> {
+        options: RawWebSocketFastLaneOptions<'_>,
+    ) -> Result<bool>
+    where
+        Downstream: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    {
+        let RawWebSocketFastLaneOptions {
+            remote_addr,
+            scheme,
+            downstream_leftover,
+            downstream_started,
+            downstream_detached,
+            #[cfg(target_os = "linux")]
+            plain_downstream_fd,
+        } = options;
+        #[cfg(not(target_os = "linux"))]
+        let _ = downstream_detached;
         let host = request.host.as_deref().unwrap_or("localhost");
         let Some(route) = config
             .services
@@ -7607,7 +8648,7 @@ impl Gateway {
             status: None,
             content_type: None,
         };
-        let remote_addr = remote_addr.to_string();
+        let remote_addr_text = remote_addr.to_string();
         let selected_upstream = self
             .select_upstream_plan(
                 config,
@@ -7615,7 +8656,7 @@ impl Gateway {
                 "websocket",
                 Some(&route.name),
                 None,
-                Some(&remote_addr),
+                Some(&remote_addr_text),
             )
             .into_iter()
             .next()
@@ -7636,9 +8677,16 @@ impl Gateway {
                 )
             })?;
         let _ = upstream_io.set_nodelay(true);
+        tune_tcp_stream_for_latency(&upstream_io);
 
-        let request_bytes =
-            serialize_raw_websocket_fast_lane_request(request, path_and_query.as_ref(), host);
+        let request_bytes = serialize_raw_websocket_fast_lane_request(
+            request,
+            path_and_query.as_ref(),
+            host,
+            remote_addr,
+            scheme,
+            route.forward_headers,
+        );
         upstream_io
             .write_all(&request_bytes)
             .await
@@ -7657,6 +8705,7 @@ impl Gateway {
                     selected_upstream
                 )
             })?;
+        *downstream_started = true;
         downstream
             .write_all(&response_head.raw_head)
             .await
@@ -7673,14 +8722,52 @@ impl Gateway {
             return Ok(true);
         }
 
-        copy_bidirectional_with_pooled_buffers_limit(
-            downstream,
-            &mut upstream_io,
-            websocket_relay_buffer_pool(),
-            WEBSOCKET_RELAY_POLL_STEPS,
-        )
-        .await
-        .context("raw websocket tunnel relay failed")?;
+        if !downstream_leftover.is_empty() {
+            upstream_io
+                .write_all(downstream_leftover)
+                .await
+                .context("failed forwarding early raw websocket client bytes")?;
+        }
+
+        #[cfg(target_os = "linux")]
+        if LINUX_STREAM_REACTOR_ENABLED && plain_downstream_fd.is_some() {
+            let downstream_fd = plain_downstream_fd.expect("plain downstream fd checked");
+            match crate::stream_reactor::dispatch(
+                downstream_fd,
+                upstream_io.as_raw_fd(),
+                realtime_stream_reactor_workers(),
+            ) {
+                Ok(()) => {
+                    *downstream_detached = true;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    tracing::debug!(?error, %remote_addr, "plain WebSocket epoll handoff unavailable; using async relay");
+                }
+            }
+        }
+
+        if scheme.eq_ignore_ascii_case("https") {
+            copy_bidirectional_with_pooled_buffers_limit::<
+                _,
+                _,
+                WEBSOCKET_RELAY_POLL_STEPS,
+                true,
+                true,
+            >(downstream, &mut upstream_io, websocket_relay_buffer_pool())
+            .await
+            .context("buffered WSS tunnel relay failed")?;
+        } else {
+            copy_bidirectional_with_pooled_buffers_limit::<
+                _,
+                _,
+                WEBSOCKET_RELAY_POLL_STEPS,
+                false,
+                false,
+            >(downstream, &mut upstream_io, websocket_relay_buffer_pool())
+            .await
+            .context("plain WebSocket tunnel relay failed")?;
+        }
         Ok(true)
     }
 
@@ -7765,11 +8852,16 @@ impl Gateway {
                             .context("failed flushing upstream websocket prelude")?;
                     }
                 }
-                copy_bidirectional_with_pooled_buffers_limit(
+                copy_bidirectional_with_pooled_buffers_limit::<
+                    _,
+                    _,
+                    WEBSOCKET_RELAY_POLL_STEPS,
+                    true,
+                    true,
+                >(
                     &mut client,
                     &mut *upstream_io,
                     websocket_relay_buffer_pool(),
-                    WEBSOCKET_RELAY_POLL_STEPS,
                 )
                 .await
                 .context("websocket tunnel relay failed")?;
@@ -9504,13 +10596,68 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
 }
 
-struct StaticFastPathRequest {
+#[cfg(target_os = "linux")]
+async fn apply_h2_mixed_fairness() {
+    if PLAIN_HYPER_CONNECTIONS_ACTIVE.load(Ordering::Relaxed) == 0
+        && TCP_STREAMS_ACTIVE.load(Ordering::Relaxed) == 0
+    {
+        H2_MIXED_NEXT_SLOT_NS.store(0, Ordering::Relaxed);
+        return;
+    }
+
+    const PER_CORE_OPS: u64 = 2_000;
+    const BURST_REQUESTS: u64 = 64;
+    let limit = (data_plane_cpu_ids().len() as u64)
+        .saturating_mul(PER_CORE_OPS)
+        .max(PER_CORE_OPS);
+    let interval_ns = 1_000_000_000_u64 / limit;
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    let floor = now_ns.saturating_sub(interval_ns.saturating_mul(BURST_REQUESTS));
+
+    let scheduled_ns = loop {
+        let current = H2_MIXED_NEXT_SLOT_NS.load(Ordering::Relaxed);
+        let scheduled = current.max(floor).saturating_add(interval_ns);
+        if H2_MIXED_NEXT_SLOT_NS
+            .compare_exchange_weak(current, scheduled, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break scheduled;
+        }
+    };
+
+    if scheduled_ns > now_ns {
+        tokio::time::sleep(Duration::from_nanos(scheduled_ns - now_ns)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn apply_h2_mixed_fairness() {}
+
+fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
+    let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new())
+        .adaptive_window(true)
+        .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
+        .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
+        .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
+        .max_concurrent_streams(Some(HTTP2_MAX_CONCURRENT_STREAMS))
+        .keep_alive_interval(Some(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS)))
+        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
+        .max_send_buf_size(HTTP2_MAX_SEND_BUF_BYTES);
+    builder
+}
+
+struct StaticFastPathRequest<'a> {
     method: &'static str,
-    target: String,
-    path: String,
-    host: Option<String>,
+    target: &'a str,
+    path: &'a str,
+    host: Option<&'a str>,
     keep_alive: bool,
-    head_len: usize,
 }
 
 struct StaticFastPathCandidate {
@@ -9519,6 +10666,47 @@ struct StaticFastPathCandidate {
     content_type: &'static str,
     cached_body: Option<Bytes>,
     sendfile: Option<Arc<std::fs::File>>,
+}
+
+struct ConnectionStaticFastPathCache {
+    target: String,
+    host: Option<String>,
+    checked_at: Instant,
+    header: Bytes,
+    combined_response: Option<Bytes>,
+    body: Option<Bytes>,
+    file_path: PathBuf,
+    len: u64,
+    sendfile: Option<Arc<std::fs::File>>,
+}
+
+impl ConnectionStaticFastPathCache {
+    fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
+        request.method == "GET"
+            && request.keep_alive
+            && self.target == request.target
+            && self.host.as_deref() == request.host
+    }
+
+    fn matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
+        self.identity_matches(request)
+            && self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+    }
+
+    fn same_payload(&self, candidate: &StaticFastPathCandidate) -> bool {
+        self.len == candidate.len
+            && match (&self.body, &candidate.cached_body) {
+                (Some(current), Some(candidate)) => {
+                    current.len() == candidate.len() && current.as_ptr() == candidate.as_ptr()
+                }
+                (None, None) => match (&self.sendfile, &candidate.sendfile) {
+                    (Some(current), Some(candidate)) => Arc::ptr_eq(current, candidate),
+                    (None, None) => true,
+                    _ => false,
+                },
+                _ => false,
+            }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -9539,15 +10727,93 @@ struct PlainFastLaneRequest {
     accepts_sse: bool,
     host: Option<String>,
     keep_alive: bool,
-    head_len: usize,
 }
 
 struct PlainWebSocketFastLaneRequest {
     target: String,
     path: String,
     header_bytes: Vec<u8>,
+    forwarding_headers: RawForwardingHeaderSnapshot,
     host: Option<String>,
-    head_len: usize,
+}
+
+struct PrefixedIo<S> {
+    inner: S,
+    prefix: Bytes,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(inner: S, prefix: Bytes) -> Self {
+        Self { inner, prefix }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() && buffer.remaining() > 0 {
+            let copied = self.prefix.len().min(buffer.remaining());
+            buffer.put_slice(&self.prefix[..copied]);
+            self.prefix.advance(copied);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+enum TlsRawWebSocketAttempt {
+    Served,
+    Fallback(Bytes),
+}
+
+enum TlsStaticFastLaneAttempt {
+    Served,
+    Fallback(Bytes),
+}
+
+enum PlainHttpFastLaneAttempt {
+    Served,
+    Fallback { stream: TcpStream, prefix: Bytes },
+}
+
+enum PlainHttpFastLaneDecision {
+    Served,
+    Detached,
+    Fallback(Bytes),
+}
+
+struct RawWebSocketFastLaneOptions<'a> {
+    remote_addr: SocketAddr,
+    scheme: &'a str,
+    downstream_leftover: &'a [u8],
+    downstream_started: &'a mut bool,
+    downstream_detached: &'a mut bool,
+    #[cfg(target_os = "linux")]
+    plain_downstream_fd: Option<i32>,
 }
 
 struct RawReverseLaneUpstream {
@@ -9595,7 +10861,7 @@ fn peek_static_fast_path_path(buffer: &[u8]) -> Option<&str> {
     )
 }
 
-fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest> {
+fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest<'_>> {
     let head = std::str::from_utf8(buffer).ok()?;
     let head_end = head.find("\r\n\r\n")?;
     let mut lines = head[..head_end].split("\r\n");
@@ -9637,7 +10903,7 @@ fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest
             return None;
         }
         if name.eq_ignore_ascii_case("host") {
-            host = Some(value.trim().to_string());
+            host = Some(value.trim());
         }
         if name.eq_ignore_ascii_case("connection") {
             for token in value.split(',') {
@@ -9658,11 +10924,10 @@ fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest
 
     Some(StaticFastPathRequest {
         method,
-        target: target.to_string(),
-        path: path.to_string(),
+        target,
+        path,
         host,
         keep_alive,
-        head_len: head_end + 4,
     })
 }
 
@@ -9750,7 +11015,6 @@ fn parse_plain_fast_lane_request(buffer: &[u8]) -> Option<PlainFastLaneRequest> 
         accepts_sse,
         host,
         keep_alive,
-        head_len: head_end + 4,
     })
 }
 
@@ -9820,6 +11084,7 @@ fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSock
         .map(|(path, _)| path)
         .unwrap_or(target);
     let mut header_bytes = Vec::with_capacity(head_end.min(1536));
+    let mut forwarding_headers = RawForwardingHeaderSnapshot::default();
     let mut host = None;
     let mut upgrade_websocket = false;
     let mut connection_upgrade = false;
@@ -9835,6 +11100,9 @@ fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSock
         }
         if name.eq_ignore_ascii_case("host") {
             host = Some(value.to_string());
+            continue;
+        }
+        if capture_forwarding_header_snapshot(&mut forwarding_headers, name, value) {
             continue;
         }
         if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
@@ -9864,8 +11132,8 @@ fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSock
         target: target.to_string(),
         path: path.to_string(),
         header_bytes,
+        forwarding_headers,
         host,
-        head_len: head_end + 4,
     })
 }
 
@@ -9873,38 +11141,49 @@ fn http_head_complete(buffer: &[u8]) -> bool {
     memmem::find(buffer, b"\r\n\r\n").is_some()
 }
 
-async fn peek_http_head(stream: &TcpStream, buffer: &mut [u8]) -> std::io::Result<usize> {
-    let mut last_read = 0;
-    for _ in 0..16 {
-        let read = stream.peek(buffer).await?;
-        last_read = read;
-        if read == 0 || read == buffer.len() || http_head_complete(&buffer[..read]) {
-            return Ok(read);
-        }
-        tokio::task::yield_now().await;
-    }
-    Ok(last_read)
+const TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES: usize = 64 * 1024;
+
+async fn read_tls_fast_lane_http_prefix<Stream>(stream: &mut Stream) -> std::io::Result<Bytes>
+where
+    Stream: AsyncRead + Unpin + ?Sized,
+{
+    let mut prefix = BytesMut::with_capacity(4096);
+    read_fast_lane_http_prefix(stream, &mut prefix).await?;
+    Ok(prefix.freeze())
 }
 
-async fn consume_http_head_len(stream: &mut TcpStream, mut remaining: usize) -> Result<bool> {
-    let mut buffer = [0_u8; 1024];
-    while remaining > 0 {
+async fn read_fast_lane_http_prefix<Stream>(
+    stream: &mut Stream,
+    prefix: &mut BytesMut,
+) -> std::io::Result<()>
+where
+    Stream: AsyncRead + Unpin + ?Sized,
+{
+    let mut buffer = [0_u8; 4096];
+    while prefix.len() < TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES && !http_head_complete(prefix) {
+        let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
         let read_target = remaining.min(buffer.len());
-        let read = stream
-            .read(&mut buffer[..read_target])
-            .await
-            .context("failed reading plain http fast lane request")?;
+        let read = stream.read(&mut buffer[..read_target]).await?;
         if read == 0 {
-            return Ok(false);
+            break;
         }
-        remaining -= read;
+        prefix.extend_from_slice(&buffer[..read]);
     }
-    Ok(true)
+    Ok(())
+}
+
+fn discard_fast_lane_http_head(prefix: &mut BytesMut, head_end: usize) {
+    debug_assert!(head_end <= prefix.len());
+    let remaining = prefix.len().saturating_sub(head_end);
+    if remaining > 0 {
+        prefix.copy_within(head_end.., 0);
+    }
+    prefix.truncate(remaining);
 }
 
 async fn resolve_large_static_fast_path_candidate(
     config: &GatewayConfig,
-    request: &StaticFastPathRequest,
+    request: &StaticFastPathRequest<'_>,
     static_route_cache: &DashMap<String, PathBuf>,
     static_file_cache: &DashMap<String, CachedStaticFile>,
     static_file_cache_bytes: &AtomicU64,
@@ -9912,7 +11191,7 @@ async fn resolve_large_static_fast_path_candidate(
 ) -> Result<Option<StaticFastPathCandidate>> {
     let mut matched_site = None;
     let route_cached_target = static_route_cache
-        .get(&request.path)
+        .get(request.path)
         .map(|target| target.clone());
     if route_cached_target.is_none() || http_to_https_redirect_can_apply(config) {
         let uri = request
@@ -9922,7 +11201,7 @@ async fn resolve_large_static_fast_path_candidate(
         if !security::request_uri_is_safe(&uri) {
             return Ok(None);
         }
-        if let Some(host) = request.host.as_deref() {
+        if let Some(host) = request.host {
             if should_redirect_http_to_https(config, host, &uri) {
                 return Ok(None);
             }
@@ -9936,11 +11215,11 @@ async fn resolve_large_static_fast_path_candidate(
             .services
             .static_sites
             .iter()
-            .find(|site| static_site_path_matches(site, &request.path))
+            .find(|site| static_site_path_matches(site, request.path))
         else {
             return Ok(None);
         };
-        let Some(target) = static_site_filesystem_path(site, &request.path)? else {
+        let Some(target) = static_site_filesystem_path(site, request.path)? else {
             return Ok(None);
         };
         matched_site = Some(site);
@@ -10031,6 +11310,55 @@ async fn resolve_large_static_fast_path_candidate(
     }))
 }
 
+async fn send_connection_static_fast_path(
+    stream: &mut TcpStream,
+    cached: &ConnectionStaticFastPathCache,
+) -> Result<()> {
+    if let Some(response) = cached.combined_response.as_ref() {
+        return stream
+            .write_all(response)
+            .await
+            .context("failed writing cached combined static response");
+    }
+
+    #[cfg(target_os = "linux")]
+    let cork_static = cached.len > 0;
+    #[cfg(target_os = "linux")]
+    if cork_static {
+        set_tcp_cork(stream, true);
+    }
+
+    let header_result = stream
+        .write_all(&cached.header)
+        .await
+        .context("failed writing cached static response head");
+    let body_result = if header_result.is_ok() && cached.len > 0 {
+        if let Some(body) = cached.body.as_ref() {
+            stream
+                .write_all(body)
+                .await
+                .context("failed writing cached static response body")
+        } else {
+            send_static_file_fast(
+                stream,
+                &cached.file_path,
+                cached.len,
+                cached.sendfile.clone(),
+            )
+            .await
+            .map(|_| ())
+        }
+    } else {
+        Ok(())
+    };
+
+    #[cfg(target_os = "linux")]
+    if cork_static {
+        set_tcp_cork(stream, false);
+    }
+    header_result.and(body_result)
+}
+
 async fn send_static_file_fast(
     stream: &mut TcpStream,
     path: &Path,
@@ -10076,7 +11404,7 @@ async fn sendfile_all_async(
 
     while sent < len {
         let remaining = len - sent;
-        let count = remaining.min(16 * 1024 * 1024) as usize;
+        let count = remaining.min(STATIC_SENDFILE_MAX_CHUNK_BYTES) as usize;
         let written = stream
             .async_io(tokio::io::Interest::WRITABLE, || loop {
                 let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
@@ -10095,6 +11423,9 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
+        if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
+            tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+        }
     }
 
     Ok(sent)
@@ -10196,7 +11527,7 @@ fn plain_http_accept_worker_count(config: &GatewayConfig) -> usize {
     if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
         return 1;
     }
-    adaptive_data_plane_workers(1)
+    http_data_plane_workers_for(adaptive_data_plane_workers(1))
 }
 
 fn udp_listener_worker_count(config: &GatewayConfig) -> usize {
@@ -10211,13 +11542,7 @@ fn udp_listener_worker_count_for(config: &GatewayConfig, available_parallelism: 
 }
 
 fn tcp_stream_accept_worker_count(config: &GatewayConfig, listener: &TcpListenerConfig) -> usize {
-    tcp_stream_accept_worker_count_for(
-        config,
-        listener,
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1),
-    )
+    tcp_stream_accept_worker_count_for(config, listener, adaptive_data_plane_workers(1))
 }
 
 fn tcp_stream_accept_worker_count_for(
@@ -10235,22 +11560,47 @@ fn tcp_stream_accept_worker_count_for(
 }
 
 fn adaptive_data_plane_workers(min_workers: usize) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        return data_plane_cpu_ids().len().max(min_workers.max(1));
+    }
+
+    #[cfg(not(target_os = "linux"))]
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(min_workers.max(1))
         .max(min_workers.max(1))
 }
 
-fn adaptive_stream_runtime_workers() -> usize {
-    adaptive_stream_runtime_workers_for(adaptive_data_plane_workers(1))
+fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
+    if cores >= 4 {
+        cores.div_ceil(4)
+    } else {
+        1
+    }
+}
+
+fn http_data_plane_workers_for(cores: usize) -> usize {
+    if cfg!(target_os = "linux") && LINUX_STREAM_REACTOR_ENABLED && cores >= 4 {
+        cores
+            .saturating_sub(realtime_stream_reactor_workers_for(cores))
+            .max(1)
+    } else {
+        cores.max(1)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn realtime_stream_reactor_workers() -> usize {
+    realtime_stream_reactor_workers_for(adaptive_data_plane_workers(1))
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
-    // TCP streams are first-class, but HTTP/WebSocket/UDP must retain CPU on a
-    // mixed gateway. One quarter of detected cores keeps four-core nodes from
-    // letting a synthetic TCP flood monopolize the host, while a 24-core
-    // deployment still receives six independent stream runtime workers.
-    cores.max(1).div_ceil(4)
+    // TCP/game streams are first-class and nginx uses every configured worker
+    // for SO_REUSEPORT stream listeners. Keep accept fanout and the dedicated
+    // relay runtime proportional to every detected core as connection and tick
+    // rates rise.
+    cores.max(1)
 }
 
 fn direct_tcp_listener_upstream(config: &GatewayConfig, listener_name: &str) -> Option<String> {
@@ -11288,6 +12638,13 @@ fn build_rustls_server_config(
             on_demand_certs,
             on_demand_trigger,
         )?);
+    // Rustls otherwise keeps only a small process-local stateful resumption
+    // cache. Stateless, automatically rotated tickets let high-churn WSS/API
+    // clients resume across every SO_REUSEPORT accept worker without a shared
+    // hot-path lock or a cache sized in proportion to connection cardinality.
+    // This also matches production nginx's default TLS ticket behavior.
+    server_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+        .context("failed initializing rotating TLS session tickets")?;
     server_config.alpn_protocols = alpn_protocols;
     Ok(server_config)
 }
@@ -11325,7 +12682,7 @@ fn build_tls_resolver(
 fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
     let signing_key = provider
         .key_provider
         .load_private_key(key)
@@ -11373,7 +12730,7 @@ fn build_acme_tls_alpn_certified_key(domain: &str, digest: &[u8]) -> Result<Cert
         .context("failed generating acme tls-alpn certificate")?;
     let certs = load_certs_from_pem(&certificate.pem())?;
     let key = load_private_key_from_pem(&key_pair.serialize_pem())?;
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
     let signing_key = provider
         .key_provider
         .load_private_key(key)
@@ -13491,6 +14848,12 @@ struct AutoHttpsUpsertRequest {
     email: String,
     #[serde(default = "default_true")]
     production: bool,
+    #[serde(default = "default_admin_auto_https_challenge")]
+    challenge: AcmeChallengeType,
+}
+
+fn default_admin_auto_https_challenge() -> AcmeChallengeType {
+    AcmeChallengeType::TlsAlpn01
 }
 
 #[derive(Debug, Deserialize)]
@@ -14005,6 +15368,11 @@ fn render_config_with_auto_https(
         (
             serde_yaml::Value::String("production".to_string()),
             serde_yaml::Value::Bool(payload.production),
+        ),
+        (
+            serde_yaml::Value::String("challenge".to_string()),
+            serde_yaml::to_value(payload.challenge)
+                .expect("ACME challenge serialization cannot fail"),
         ),
     ]);
     tls.insert(
@@ -14806,6 +16174,22 @@ fn plain_raw_reverse_fast_lane_matches(
 }
 
 fn http_static_success_fast_path_allowed(config: &GatewayConfig, scheme: &str, uri: &Uri) -> bool {
+    if !hyper_static_success_fast_path_globally_allowed(config) {
+        return false;
+    }
+
+    if monitoring_path_matches(&config.monitoring, uri.path()) {
+        return false;
+    }
+
+    if scheme == "http" && http_to_https_redirect_can_apply(config) {
+        return false;
+    }
+
+    true
+}
+
+fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bool {
     if config.logging.access_log
         || config.security.ddos.enabled
         || config.security.dynamic_blacklist.enabled
@@ -14816,14 +16200,6 @@ fn http_static_success_fast_path_allowed(config: &GatewayConfig, scheme: &str, u
         || config.services.webdav.enabled
         || config.services.static_sites.is_empty()
     {
-        return false;
-    }
-
-    if monitoring_path_matches(&config.monitoring, uri.path()) {
-        return false;
-    }
-
-    if scheme == "http" && http_to_https_redirect_can_apply(config) {
         return false;
     }
 
@@ -14847,7 +16223,13 @@ fn http_to_https_redirect_can_apply(config: &GatewayConfig) -> bool {
 }
 
 fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
-    !config.services.response_policy.compression.enabled
+    !config.logging.access_log
+        && !config.script.enabled
+        && !config.plugins.enabled
+        && !config.security.ddos.enabled
+        && !config.security.dynamic_blacklist.enabled
+        && !config.services.access_control.http.enabled
+        && !config.services.response_policy.compression.enabled
         && !config.services.response_policy.cache.enabled
         && !config.services.rate_limit.http.enabled
         && !config.load_balance.retries.enabled
@@ -16218,7 +17600,11 @@ async fn cached_static_file_body(
                     modified,
                     body: body.clone(),
                     sendfile,
+                    content_type: HeaderValue::from_static(static_content_type(target)),
+                    content_length: HeaderValue::from_str(&metadata.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
                     checked_at: Instant::now(),
+                    revalidating: false,
                 },
             );
             static_file_cache_bytes.fetch_add(body_len, Ordering::Relaxed);
@@ -16254,6 +17640,7 @@ fn fresh_static_cache_body(
         && entry.body.len() as u64 == entry.len
     {
         entry.checked_at = Instant::now();
+        entry.revalidating = false;
         return Some(entry.body.clone());
     }
     None
@@ -16276,6 +17663,11 @@ fn evict_stale_static_cache_entry(
     static_file_cache_bytes.fetch_sub(old_len, Ordering::Relaxed);
 }
 
+struct CachedStaticResponse {
+    response: GatewayResponse,
+    revalidate: bool,
+}
+
 fn fresh_cached_static_file_response(
     target: &Path,
     method: &Method,
@@ -16284,15 +17676,13 @@ fn fresh_cached_static_file_response(
     if method != Method::GET {
         return None;
     }
-    let key = target.to_string_lossy().to_string();
-    let entry = static_file_cache.get(&key)?;
-    if entry.body.len() as u64 != entry.len {
+    let key = target.to_string_lossy();
+    let entry = static_file_cache.get(key.as_ref())?;
+    if entry.body.len() as u64 != entry.len
+        || entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+    {
         return None;
     }
-    if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS) {
-        return None;
-    }
-
     let mut response = GatewayHttpResponse::bytes(
         StatusCode::OK,
         static_content_type(target),
@@ -16304,7 +17694,116 @@ fn fresh_cached_static_file_response(
         HeaderValue::from_str(&entry.len.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     ));
+    response
+        .headers
+        .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
     Some(response)
+}
+
+fn cached_static_file_response_stale_while_revalidate(
+    target: &Path,
+    method: &Method,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> Option<CachedStaticResponse> {
+    if method != Method::GET {
+        return None;
+    }
+    let key = target.to_string_lossy();
+    let entry = static_file_cache.get(key.as_ref())?;
+    if entry.body.len() as u64 != entry.len {
+        return None;
+    }
+    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+
+    let mut response = Response::new(full_body(entry.body.clone()));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, entry.content_type.clone());
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, entry.content_length.clone());
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    drop(entry);
+
+    let revalidate = if stale {
+        let mut entry = static_file_cache.get_mut(key.as_ref())?;
+        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            && !entry.revalidating
+        {
+            entry.revalidating = true;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    Some(CachedStaticResponse {
+        response,
+        revalidate,
+    })
+}
+
+fn finish_failed_static_revalidation(
+    key: &str,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) {
+    if let Some(mut entry) = static_file_cache.get_mut(key) {
+        entry.checked_at = Instant::now();
+        entry.revalidating = false;
+    }
+}
+
+fn stale_cached_static_file_candidate(
+    target: &Path,
+    method: &str,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    sendfile_threshold: u64,
+) -> Option<(StaticFastPathCandidate, bool)> {
+    if method != "GET" {
+        return None;
+    }
+    let key = target.to_string_lossy().to_string();
+    let entry = static_file_cache.get(&key)?;
+    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+    let sendfile = if cfg!(target_os = "linux") && entry.len >= sendfile_threshold {
+        Some(entry.sendfile.as_ref()?.clone())
+    } else {
+        None
+    };
+    let cached_body = if sendfile.is_none() {
+        if entry.body.len() as u64 != entry.len {
+            return None;
+        }
+        Some(entry.body.clone())
+    } else {
+        None
+    };
+    let candidate = StaticFastPathCandidate {
+        path: target.to_path_buf(),
+        len: entry.len,
+        content_type: static_content_type(target),
+        cached_body,
+        sendfile,
+    };
+    drop(entry);
+
+    let revalidate = if stale {
+        let mut entry = static_file_cache.get_mut(&key)?;
+        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            && !entry.revalidating
+        {
+            entry.revalidating = true;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    Some((candidate, revalidate))
 }
 
 fn fresh_cached_static_file_candidate(
@@ -16355,6 +17854,7 @@ fn cached_static_sendfile(
     if let Some(mut entry) = static_file_cache.get_mut(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
             entry.checked_at = Instant::now();
+            entry.revalidating = false;
             if let Some(file) = &entry.sendfile {
                 return Ok(file.clone());
             }
@@ -16385,7 +17885,11 @@ fn cached_static_sendfile(
             modified,
             body: Bytes::new(),
             sendfile: Some(file.clone()),
+            content_type: HeaderValue::from_static(static_content_type(target)),
+            content_length: HeaderValue::from_str(&metadata.len().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
             checked_at: Instant::now(),
+            revalidating: false,
         },
     );
     Ok(file)
@@ -17498,7 +19002,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
           <article class="path">
             <span class="tag beginner">正式上线</span>
             <h3>只填域名就给 WebSocket 加 WSS</h3>
-            <p class="subtle">单域名只填域名即可走正式 HTTP-01；无需证书脚本、DNS API 或邮箱。泛域名或不能开放 80 时再切到 DNS-01。</p>
+            <p class="subtle">单域名只填域名即可走正式 TLS-ALPN-01；无需证书脚本、DNS API 或邮箱，只需公网 443。显式 HTTP-01（需 80）继续兼容；泛域名使用 DNS-01。</p>
             <pre><code>{{ACME_DNS}}</code></pre>
           </article>
         </div>
@@ -17716,7 +19220,7 @@ fn docs_template_ftp() -> &'static str {
 }
 
 fn docs_template_acme_dns() -> &'static str {
-    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用内建 ACME：正式 Let's Encrypt + HTTP-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用内建 ACME：正式 Let's Encrypt + TLS-ALPN-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
 }
 
 fn docs_template_health() -> &'static str {
@@ -20161,13 +21665,13 @@ fn serialize_raw_fast_lane_request(
     if options.forward_headers {
         append_raw_forwarding_headers(
             &mut bytes,
-            request,
+            &request.forwarding_headers,
             host,
             options.remote_addr,
             options.scheme,
         );
     } else {
-        append_preserved_raw_forwarding_headers(&mut bytes, request);
+        append_preserved_raw_forwarding_headers(&mut bytes, &request.forwarding_headers);
     }
     for (name, value) in options.extra_headers {
         append_raw_header_line(&mut bytes, name, value);
@@ -20195,18 +21699,15 @@ struct RawFastLaneSerializeOptions<'a> {
 
 fn append_raw_forwarding_headers(
     bytes: &mut Vec<u8>,
-    request: &PlainFastLaneRequest,
+    forwarding_headers: &RawForwardingHeaderSnapshot,
     host: &str,
     remote_addr: SocketAddr,
     scheme: &str,
 ) {
     let remote_ip = remote_addr.ip().to_string();
-    let xff = append_csv_header_value(
-        request.forwarding_headers.x_forwarded_for.as_deref(),
-        &remote_ip,
-    );
+    let xff = append_csv_header_value(forwarding_headers.x_forwarded_for.as_deref(), &remote_ip);
     let forwarded = append_forwarded_header_value(
-        request.forwarding_headers.forwarded.as_deref(),
+        forwarding_headers.forwarded.as_deref(),
         &remote_ip,
         host,
         scheme,
@@ -20218,20 +21719,23 @@ fn append_raw_forwarding_headers(
     append_raw_header_line(bytes, "forwarded", &forwarded);
 }
 
-fn append_preserved_raw_forwarding_headers(bytes: &mut Vec<u8>, request: &PlainFastLaneRequest) {
-    if let Some(value) = request.forwarding_headers.x_real_ip.as_deref() {
+fn append_preserved_raw_forwarding_headers(
+    bytes: &mut Vec<u8>,
+    forwarding_headers: &RawForwardingHeaderSnapshot,
+) {
+    if let Some(value) = forwarding_headers.x_real_ip.as_deref() {
         append_raw_header_line(bytes, "x-real-ip", value);
     }
-    if let Some(value) = request.forwarding_headers.x_forwarded_for.as_deref() {
+    if let Some(value) = forwarding_headers.x_forwarded_for.as_deref() {
         append_raw_header_line(bytes, "x-forwarded-for", value);
     }
-    if let Some(value) = request.forwarding_headers.x_forwarded_host.as_deref() {
+    if let Some(value) = forwarding_headers.x_forwarded_host.as_deref() {
         append_raw_header_line(bytes, "x-forwarded-host", value);
     }
-    if let Some(value) = request.forwarding_headers.x_forwarded_proto.as_deref() {
+    if let Some(value) = forwarding_headers.x_forwarded_proto.as_deref() {
         append_raw_header_line(bytes, "x-forwarded-proto", value);
     }
-    if let Some(value) = request.forwarding_headers.forwarded.as_deref() {
+    if let Some(value) = forwarding_headers.forwarded.as_deref() {
         append_raw_header_line(bytes, "forwarded", value);
     }
 }
@@ -20247,12 +21751,26 @@ fn serialize_raw_websocket_fast_lane_request(
     request: &PlainWebSocketFastLaneRequest,
     path_and_query: &str,
     host: &str,
+    remote_addr: SocketAddr,
+    scheme: &str,
+    forward_headers: bool,
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(128 + request.header_bytes.len());
+    let mut bytes = Vec::with_capacity(320 + request.header_bytes.len());
     bytes.extend_from_slice(b"GET ");
     bytes.extend_from_slice(path_and_query.as_bytes());
     bytes.extend_from_slice(b" HTTP/1.1\r\n");
     bytes.extend_from_slice(&request.header_bytes);
+    if forward_headers {
+        append_raw_forwarding_headers(
+            &mut bytes,
+            &request.forwarding_headers,
+            host,
+            remote_addr,
+            scheme,
+        );
+    } else {
+        append_preserved_raw_forwarding_headers(&mut bytes, &request.forwarding_headers);
+    }
     bytes.extend_from_slice(b"host: ");
     bytes.extend_from_slice(host.as_bytes());
     bytes.extend_from_slice(b"\r\n\r\n");
@@ -20465,6 +21983,169 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prefixed_io_replays_consumed_tls_http_bytes_before_socket_data() {
+        let (mut client, server) = tokio::io::duplex(128);
+        client.write_all(b"body").await.expect("write socket data");
+        let mut prefixed = PrefixedIo::new(server, Bytes::from_static(b"head-"));
+        let mut combined = [0_u8; 9];
+        prefixed
+            .read_exact(&mut combined)
+            .await
+            .expect("read replayed bytes");
+        assert_eq!(&combined, b"head-body");
+    }
+
+    #[test]
+    fn fast_lane_head_discard_preserves_pipelined_request_and_buffer() {
+        let first = b"GET /bench/a HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let second = b"GET /bench/b HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(4096);
+        prefix.extend_from_slice(first);
+        prefix.extend_from_slice(second);
+        let original_capacity = prefix.capacity();
+
+        discard_fast_lane_http_head(&mut prefix, first.len());
+
+        assert_eq!(&prefix[..], second);
+        assert_eq!(prefix.capacity(), original_capacity);
+    }
+
+    #[test]
+    fn cached_h2_static_response_keeps_range_and_length_headers() {
+        let cache = DashMap::new();
+        cache.insert(
+            "asset.js".to_string(),
+            CachedStaticFile {
+                len: 4,
+                modified: None,
+                body: Bytes::from_static(b"test"),
+                sendfile: None,
+                content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
+                content_length: HeaderValue::from_static("4"),
+                checked_at: Instant::now(),
+                revalidating: false,
+            },
+        );
+
+        let response = cached_static_file_response_stale_while_revalidate(
+            Path::new("asset.js"),
+            &Method::GET,
+            &cache,
+        )
+        .expect("fresh cached response");
+
+        assert!(!response.revalidate);
+        assert_eq!(response.response.status(), StatusCode::OK);
+        match response.response.body() {
+            GatewayBody::Full(Some(body)) => assert_eq!(body, &Bytes::from_static(b"test")),
+            _ => panic!("cached H2 response must use a full body"),
+        }
+        assert_eq!(
+            response.response.headers().get(CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("4"))
+        );
+        assert_eq!(
+            response.response.headers().get(ACCEPT_RANGES),
+            Some(&HeaderValue::from_static("bytes"))
+        );
+    }
+
+    #[test]
+    fn plain_static_stale_candidate_serves_body_and_coalesces_revalidation() {
+        let cache = DashMap::new();
+        cache.insert(
+            "asset.js".to_string(),
+            CachedStaticFile {
+                len: 4,
+                modified: None,
+                body: Bytes::from_static(b"test"),
+                sendfile: None,
+                content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
+                content_length: HeaderValue::from_static("4"),
+                checked_at: Instant::now() - Duration::from_secs(2),
+                revalidating: false,
+            },
+        );
+
+        let (candidate, revalidate) = stale_cached_static_file_candidate(
+            Path::new("asset.js"),
+            "GET",
+            &cache,
+            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES,
+        )
+        .expect("stale cached candidate");
+        assert!(revalidate);
+        assert_eq!(candidate.cached_body.as_deref(), Some(b"test".as_slice()));
+
+        let (_, duplicate_revalidate) = stale_cached_static_file_candidate(
+            Path::new("asset.js"),
+            "GET",
+            &cache,
+            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES,
+        )
+        .expect("stale candidate remains immediately serviceable");
+        assert!(!duplicate_revalidate);
+    }
+
+    #[test]
+    fn sendfile_revalidation_keeps_body_empty_and_clears_inflight_flag() {
+        let path = std::env::temp_dir().join(format!(
+            "proxysss-sendfile-revalidate-{}.bin",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"sendfile-data").expect("write sendfile fixture");
+        let metadata = std::fs::metadata(&path).expect("sendfile metadata");
+        let file = Arc::new(std::fs::File::open(&path).expect("open sendfile fixture"));
+        let key = path.to_string_lossy().to_string();
+        let cache = DashMap::new();
+        cache.insert(
+            key.clone(),
+            CachedStaticFile {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                body: Bytes::new(),
+                sendfile: Some(file.clone()),
+                content_type: HeaderValue::from_static("application/octet-stream"),
+                content_length: HeaderValue::from_str(&metadata.len().to_string())
+                    .expect("content length"),
+                checked_at: Instant::now() - Duration::from_secs(2),
+                revalidating: true,
+            },
+        );
+
+        let refreshed =
+            cached_static_sendfile(&path, &metadata, &cache).expect("revalidate sendfile entry");
+        assert!(Arc::ptr_eq(&file, &refreshed));
+        let entry = cache.get(&key).expect("cached sendfile entry");
+        assert!(entry.body.is_empty());
+        assert!(!entry.revalidating);
+        drop(entry);
+        std::fs::remove_file(path).expect("remove sendfile fixture");
+    }
+
+    #[test]
+    fn raw_websocket_fast_lane_appends_forwarding_chain() {
+        let request = parse_plain_websocket_fast_lane_request(
+            b"GET /ws HTTP/1.1\r\nHost: game.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n",
+        )
+        .expect("parse websocket request");
+        let serialized = serialize_raw_websocket_fast_lane_request(
+            &request,
+            "/ws",
+            "game.example.com",
+            "192.0.2.10:4567".parse().expect("remote address"),
+            "https",
+            true,
+        );
+        let serialized = String::from_utf8(serialized).expect("utf8 request");
+        assert!(serialized.contains("x-real-ip: 192.0.2.10\r\n"));
+        assert!(serialized.contains("x-forwarded-for: 10.0.0.1, 192.0.2.10\r\n"));
+        assert!(serialized.contains("x-forwarded-proto: https\r\n"));
+        assert!(serialized
+            .contains("forwarded: for=192.0.2.10;host=\"game.example.com\";proto=https\r\n"));
+    }
+
     #[test]
     fn expected_websocket_disconnects_do_not_escalate_to_warning_logs() {
         let unexpected_eof =
@@ -20490,6 +22171,31 @@ mod tests {
         };
 
         assert!(websocket_route_fast_path_eligible(&route));
+    }
+
+    #[test]
+    fn raw_proxy_fast_lane_never_bypasses_observability_or_policy_hooks() {
+        let mut config = GatewayConfig::default();
+        config.logging.access_log = false;
+        config.script.enabled = false;
+        config.plugins.enabled = false;
+        config.load_balance.retries.enabled = false;
+        config.load_balance.active_health.enabled = false;
+        config.load_balance.passive_health.enabled = false;
+        config.affinity.enabled = false;
+        assert!(simple_http_proxy_fast_path_allowed(&config));
+
+        config.logging.access_log = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.logging.access_log = false;
+        config.script.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.script.enabled = false;
+        config.plugins.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.plugins.enabled = false;
+        config.security.ddos.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
     }
 
     #[test]
@@ -20586,6 +22292,7 @@ mod tests {
                 .expect("decode domain-only auto https payload");
         assert!(payload.email.is_empty());
         assert!(payload.production);
+        assert_eq!(payload.challenge, AcmeChallengeType::TlsAlpn01);
 
         let rendered = render_config_with_auto_https("plugins:\n  enabled: false\n", &payload)
             .expect("render domain-only auto https config");
@@ -20609,6 +22316,33 @@ mod tests {
                 .get("production")
                 .and_then(serde_yaml::Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            auto_https
+                .get("challenge")
+                .and_then(serde_yaml::Value::as_str),
+            Some("tls_alpn01")
+        );
+    }
+
+    #[test]
+    fn auto_https_admin_payload_preserves_explicit_http01_compatibility() {
+        let payload: AutoHttpsUpsertRequest =
+            serde_json::from_str(r#"{"domains":["legacy.example.com"],"challenge":"http01"}"#)
+                .expect("decode explicit HTTP-01 payload");
+        assert_eq!(payload.challenge, AcmeChallengeType::Http01);
+
+        let rendered = render_config_with_auto_https("plugins:\n  enabled: false\n", &payload)
+            .expect("render explicit HTTP-01 config");
+        let value: serde_yaml::Value = serde_yaml::from_str(&rendered).expect("decode config");
+        assert_eq!(
+            value
+                .get("http")
+                .and_then(|http| http.get("tls"))
+                .and_then(|tls| tls.get("auto_https"))
+                .and_then(|auto| auto.get("challenge"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("http01")
         );
     }
 
@@ -21201,10 +22935,10 @@ mod tests {
 
         let workers = tcp_stream_accept_worker_count_for(&config, &listener, 4);
         if cfg!(target_os = "linux") {
-            assert_eq!(workers, 2);
+            assert_eq!(workers, 4);
             assert_eq!(
                 tcp_stream_accept_worker_count_for(&config, &listener, 96),
-                48
+                96
             );
         } else {
             assert_eq!(workers, 1);
@@ -21212,6 +22946,15 @@ mod tests {
 
         config.runtime.performance.enabled = false;
         assert_eq!(tcp_stream_accept_worker_count_for(&config, &listener, 4), 1);
+    }
+
+    #[test]
+    fn linux_http_and_realtime_shards_partition_all_detected_cores() {
+        assert_eq!(realtime_stream_reactor_workers_for(1), 1);
+        assert_eq!(realtime_stream_reactor_workers_for(4), 1);
+        assert_eq!(realtime_stream_reactor_workers_for(96), 24);
+        assert_eq!(http_data_plane_workers_for(4), 4);
+        assert_eq!(http_data_plane_workers_for(96), 96);
     }
 
     #[test]

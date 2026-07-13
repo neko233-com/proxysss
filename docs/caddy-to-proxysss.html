@@ -333,7 +333,7 @@
   tls:
     auto_https:
       domains: [wss.example.com]</code></pre>
-            <p class="subtle">只给域名即可走内建 managed ACME 的正式 HTTP-01，无需 certbot、acme.sh、DNS API 或邮箱。A/AAAA 必须指向网关，且 80/443 可公网访问；邮箱只是到期和安全通知的可选项。旧的显式 HTTP-01 / TLS-ALPN-01 / DNS-01 配置保持兼容。</p>
+            <p class="subtle">只给域名即可走内建 managed ACME 的正式 TLS-ALPN-01，无需 certbot、acme.sh、DNS API 或邮箱。A/AAAA 必须指向网关，且公网 443 可达；邮箱只是到期和安全通知的可选项。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。</p>
           </article>
         </div>
       </section>
@@ -417,7 +417,7 @@ udp:
             <div class="kicker">Validation</div>
             <h2>迁移完成的标准，要看 mixed-load</h2>
           </div>
-          <p class="subtle">proxysss 的迁移和后续性能优化，不能只看单站点 HTTP。generic SSE、static、HTTP reverse proxy、TCP、UDP 要一起看，而且必须无副作用；KCP/QCP 是独立能力，不进入当前性能 benchmark 矩阵。</p>
+          <p class="subtle">proxysss 的迁移和后续性能优化，不能只看单站点 HTTP。generic SSE、static、HTTP reverse proxy、TCP、UDP 要一起看，而且必须无副作用；KCP/QCP 是独立能力，不进入当前性能 benchmark 矩阵。涉及公网/NIC 延迟时，必须从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>，Docker cpuset 数据不能冒充跨机结果。</p>
         </div>
 
         <pre><code>proxysss tune linux --apply

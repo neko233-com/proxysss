@@ -198,7 +198,7 @@ pub struct AutoHttpsConfig {
     pub production: bool,
     #[serde(default = "default_acme_client")]
     pub client: String,
-    #[serde(default)]
+    #[serde(default = "default_auto_https_challenge")]
     pub challenge: AcmeChallengeType,
     #[serde(default = "default_acme_renew_hours")]
     pub renew_interval_hours: u64,
@@ -2429,7 +2429,7 @@ impl Default for AutoHttpsConfig {
             email: String::new(),
             production: default_acme_production(),
             client: default_acme_client(),
-            challenge: AcmeChallengeType::default(),
+            challenge: default_auto_https_challenge(),
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
         }
@@ -3129,6 +3129,10 @@ fn default_acme_client() -> String {
 
 fn default_acme_production() -> bool {
     true
+}
+
+fn default_auto_https_challenge() -> AcmeChallengeType {
+    AcmeChallengeType::TlsAlpn01
 }
 
 fn default_acme_cache_dir() -> PathBuf {
@@ -4045,7 +4049,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_only_auto_https_enables_production_http01_without_contact_email() {
+    fn domain_only_auto_https_enables_production_tls_alpn01_without_contact_email() {
         let base_dir = std::env::temp_dir().join(format!(
             "proxysss-domain-only-auto-https-test-{}",
             std::process::id()
@@ -4061,7 +4065,7 @@ mod tests {
         let config = GatewayConfig::load(&config_path).expect("load domain-only auto https config");
         assert!(config.http.tls.auto_https.enabled);
         assert_eq!(config.http.tls.mode, TlsMode::AcmeManaged);
-        assert_eq!(config.http.tls.acme.challenge, AcmeChallengeType::Http01);
+        assert_eq!(config.http.tls.acme.challenge, AcmeChallengeType::TlsAlpn01);
         assert!(config.http.tls.acme.directory_production);
         assert!(config.http.tls.acme.email.is_empty());
         assert!(config

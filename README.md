@@ -118,7 +118,7 @@ services:
 
 How to think about it:
 
-- A non-empty `auto_https.domains` list enables built-in managed ACME automatically. Its production default uses HTTP-01, so this is enough for `wss://` without `certbot`, `acme.sh`, a DNS API, or an account email.
+- `auto_https.domains` 非空就自动启用内建 managed ACME。生产默认使用 TLS-ALPN-01，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。原有显式 `challenge: http01` 仍完整兼容（需开放 80）。
 - The domain's public A/AAAA record must reach this host and ports 80 and 443 must be reachable. `email` is optional; adding it enables certificate-expiry/security notices.
 - The route still lives in `domain_routes`; TLS automation does not change how you declare backends.
 
@@ -447,7 +447,20 @@ Production validation flow:
 
 ```bash
 proxysss tune linux --apply
-scripts/benchmark-all-scenarios.sh
+STRICT_SUPERIORITY=1 PROXY_BIN=target/release/proxysss \
+  scripts/benchmark-all-scenarios-isolated.sh
+PROXY_BIN=target/release/proxysss \
+  scripts/benchmark-production-scale-matrix.sh
+```
+
+The role-isolated gate pins the 4c/8GiB gateway, backend, and clients to disjoint CPU sets/cgroups (the default allocation needs a 16-core Linux host), compares against nginx 1.31.2 mainline, and keeps three measurements separate: mixed aggregate saturation, per-scenario isolated saturation, and equal-offered-load p50/p95/p99. Mixed/equal-load phases default to four order-balanced samples; isolated saturation uses three. Metrics use medians while retaining the maximum observed error count. Fixed-load rows must complete at least 98% of the declared target; reports include both ratios and percentage improvements. The scale driver repeats the complete gate at 1x/2x/4x workload.
+
+For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, records host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
+
+```bash
+GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
+GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
+bash scripts/benchmark-cross-host-wss.sh
 ```
 
 Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles, and no longer runs tests, smoke benchmarks, or performance gates automatically. Performance evidence is collected manually on Linux hosts or benchmark containers.
@@ -461,8 +474,8 @@ Current UDP fast-path evidence for v1.3.5:
 What that benchmark means:
 
 - it is Linux-only release evidence
-- it runs a mixed matrix, not a cherry-picked single test
-- it compares nginx-comparable static, reverse proxy, generic SSE, WebSocket, game TCP, generic TCP, and UDP together
+- it is a UDP-only diagnostic from the official Go helper path, not proof that the full mixed matrix passed
+- the release gate separately compares nginx-comparable static, reverse proxy, generic SSE, WebSocket, game TCP, generic TCP, and UDP together
 - New API provider routes and KCP/QCP special UDP encapsulations stay supported as product capabilities, but they are excluded from the current performance benchmark matrix
 - it uses a fair default ratio floor instead of pretending every feature-rich gateway must win every micro-benchmark outright
 
@@ -474,9 +487,9 @@ proxysss bench websocket --url ws://gateway.example.com/gateway/ws \
   --connect-timeout-ms 10000 --connect-retries 4 --duration-secs 30
 ```
 
-Run 100k capacity from multiple client source IPs, and route WebSocket tunnels across multiple backend `IP:port` tuples (or a proxy source-IP pool). A single TCP source/destination tuple is limited by the Linux ephemeral-port space; this is a TCP constraint rather than a gateway implementation detail.
+The production gate defaults to 20k idle WSS connections and up to 4096 active message connections on a 4c/8GiB gateway. If you intentionally raise the capacity target above one source address's ephemeral-port range, use multiple client source IPs and multiple backend `IP:port` tuples (or a proxy source-IP pool); that four-tuple limit is a TCP constraint rather than a gateway implementation detail.
 
-For a production-style WSS gateway comparison with a fixed `4c/8GiB` gateway budget, run `bash scripts/benchmark-websocket-isolated.sh` on a Linux Docker host with enough separate CPU/RAM for four backends and multiple client containers. It compares nginx and proxysss with the same active WSS workload (ops/s, p50, p95) and a 100k idle-connection hold test. The Docker roles are cgroup/network-namespace isolated; repeat on separate gateway/backend/client hosts before making a physical-network latency claim.
+For a production-style WSS gateway comparison with a fixed `4c/8GiB` gateway budget, run `bash scripts/benchmark-websocket-production-gate.sh` on a 16-core-or-larger Linux Docker host with enough RAM for four backends and multiple client containers. It compares nginx and proxysss with the same active WSS workload (ops/s, p50/p95/p99) and a 20k idle-connection hold test, with repeated interleaved runs and median gates. The Docker roles are cgroup/network-namespace isolated; use `benchmark-cross-host-wss.sh` before making a physical-network latency claim.
 
 ## Docs Map
 

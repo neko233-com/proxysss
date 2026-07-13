@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::{
     connect_async_tls_with_config, connect_async_with_config, tungstenite::Message, Connector,
     MaybeTlsStream, WebSocketStream,
@@ -43,6 +44,11 @@ pub struct HttpBenchArgs {
     pub insecure: bool,
     #[arg(long, default_value_t = false)]
     pub http1_only: bool,
+    /// Fixed delay between operations per worker, in microseconds. Zero keeps
+    /// saturation mode; a positive value enables equal-offered-load latency
+    /// measurement.
+    #[arg(long, default_value_t = 0)]
+    pub operation_interval_micros: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -59,6 +65,11 @@ pub struct SseBenchArgs {
     pub insecure: bool,
     #[arg(long, default_value_t = false)]
     pub http1_only: bool,
+    /// Fixed delay between operations per worker, in microseconds. Zero keeps
+    /// saturation mode; a positive value enables equal-offered-load latency
+    /// measurement.
+    #[arg(long, default_value_t = 0)]
+    pub operation_interval_micros: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -71,6 +82,11 @@ pub struct WebSocketBenchArgs {
     pub duration_secs: u64,
     #[arg(long, default_value_t = 256)]
     pub payload_bytes: usize,
+    /// Fixed delay between echo exchanges per connection, in microseconds.
+    /// Zero keeps the saturation/closed-loop mode. A positive value is the
+    /// equal-offered-load latency mode used for fair nginx comparisons.
+    #[arg(long, default_value_t = 0)]
+    pub message_interval_micros: u64,
     /// Open the requested connections, keep them idle, then report connection
     /// capacity and WebSocket handshake latency instead of echo message rate.
     #[arg(long, default_value_t = false)]
@@ -100,6 +116,9 @@ pub struct TcpBenchArgs {
     pub duration_secs: u64,
     #[arg(long, default_value_t = 1024)]
     pub payload_bytes: usize,
+    /// Fixed delay between echo exchanges per connection, in microseconds.
+    #[arg(long, default_value_t = 0)]
+    pub operation_interval_micros: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -114,6 +133,9 @@ pub struct UdpBenchArgs {
     pub payload_bytes: usize,
     #[arg(long, default_value_t = 1000)]
     pub timeout_ms: u64,
+    /// Fixed delay between datagram exchanges per socket, in microseconds.
+    #[arg(long, default_value_t = 0)]
+    pub operation_interval_micros: u64,
 }
 
 #[derive(Default)]
@@ -159,7 +181,7 @@ impl ServerCertVerifier for InsecureBenchmarkCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -170,7 +192,7 @@ fn insecure_wss_client_config(insecure: bool) -> Option<Arc<ClientConfig>> {
         return None;
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     Some(Arc::new(
         ClientConfig::builder()
             .dangerous()
@@ -225,6 +247,93 @@ impl TaskStats {
     }
 }
 
+/// Synchronizes every load-generator worker onto one measurement window and,
+/// when requested, produces a fixed-rate ticker. The shared future start keeps
+/// task-spawn and connection-ramp skew out of p50/p95/p99 comparisons.
+struct BenchmarkSchedule {
+    barrier: Barrier,
+    scheduled_start: OnceLock<tokio::time::Instant>,
+    duration: Duration,
+    operation_interval: Option<Duration>,
+    participants: usize,
+    stagger_operations: bool,
+}
+
+impl BenchmarkSchedule {
+    fn new(
+        participants: usize,
+        duration_secs: u64,
+        operation_interval_micros: u64,
+        stagger_operations: bool,
+    ) -> Self {
+        let participants = participants.max(1);
+        Self {
+            barrier: Barrier::new(participants),
+            scheduled_start: OnceLock::new(),
+            duration: Duration::from_secs(duration_secs.max(1)),
+            operation_interval: (operation_interval_micros > 0)
+                .then(|| Duration::from_micros(operation_interval_micros)),
+            participants,
+            stagger_operations,
+        }
+    }
+
+    async fn begin(
+        &self,
+        worker_index: usize,
+    ) -> (tokio::time::Instant, Option<tokio::time::Interval>) {
+        let barrier_result = self.barrier.wait().await;
+        if barrier_result.is_leader() {
+            let _ = self
+                .scheduled_start
+                .set(tokio::time::Instant::now() + Duration::from_millis(250));
+        }
+        self.barrier.wait().await;
+        let measurement_start = *self
+            .scheduled_start
+            .get()
+            .expect("benchmark start time initialized");
+        tokio::time::sleep_until(measurement_start).await;
+        let ticker = self.operation_interval.map(|interval| {
+            // Independent HTTP/SSE clients are phase-spread across one
+            // interval so equal-load percentiles measure the declared rate,
+            // not an artificial all-workers-at-once microburst. Game TCP/UDP
+            // and WebSocket schedules stay synchronized to model game ticks.
+            let first_offset = if self.stagger_operations {
+                interval.mul_f64(
+                    (worker_index.min(self.participants - 1) + 1) as f64 / self.participants as f64,
+                )
+            } else {
+                interval
+            };
+            let mut ticker = tokio::time::interval_at(measurement_start + first_offset, interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker
+        });
+        (measurement_start + self.duration, ticker)
+    }
+}
+
+async fn wait_for_operation_slot(
+    ticker: &mut Option<tokio::time::Interval>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if let Some(ticker) = ticker.as_mut() {
+        ticker.tick().await;
+    }
+    tokio::time::Instant::now() < deadline
+}
+
+fn print_operation_target(participants: usize, interval: Option<Duration>) {
+    if let Some(interval) = interval {
+        println!("operation interval: {} us", interval.as_micros());
+        println!(
+            "target ops/sec : {:.2}",
+            participants.max(1) as f64 / interval.as_secs_f64()
+        );
+    }
+}
+
 pub async fn run(command: BenchCommand) -> Result<()> {
     match command {
         BenchCommand::Http(args) => run_http(args).await,
@@ -239,7 +348,13 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
     let method = Method::from_bytes(args.method.as_bytes()).context("invalid http method")?;
     let payload = Arc::new(vec![b'x'; args.body_bytes]);
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
+    let concurrency = args.concurrency.max(1);
+    let schedule = Arc::new(BenchmarkSchedule::new(
+        concurrency,
+        args.duration_secs,
+        args.operation_interval_micros,
+        true,
+    ));
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(args.insecure)
@@ -252,16 +367,18 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     let url = Arc::new(args.url);
 
     let mut tasks = JoinSet::new();
-    for _ in 0..args.concurrency.max(1) {
+    for worker_index in 0..concurrency {
         let stats = stats.clone();
         let client = client.clone();
         let url = url.clone();
         let payload = payload.clone();
         let method = method.clone();
+        let schedule = schedule.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
-            while Instant::now() < deadline {
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 match client
                     .request(method.clone(), url.as_str())
@@ -286,14 +403,24 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
         latencies.extend(result.context("http benchmark task failed")?);
     }
 
+    print_operation_target(concurrency, schedule.operation_interval);
     print_summary("http", args.duration_secs, &stats, latencies);
     Ok(())
 }
 
 async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
-    let request_timeout = Duration::from_secs(10);
+    let concurrency = args.concurrency.max(1);
+    let schedule = Arc::new(BenchmarkSchedule::new(
+        concurrency,
+        args.duration_secs,
+        args.operation_interval_micros,
+        true,
+    ));
+    // SSE is a long-lived protocol. Keep a generous whole-exchange deadline
+    // even when a benchmark reads only the first chunk; a 10-second client
+    // deadline can misclassify a healthy stream during a saturated mixed wave.
+    let request_timeout = Duration::from_secs(30);
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(args.insecure)
@@ -311,14 +438,16 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let max_chunks = args.max_chunks.max(1);
 
     let mut tasks = JoinSet::new();
-    for _ in 0..args.concurrency.max(1) {
+    for worker_index in 0..concurrency {
         let stats = stats.clone();
         let client = client.clone();
         let url = url.clone();
+        let schedule = schedule.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
-            while Instant::now() < deadline {
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let exchange = async {
                     let response = client
@@ -362,7 +491,10 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
 
                 match tokio::time::timeout(request_timeout, exchange).await {
                     Ok(Ok((latency, bytes))) => local.record_success(latency, bytes),
-                    Ok(Err(())) | Err(_) => local.record_error(),
+                    Ok(Err(())) | Err(_) if tokio::time::Instant::now() < deadline => {
+                        local.record_error();
+                    }
+                    Ok(Err(())) | Err(_) => {}
                 }
             }
             stats.add_task(&local);
@@ -375,6 +507,7 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
         latencies.extend(result.context("sse benchmark task failed")?);
     }
 
+    print_operation_target(concurrency, schedule.operation_interval);
     print_summary("sse", args.duration_secs, &stats, latencies);
     Ok(())
 }
@@ -386,33 +519,92 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
 
     let stats = Arc::new(BenchStats::default());
     let payload = Arc::new(vec![b'x'; args.payload_bytes.max(1)]);
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
     let url = Arc::new(args.url);
     let insecure_tls_config = insecure_wss_client_config(args.insecure);
+    let connection_count = args.connections.max(1);
+    let start_barrier = Arc::new(Barrier::new(connection_count));
+    let scheduled_start = Arc::new(OnceLock::<tokio::time::Instant>::new());
+    let connect_timeout = Duration::from_millis(args.connect_timeout_ms.max(1));
+    let measurement_duration = Duration::from_secs(args.duration_secs.max(1));
+    let message_interval = (args.message_interval_micros > 0)
+        .then(|| Duration::from_micros(args.message_interval_micros));
 
     let mut tasks = JoinSet::new();
-    for _ in 0..args.connections.max(1) {
+    for _ in 0..connection_count {
         let stats = stats.clone();
         let payload = payload.clone();
         let url = url.clone();
         let insecure_tls_config = insecure_tls_config.clone();
+        let start_barrier = start_barrier.clone();
+        let scheduled_start = scheduled_start.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
-            let mut websocket = loop {
-                match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
-                    Ok((stream, _)) => break stream,
-                    Err(_) => {
+            let connect_deadline = Instant::now() + connect_timeout;
+            let websocket = loop {
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break None;
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    connect_websocket(url.as_str(), insecure_tls_config.clone()),
+                )
+                .await
+                {
+                    Ok(Ok((stream, _))) => break Some(stream),
+                    Ok(Err(_)) | Err(_) => {
                         local.record_error();
-                        if Instant::now() >= deadline {
-                            stats.add_task(&local);
-                            return local.latencies_us;
-                        }
                     }
                 }
             };
 
-            while Instant::now() < deadline {
+            // Active-session latency must not include a staggered TLS/HTTP
+            // handshake ramp. Capacity mode measures handshake rate and
+            // percentiles separately; this barrier gives every established
+            // session the same steady-state measurement window.
+            let barrier_result = start_barrier.wait().await;
+            if barrier_result.is_leader() {
+                // Give every connection task time to leave the barrier and
+                // register the same future start instant. This removes the
+                // load generator's task-spawn skew from gateway percentiles.
+                let _ =
+                    scheduled_start.set(tokio::time::Instant::now() + Duration::from_millis(250));
+            }
+            // Tokio barriers are reusable. The second generation publishes
+            // the leader's timestamp to every task before any traffic starts.
+            start_barrier.wait().await;
+            let Some(mut websocket) = websocket else {
+                stats.add_task(&local);
+                return local.latencies_us;
+            };
+            let measurement_start = *scheduled_start
+                .get()
+                .expect("websocket benchmark start time initialized");
+            tokio::time::sleep_until(measurement_start).await;
+            let deadline = measurement_start + measurement_duration;
+            let mut ticker = message_interval.map(|interval| {
+                // `tokio::time::interval` yields its first tick immediately,
+                // which adds one operation per connection and overstates a
+                // short fixed-rate run. Start after one complete interval so
+                // the declared offered rate and measured window agree.
+                tokio::time::interval_at(measurement_start + interval, interval)
+            });
+            if let Some(ticker) = ticker.as_mut() {
+                // Drop missed ticks instead of generating a catch-up burst.
+                // Every connection creates its ticker immediately after the
+                // shared barrier, intentionally preserving synchronized game
+                // tick bursts while holding offered rate equal for gateways.
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            }
+
+            while tokio::time::Instant::now() < deadline {
+                if let Some(ticker) = ticker.as_mut() {
+                    ticker.tick().await;
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
                 let started = Instant::now();
                 let result = async {
                     websocket
@@ -443,7 +635,7 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
 
                 match result {
                     Ok(size) => local.record_success(started.elapsed(), payload.len() + size),
-                    Err(_) if Instant::now() < deadline => {
+                    Err(_) if tokio::time::Instant::now() < deadline => {
                         local.record_error();
                         match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
                             Ok((stream, _)) => websocket = stream,
@@ -463,6 +655,13 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
         latencies.extend(result.context("websocket benchmark task failed")?);
     }
 
+    if let Some(interval) = message_interval {
+        println!("message interval: {} us", interval.as_micros());
+        println!(
+            "target ops/sec : {:.2}",
+            connection_count as f64 / interval.as_secs_f64()
+        );
+    }
     print_summary("websocket", args.duration_secs, &stats, latencies);
     Ok(())
 }
@@ -587,32 +786,39 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
 async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
     let payload = Arc::new(vec![b'x'; args.payload_bytes.max(1)]);
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
     let addr = Arc::new(args.addr);
+    let connection_count = args.connections.max(1);
+    let schedule = Arc::new(BenchmarkSchedule::new(
+        connection_count,
+        args.duration_secs,
+        args.operation_interval_micros,
+        false,
+    ));
 
     let mut tasks = JoinSet::new();
-    for _ in 0..args.connections.max(1) {
+    for worker_index in 0..connection_count {
         let stats = stats.clone();
         let payload = payload.clone();
         let addr = addr.clone();
+        let schedule = schedule.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
-            let mut stream = loop {
-                match TcpStream::connect(addr.as_str()).await {
-                    Ok(stream) => break stream,
-                    Err(_) => {
-                        local.record_error();
-                        if Instant::now() >= deadline {
-                            stats.add_task(&local);
-                            return local.latencies_us;
-                        }
-                    }
+            let stream =
+                tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr.as_str()))
+                    .await;
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            let mut stream = match stream {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) | Err(_) => {
+                    local.record_error();
+                    stats.add_task(&local);
+                    return local.latencies_us;
                 }
             };
 
             let mut buffer = vec![0_u8; payload.len()];
-            while Instant::now() < deadline {
+            while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let result = async {
                     stream.write_all(&payload).await?;
@@ -642,6 +848,7 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
         latencies.extend(result.context("tcp benchmark task failed")?);
     }
 
+    print_operation_target(connection_count, schedule.operation_interval);
     print_summary("tcp", args.duration_secs, &stats, latencies);
     Ok(())
 }
@@ -649,15 +856,22 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
 async fn run_udp(args: UdpBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
     let payload = Arc::new(vec![b'x'; args.payload_bytes.max(1)]);
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
     let addr = Arc::new(args.addr);
     let timeout_ms = args.timeout_ms.max(1);
+    let connection_count = args.connections.max(1);
+    let schedule = Arc::new(BenchmarkSchedule::new(
+        connection_count,
+        args.duration_secs,
+        args.operation_interval_micros,
+        false,
+    ));
 
     let mut tasks = JoinSet::new();
-    for _ in 0..args.connections.max(1) {
+    for worker_index in 0..connection_count {
         let stats = stats.clone();
         let payload = payload.clone();
         let addr = addr.clone();
+        let schedule = schedule.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
@@ -667,22 +881,21 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
                 "0.0.0.0:0"
             };
             let socket = match UdpSocket::bind(bind_any).await {
-                Ok(socket) => socket,
-                Err(_) => {
+                Ok(socket) if socket.connect(addr.as_str()).await.is_ok() => Some(socket),
+                Ok(_) | Err(_) => None,
+            };
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            let socket = match socket {
+                Some(socket) => socket,
+                None => {
                     local.record_error();
                     stats.add_task(&local);
                     return local.latencies_us;
                 }
             };
 
-            if socket.connect(addr.as_str()).await.is_err() {
-                local.record_error();
-                stats.add_task(&local);
-                return local.latencies_us;
-            }
-
             let mut buffer = vec![0_u8; payload.len().max(65_536)];
-            while Instant::now() < deadline {
+            while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let result = async {
                     socket.send(&payload).await?;
@@ -706,7 +919,7 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
 
                 match result {
                     Ok(size) => local.record_success(started.elapsed(), payload.len() + size),
-                    Err(_) if Instant::now() < deadline => local.record_error(),
+                    Err(_) if tokio::time::Instant::now() < deadline => local.record_error(),
                     Err(_) => {}
                 }
             }
@@ -720,6 +933,7 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
         latencies.extend(result.context("udp benchmark task failed")?);
     }
 
+    print_operation_target(connection_count, schedule.operation_interval);
     print_summary("udp", args.duration_secs, &stats, latencies);
     Ok(())
 }

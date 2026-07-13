@@ -686,7 +686,7 @@ services:
           - url: "http://127.0.0.1:9000"</code></pre>
 
           <p class="subtle">这份最小配置对应的架构路径很直白：`TLS/HTTP listener -> reverse_proxy route match -> upstream connect -> access/error log`。</p>
-          <p class="subtle">普通公网 WSS 可把 `http.tls.auto_https.domains` 直接写成域名列表：非空列表会选中内建 managed ACME、正式 Let's Encrypt 和 HTTP-01。`/.well-known/acme-challenge/*`、证书持久化、续期和 reload 都由网关处理，不需要外部证书工具、DNS API 或账号邮箱；A/AAAA 必须指向网关且 80/443 可达。邮箱仅用于到期/安全通知，显式 HTTP-01、TLS-ALPN-01、DNS-01 与外部 ACME 配置仍兼容。</p>
+          <p class="subtle">普通公网 WSS 可把 `http.tls.auto_https.domains` 直接写成域名列表：非空列表会选中内建 managed ACME、正式 Let's Encrypt 和默认 TLS-ALPN-01。临时 `acme-tls/1` 证书、证书持久化、续期和 reload 都由网关处理，不需要外部证书工具、DNS API 或账号邮箱；A/AAAA 必须指向网关且公网 443 可达。邮箱仅用于到期/安全通知；显式 HTTP-01（需 80）、TLS-ALPN-01、DNS-01 与外部 ACME 配置仍兼容。</p>
         </section>
 
         <section id="stream-flow" class="panel">
@@ -738,6 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
+          <p class="subtle">Linux 性能模式下，listener 按 `sched_getaffinity` 检测到的 cpuset 建立 `SO_REUSEPORT` accept worker。plain `ws://`、游戏小帧 TCP、通用 1 KiB TCP 与 WSS 默认使用多核 Tokio relay、有界 buffer pool、backpressure 和 half-close；这条路径避免单 reactor 的唤醒瓶颈。bulk/file profile 使用 `splice`。TLS 低密度连接复用 HTTP shard，达到每 base shard 64 条活跃连接后才弹性启动额外 TLS shard。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用 CPU 自适应 `SO_REUSEPORT` worker、复用有界 UDP buffer pool；无 policy 的 worker 本地缓存 upstream/config 快照，只在每秒或 reload 后刷新，普通数据报不会抢动态配置锁。新会话 pending 去重是分片集合，association prune 按时间、创建数量和容量压力节流，避免重连风暴每建一条会话就扫全表。</p>
         </section>
 
@@ -866,7 +867,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Validation</span>
               <h3>只赢一项，不算赢</h3>
-              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 都要一起看；KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。</p>
+              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 都要一起看；角色隔离脚本默认交错跑 3 次并比较中位数，任一轮错误取最大值，equal-offered-load 再严格判 p50/p95/p99。KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前 nginx 对标矩阵。</p>
             </article>
             <article class="card">
               <span class="tag expert">Fast lane</span>
@@ -876,7 +877,12 @@ plugins:
             <article class="card">
               <span class="tag expert">WebSocket relay</span>
               <h3>游戏重连不会反复打分配器</h3>
-              <p class="subtle">`ws://` 快路径和通用 HTTP/TLS upgrade 隧道都从有界无锁池借用两个 4 KiB 游戏帧双向缓冲；TCP 半关闭会继续透传，连接结束或重连波峰退去后，多余缓冲自动释放。relay 会消耗 Tokio cooperative budget，并限制每个 WebSocket 方向每轮只处理一个 read/write batch，避免热连接饿死大量游戏会话。这样 10 万条大多空闲的隧道不会仅因 16 KiB relay buffer 就固定占用 3.2 GiB。HTTP/WebSocket accept 与 upstream 保持内核默认队列加 `TCP_NODELAY`：逐连接套多 MiB buffer 会增加握手 syscall 并破坏高连接数内存预算；512 KiB/1 MiB 与 16 KiB `TCP_NOTSENT_LOWAT` 仍属于直连 realtime TCP profile。WSS 的 TLS 协议处理保持不变。</p>
+              <p class="subtle">plain WebSocket 与 WSS 在握手后使用多核 Tokio relay；只有出现 pending 数据时才从有界 `ByteBufferPool` 借 buffer，空闲长连接不会预占每方向固定大块内存。4c/8GiB 生产门禁默认验证 20k idle WSS 容量和最多 4096 条活跃消息连接，并分别比较握手/消息的 p50、p95、p99。</p>
+            </article>
+            <article class="card">
+              <span class="tag expert">Static sendfile</span>
+              <h3>零拷贝也要保证并行公平</h3>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次最多 2 MiB；small traffic profile 下加入 125µs 公平 pacing，Range 与 backpressure 语义保持不变。</p>
             </article>
           </div>
 
@@ -887,9 +893,10 @@ proxysss config reload-plan
 scripts/verify-docker-scenarios.sh
 .\scripts\verify-docker-scenarios.ps1
 scripts/benchmark-all-scenarios.sh
-scripts/benchmark-websocket-isolated.sh</code></pre>
+scripts/benchmark-all-scenarios-isolated.sh
+scripts/benchmark-websocket-production-gate.sh</code></pre>
 
-          <p class="subtle">这套顺序的意思是：先把 Linux 环境调到位，再确认实例能力和 reload 边界，可用 Docker 验证全场景配置面，最后手动跑 mixed-load benchmark。`benchmark-websocket-isolated.sh` 额外把 nginx/proxysss 固定在同样的 4c/8GiB 网关 cgroup，并把 WSS 回源与多个客户端拆到独立 cgroup/网络命名空间，记录 active WSS 吞吐、p50/p95 和 10 万 idle 连接。它不能替代独立网关、回源、压测主机的物理网络延迟复跑。默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。单场景 benchmark 只适合定位问题；v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
+          <p class="subtle">`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，保存同 SHA binary、主机指纹、nginx -V 与原始样本。Docker role isolation 不能冒充三台物理机。</p>
         </section>
 
         <section id="config-map" class="panel">

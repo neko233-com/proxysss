@@ -25,8 +25,19 @@ HTTPS_CONCURRENCY_SET="${HTTPS_CONCURRENCY+x}"
 STREAM_CONNECTIONS_SET="${STREAM_CONNECTIONS+x}"
 SSE_CONCURRENCY_SET="${SSE_CONCURRENCY+x}"
 DURATION_SECS_SET="${DURATION_SECS+x}"
+MIN_RATIO_SET="${MIN_RATIO+x}"
+CRITICAL_RATIO_SET="${CRITICAL_RATIO+x}"
+AGGREGATE_RATIO_SET="${AGGREGATE_RATIO+x}"
+DIAGNOSTIC_SCENARIOS_SET="${DIAGNOSTIC_SCENARIOS+x}"
+WEBSOCKET_ERROR_TOLERANCE_SET="${WEBSOCKET_ERROR_TOLERANCE+x}"
+SSE_ERROR_TOLERANCE_SET="${SSE_ERROR_TOLERANCE+x}"
+FAST_GATE_RATIO_SET="${FAST_GATE_RATIO+x}"
 CPU_CORES="${CPU_CORES:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)}"
 CPU_CORES="${CPU_CORES:-1}"
+if ! [[ "$CPU_CORES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CPU_CORES must be a positive integer" >&2
+  exit 1
+fi
 CONCURRENCY="${CONCURRENCY:-$((CPU_CORES * 16))}"
 STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-$CPU_CORES}"
 HTTPS_CONCURRENCY="${HTTPS_CONCURRENCY:-$((CPU_CORES * 4))}"
@@ -35,7 +46,7 @@ SSE_CONCURRENCY="${SSE_CONCURRENCY:-$CPU_CORES}"
 SSE_MAX_CHUNKS="${SSE_MAX_CHUNKS:-1}"
 DURATION_SECS="${DURATION_SECS:-30}"
 UDP_TIMEOUT_MS="${UDP_TIMEOUT_MS:-7000}"
-NGINX_VERSION="${NGINX_VERSION:-1.31.0}"
+NGINX_VERSION="${NGINX_VERSION:-1.31.2}"
 QUICK="${QUICK:-0}"
 HTTPS_HTTP1_ONLY="${HTTPS_HTTP1_ONLY:-0}"
 MIN_RATIO="${MIN_RATIO:-0.50}"
@@ -58,6 +69,21 @@ FAST_GATE_SCENARIOS="${FAST_GATE_SCENARIOS:-$CRITICAL_SCENARIOS}"
 SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 MIXED_MATRIX="${MIXED_MATRIX:-1}"
 AGGREGATE_RATIO="${AGGREGATE_RATIO:-0.97}"
+STRICT_SUPERIORITY="${STRICT_SUPERIORITY:-0}"
+MAX_LATENCY_RATIO="${MAX_LATENCY_RATIO:-1.0}"
+REQUIRE_LATENCY_PERCENTILES="${REQUIRE_LATENCY_PERCENTILES:-$STRICT_SUPERIORITY}"
+REQUIRE_ZERO_ERRORS="${REQUIRE_ZERO_ERRORS:-$STRICT_SUPERIORITY}"
+
+if [[ "$STRICT_SUPERIORITY" == "1" ]]; then
+  [[ -z "$MIN_RATIO_SET" ]] && MIN_RATIO=1.0
+  [[ -z "$CRITICAL_RATIO_SET" ]] && CRITICAL_RATIO=1.0
+  [[ -z "$AGGREGATE_RATIO_SET" ]] && AGGREGATE_RATIO=1.0
+  [[ -z "$DIAGNOSTIC_SCENARIOS_SET" ]] && DIAGNOSTIC_SCENARIOS=""
+  [[ -z "$WEBSOCKET_ERROR_TOLERANCE_SET" ]] && WEBSOCKET_ERROR_TOLERANCE=0
+  [[ -z "$SSE_ERROR_TOLERANCE_SET" ]] && SSE_ERROR_TOLERANCE=0
+  [[ -z "$UDP_ERROR_TOLERANCE_SET" ]] && UDP_ERROR_TOLERANCE=0
+  [[ -z "$FAST_GATE_RATIO_SET" ]] && FAST_GATE_RATIO=1.0
+fi
 
 if [[ "$QUICK" == "1" ]]; then
   [[ -z "$CONCURRENCY_SET" ]] && CONCURRENCY=$((CPU_CORES * 16))
@@ -68,7 +94,7 @@ if [[ "$QUICK" == "1" ]]; then
   [[ -z "$DURATION_SECS_SET" ]] && DURATION_SECS=10
 fi
 
-if [[ -z "$UDP_ERROR_TOLERANCE_SET" && ! -e /proc/sys/net/core/rmem_max ]]; then
+if [[ "$REQUIRE_ZERO_ERRORS" != "1" && -z "$UDP_ERROR_TOLERANCE_SET" && ! -e /proc/sys/net/core/rmem_max ]]; then
   UDP_ERROR_TOLERANCE=16
   echo "==> /proc/sys/net/core/rmem_max is unavailable; using Docker/WSL UDP error tolerance +$UDP_ERROR_TOLERANCE" >&2
 fi
@@ -98,8 +124,21 @@ FORCE_BUILD="${FORCE_BUILD:-0}"
 stop_bench_processes() {
   if [[ -f "$PID_FILE" ]]; then
     while read -r pid; do
-      kill "$pid" 2>/dev/null || true
+      if ! [[ "$pid" =~ ^[1-9][0-9]*$ ]] || [[ ! -r "/proc/$pid/exe" ]]; then
+        continue
+      fi
+      local executable command_line proxy_executable helper_executable
+      executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+      command_line="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+      proxy_executable="$(readlink -f "$PROXY_BIN" 2>/dev/null || true)"
+      helper_executable="$(readlink -f "$BENCH_HELPER_BIN" 2>/dev/null || true)"
+      if [[ ( -n "$proxy_executable" && "$executable" == "$proxy_executable" ) \
+        || ( -n "$helper_executable" && "$executable" == "$helper_executable" ) \
+        || "$command_line" == *"$RUN_DIR/nginx.conf"* ]]; then
+        kill "$pid" 2>/dev/null || true
+      fi
     done < "$PID_FILE"
+    rm -f "$PID_FILE"
   fi
   pkill -f "$RUN_DIR/nginx.conf" 2>/dev/null || true
 }
@@ -153,7 +192,9 @@ if [[ ! -x "$NGINX_BIN" ]]; then
       --with-stream_ssl_preread_module \
       --with-threads \
       --with-file-aio \
-      --without-http_rewrite_module >/dev/null
+      --without-http_rewrite_module \
+      --with-cc-opt='-O3 -fno-plt' \
+      --with-ld-opt='-Wl,-O1,--as-needed' >/dev/null
     make -j"$(nproc)" >/dev/null
     make install >/dev/null
   )
@@ -252,7 +293,7 @@ YAML
 
 cat >"$RUN_DIR/nginx.conf" <<NGINX
 user www-data;
-worker_processes  auto;
+worker_processes  ${CPU_CORES};
 worker_rlimit_nofile 1048576;
 events {
     use epoll;
@@ -455,7 +496,7 @@ scenario_enabled() {
 SSE_UPSTREAM_PID=""
 
 start_sse_backend() {
-  "$BENCH_HELPER_BIN" serve-sse --listen 127.0.0.1:18191 >/dev/null 2>&1 &
+  "$BENCH_HELPER_BIN" serve-sse --listen 127.0.0.1:18191 --chunks 1 >/dev/null 2>&1 &
   SSE_UPSTREAM_PID="$!"
   echo "$SSE_UPSTREAM_PID" >>"$PID_FILE"
   wait_http "http://127.0.0.1:18191/sse"
@@ -626,7 +667,13 @@ if [[ "$FAST_GATE" == "1" ]]; then
 
   QUICK_ROWS_FILE="$RUN_DIR/quick-rows.jsonl"
   printf '%s\n' "${QUICK_ROWS[@]}" >"$QUICK_ROWS_FILE"
-  "$BENCH_HELPER_BIN" quick-gate --min-ratio "$FAST_GATE_RATIO" --rows "$QUICK_ROWS_FILE"
+  "$BENCH_HELPER_BIN" quick-gate \
+    --min-ratio "$FAST_GATE_RATIO" \
+    --max-latency-ratio "$MAX_LATENCY_RATIO" \
+    --require-latency-percentiles="$REQUIRE_LATENCY_PERCENTILES" \
+    --require-zero-errors="$REQUIRE_ZERO_ERRORS" \
+    --strict-superiority="$STRICT_SUPERIORITY" \
+    --rows "$QUICK_ROWS_FILE"
 fi
 
 append_deep_matrix_serial() {
@@ -773,6 +820,21 @@ if [[ "$MIXED_MATRIX" == "1" ]]; then
   MIXED_MATRIX_BOOL=true
 fi
 
+STRICT_SUPERIORITY_BOOL=false
+if [[ "$STRICT_SUPERIORITY" == "1" ]]; then
+  STRICT_SUPERIORITY_BOOL=true
+fi
+
+REQUIRE_LATENCY_PERCENTILES_BOOL=false
+if [[ "$REQUIRE_LATENCY_PERCENTILES" == "1" ]]; then
+  REQUIRE_LATENCY_PERCENTILES_BOOL=true
+fi
+
+REQUIRE_ZERO_ERRORS_BOOL=false
+if [[ "$REQUIRE_ZERO_ERRORS" == "1" ]]; then
+  REQUIRE_ZERO_ERRORS_BOOL=true
+fi
+
 "$BENCH_HELPER_BIN" write-all-scenarios-summary \
   --results "$RESULTS_FILE" \
   --md "$SUMMARY_MD" \
@@ -785,6 +847,10 @@ fi
   --websocket-error-tolerance "$WEBSOCKET_ERROR_TOLERANCE" \
   --udp-error-tolerance "$UDP_ERROR_TOLERANCE" \
   --aggregate-ratio "$AGGREGATE_RATIO" \
+  --max-latency-ratio "$MAX_LATENCY_RATIO" \
+  --require-latency-percentiles="$REQUIRE_LATENCY_PERCENTILES_BOOL" \
+  --require-zero-errors="$REQUIRE_ZERO_ERRORS_BOOL" \
+  --strict-superiority="$STRICT_SUPERIORITY_BOOL" \
   --mixed-matrix="$MIXED_MATRIX_BOOL" \
   --cpu-cores "$CPU_CORES" \
   --http-concurrency "$CONCURRENCY" \

@@ -466,7 +466,7 @@ services:
             <article class="path">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就给 WebSocket 加 WSS</h3>
-              <p class="subtle">当 80 / 443 能直连公网时，只填写域名即可自动签正式证书；不需要证书脚本、DNS API 或邮箱。</p>
+              <p class="subtle">A/AAAA 指向网关且公网 443 可达时，只填写域名即可通过默认 TLS-ALPN-01 自动签正式证书；不需要证书脚本、DNS API 或邮箱。HTTP-01 仍可显式启用。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
@@ -700,7 +700,7 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 proxysss token show</code></pre>
 
-          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后跑 mixed-load benchmark，而不是只截一张单场景好看的图。</p>
+          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后跑带 cpuset 预检的 mixed-load benchmark；涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh` 保存原始证据，而不是只截一张单场景好看的图。</p>
         </section>
 
         <section id="more" class="panel">
@@ -741,7 +741,7 @@ proxysss token show</code></pre>
             <a class="link-card" href="benchmark-linux.html">
               <span class="tag expert">性能对比</span>
               <h3>性能对比数据</h3>
-              <p class="subtle">官方 Linux benchmark 页，先展示 v1.3.5 UDP fast path 当前结果，再保留历史 Ubuntu 24 / Docker mixed-load 基线，并说明性能优化为什么必须无副作用。</p>
+              <p class="subtle">官方 Linux benchmark 页，先展示 v1.3.5 UDP fast path 当前结果，再保留 Ubuntu 24 / Docker mixed-load 基线、20k WSS 容量与独立三主机复跑方法，并说明性能优化为什么必须无副作用。</p>
             </a>
           </div>
         </section>

@@ -83,7 +83,25 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 bench
 
 这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
 
-### 4.1 WebSocket 10 万连接容量与延迟要分开验证
+### 4.1 三阶段公平判定，不能混用吞吐与延迟口径
+
+`scripts/benchmark-all-scenarios-isolated.sh` 把 4c/8GiB gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。
+
+它分三阶段输出 JSON、Markdown、HTML 与百分比表。mixed saturation 与 equal offered load 默认交错运行 4 次，serial isolated saturation 默认 3 次，并对 ops/s、p50、p95、p99 取中位数；任一轮出现错误时聚合结果保留最大错误数，不能用中位数掩盖不稳定：
+
+1. `mixed saturation`：十个场景同时跑，只判聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
+2. `isolated saturation`：每次只跑一个场景并交替先后顺序，判单场景最大吞吐/容量。
+3. `equal offered load`：从两边较慢的饱和吞吐取 70%，固定发送间隔；双方必须完成至少 98% 目标负载，并且 proxysss 的 p50/p95/p99 都严格低于 nginx。
+
+```bash
+PROXY_BIN=target/release/proxysss \
+STRICT_SUPERIORITY=1 DURATION_SECS=30 \
+bash scripts/benchmark-all-scenarios-isolated.sh
+```
+
+Docker role isolation 解决的是同进程、同 cgroup、同 CPU 抢占混淆，不等于三台物理机。脚本会先拒绝角色 cpuset 重叠或默认 16 核包络之外的机器；公网 RTT、NIC/IRQ/RSS、跨机丢包结论仍要在独立 gateway/backend/client 主机复跑。
+
+### 4.2 WebSocket 容量与延迟要分开验证
 
 `ops/s` 是一条已建立 WebSocket 上的回显消息轮次，不是并发连接数。原生 benchmark 还提供只建连、保持、采样握手延迟的容量模式：
 
@@ -98,22 +116,34 @@ proxysss bench websocket \
   --duration-secs 30
 ```
 
-单个 IPv4 源地址到单个后端 `IP:port` 只有有限临时端口；默认 Linux 端口范围通常约 2.8 万。因此 10 万连接验证至少需要多个压测源地址，并且 WebSocket 反代到单一后端时还必须有多个不同后端 `IP:port`（或代理源 IP 池）。这是 TCP 四元组限制，nginx 和 proxysss 都不能绕过。`upstreams` 可配置这些后端；未启用玩家亲和时，proxysss 的 WebSocket 快路径会 round-robin 分流，启用 affinity 后才使用 Rendezvous 粘性。
+4c/8GiB 的默认生产目标是 20k idle WSS 与最多 4096 条活跃消息连接。单个 IPv4 源地址到单个后端 `IP:port` 仍只有有限临时端口；若主动把目标提高到单源端口范围以上，必须增加压测源 IP 和后端 `IP:port`（或代理源 IP 池）。这是 TCP 四元组限制，nginx 和 proxysss 都不能绕过。
 
 容量成功只说明可保持足够多连接；低延迟与消息吞吐仍要单独用普通 `proxysss bench websocket` 以及 mixed-load 矩阵验证。
 
-### 4.2 单网关 WSS 隔离 Docker 验证
+### 4.3 单网关 WSS 隔离 Docker 验证
 
-对 Rust 游戏网关，先跑下面的角色隔离测试。它会把 nginx/proxysss 网关固定在 `4 CPU / 8 GiB`，把 4 个回源和多个客户端放到独立 cgroup 与网络命名空间；每个候选都跑相同的 WSS 活跃回显吞吐、p50/p95 延迟与 10 万 idle WSS 容量，输出百分比表和网关容器的资源快照：
+对 Rust 游戏网关，先跑下面的生产门禁。它会把 nginx/proxysss 网关固定在 `4 CPU / 8 GiB`，把 4 个回源和多个客户端放到独立 cgroup 与网络命名空间；默认按 256/1024/4096 active WSS 和 5k/10k/20k idle WSS 逐级验证，四轮 Latin-square 平衡候选顺序与地址哈希，并比较吞吐、p50/p95/p99、握手延迟、错误和 RSS：
 
 ```bash
 proxysss tune linux --apply
-bash scripts/benchmark-websocket-isolated.sh
+bash scripts/benchmark-websocket-production-gate.sh
 ```
 
-默认 10 万容量使用 5 个客户端 IP、4 个后端 `IP:port`，避开 TCP 四元组误判。参考压测机至少要有 12 CPU / 32 GiB，才能让网关的 4c8g 配额不与客户端、回源争抢资源。该脚本刻意使用生成的自签名 WSS fixture，并仅在压测客户端加 `--insecure`；它验证 TLS/WSS 数据路径，不是证书信任测试。
+默认容量上限 20k，仍使用多个客户端地址和 4 个后端 `IP:port`，避免把端口耗尽误判成网关失败。参考压测机至少要有 16 CPU / 32 GiB；默认 4 gateway + 4 backend + 8 client 的 cpuset 预检会在不满足时失败，而不是悄悄让角色抢 CPU。该脚本刻意使用生成的自签名 WSS fixture，并仅在压测客户端加 `--insecure`；它验证 TLS/WSS 数据路径，不是证书信任测试，真实 ACME 由 Docker 场景测试与公网证书测试单独覆盖。
 
 Docker 的 cgroup、网络命名空间和 CPU 集隔离能排除“同一进程/同一容器”干扰，但仍共享同一 Linux 内核；生产发布结论还必须在独立的网关、回源、压测主机上复跑，不能把单机 Docker 结果伪装成跨机网络延迟。
+
+### 4.4 三台独立主机 WSS 严格复跑
+
+从独立的 Linux 压测机运行下面的入口。它把同一个 SHA-256 的 proxysss 二进制复制到 gateway 和 backend，保存三台主机的 `uname`/`lscpu`、gateway `nginx -V`、每一轮原始输出与中位数报告；顺序交错四轮，饱和吞吐和 equal-offered-load 的 p50/p95/p99 都必须严格优于 nginx，20k 容量每轮必须零失败。`GATEWAY_ADDR` 是压测机可访问的网关地址，`BACKEND_ADDR` 是网关可访问的回源地址。
+
+```bash
+GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
+GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
+bash scripts/benchmark-cross-host-wss.sh
+```
+
+默认使用可跨同架构 Linux 主机运行的 release-fast 二进制。只有三台机器 CPU 特性一致时，才可显式 `BUILD_NATIVE=1` 以 `target-cpu=native` 编译；否则不得以优化名义引入非法指令风险。
 
 ## 5. CI 和 benchmark 的边界
 
@@ -122,7 +152,9 @@ Docker 的 cgroup、网络命名空间和 CPU 集隔离能排除“同一进程/
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
-- `scripts/benchmark-websocket-isolated.sh`：4c8g 单网关 WSS active-latency + 10 万连接角色隔离入口
+- `scripts/benchmark-all-scenarios-isolated.sh`：4c8g role-isolated saturation + equal-offered-load 严格对照入口
+- `scripts/benchmark-websocket-production-gate.sh`：4c8g 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口
+- `scripts/benchmark-cross-host-wss.sh`：三台独立 Linux 主机 WSS 严格吞吐、p50/p95/p99 与 20k 容量证据入口
 - `SCENARIO_FILTER=udp-stream`：定位 UDP fast path 的专项入口
 - `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 输出
 

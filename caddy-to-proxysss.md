@@ -157,7 +157,7 @@ http:
       domains: [wss.example.com]
 ```
 
-这会使用内建 managed ACME 的正式 HTTP-01，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且 80/443 可公网访问。邮箱仍可通过 `http.tls.auto_https.email` 选填，以接收到期和安全通知。旧的显式 HTTP-01 / TLS-ALPN-01 / DNS-01 配置保持兼容。
+这会使用内建 managed ACME 的正式 TLS-ALPN-01，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且公网 443 可达。邮箱仍可通过 `http.tls.auto_https.email` 选填，以接收到期和安全通知。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。
 
 如果是泛域名：
 
@@ -387,6 +387,7 @@ proxysss 的性能优化和迁移结论都要遵循同一条纪律：
 - 后续所有性能优化都要压测
 - 必须是无副作用优化
 - SSE、static、HTTP reverse proxy、TCP、UDP、KCP-style、QCP 要一起看
+- 涉及公网/NIC 延迟时必须用 `scripts/benchmark-cross-host-wss.sh` 在独立 client/gateway/backend 主机复跑，Docker cpuset 数据不能冒充跨机结果
 
 ## 5. 一句迁移建议
 

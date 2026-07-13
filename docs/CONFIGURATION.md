@@ -70,7 +70,7 @@ services:
 
 这段配置做了什么：
 
-- 只要 `auto_https.domains` 非空，proxysss 就自动切到内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 HTTP-01。它保留了显式 `mode: acme_managed`、`challenge: http01`、`tls_alpn01` 和 DNS-01 的兼容入口。
+- 只要 `auto_https.domains` 非空，proxysss 就自动切到内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 TLS-ALPN-01：A/AAAA 指向网关且公网 443 可达即可，不需要额外证书工具、DNS API 或邮箱。显式 `challenge: http01` 仍完整兼容（需要公网 80），`tls_alpn01` 与 DNS-01 入口也保持不变。
 - 不用额外跑 `certbot`、`acme.sh` 或云厂商 CLI，也不必填写邮箱。邮箱是可选项：填写 `http.tls.auto_https.email` 才会收到到期和安全通知。
 - WebSocket upgrade 路由照常声明；签证完成后同一条 `/ws` 自动同时支持 `ws://` 与 `wss://`。
 
@@ -568,7 +568,7 @@ proxysss config reload-plan
 scripts/benchmark-all-scenarios.sh
 ```
 
-默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
+默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。上面的 benchmark 是手动/专机验证入口；role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠，物理网络 WSS 结论还要从独立 client 主机运行 `scripts/benchmark-cross-host-wss.sh`，保存同 SHA、`nginx -V`、主机指纹和原始样本。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
 
 如果要先在 Docker 里验证“全场景配置面没有退化”，运行：
 

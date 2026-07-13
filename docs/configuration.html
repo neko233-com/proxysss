@@ -485,7 +485,7 @@ services:
             <article class="card">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就把 WebSocket 升为 WSS</h3>
-              <p class="subtle">如果 80/443 能直连公网，只填写域名即可启用内建 ACME：默认正式 Let's Encrypt + HTTP-01，不需要 certbot、acme.sh、DNS API 或账号邮箱。</p>
+              <p class="subtle">只填写域名即可启用内建 ACME：默认正式 Let's Encrypt + TLS-ALPN-01，只要求 A/AAAA 指向网关且公网 443 可达，不需要 certbot、acme.sh、DNS API 或账号邮箱。显式 `challenge: http01` 仍兼容，需要公网 80。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
@@ -720,7 +720,7 @@ proxysss config reload-plan
 scripts/verify-docker-scenarios.sh
 .\scripts\verify-docker-scenarios.ps1
 scripts/benchmark-all-scenarios.sh</code></pre>
-              <p class="subtle">默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。Docker 场景验证是手动入口，用于检查全场景样例、Range、注册中心配置和能力矩阵；benchmark 是手动/专机性能验证入口。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`，`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。</p>
+              <p class="subtle">默认 GitHub Actions CI 现在只负责全平台二进制打包，不自动跑测试、smoke 或性能压测。Docker 场景验证是手动入口，用于检查全场景样例、Range、注册中心配置和能力矩阵；benchmark 是手动/专机性能验证入口。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠；物理网络 WSS 结论还要从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>，保存同 SHA、<code>nginx -V</code>、主机指纹和原始样本。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>，<code>proxysss 127742.75 ops/s</code> vs <code>nginx 31577.33 ops/s</code>，两边 0 错误。</p>
             </article>
 
             <article class="card">

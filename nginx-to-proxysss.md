@@ -247,7 +247,7 @@ http:
       domains: [wss.example.com]
 ```
 
-只给域名就会启用内建 managed ACME，默认正式环境 HTTP-01；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网可访问 80/443。`email` 是可选通知地址；保留的显式 `http.tls.mode: acme_managed`、`challenge: http01`、`tls_alpn01` 和 DNS-01 配置仍完全支持。
+只给域名就会启用内建 managed ACME，默认正式环境 TLS-ALPN-01；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。`email` 是可选通知地址；保留的显式 `http.tls.mode: acme_managed`、`challenge: http01`（需 80）、`tls_alpn01` 和 DNS-01 配置仍完全支持。
 
 如果你做的是泛域名：
 
@@ -380,7 +380,7 @@ services:
 原因很直接：
 
 - 流式输出对 flush、`tcp_nodelay`、keepalive 更敏感
-- 后续性能优化必须看 mixed-load，而不是单独挑一条 SSE 压测图
+- 后续性能优化必须看 mixed-load，而不是单独挑一条 SSE 压测图；涉及公网/NIC 延迟时再用 `scripts/benchmark-cross-host-wss.sh` 在独立 client/gateway/backend 主机保存原始证据
 
 ## 4. 迁移时最容易踩的坑
 

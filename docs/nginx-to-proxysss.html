@@ -336,7 +336,7 @@
   tls:
     auto_https:
       domains: [wss.example.com]</code></pre>
-            <p class="subtle">只给域名就会启用内建 managed ACME，默认正式环境 HTTP-01；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网可访问 80/443。邮箱只是到期/安全通知的可选项；显式 HTTP-01、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
+            <p class="subtle">只给域名就会启用内建 managed ACME，默认正式环境 TLS-ALPN-01；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。邮箱只是到期/安全通知的可选项；显式 HTTP-01（需 80）、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
           </article>
         </div>
       </section>
@@ -416,7 +416,7 @@ udp:
             <div class="kicker">Validation</div>
             <h2>迁移验证不是看一张 benchmark 图</h2>
           </div>
-          <p class="subtle">真正的迁移完成，应该同时确认配置面、路由视图、能力面和 mixed-load 性能纪律。</p>
+          <p class="subtle">真正的迁移完成，应该同时确认配置面、路由视图、能力面和 mixed-load 性能纪律；涉及公网/NIC 延迟时，再从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code> 保存原始证据。</p>
         </div>
 
         <pre><code>proxysss tune linux --apply

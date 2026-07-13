@@ -10,7 +10,8 @@ http:
     auto_https:
       domains:
         - gateway.example.com
-      # Uses production HTTP-01 by default. Email is optional, for renewal notices only.
+      # Uses production TLS-ALPN-01 by default: DNS + public 443 only.
+      # Email is optional and is used only for renewal/security notices.
       # email: ops@example.com
 # HTTP-01 compatibility override example: this explicit form remains supported.
 #    mode: acme_managed
