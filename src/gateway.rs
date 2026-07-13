@@ -4730,6 +4730,7 @@ impl Gateway {
         let mut small_static_response = Vec::with_capacity(4096);
         let mut static_response_cache: Option<ConnectionStaticFastPathCache> = None;
         let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
+        let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
         let outcome = 'fast_lane: loop {
             read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -4747,6 +4748,23 @@ impl Gateway {
             };
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
+            if let Some(cached) = static_response_cache
+                .as_ref()
+                .filter(|cached| cached.raw_request_matches(request_head))
+            {
+                // reqwest, browsers, and CDN probes commonly repeat the exact
+                // same keep-alive GET bytes. Once validated, skip UTF-8/header
+                // parsing and route lookup until the revalidation deadline.
+                send_connection_static_fast_path(&mut stream, cached).await?;
+                served_any = true;
+                discard_fast_lane_http_head(&mut prefix, head_end);
+                served_since_yield = served_since_yield.saturating_add(1);
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                    served_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
             let Some(path_hint) = peek_static_fast_path_path(request_head) else {
                 tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http static fast path request-line miss");
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
@@ -4809,11 +4827,25 @@ impl Gateway {
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
-                let Some(request) = parse_plain_fast_lane_request(request_head) else {
-                    tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http raw fast lane parse miss");
-                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                let parsed_request;
+                let reverse_request_cache_hit = !raw_sse_prefix_hit
+                    && raw_reverse_request_cache
+                        .as_ref()
+                        .is_some_and(|cached| cached.request_head.as_ref() == request_head);
+                let request = if reverse_request_cache_hit {
+                    &raw_reverse_request_cache
+                        .as_ref()
+                        .expect("raw reverse request cache hit checked")
+                        .request
+                } else {
+                    let Some(request) = parse_plain_fast_lane_request(request_head) else {
+                        tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http raw fast lane parse miss");
+                        break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                    };
+                    parsed_request = request;
+                    &parsed_request
                 };
-                if raw_sse_prefix_hit && plain_raw_sse_fast_lane_matches(config, &request) {
+                if raw_sse_prefix_hit && plain_raw_sse_fast_lane_matches(config, request) {
                     // SSE owns the HTTP connection for the lifetime of the
                     // stream. Preserve an unusual pipelined request by handing
                     // the untouched bytes to Hyper instead of dropping it.
@@ -4824,7 +4856,7 @@ impl Gateway {
                         .try_serve_plain_raw_sse_fast_lane(
                             config,
                             &mut stream,
-                            &request,
+                            request,
                             remote_addr,
                         )
                         .await?
@@ -4833,20 +4865,29 @@ impl Gateway {
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
-                if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, &request) {
+                if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, request) {
                     if self
                         .try_serve_plain_raw_reverse_fast_lane(
                             config,
                             &mut stream,
-                            &request,
+                            request,
                             remote_addr,
                             &mut raw_reverse_upstream,
                         )
                         .await?
                     {
                         served_any = true;
-                        if !request.keep_alive {
+                        let keep_alive = request.keep_alive;
+                        let request_to_cache =
+                            (!reverse_request_cache_hit).then(|| request.clone());
+                        if !keep_alive {
                             break 'fast_lane PlainHttpFastLaneDecision::Served;
+                        }
+                        if let Some(request) = request_to_cache {
+                            raw_reverse_request_cache = Some(RawReverseParsedRequestCache {
+                                request_head: Bytes::copy_from_slice(request_head),
+                                request,
+                            });
                         }
                         discard_fast_lane_http_head(&mut prefix, head_end);
                         served_since_yield = served_since_yield.saturating_add(1);
@@ -4961,6 +5002,7 @@ impl Gateway {
                     })
                 });
                 let cached = ConnectionStaticFastPathCache {
+                    request_head: Bytes::copy_from_slice(request_head),
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
                     checked_at: Instant::now(),
@@ -10673,6 +10715,7 @@ struct StaticFastPathCandidate {
 }
 
 struct ConnectionStaticFastPathCache {
+    request_head: Bytes,
     target: String,
     host: Option<String>,
     checked_at: Instant,
@@ -10685,6 +10728,11 @@ struct ConnectionStaticFastPathCache {
 }
 
 impl ConnectionStaticFastPathCache {
+    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
+        self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            && self.request_head.as_ref() == request_head
+    }
+
     fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
         request.method == "GET"
             && request.keep_alive
@@ -10722,6 +10770,7 @@ struct RawForwardingHeaderSnapshot {
     forwarded: Option<String>,
 }
 
+#[derive(Clone)]
 struct PlainFastLaneRequest {
     method: Method,
     target: String,
@@ -10824,6 +10873,11 @@ struct RawReverseLaneUpstream {
     key: String,
     pool: Arc<RawHttpUpstreamPool>,
     stream: TcpStream,
+}
+
+struct RawReverseParsedRequestCache {
+    request_head: Bytes,
+    request: PlainFastLaneRequest,
 }
 
 fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {

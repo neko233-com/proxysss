@@ -872,7 +872,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Fast lane</span>
               <h3>默认头语义也要能吃到快路径</h3>
-              <p class="subtle">plain HTTP 的 raw reverse proxy 和 raw SSE fast lane 会保留 `X-Forwarded-*` / `Forwarded`，不需要为了性能去关闭可观测性或改配置语义。tiny cached static 与 raw reverse connection 每完成 32 个请求才做一次显式 cooperative yield；socket read/write 未就绪时仍会自然让出 runtime。</p>
+              <p class="subtle">plain HTTP 的 raw reverse proxy 和 raw SSE fast lane 会保留 `X-Forwarded-*` / `Forwarded`，不需要为了性能去关闭可观测性或改配置语义。同一 keep-alive connection 重复的 exact static GET head 在首次校验后直接命中 connection response cache，直到 revalidation deadline 前不再重复 UTF-8/header parse 与 route lookup；exact raw reverse request 同样复用已验证的 parsed request，避免每次重建 target/path/forwarding header。tiny cached static 与 raw reverse connection 每完成 32 个请求才做一次显式 cooperative yield；socket read/write 未就绪时仍会自然让出 runtime。</p>
             </article>
             <article class="card">
               <span class="tag expert">WebSocket relay</span>
