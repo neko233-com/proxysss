@@ -1516,6 +1516,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static STATIC_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -1565,6 +1566,26 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_http_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn dedicated_static_connection_runtime() -> &'static tokio::runtime::Runtime {
+    &STATIC_CONNECTION_RUNTIMES.get_or_init(|| {
+        let worker_count = adaptive_data_plane_workers(1);
+        tracing::info!(
+            runtime_workers = worker_count,
+            "starting work-stealing static sendfile runtime"
+        );
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(worker_count)
+            .thread_name("proxysss-sendfile")
+            .global_queue_interval(2)
+            .event_interval(3)
+            .enable_all();
+        vec![builder
+            .build()
+            .expect("failed to build proxysss static sendfile runtime")]
+    })[0]
 }
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -4672,6 +4693,76 @@ impl Gateway {
     }
 
     async fn serve_plain_http_connection(
+        self: Arc<Self>,
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+        worker_index: usize,
+        mut initial_prefix: Bytes,
+    ) {
+        let mut stream = stream;
+        if cfg!(target_os = "linux")
+            && static_connection_runtime_profile_enabled(
+                self.bootstrap_config.runtime.performance.enabled,
+                self.bootstrap_config.runtime.performance.traffic_profile,
+            )
+        {
+            let mut probe = BytesMut::with_capacity(4096.max(initial_prefix.len()));
+            probe.extend_from_slice(&initial_prefix);
+            if let Err(error) = read_fast_lane_http_prefix(&mut stream, &mut probe).await {
+                tracing::debug!(?error, %remote_addr, "failed probing plain HTTP connection for static runtime");
+                return;
+            }
+            let should_migrate = memmem::find(&probe, b"\r\n\r\n")
+                .map(|head_end| &probe[..head_end + 4])
+                .and_then(peek_static_fast_path_path)
+                .and_then(|path| {
+                    self.static_route_cache
+                        .get(path)
+                        .map(|target| target.clone())
+                })
+                .is_some_and(|target| {
+                    self.static_file_cache
+                        .get(target.to_string_lossy().as_ref())
+                        .is_some_and(|cached| cached.sendfile.is_some())
+                });
+            initial_prefix = probe.freeze();
+            if should_migrate {
+                let stream = match stream.into_std() {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::debug!(?error, %remote_addr, "failed detaching static connection from HTTP runtime");
+                        return;
+                    }
+                };
+                let gateway = self.clone();
+                std::mem::drop(dedicated_static_connection_runtime().spawn(async move {
+                    let stream = match TcpStream::from_std(stream) {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::debug!(?error, %remote_addr, "failed registering static connection on sendfile runtime");
+                            return;
+                        }
+                    };
+                    gateway
+                        .serve_plain_http_connection_on_owner(
+                            stream, remote_addr, worker_index, initial_prefix,
+                        )
+                        .await;
+                }));
+                return;
+            }
+        }
+
+        self.serve_plain_http_connection_on_owner(
+            stream,
+            remote_addr,
+            worker_index,
+            initial_prefix,
+        )
+        .await;
+    }
+
+    async fn serve_plain_http_connection_on_owner(
         self: Arc<Self>,
         stream: TcpStream,
         remote_addr: SocketAddr,
@@ -11727,6 +11818,13 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+}
+
+fn static_connection_runtime_profile_enabled(
+    performance_enabled: bool,
+    profile: RuntimePerformanceTrafficProfile,
+) -> bool {
+    performance_enabled && matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(target_os = "linux")]
@@ -23137,6 +23235,18 @@ mod tests {
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
+        assert!(static_connection_runtime_profile_enabled(
+            true,
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!static_connection_runtime_profile_enabled(
+            false,
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!static_connection_runtime_profile_enabled(
+            true,
             RuntimePerformanceTrafficProfile::Bulk
         ));
     }
