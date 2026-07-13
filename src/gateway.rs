@@ -1529,8 +1529,6 @@ static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
-static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
-#[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
@@ -1683,11 +1681,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 ),
             Ordering::Relaxed,
         );
-        let sendfile_reactor_divisor = match config.runtime.performance.traffic_profile {
-            RuntimePerformanceTrafficProfile::Balanced => 2,
-            RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 1,
-        };
-        STATIC_SENDFILE_REACTOR_CPU_DIVISOR.store(sendfile_reactor_divisor, Ordering::Relaxed);
         let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
             RuntimePerformanceTrafficProfile::Small => 2,
             RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => {
@@ -4761,10 +4754,15 @@ impl Gateway {
                 prefix: initial_prefix,
             });
         }
+        #[cfg(target_os = "linux")]
+        let native_sendfile_reactor_enabled =
+            STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed);
+        #[cfg(not(target_os = "linux"))]
+        let native_sendfile_reactor_enabled = false;
         let yield_after_sendfile_response = config.runtime.performance.enabled
-            && matches!(
+            && sendfile_post_response_yield_required(
                 config.runtime.performance.traffic_profile,
-                RuntimePerformanceTrafficProfile::Balanced
+                native_sendfile_reactor_enabled,
             );
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
@@ -11515,7 +11513,7 @@ async fn sendfile_all_async(
             in_fd,
             len,
             max_chunk_bytes,
-            sendfile_reactor_workers(),
+            adaptive_data_plane_workers(1),
         ) {
             Ok(completion) => {
                 return completion.await.map_err(|_| {
@@ -11738,17 +11736,11 @@ fn realtime_stream_reactor_workers() -> usize {
     )
 }
 
-#[cfg(any(test, target_os = "linux"))]
-fn sendfile_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
-    cores.max(1).div_ceil(cpu_divisor.max(1))
-}
-
-#[cfg(target_os = "linux")]
-fn sendfile_reactor_workers() -> usize {
-    sendfile_reactor_workers_for(
-        adaptive_data_plane_workers(1),
-        STATIC_SENDFILE_REACTOR_CPU_DIVISOR.load(Ordering::Relaxed),
-    )
+fn sendfile_post_response_yield_required(
+    traffic_profile: RuntimePerformanceTrafficProfile,
+    native_reactor_enabled: bool,
+) -> bool {
+    matches!(traffic_profile, RuntimePerformanceTrafficProfile::Balanced) && !native_reactor_enabled
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
@@ -23142,10 +23134,18 @@ mod tests {
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
         assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
         assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
-        assert_eq!(sendfile_reactor_workers_for(1, 2), 1);
-        assert_eq!(sendfile_reactor_workers_for(4, 2), 2);
-        assert_eq!(sendfile_reactor_workers_for(96, 2), 48);
-        assert_eq!(sendfile_reactor_workers_for(96, 1), 96);
+        assert!(!sendfile_post_response_yield_required(
+            RuntimePerformanceTrafficProfile::Balanced,
+            true
+        ));
+        assert!(sendfile_post_response_yield_required(
+            RuntimePerformanceTrafficProfile::Balanced,
+            false
+        ));
+        assert!(!sendfile_post_response_yield_required(
+            RuntimePerformanceTrafficProfile::Small,
+            false
+        ));
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
     }
