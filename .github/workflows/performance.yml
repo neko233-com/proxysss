@@ -21,6 +21,15 @@ on:
         description: Concurrent HTTP clients per detected CPU core
         required: true
         default: "16"
+      load_scale:
+        description: Scale every HTTP, HTTPS, SSE, WebSocket, TCP, and UDP workload together
+        required: true
+        default: "1"
+      extended_realtime:
+        description: Add opt-in transparent QCP forwarding to the strict mixed matrix
+        required: true
+        type: boolean
+        default: false
       strict_superiority:
         description: Require every scenario and aggregate throughput to beat nginx
         required: true
@@ -70,12 +79,23 @@ jobs:
           DURATION_SECS: ${{ inputs.duration_secs || '10' }}
           STREAM_CONNECTIONS_PER_CORE: ${{ inputs.stream_connections_per_core || '4' }}
           HTTP_CONCURRENCY_PER_CORE: ${{ inputs.http_concurrency_per_core || '16' }}
+          LOAD_SCALE: ${{ inputs.load_scale || '1' }}
+          EXTENDED_REALTIME: ${{ inputs.extended_realtime && '1' || '0' }}
           STRICT_SUPERIORITY: ${{ (github.event_name == 'push' || inputs.strict_superiority) && '1' || '0' }}
         run: |
           set -euo pipefail
+          for value in "$DURATION_SECS" "$STREAM_CONNECTIONS_PER_CORE" "$HTTP_CONCURRENCY_PER_CORE" "$LOAD_SCALE"; do
+            if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+              echo "performance inputs must be positive integers: $value" >&2
+              exit 1
+            fi
+          done
           cores="$(nproc)"
-          stream_connections="$((cores * STREAM_CONNECTIONS_PER_CORE))"
-          http_concurrency="$((cores * HTTP_CONCURRENCY_PER_CORE))"
+          stream_connections="$((cores * STREAM_CONNECTIONS_PER_CORE * LOAD_SCALE))"
+          http_concurrency="$((cores * HTTP_CONCURRENCY_PER_CORE * LOAD_SCALE))"
+          https_concurrency="$((cores * 4 * LOAD_SCALE))"
+          static_large_concurrency="$((cores * LOAD_SCALE))"
+          sse_concurrency="$((cores * LOAD_SCALE))"
           mkdir -p .benchmark
           docker run --rm \
             --network host \
@@ -88,6 +108,10 @@ jobs:
             -e DURATION_SECS="$DURATION_SECS" \
             -e STREAM_CONNECTIONS="$stream_connections" \
             -e CONCURRENCY="$http_concurrency" \
+            -e HTTPS_CONCURRENCY="$https_concurrency" \
+            -e STATIC_LARGE_CONCURRENCY="$static_large_concurrency" \
+            -e SSE_CONCURRENCY="$sse_concurrency" \
+            -e EXTENDED_REALTIME="$EXTENDED_REALTIME" \
             -e STRICT_SUPERIORITY="$STRICT_SUPERIORITY" \
             -e REQUIRE_ZERO_ERRORS="$STRICT_SUPERIORITY" \
             -e REQUIRE_LATENCY_PERCENTILES="$STRICT_SUPERIORITY" \

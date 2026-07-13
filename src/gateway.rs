@@ -1524,6 +1524,8 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
+static STATIC_SENDFILE_COOPERATIVE_YIELD: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
@@ -1666,6 +1668,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 && matches!(
                     config.runtime.performance.traffic_profile,
                     RuntimePerformanceTrafficProfile::Small
+                ),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_COOPERATIVE_YIELD.store(
+            config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Balanced
                 ),
             Ordering::Relaxed,
         );
@@ -11473,6 +11483,7 @@ async fn sendfile_all_async(
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
+    let cooperative_yield = STATIC_SENDFILE_COOPERATIVE_YIELD.load(Ordering::Relaxed);
 
     while sent < len {
         let remaining = len - sent;
@@ -11497,6 +11508,8 @@ async fn sendfile_all_async(
         sent = sent.saturating_add(written as u64);
         if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
             tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+        } else if sent < len && cooperative_yield {
+            tokio::task::yield_now().await;
         }
     }
 

@@ -882,7 +882,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次 chunk 随 traffic profile 自适应为 `small=2 MiB`、`balanced=8 MiB`、`bulk=16 MiB`；默认 small 下加入 125µs 公平 pacing，Range 与 backpressure 语义保持不变。要求同一轮把 small/realtime 与 bulk 都设为严格 gate 时，可显式使用 `TRAFFIC_PROFILE=balanced`；它关闭该 pacing，但仍必须重新通过全部混合场景。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次 chunk 随 traffic profile 自适应为 `small=2 MiB`、`balanced=8 MiB`、`bulk=16 MiB`；默认 small 下加入 125µs 公平 pacing，`balanced` 不做固定 sleep，但每个未完成 chunk 后 cooperative yield 一次，避免共享 HTTP shard 饿死小包任务。Range 与 backpressure 语义保持不变，同轮仍必须重新通过全部混合场景。</p>
             </article>
           </div>
 
@@ -896,7 +896,8 @@ scripts/benchmark-all-scenarios.sh
 scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
-          <p class="subtle">`benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次共享 runner 抖动决定结论。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
+          <p class="subtle">`benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次共享 runner 抖动决定结论。Ubuntu 24 x86_64 workflow 的 `load_scale` 会同时放大 HTTP、HTTPS、static-large、SSE、WebSocket、TCP 与 UDP 并发，禁止只扩大优势路径。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
+          <p class="subtle">默认 nginx 对照矩阵不含 KCP/QCP 协议专用封装；`EXTENDED_REALTIME=1` 只把 `protocol: qcp` 的透明 UDP 转发加入同一 mixed wave，与 nginx 等价 UDP stream 接受同一严格门禁。该结果证明 edge forwarding，不代表 proxysss 在热路径解析或终止 QCP frame。</p>
         </section>
 
         <section id="config-map" class="panel">

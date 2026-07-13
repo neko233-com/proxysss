@@ -7,7 +7,8 @@
 # extra config to match. Static, reverse proxy, and generic SSE still run
 # together with a soft floor; bulk/TLS static are diagnostic unless explicitly
 # promoted to a gate. New API, KCP, and QCP protocol-specific wrappers are not
-# part of this nginx-comparable benchmark matrix.
+# part of the default nginx-comparable matrix; EXTENDED_REALTIME=1 adds an
+# explicitly transparent QCP listener comparison without claiming frame parsing.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -77,6 +78,7 @@ GATE_LATENCY="${GATE_LATENCY:-0}"
 TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-small}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
+EXTENDED_REALTIME="${EXTENDED_REALTIME:-0}"
 
 case "$TRAFFIC_PROFILE" in
   small|balanced|bulk) ;;
@@ -91,6 +93,10 @@ if ! [[ "$BENCHMARK_REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ "$RUN_ORDER" != "nginx proxysss" && "$RUN_ORDER" != "proxysss nginx" ]]; then
   echo "RUN_ORDER must be 'nginx proxysss' or 'proxysss nginx'" >&2
+  exit 1
+fi
+if [[ "$EXTENDED_REALTIME" != "0" && "$EXTENDED_REALTIME" != "1" ]]; then
+  echo "EXTENDED_REALTIME must be 0 or 1" >&2
   exit 1
 fi
 
@@ -234,6 +240,13 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -subj "/CN=localhost" \
   -days 1 >/dev/null 2>&1
 
+QCP_PROXY_LISTENER=""
+QCP_NGINX_LISTENER=""
+if [[ "$EXTENDED_REALTIME" == "1" ]]; then
+  QCP_PROXY_LISTENER=$'    - name: qcp-transparent\n      bind: 127.0.0.1:18310\n      upstream: 127.0.0.1:18301\n      protocol: qcp\n      session_ttl_secs: 30\n      max_associations: 65536'
+  QCP_NGINX_LISTENER=$'    server {\n        listen 127.0.0.1:18312 udp reuseport;\n        proxy_pass udp_echo;\n        proxy_responses 1;\n        proxy_timeout 30s;\n    }'
+fi
+
 cat >"$PROXY_DIR/proxysss.yaml" <<YAML
 config_version: 1
 logging:
@@ -307,6 +320,7 @@ udp:
       upstream: 127.0.0.1:18301
       session_ttl_secs: 30
       max_associations: 65536
+$QCP_PROXY_LISTENER
 YAML
 
 "$PROXY_BIN" -config "$PROXY_DIR/proxysss.yaml" check-config
@@ -414,6 +428,7 @@ stream {
         proxy_responses 1;
         proxy_timeout 30s;
     }
+$QCP_NGINX_LISTENER
 }
 NGINX
 
@@ -607,6 +622,10 @@ warm_udp_gateway "127.0.0.1:18300" 512
 warm_udp_gateway "127.0.0.1:18302" 512
 warm_udp_gateway "127.0.0.1:18300" 1200
 warm_udp_gateway "127.0.0.1:18302" 1200
+if [[ "$EXTENDED_REALTIME" == "1" ]]; then
+  warm_udp_gateway "127.0.0.1:18310" 512
+  warm_udp_gateway "127.0.0.1:18312" 512
+fi
 
 sleep 2
 printf 'hot-update-v2\n' >"$WWW_DIR/hot.dat"
@@ -739,6 +758,10 @@ append_deep_matrix_serial() {
     RESULT_ROWS+=("$(run_udp_bench udp-stream nginx 127.0.0.1:18302)")
     RESULT_ROWS+=("$(run_udp_bench udp-stream proxysss 127.0.0.1:18300)")
   fi
+  if [[ "$EXTENDED_REALTIME" == "1" ]] && scenario_enabled qcp-transparent; then
+    RESULT_ROWS+=("$(run_udp_bench qcp-transparent nginx 127.0.0.1:18312)")
+    RESULT_ROWS+=("$(run_udp_bench qcp-transparent proxysss 127.0.0.1:18310)")
+  fi
 }
 
 append_deep_matrix_mixed() {
@@ -758,6 +781,7 @@ append_deep_matrix_mixed() {
     game-long-connection-nginx game-long-connection-proxysss
     tcp-stream-nginx tcp-stream-proxysss
     udp-stream-nginx udp-stream-proxysss
+    qcp-transparent-nginx qcp-transparent-proxysss
   )
 
   launch_bench() {
@@ -804,6 +828,9 @@ append_deep_matrix_mixed() {
       launch_scenario_bench game-long-connection game-long-connection-nginx run_tcp_bench game-long-connection nginx 127.0.0.1:18202 256
       launch_scenario_bench tcp-stream tcp-stream-nginx run_tcp_bench tcp-stream nginx 127.0.0.1:18202 1024
       launch_scenario_bench udp-stream udp-stream-nginx run_udp_bench udp-stream nginx 127.0.0.1:18302
+      if [[ "$EXTENDED_REALTIME" == "1" ]]; then
+        launch_scenario_bench qcp-transparent qcp-transparent-nginx run_udp_bench qcp-transparent nginx 127.0.0.1:18312
+      fi
     else
       launch_scenario_bench static-small static-small-proxysss run_http_bench static-small proxysss http://127.0.0.1:18083/bench/small.html
       launch_scenario_bench static-large static-large-proxysss run_http_bench static-large proxysss http://127.0.0.1:18083/bench/large.bin
@@ -815,6 +842,9 @@ append_deep_matrix_mixed() {
       launch_scenario_bench game-long-connection game-long-connection-proxysss run_tcp_bench game-long-connection proxysss 127.0.0.1:18200 256
       launch_scenario_bench tcp-stream tcp-stream-proxysss run_tcp_bench tcp-stream proxysss 127.0.0.1:18200 1024
       launch_scenario_bench udp-stream udp-stream-proxysss run_udp_bench udp-stream proxysss 127.0.0.1:18300
+      if [[ "$EXTENDED_REALTIME" == "1" ]]; then
+        launch_scenario_bench qcp-transparent qcp-transparent-proxysss run_udp_bench qcp-transparent proxysss 127.0.0.1:18310
+      fi
     fi
     wait_for_group
   }
