@@ -74,6 +74,15 @@ MAX_LATENCY_RATIO="${MAX_LATENCY_RATIO:-1.0}"
 REQUIRE_LATENCY_PERCENTILES="${REQUIRE_LATENCY_PERCENTILES:-$STRICT_SUPERIORITY}"
 REQUIRE_ZERO_ERRORS="${REQUIRE_ZERO_ERRORS:-$STRICT_SUPERIORITY}"
 GATE_LATENCY="${GATE_LATENCY:-0}"
+TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-small}"
+
+case "$TRAFFIC_PROFILE" in
+  small|balanced|bulk) ;;
+  *)
+    echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$STRICT_SUPERIORITY" == "1" ]]; then
   [[ -z "$MIN_RATIO_SET" ]] && MIN_RATIO=1.0
@@ -237,7 +246,7 @@ runtime:
   performance:
     enabled: true
     profile: edge
-    traffic_profile: small
+    traffic_profile: $TRAFFIC_PROFILE
     adaptive_system: true
     socket_extreme: true
     log_on_start: true
@@ -860,6 +869,7 @@ fi
   --strict-superiority="$STRICT_SUPERIORITY_BOOL" \
   --mixed-matrix="$MIXED_MATRIX_BOOL" \
   --cpu-cores "$CPU_CORES" \
+  --traffic-profile "$TRAFFIC_PROFILE" \
   --http-concurrency "$CONCURRENCY" \
   --https-concurrency "$HTTPS_CONCURRENCY" \
   --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \

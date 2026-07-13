@@ -83,6 +83,7 @@ jobs:
             -e BUILD_PROFILE=release \
             -e FORCE_BUILD=0 \
             -e MIXED_MATRIX=1 \
+            -e TRAFFIC_PROFILE=balanced \
             -e DURATION_SECS="$DURATION_SECS" \
             -e STREAM_CONNECTIONS="$stream_connections" \
             -e CONCURRENCY="$http_concurrency" \

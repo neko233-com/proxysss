@@ -973,6 +973,7 @@ func runWriteAllScenariosSummary(args []string) error {
 	phase := fs.String("phase", "saturation", "benchmark phase label")
 	mixedMatrix := fs.Bool("mixed-matrix", true, "whether results came from mixed matrix")
 	cpuCores := fs.String("cpu-cores", "", "detected cores")
+	trafficProfile := fs.String("traffic-profile", "unspecified", "runtime performance traffic profile")
 	httpConcurrency := fs.String("http-concurrency", "", "http concurrency")
 	httpsConcurrency := fs.String("https-concurrency", "", "https concurrency")
 	staticLargeConcurrency := fs.String("static-large-concurrency", "", "static large concurrency")
@@ -1063,6 +1064,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		fmt.Sprintf("- Measurement phase: `%s`", *phase),
 		fmt.Sprintf("- Interleaved samples per gateway: `%d` (median metrics, maximum observed errors)", *samplesPerGateway),
 		fmt.Sprintf("- Detected CPU cores: `%s`", *cpuCores),
+		fmt.Sprintf("- Runtime traffic profile: `%s`", *trafficProfile),
 		fmt.Sprintf("- Auto concurrency: HTTP `%s`, HTTPS `%s`, static-large `%s`, SSE `%s`, TCP/UDP/WebSocket `%s`", *httpConcurrency, *httpsConcurrency, *staticLargeConcurrency, *sseConcurrency, *streamConnections),
 		fmt.Sprintf("- Non-critical minimum proxysss/nginx ops ratio: `%.2f` except diagnostic scenarios `%s`", *minRatio, strings.Join(sortedSetMembers(diagnosticSet), ", ")),
 		fmt.Sprintf("- SSE stream error tolerance: `proxysss <= nginx + %d`", *sseTolerance),
@@ -1134,7 +1136,7 @@ func runWriteAllScenariosSummary(args []string) error {
 	if err := os.WriteFile(*mdPath, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(*htmlPath, []byte(buildAllScenariosHTML(byScenario, ratioPairs, aggregate)), 0o644); err != nil {
+	if err := os.WriteFile(*htmlPath, []byte(buildAllScenariosHTML(byScenario, ratioPairs, aggregate, *trafficProfile)), 0o644); err != nil {
 		return err
 	}
 
@@ -1185,7 +1187,7 @@ func runWriteAllScenariosSummary(args []string) error {
 func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []struct {
 	Scenario string
 	Ratio    float64
-}, aggregate float64) string {
+}, aggregate float64, trafficProfile string) string {
 	var bodyRows strings.Builder
 	for _, item := range ratios {
 		proxy := byScenario[item.Scenario]["proxysss"]
@@ -1221,6 +1223,7 @@ func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []s
 <body>
   <main>
     <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>%s</strong></p>
     <p>Aggregate proxysss/nginx ratio: <strong>%.3fx</strong></p>
     <table>
       <thead>
@@ -1230,7 +1233,7 @@ func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []s
     </table>
   </main>
 </body>
-</html>`, aggregate, bodyRows.String())
+</html>`, html.EscapeString(trafficProfile), aggregate, bodyRows.String())
 }
 
 func runPrintResultsSummary(args []string) error {

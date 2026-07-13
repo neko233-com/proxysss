@@ -882,7 +882,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次最多 2 MiB；small traffic profile 下加入 125µs 公平 pacing，Range 与 backpressure 语义保持不变。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder，不重复 HTTP/1 协议探测；TLS accept、handshake 与 H2 connection 全程留在同一个 shard，避免跨 runtime wake。`SO_REUSEPORT` shard 数来自进程 cpuset。H2 小静态热对象以 immutable `Bytes` 直接应答，并用 stale-while-revalidate 避免每请求 metadata syscall。大静态文件复用缓存 fd 并走 Linux `sendfile`，单次最多 2 MiB；默认 small traffic profile 下加入 125µs 公平 pacing，Range 与 backpressure 语义保持不变。要求同一轮把 small/realtime 与 bulk 都设为严格 gate 时，可显式使用 `TRAFFIC_PROFILE=balanced`；它关闭该 pacing，但仍必须重新通过全部混合场景。</p>
             </article>
           </div>
 
