@@ -1485,11 +1485,9 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const STATIC_SENDFILE_HANDOFF_PREFIX_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1530,8 +1528,6 @@ static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
-#[cfg(target_os = "linux")]
-static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
@@ -1683,13 +1679,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 ),
             Ordering::Relaxed,
         );
-        let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
-            RuntimePerformanceTrafficProfile::Small => 2,
-            RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => {
-                4
-            }
-        };
-        REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
             RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_CHUNK_BYTES,
             RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_CHUNK_BYTES,
@@ -4756,15 +4745,10 @@ impl Gateway {
                 prefix: initial_prefix,
             });
         }
-        #[cfg(target_os = "linux")]
-        let native_sendfile_reactor_enabled =
-            STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed);
-        #[cfg(not(target_os = "linux"))]
-        let native_sendfile_reactor_enabled = false;
         let yield_after_sendfile_response = config.runtime.performance.enabled
-            && sendfile_post_response_yield_required(
+            && matches!(
                 config.runtime.performance.traffic_profile,
-                native_sendfile_reactor_enabled,
+                RuntimePerformanceTrafficProfile::Balanced
             );
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
@@ -11513,49 +11497,18 @@ async fn sendfile_all_async(
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
-        // Fill the initial nonblocking socket window behind the already-corked
-        // response head on the CPU-local HTTP shard. The 2 MiB budget matches
-        // nginx's modern sendfile_max_chunk default; only the backpressured
-        // remainder pays cross-thread handoff costs.
-        let prefix_budget = len.min(STATIC_SENDFILE_HANDOFF_PREFIX_BYTES);
-        while sent < prefix_budget {
-            let prefix_count = (prefix_budget - sent) as usize;
-            let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, prefix_count) };
-            if written > 0 {
-                sent = sent.saturating_add(written as u64);
-                continue;
-            }
-            if written == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "sendfile source ended before configured length",
-                ));
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                break;
-            }
-            return Err(error);
-        }
-        if sent >= len {
-            return Ok(sent);
-        }
         match crate::sendfile_reactor::dispatch(
             out_fd,
             in_fd,
-            offset as u64,
-            len - sent,
+            0,
+            len,
             max_chunk_bytes,
             adaptive_data_plane_workers(1),
         ) {
             Ok(completion) => {
-                let reactor_sent = completion.await.map_err(|_| {
+                return completion.await.map_err(|_| {
                     std::io::Error::other("sendfile reactor stopped before job completion")
-                })??;
-                return Ok(sent.saturating_add(reactor_sent));
+                })?;
             }
             Err(error) => {
                 tracing::debug!(
@@ -11752,13 +11705,12 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
+fn realtime_stream_reactor_workers_for(cores: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
-    // running a permanently-ready reactor alongside every HTTP shard. The
-    // realtime-first profile uses one owner per two CPUs; balanced/bulk use one
-    // per four so mixed HTTP/TLS/UDP retains scheduler capacity. Both remain
-    // proportional on high-core hosts; HTTP accept fanout stays fully per-core.
-    cores.max(1).div_ceil(cpu_divisor.max(1))
+    // running a permanently-ready reactor alongside every HTTP shard. One
+    // owner per two CPUs preserves stream scale while leaving mixed HTTP/TLS/
+    // UDP work enough scheduler capacity; HTTP still keeps full per-core fanout.
+    cores.max(1).div_ceil(2)
 }
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
@@ -11767,17 +11719,7 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(target_os = "linux")]
 fn realtime_stream_reactor_workers() -> usize {
-    realtime_stream_reactor_workers_for(
-        adaptive_data_plane_workers(1),
-        REALTIME_STREAM_REACTOR_CPU_DIVISOR.load(Ordering::Relaxed),
-    )
-}
-
-fn sendfile_post_response_yield_required(
-    traffic_profile: RuntimePerformanceTrafficProfile,
-    native_reactor_enabled: bool,
-) -> bool {
-    matches!(traffic_profile, RuntimePerformanceTrafficProfile::Balanced) && !native_reactor_enabled
+    realtime_stream_reactor_workers_for(adaptive_data_plane_workers(1))
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
@@ -23166,23 +23108,9 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
-        assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
-        assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
-        assert!(!sendfile_post_response_yield_required(
-            RuntimePerformanceTrafficProfile::Balanced,
-            true
-        ));
-        assert!(sendfile_post_response_yield_required(
-            RuntimePerformanceTrafficProfile::Balanced,
-            false
-        ));
-        assert!(!sendfile_post_response_yield_required(
-            RuntimePerformanceTrafficProfile::Small,
-            false
-        ));
+        assert_eq!(realtime_stream_reactor_workers_for(1), 1);
+        assert_eq!(realtime_stream_reactor_workers_for(4), 2);
+        assert_eq!(realtime_stream_reactor_workers_for(96), 48);
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
     }
