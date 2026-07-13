@@ -25,7 +25,6 @@ use tokio::sync::oneshot;
 const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const WAKE_TOKEN: u64 = u64::MAX;
-const MODERATE_CONTENTION_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const HIGH_CONTENTION_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
 struct SendfileJob {
@@ -338,8 +337,7 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
 
 fn sendfile_event_chunk_bytes(configured_max: u64, active_jobs: usize) -> u64 {
     match active_jobs {
-        0..=2 => configured_max,
-        3 => configured_max.min(MODERATE_CONTENTION_CHUNK_BYTES),
+        0..=3 => configured_max,
         _ => configured_max.min(HIGH_CONTENTION_CHUNK_BYTES),
     }
     .max(1)
@@ -498,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             sendfile_event_chunk_bytes(16 * 1024 * 1024, 3),
-            8 * 1024 * 1024
+            16 * 1024 * 1024
         );
         assert_eq!(
             sendfile_event_chunk_bytes(16 * 1024 * 1024, 4),
