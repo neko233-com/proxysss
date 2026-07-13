@@ -1524,6 +1524,8 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
@@ -1664,6 +1666,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_QOS_ENABLED.store(
             config.runtime.performance.enabled
                 && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Small
+                ),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_REACTOR_ENABLED.store(
+            config.runtime.performance.enabled
+                && !matches!(
                     config.runtime.performance.traffic_profile,
                     RuntimePerformanceTrafficProfile::Small
                 ),
@@ -11482,6 +11492,28 @@ async fn sendfile_all_async(
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
+
+    if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+        match crate::sendfile_reactor::dispatch(
+            out_fd,
+            in_fd,
+            len,
+            max_chunk_bytes,
+            adaptive_data_plane_workers(1),
+        ) {
+            Ok(completion) => {
+                return completion.await.map_err(|_| {
+                    std::io::Error::other("sendfile reactor stopped before job completion")
+                })?;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "sendfile reactor unavailable; using Tokio readiness"
+                );
+            }
+        }
+    }
 
     while sent < len {
         let remaining = len - sent;
