@@ -230,7 +230,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
                 0
             };
             let flags = event.events as i32;
-            if flags & (libc::EPOLLERR | libc::EPOLLHUP) != 0 {
+            if flags & libc::EPOLLERR != 0 {
                 close_pair(epoll_fd, &mut sockets, fd);
                 continue;
             }
@@ -244,7 +244,13 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
                 close_pair(epoll_fd, &mut sockets, fd);
                 continue;
             }
-            if flags & libc::EPOLLRDHUP != 0 && flags & libc::EPOLLIN == 0 {
+            // HUP/RDHUP can arrive together with EPOLLIN while the peer's
+            // final bytes are still queued. Drain readable data before
+            // propagating half-close so tail frames cannot be discarded.
+            if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) != 0
+                && flags & libc::EPOLLIN == 0
+                && sockets.get(&fd).is_some_and(|state| state.read_enabled)
+            {
                 if !mark_read_closed(epoll_fd, &mut sockets, fd) {
                     close_pair(epoll_fd, &mut sockets, fd);
                     continue;
@@ -609,11 +615,12 @@ mod tests {
         let mut eof = [0_u8; 1];
         assert_eq!(backend.read(&mut eof).unwrap(), 0);
 
-        backend.write_all(b"pong").unwrap();
+        let pong = vec![0x5a_u8; RELAY_BUFFER_BYTES * 2 + 17];
+        backend.write_all(&pong).unwrap();
         backend.shutdown(Shutdown::Write).unwrap();
-        let mut pong = [0_u8; 4];
-        client.read_exact(&mut pong).unwrap();
-        assert_eq!(&pong, b"pong");
+        let mut received = vec![0_u8; pong.len()];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, pong);
         assert_eq!(client.read(&mut eof).unwrap(), 0);
     }
 }
