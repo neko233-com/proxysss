@@ -1764,7 +1764,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     );
     #[cfg(target_os = "linux")]
     {
-        let data_plane_cores = adaptive_data_plane_workers(1);
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
         SHARED_BALANCED_UDP_RUNTIMES.store(
             config.runtime.performance.enabled
@@ -1776,7 +1775,7 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             Ordering::Relaxed,
         );
         TLS_HTTP_RUNTIME_NICE.store(
-            tls_http_runtime_nice_for(config.runtime.performance.traffic_profile, data_plane_cores),
+            tls_http_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         UDP_RUNTIME_CPU_DIVISOR.store(
@@ -1812,10 +1811,7 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             realtime_stream_reactor_cpu_divisor(config.runtime.performance.traffic_profile);
         REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
         REALTIME_STREAM_REACTOR_NICE.store(
-            realtime_stream_reactor_nice_for(
-                config.runtime.performance.traffic_profile,
-                data_plane_cores,
-            ),
+            realtime_stream_reactor_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
@@ -12046,24 +12042,11 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn realtime_stream_reactor_nice_for(
-    profile: RuntimePerformanceTrafficProfile,
-    cores: usize,
-) -> i32 {
-    let base = match profile {
+fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
-    };
-    if !matches!(profile, RuntimePerformanceTrafficProfile::Small)
-        && sparse_worker_floor_is_active(cores, realtime_stream_reactor_cpu_divisor(profile))
-    {
-        // Two nice +8 workers have approximately the same aggregate CFS
-        // weight as the former single nice +5 worker. Preserve the mixed-load
-        // CPU budget while removing single-owner head-of-line blocking.
-        base + 3
-    } else {
-        base
     }
 }
 
@@ -12089,27 +12072,12 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile, cores: usize) -> i32 {
-    let base = match profile {
+fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
-    };
-    if !matches!(profile, RuntimePerformanceTrafficProfile::Small)
-        && sparse_worker_floor_is_active(cores, tls_http_runtime_cpu_divisor(profile))
-    {
-        // Two nice +6 workers retain the aggregate CFS share of the former
-        // single nice +3 crypto worker instead of silently doubling TLS weight.
-        base + 3
-    } else {
-        base
     }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn sparse_worker_floor_is_active(cores: usize, cpu_divisor: usize) -> bool {
-    let cores = cores.max(1);
-    sparse_runtime_workers_for(cores, cpu_divisor) > cores.div_ceil(cpu_divisor.max(1))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23859,19 +23827,15 @@ mod tests {
             4
         );
         assert_eq!(
-            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Small, 2),
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
-            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced, 2),
-            8
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            5
         );
         assert_eq!(
-            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk, 4),
-            8
-        );
-        assert_eq!(
-            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced, 8),
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             5
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
@@ -23904,23 +23868,15 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(4, 4), 2);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
         assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small, 2),
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced, 2),
-            6
-        );
-        assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk, 4),
-            8
-        );
-        assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced, 8),
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
             3
         );
         assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk, 8),
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             5
         );
         assert_eq!(
