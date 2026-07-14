@@ -1552,27 +1552,30 @@ static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
-        // Keep one accept socket per CPU, but let established connections move
-        // across the CPU-sized runtime. SO_REUSEPORT hashing is deliberately
-        // connection-stable, not load-aware: fixed one-thread ownership makes
-        // a hot keep-alive bucket strand idle CPUs during mixed HTTP/SSE/file
-        // waves. Tokio work stealing removes that imbalance while accept and
-        // connection I/O still stay inside the same dedicated runtime.
-        let worker_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
+        // one reactor thread. This avoids work-stealing and global-queue costs
+        // under sustained static/reverse-proxy load. TLS connections remain on
+        // the accepting shard so rustls sockets are never migrated mid-flight.
+        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
         tracing::info!(
-            runtime_workers = worker_count,
-            "starting work-stealing plain HTTP data runtime"
+            runtime_shards = shard_count,
+            "starting sharded plain HTTP data runtimes"
         );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(worker_count)
-            .thread_name("proxysss-http")
-            .global_queue_interval(2)
-            .event_interval(3)
-            .enable_all();
-        vec![builder
-            .build()
-            .expect("failed to build proxysss HTTP data runtime")]
+        (0..shard_count)
+            .map(|shard_index| {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
+                    .worker_threads(1)
+                    .thread_name(format!("proxysss-http-{shard_index}"))
+                    .global_queue_interval(2)
+                    .event_interval(3)
+                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
+                    .enable_all();
+                builder
+                    .build()
+                    .expect("failed to build proxysss HTTP runtime shard")
+            })
+            .collect()
     })
 }
 
@@ -1631,6 +1634,24 @@ fn data_plane_cpu_ids() -> &'static [usize] {
         cpus
     })
 }
+
+#[cfg(target_os = "linux")]
+fn pin_current_data_plane_thread(worker_index: usize) {
+    let cpus = data_plane_cpu_ids();
+    let cpu = cpus[worker_index % cpus.len()];
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_data_plane_thread(_worker_index: usize) {}
 
 fn spawn_http_connection<Connection>(
     performance_enabled: bool,
