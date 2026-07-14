@@ -1508,7 +1508,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead every 8 requests. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
@@ -1541,6 +1541,8 @@ static STATIC_SENDFILE_RESPONSES_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
@@ -1714,6 +1716,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
+        STATIC_SENDFILE_REACTOR_NICE.store(
+            sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
     }
     plan
 }
@@ -11642,6 +11648,7 @@ async fn sendfile_all_async(
             len,
             max_chunk_bytes,
             reactor_workers,
+            STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
             Ok(completion) => {
                 return completion.await.map_err(|_| {
@@ -11924,6 +11931,14 @@ fn balanced_sendfile_reactor_density_reached(active: usize, cores: usize) -> boo
 #[cfg(any(test, target_os = "linux"))]
 fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
     cores.max(1).div_ceil(2)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23645,6 +23660,18 @@ mod tests {
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
         assert_eq!(balanced_sendfile_reactor_workers_for(4), 2);
         assert_eq!(balanced_sendfile_reactor_workers_for(96), 48);
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
+            0
+        );
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            1
+        );
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
+            0
+        );
     }
 
     #[test]

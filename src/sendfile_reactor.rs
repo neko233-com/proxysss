@@ -69,13 +69,14 @@ pub(crate) fn dispatch(
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
+    scheduler_nice: i32,
 ) -> io::Result<oneshot::Receiver<io::Result<u64>>> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
         let _ = sender.send(Ok(0));
         return Ok(receiver);
     }
-    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
     let socket = duplicate_stream(socket_fd)?;
     let file = duplicate_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
@@ -98,7 +99,7 @@ pub(crate) fn dispatch(
 }
 
 impl Reactors {
-    fn start(requested_workers: usize) -> Self {
+    fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
@@ -113,7 +114,7 @@ impl Reactors {
             let cpu = allowed_cpus.get(index % allowed_cpus.len()).copied();
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu))
+                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
         }
@@ -150,10 +151,11 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
+fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i32) {
     if let Some(cpu) = cpu {
         pin_current_thread(cpu);
     }
+    set_current_thread_nice(scheduler_nice);
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating sendfile epoll instance");
     let mut wake_event = libc::epoll_event {
@@ -364,6 +366,18 @@ fn pin_current_thread(cpu: usize) {
     }
 }
 
+fn set_current_thread_nice(scheduler_nice: i32) {
+    if scheduler_nice <= 0 {
+        return;
+    }
+    // Linux applies setpriority to the calling task (native thread). Positive
+    // nice values need no elevated capability and preserve full idle-CPU use;
+    // they only give HTTP shards more CFS weight when both paths are runnable.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, scheduler_nice);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +412,7 @@ mod tests {
             (expected.len() - start) as u64,
             16 * 1024,
             1,
+            0,
         )
         .unwrap();
         drop(server);

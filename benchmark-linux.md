@@ -169,7 +169,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 ## 5. CI 和 benchmark 的边界
 
-默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
+默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact。GitHub Actions 中禁止自动或手动 workflow 运行 test、smoke 或性能 benchmark；性能验证必须直连专用 Linux 主机或 Ubuntu 24 x86_64 Docker 容器。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
 
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
@@ -194,7 +194,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 这里要把话说清楚：
 
-- **GitHub-hosted Linux benchmark** 只适合手动诊断或临时验证，不再是默认 CI 发布门槛
+- **GitHub-hosted Linux benchmark 禁止使用**；诊断和正式证据都必须来自直连专机，Actions 只做打包
 - `KCP`、`QCP` 是 proxysss 独立 UDP listener 能力，不进入当前 nginx 对标性能矩阵
 - 真正的 `realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
 - Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`

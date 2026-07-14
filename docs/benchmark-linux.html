@@ -459,7 +459,7 @@ bash scripts/benchmark-websocket-production-gate.sh</code></pre>
         <div class="two-up">
           <div class="note">
             <strong>默认 CI：</strong>
-            <p>现在只做六个平台 release binary 构建、打包、上传 artifact，不再自动跑 test、smoke 或性能 benchmark。</p>
+            <p>现在只做六个平台 release binary 构建、打包、上传 artifact；禁止自动或手动 workflow 运行 test、smoke 或性能 benchmark。</p>
           </div>
           <div class="note">
             <strong>手动 benchmark：</strong>
@@ -474,7 +474,7 @@ bash scripts/benchmark-websocket-production-gate.sh</code></pre>
         <div class="two-up">
           <div class="note">
             <strong>GitHub-hosted runner：</strong>
-            <p>只适合手动诊断或临时验证，不再是默认 CI 发布门槛；hosted runner 上的 UDP 噪声仍只适合看趋势。</p>
+            <p>禁止用于性能诊断或正式压测；Actions 只负责打包，性能证据必须来自直连专机。</p>
           </div>
           <div class="note">
             <strong>专门调优过的 Linux 主机：</strong>
@@ -516,7 +516,7 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
     </div>
 
     <div class="footer">
-      默认 CI 现在只负责打包；性能判断继续走 Linux mixed-load 和必要的单场景诊断。v1.3.5 的 UDP fast path 当前专项结果是 4.045x，历史 mixed-load 表只作为整体基线保留。
+      GitHub Actions 只负责打包且禁止性能压测；性能判断必须直连 Linux 专机运行 mixed-load 和必要的单场景诊断。v1.3.5 的 UDP fast path 当前专项结果是 4.045x，历史 mixed-load 表只作为整体基线保留。
     </div>
   </div>
 </body>
