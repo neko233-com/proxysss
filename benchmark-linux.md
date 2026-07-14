@@ -20,7 +20,7 @@
 
 这说明 `0.855x` / `0.861x` 那组旧数字不能再当成当前 UDP fast path 的结论。它们是 v1.3.0 附近 mixed-load 历史报告里的 UDP 行，当时 UDP 还没有现在的 sharded pending-session dedupe、池化 recv buffer、批量 response drain、policy-free single-upstream direct fast path。
 
-KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 benchmark 矩阵。当前 benchmark 只覆盖普通 UDP 转发；KCP/QCP 的协议语义由各自上游服务和功能验证负责，不拿 nginx 做伪对照。
+KCP 和 QCP 仍然是两套独立 UDP listener 能力。协议终止语义不拿 nginx 做伪对照；严格本机矩阵只把 `protocol: qcp` 标记的透明 UDP edge forwarding 与 nginx 等价 UDP listener 对比，KCP/QCP frame 语义仍由各自上游服务和功能验证负责。
 
 ## 3. 历史 mixed-load 跑分基线（旧矩阵，仅供对照）
 
@@ -81,15 +81,15 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力，但不进入性能 bench
 - `tcp-stream`
 - `udp-stream`
 
-这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、静态或 reverse proxy 退了，那不算成功。KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
+这也是为什么仓库一直强调：**性能优化必须无副作用**。如果 SSE 更快了，但 WebSocket、TCP、UDP、透明 QCP、静态或 reverse proxy 退了，那不算成功。QCP 在严格本机矩阵中只验证透明 edge forwarding，不声称协议终止。
 
 ### 4.1 三阶段公平判定，不能混用吞吐与延迟口径
 
-`scripts/benchmark-all-scenarios-isolated.sh` 把 4c gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。
+`scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认是 4+4+8 CPU，也允许本机 wrapper 按 Docker 可用核数等比例切分；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
 
 它分三阶段输出 JSON、Markdown、HTML 与百分比表。mixed saturation 与 equal offered load 默认交错运行 4 次，serial isolated saturation 默认 3 次，并对 ops/s、p50、p95、p99 取中位数；任一轮出现错误时聚合结果保留最大错误数，不能用中位数掩盖不稳定：
 
-1. `mixed saturation`：十个场景同时跑，只判聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
+1. `mixed saturation`：十一个场景（含透明 QCP）同时跑，只判逐场景/聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
 2. `isolated saturation`：每次只跑一个场景并交替先后顺序，判单场景最大吞吐/容量。
 3. `equal offered load`：从两边较慢的饱和吞吐取 70%，固定发送间隔；双方必须完成至少 98% 目标负载，并且 proxysss 的 p50/p95/p99 都严格低于 nginx。
 
@@ -173,9 +173,9 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
-- `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 benchmark 容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
+- `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64，在容器内构建当前 checkout，并把 gateway/backend/client 分配到互不重叠的 cpuset。默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档同时跑 mixed saturation 与 equal-offered-load，要求零错误、逐场景吞吐和延迟严格胜出。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
 
-这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home`、`.benchmark/ubuntu24-amd64-target` 与 `.benchmark/ubuntu24-amd64-vendors` 复用 Cargo registry/target 和同版本优化 nginx 产物；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`SCENARIO_FILTER='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；正式证据必须清空 filter、保留全部场景并使用多轮交错顺序。
+这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home` 与 `.benchmark/ubuntu24-amd64-target` 复用 Cargo registry/target，优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；正式证据必须清空 filter、保留全部场景并使用至少四轮交错顺序。
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
@@ -198,7 +198,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 这里要把话说清楚：
 
 - **GitHub-hosted Linux benchmark 禁止使用**；诊断可以来自本机 Ubuntu 24 amd64 Docker，原生生产证据来自专机，Actions 只做打包
-- `KCP`、`QCP` 是 proxysss 独立 UDP listener 能力，不进入当前 nginx 对标性能矩阵
+- `KCP`、`QCP` 是 proxysss 独立 UDP listener 能力；严格本机矩阵只对标 QCP-labelled 透明 UDP forwarding，不对标 KCP/QCP frame termination
 - 真正的 `realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
 - Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`
 

@@ -1,3 +1,6 @@
+ARG DOCKER_CLI_VERSION=29
+FROM docker:${DOCKER_CLI_VERSION}-cli AS docker-cli
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,5 +29,7 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN rustup default stable
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /work

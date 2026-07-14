@@ -867,7 +867,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Validation</span>
               <h3>只赢一项，不算赢</h3>
-              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 都要一起看；角色隔离脚本默认交错跑 3 次并比较中位数，任一轮错误取最大值，equal-offered-load 再严格判 p50/p95/p99。KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前 nginx 对标矩阵。</p>
+              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 与透明 QCP 都要一起看；角色隔离脚本的 mixed/equal-load 默认交错跑 4 次并比较中位数，任一轮错误取最大值，equal-offered-load 再严格判 p50/p95/p99。KCP/QCP frame termination 不拿 nginx 做伪对照；QCP 行只验证与等价 nginx UDP listener 的透明 edge forwarding。</p>
             </article>
             <article class="card">
               <span class="tag expert">Fast lane</span>
@@ -897,8 +897,8 @@ scripts/benchmark-all-scenarios.sh
 scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
-          <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 是禁止 GitHub Actions 性能压测后的本机/原生 Docker 入口：硬校验 benchmark 容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，再把 HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大，逐档要求零错误和严格 `>1.0`，原始证据保存在 `.benchmark/direct-ubuntu24-amd64/`。arm64 daemon 使用 `linux/amd64` 模拟时明确记录 `execution_mode=emulated-amd64`；双方承受相同模拟成本，但结果不能冒充物理 x86。底层 `benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次抖动决定结论。static-large 严格基线从每核 2 条流开始，双方完全相同，避免每核仅 1 条时 `SO_REUSEPORT` hash placement 主导稀疏样本。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
-          <p class="subtle">默认 nginx 对照矩阵不含 KCP/QCP 协议专用封装；`EXTENDED_REALTIME=1` 只把 `protocol: qcp` 的透明 UDP 转发加入同一 mixed wave，与 nginx 等价 UDP stream 接受同一严格门禁。该结果证明 edge forwarding，不代表 proxysss 在热路径解析或终止 QCP frame。</p>
+          <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 是禁止 GitHub Actions 性能压测后的本机/原生 Docker 入口：硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64，在容器内构建当前 checkout，并把 gateway、backend、load client 固定到互不重叠的 cpuset/cgroup。这样更快的 closed-loop TCP/UDP 不会让 client/backend 多消耗 CPU、反向饿死同轮 HTTP。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大；逐档同时判 mixed saturation 吞吐和 equal-offered-load p50/p95/p99，要求零错误、逐场景与聚合严格胜出。arm64 daemon 明确记录 `execution_mode=emulated-amd64`，不能冒充物理 x86。底层 `benchmark-all-scenarios-isolated.sh` 默认按 4+4+8 CPU 分配，也允许本机 wrapper 按 Docker 可用核数等比例切分，报告从实际 gateway cpuset 计算核数。nginx 1.31.2 mainline 使用 `-O3 -fno-plt`、相同 gateway cpuset 与等价协议配置。mixed/equal-load 默认交错运行 4 次并取中位数，任一轮错误取最大值；serial isolated saturation 可另跑 3 次做诊断，但不能替代 mixed gate。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。Docker role isolation 不能冒充三台物理机。</p>
+          <p class="subtle">严格矩阵中的 `protocol: qcp` 是透明 UDP edge forwarding：proxysss 与 nginx 等价 UDP listener 接受相同负载和门禁。该结果不代表 proxysss 在热路径解析或终止 QCP frame；KCP 专用封装仍不进入默认 nginx head-to-head 矩阵。</p>
         </section>
 
         <section id="config-map" class="panel">

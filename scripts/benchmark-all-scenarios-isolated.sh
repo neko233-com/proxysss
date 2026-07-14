@@ -34,6 +34,8 @@ BACKEND_MEMORY="${BACKEND_MEMORY:-}"
 CLIENT_MEMORY="${CLIENT_MEMORY:-}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-300000}"
 NGINX_WORKERS="${NGINX_WORKERS:-4}"
+TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-balanced}"
+BENCH_PLATFORM="${BENCH_PLATFORM:-linux/amd64}"
 HTTP_CONCURRENCY="${HTTP_CONCURRENCY:-64}"
 HTTPS_CONCURRENCY="${HTTPS_CONCURRENCY:-16}"
 STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-4}"
@@ -159,6 +161,15 @@ validate_role_cpusets() {
 }
 
 validate_role_cpusets
+GATEWAY_CPU_CORES="$(cpuset_cpu_ids "$GATEWAY_CPUSET" | wc -l | tr -d '[:space:]')"
+[[ "$GATEWAY_CPU_CORES" =~ ^[1-9][0-9]*$ ]] || {
+  echo "cannot determine gateway CPU count from $GATEWAY_CPUSET" >&2
+  exit 1
+}
+case "$TRAFFIC_PROFILE" in
+  small|balanced|bulk) ;;
+  *) echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2; exit 1 ;;
+esac
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]] \
   && (( BENCHMARK_REPETITIONS < 4 || BENCHMARK_REPETITIONS % 2 != 0 )); then
   echo "BENCHMARK_REPETITIONS must be an even number >= 4 for balanced gateway order" >&2
@@ -169,7 +180,7 @@ mkdir -p "$RUN_DIR" "$CONTEXT_DIR" "$WWW_DIR"
 go build -o "$HELPER" "$ROOT/scripts/benchmark-helper.go"
 cp "$PROXY_BIN" "$CONTEXT_DIR/proxysss"
 cp "$ROOT/docker/isolated-websocket-bench.Dockerfile" "$CONTEXT_DIR/Dockerfile"
-docker build --build-arg NGINX_VERSION=1.31.2 -t "$IMAGE" "$CONTEXT_DIR" >/dev/null
+docker build --platform "$BENCH_PLATFORM" --build-arg NGINX_VERSION=1.31.2 -t "$IMAGE" "$CONTEXT_DIR" >/dev/null
 
 cat >"$WWW_DIR/small.html" <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"><title>small bench</title></head><body><h1>proxysss isolated mixed benchmark</h1><p>same payload for both gateways.</p></body></html>
@@ -208,7 +219,7 @@ runtime:
   performance:
     enabled: true
     profile: edge
-    traffic_profile: small
+    traffic_profile: ${TRAFFIC_PROFILE}
     adaptive_system: true
     socket_extreme: true
   hot_reload:
@@ -255,6 +266,12 @@ udp:
       upstream: ${BACKEND_IP}:18301
       session_ttl_secs: 30
       max_associations: 65536
+    - name: qcp-transparent
+      bind: 0.0.0.0:18310
+      upstream: ${BACKEND_IP}:18301
+      protocol: qcp
+      session_ttl_secs: 30
+      max_associations: 65536
 YAML
 }
 
@@ -295,6 +312,7 @@ stream {
   server { listen 0.0.0.0:18200 backlog=65536 reuseport; proxy_pass tcp_echo; proxy_connect_timeout 1s; proxy_timeout 30s; tcp_nodelay on; }
   upstream udp_echo { server ${BACKEND_IP}:18301; }
   server { listen 0.0.0.0:18300 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
+  server { listen 0.0.0.0:18310 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
 }
 NGINX
 }
@@ -382,6 +400,7 @@ declare -A LATENCY_INTERVALS=()
 ALL_SCENARIOS=(
   static-small static-large cdn-hot-update https-static-small reverse-proxy
   generic-sse websocket-long-connection game-long-connection tcp-stream udp-stream
+  qcp-transparent
 )
 SCENARIOS=("${ALL_SCENARIOS[@]}")
 if [[ -n "$ISOLATED_SCENARIOS" ]]; then
@@ -472,6 +491,7 @@ run_candidate() {
   scenario_requested "$only_scenario" game-long-connection && launch_client "$phase" "$kind" game-long-connection tcp "${GATEWAY_IP}:18200" "$STREAM_CONNECTIONS" tcp --addr "${GATEWAY_IP}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
   scenario_requested "$only_scenario" tcp-stream && launch_client "$phase" "$kind" tcp-stream tcp "${GATEWAY_IP}:18200" "$STREAM_CONNECTIONS" tcp --addr "${GATEWAY_IP}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024
   scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${GATEWAY_IP}:18300" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
+  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${GATEWAY_IP}:18310" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
 
   sleep "$SAMPLE_AFTER_SECS"
   local name row_scenario protocol target concurrency gateway result_phase
@@ -585,7 +605,7 @@ if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     --udp-error-tolerance 0 --aggregate-ratio 1.0 --max-latency-ratio 1.0 \
     --require-latency-percentiles=false --require-zero-errors=true \
     --gate-ops=true --gate-latency=false --min-target-achievement=0 --phase=saturation \
-    --strict-superiority="$strict" --mixed-matrix=true --cpu-cores 4 \
+    --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
     --samples-per-gateway "$BENCHMARK_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -598,12 +618,12 @@ if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
   "$HELPER" write-all-scenarios-summary \
     --results "$ISOLATED_RESULTS_JSON" --md "$ISOLATED_SUMMARY_MD" --html "$ISOLATED_SUMMARY_HTML" \
     --min-ratio 1.0 --critical-ratio 1.0 \
-    --critical-scenarios "websocket-long-connection game-long-connection tcp-stream udp-stream" \
+    --critical-scenarios "websocket-long-connection game-long-connection tcp-stream udp-stream qcp-transparent" \
     --diagnostic-scenarios "" --sse-error-tolerance 0 --websocket-error-tolerance 0 \
     --udp-error-tolerance 0 --aggregate-ratio 1.0 --max-latency-ratio 1.0 \
     --require-latency-percentiles=false --require-zero-errors=true \
     --gate-ops=true --gate-latency=false --min-target-achievement=0 --phase=isolated-saturation \
-    --strict-superiority="$strict" --mixed-matrix=false --cpu-cores 4 \
+    --strict-superiority="$strict" --mixed-matrix=false --cpu-cores "$GATEWAY_CPU_CORES" \
     --samples-per-gateway "$ISOLATED_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -615,12 +635,12 @@ if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
   "$HELPER" write-all-scenarios-summary \
     --results "$LATENCY_RESULTS_JSON" --md "$LATENCY_SUMMARY_MD" --html "$LATENCY_SUMMARY_HTML" \
     --min-ratio 1.0 --critical-ratio 1.0 \
-    --critical-scenarios "websocket-long-connection game-long-connection tcp-stream udp-stream" \
+    --critical-scenarios "websocket-long-connection game-long-connection tcp-stream udp-stream qcp-transparent" \
     --diagnostic-scenarios "" --sse-error-tolerance 0 --websocket-error-tolerance 0 \
     --udp-error-tolerance 0 --aggregate-ratio 1.0 --max-latency-ratio 1.0 \
     --require-latency-percentiles=true --require-zero-errors=true \
     --gate-ops=false --gate-latency=true --min-target-achievement="$MIN_TARGET_ACHIEVEMENT" --phase=equal-offered-load \
-    --strict-superiority="$strict" --mixed-matrix=true --cpu-cores 4 \
+    --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
     --samples-per-gateway "$BENCHMARK_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -642,10 +662,13 @@ run_mixed_matrix=$RUN_MIXED_MATRIX
 mixed_scenarios=${MIXED_SCENARIOS:-all}
 isolated_scenarios=${ISOLATED_SCENARIOS:-all}
 gateway_cpuset=$GATEWAY_CPUSET
+gateway_cpu_cores=$GATEWAY_CPU_CORES
 gateway_memory=${GATEWAY_MEMORY:-unlimited}
 backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
 nginx_workers=$NGINX_WORKERS
+traffic_profile=$TRAFFIC_PROFILE
+bench_platform=$BENCH_PLATFORM
 role_isolation=docker-cgroup-cpuset-network-namespace
 role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
 gateway_memory_samples=cgroup-v2-current-and-peak
