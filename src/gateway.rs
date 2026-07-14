@@ -4805,16 +4805,23 @@ impl Gateway {
                 tracing::debug!(%remote_addr, bytes = request_head.len(), "plain http static fast path request-line miss");
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
-            let static_prefix_hit = config
-                .services
-                .static_sites
-                .iter()
-                .any(|site| static_site_path_matches(site, path_hint));
-            let raw_sse_prefix_hit =
-                fast_lane.raw_sse_proxy && ai_proxy_fast_lane_path_matches(config, path_hint);
-            let raw_reverse_prefix_hit = fast_lane.raw_reverse_proxy
-                && reverse_proxy_fast_lane_path_matches(config, path_hint);
-            let raw_websocket_prefix_hit = fast_lane.raw_websocket_proxy
+            let raw_reverse_exact_head_hit = raw_reverse_request_cache
+                .as_ref()
+                .is_some_and(|cached| cached.request_head.as_ref() == request_head);
+            let static_prefix_hit = !raw_reverse_exact_head_hit
+                && config
+                    .services
+                    .static_sites
+                    .iter()
+                    .any(|site| static_site_path_matches(site, path_hint));
+            let raw_sse_prefix_hit = !raw_reverse_exact_head_hit
+                && fast_lane.raw_sse_proxy
+                && ai_proxy_fast_lane_path_matches(config, path_hint);
+            let raw_reverse_prefix_hit = raw_reverse_exact_head_hit
+                || (fast_lane.raw_reverse_proxy
+                    && reverse_proxy_fast_lane_path_matches(config, path_hint));
+            let raw_websocket_prefix_hit = !raw_reverse_exact_head_hit
+                && fast_lane.raw_websocket_proxy
                 && websocket_fast_lane_path_matches(config, path_hint);
             if !static_prefix_hit
                 && !raw_sse_prefix_hit
@@ -4864,15 +4871,19 @@ impl Gateway {
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
                 let parsed_request;
-                let reverse_request_cache_hit = !raw_sse_prefix_hit
-                    && raw_reverse_request_cache
-                        .as_ref()
-                        .is_some_and(|cached| cached.request_head.as_ref() == request_head);
+                let reverse_request_cache_hit = raw_reverse_exact_head_hit;
                 let cached_upstream_request = reverse_request_cache_hit.then(|| {
                     raw_reverse_request_cache
                         .as_ref()
                         .expect("raw reverse request cache hit checked")
                         .upstream_request
+                        .clone()
+                });
+                let cached_prepared_route = reverse_request_cache_hit.then(|| {
+                    raw_reverse_request_cache
+                        .as_ref()
+                        .expect("raw reverse request cache hit checked")
+                        .prepared_route
                         .clone()
                 });
                 let request = if reverse_request_cache_hit {
@@ -4908,8 +4919,9 @@ impl Gateway {
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
-                if raw_reverse_prefix_hit && plain_raw_reverse_fast_lane_matches(config, request) {
+                if raw_reverse_prefix_hit {
                     let mut serialized_upstream_request = None;
+                    let mut prepared_route = None;
                     if self
                         .try_serve_plain_raw_reverse_fast_lane(
                             config,
@@ -4918,7 +4930,9 @@ impl Gateway {
                             RawReverseFastLaneOptions {
                                 remote_addr,
                                 cached_upstream_request: cached_upstream_request.as_ref(),
+                                cached_prepared_route,
                                 serialized_upstream_request: &mut serialized_upstream_request,
+                                prepared_route: &mut prepared_route,
                                 response_buffer: &mut raw_reverse_response_buffer,
                                 lane_upstream: &mut raw_reverse_upstream,
                             },
@@ -4938,6 +4952,9 @@ impl Gateway {
                                 request,
                                 upstream_request: serialized_upstream_request.expect(
                                     "raw reverse cache miss serialized a successful upstream request",
+                                ),
+                                prepared_route: prepared_route.expect(
+                                    "raw reverse cache miss prepared a successful route",
                                 ),
                             });
                         }
@@ -8559,31 +8576,48 @@ impl Gateway {
         let RawReverseFastLaneOptions {
             remote_addr,
             cached_upstream_request,
+            cached_prepared_route,
             serialized_upstream_request,
+            prepared_route,
             response_buffer,
             lane_upstream,
         } = options;
         let host = request.host.as_deref().unwrap_or("localhost");
-        let Some(route) = config
-            .services
-            .reverse_proxy
-            .routes
-            .iter()
-            .filter(|route| reverse_proxy_route_matches(route, host, &request.path))
-            .max_by_key(|route| route.path_prefix.len())
-        else {
-            return Ok(false);
+        let mut route_for_serialization = None;
+        let prepared = if let Some(cached) = cached_prepared_route {
+            cached
+        } else {
+            let Some(route) = config
+                .services
+                .reverse_proxy
+                .routes
+                .iter()
+                .filter(|route| reverse_proxy_route_matches(route, host, &request.path))
+                .max_by_key(|route| route.path_prefix.len())
+            else {
+                return Ok(false);
+            };
+            if !reverse_proxy_route_fast_path_eligible(route) {
+                return Ok(false);
+            }
+            let Some((pool_key, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
+                return Ok(false);
+            };
+            route_for_serialization = Some(route);
+            let prepared = Arc::new(RawReversePreparedRoute {
+                pool_key,
+                pool,
+                upstream: route.upstream.clone(),
+            });
+            *prepared_route = Some(prepared.clone());
+            prepared
         };
-        if !reverse_proxy_route_fast_path_eligible(route) {
-            return Ok(false);
-        }
-
-        let Some((pool_key, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
-            return Ok(false);
-        };
+        let pool_key = &prepared.pool_key;
+        let pool = &prepared.pool;
+        let upstream = &prepared.upstream;
         let mut upstream_io = if lane_upstream
             .as_ref()
-            .map(|upstream| upstream.key == pool_key)
+            .map(|upstream| upstream.key.as_str() == pool_key.as_str())
             .unwrap_or(false)
         {
             lane_upstream
@@ -8595,15 +8629,14 @@ impl Gateway {
                 previous.pool.checkin(previous.stream);
             }
             pool.checkout().await.with_context(|| {
-                format!(
-                    "failed checking out plain raw reverse upstream {}",
-                    route.upstream
-                )
+                format!("failed checking out plain raw reverse upstream {upstream}")
             })?
         };
         let request_bytes = if let Some(cached) = cached_upstream_request {
             cached
         } else {
+            let route = route_for_serialization
+                .expect("raw reverse cache miss retained route for serialization");
             let path_and_query =
                 reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
             *serialized_upstream_request = Some(Bytes::from(serialize_raw_fast_lane_request(
@@ -8625,20 +8658,12 @@ impl Gateway {
         upstream_io
             .write_all(request_bytes)
             .await
-            .with_context(|| {
-                format!(
-                    "failed sending plain raw reverse request to {}",
-                    route.upstream
-                )
-            })?;
+            .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
         let response_head = read_raw_fast_http_response_head(&mut upstream_io, false)
             .await
             .with_context(|| {
-                format!(
-                    "failed reading plain raw reverse response from {}",
-                    route.upstream
-                )
+                format!("failed reading plain raw reverse response from {upstream}")
             })?;
         let upstream_keep_alive = !response_head.connection_close;
         let content_length = response_head.content_length;
@@ -8651,8 +8676,8 @@ impl Gateway {
                 .context("failed writing raw HTTP response head")?;
             if upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
-                    key: pool_key,
-                    pool,
+                    key: pool_key.clone(),
+                    pool: pool.clone(),
                     stream: upstream_io,
                 });
             }
@@ -8685,8 +8710,8 @@ impl Gateway {
             };
             if reusable && upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
-                    key: pool_key,
-                    pool,
+                    key: pool_key.clone(),
+                    pool: pool.clone(),
                     stream: upstream_io,
                 });
             }
@@ -8703,8 +8728,8 @@ impl Gateway {
             .await?;
             if reusable && upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
-                    key: pool_key,
-                    pool,
+                    key: pool_key.clone(),
+                    pool: pool.clone(),
                     stream: upstream_io,
                 });
             }
@@ -10947,12 +10972,21 @@ struct RawReverseParsedRequestCache {
     request_head: Bytes,
     request: PlainFastLaneRequest,
     upstream_request: Bytes,
+    prepared_route: Arc<RawReversePreparedRoute>,
+}
+
+struct RawReversePreparedRoute {
+    pool_key: String,
+    pool: Arc<RawHttpUpstreamPool>,
+    upstream: String,
 }
 
 struct RawReverseFastLaneOptions<'a> {
     remote_addr: SocketAddr,
     cached_upstream_request: Option<&'a Bytes>,
+    cached_prepared_route: Option<Arc<RawReversePreparedRoute>>,
     serialized_upstream_request: &'a mut Option<Bytes>,
+    prepared_route: &'a mut Option<Arc<RawReversePreparedRoute>>,
     response_buffer: &'a mut Vec<u8>,
     lane_upstream: &'a mut Option<RawReverseLaneUpstream>,
 }
@@ -16370,19 +16404,6 @@ fn plain_raw_sse_fast_lane_matches(config: &GatewayConfig, request: &PlainFastLa
                 && raw_http_pool_key_from_upstream(&route.upstream).is_some()
                 && crate::ai_proxy::route_matches(route, host, &request.path)
         })
-}
-
-#[allow(dead_code)]
-fn plain_raw_reverse_fast_lane_matches(
-    config: &GatewayConfig,
-    request: &PlainFastLaneRequest,
-) -> bool {
-    let host = request.host.as_deref().unwrap_or("localhost");
-    config.services.reverse_proxy.routes.iter().any(|route| {
-        reverse_proxy_route_fast_path_eligible(route)
-            && raw_http_pool_key_from_upstream(&route.upstream).is_some()
-            && reverse_proxy_route_matches(route, host, &request.path)
-    })
 }
 
 fn http_static_success_fast_path_allowed(config: &GatewayConfig, scheme: &str, uri: &Uri) -> bool {
