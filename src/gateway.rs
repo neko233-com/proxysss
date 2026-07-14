@@ -1492,7 +1492,7 @@ const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(any(test, target_os = "linux"))]
-const STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE: usize = 2;
+const STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE: usize = 1;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -23852,10 +23852,10 @@ mod tests {
             ),
             2
         );
-        assert!(!balanced_sendfile_reactor_density_reached(7, 4));
-        assert!(balanced_sendfile_reactor_density_reached(8, 4));
-        assert!(!balanced_sendfile_reactor_density_reached(191, 96));
-        assert!(balanced_sendfile_reactor_density_reached(192, 96));
+        assert!(!balanced_sendfile_reactor_density_reached(3, 4));
+        assert!(balanced_sendfile_reactor_density_reached(4, 4));
+        assert!(!balanced_sendfile_reactor_density_reached(95, 96));
+        assert!(balanced_sendfile_reactor_density_reached(96, 96));
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
         assert_eq!(balanced_sendfile_reactor_workers_for(4), 1);
         assert_eq!(balanced_sendfile_reactor_workers_for(96), 24);
