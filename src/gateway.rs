@@ -1596,27 +1596,34 @@ fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::run
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     TLS_CONNECTION_RUNTIMES.get_or_init(|| {
-        let worker_count = tls_http_runtime_workers_for(
+        let shard_count = tls_http_runtime_workers_for(
             adaptive_data_plane_workers(1),
             TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
         );
         let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
         tracing::info!(
-            runtime_workers = worker_count,
+            runtime_shards = shard_count,
             scheduler_nice,
-            "starting weighted work-stealing TLS HTTP data runtime"
+            "starting pinned TLS HTTP data runtime shards"
         );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(worker_count)
-            .thread_name("proxysss-tls")
-            .global_queue_interval(2)
-            .event_interval(3)
-            .on_thread_start(move || set_current_thread_nice(scheduler_nice))
-            .enable_all();
-        vec![builder
-            .build()
-            .expect("failed to build proxysss TLS data runtime")]
+        (0..shard_count)
+            .map(|shard_index| {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
+                    .worker_threads(1)
+                    .thread_name(format!("proxysss-tls-{shard_index}"))
+                    .global_queue_interval(2)
+                    .event_interval(3)
+                    .on_thread_start(move || {
+                        pin_current_data_plane_thread(shard_index);
+                        set_current_thread_nice(scheduler_nice);
+                    })
+                    .enable_all();
+                builder
+                    .build()
+                    .expect("failed to build proxysss TLS data runtime shard")
+            })
+            .collect()
     })
 }
 
@@ -11978,8 +11985,8 @@ fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -23770,7 +23777,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
