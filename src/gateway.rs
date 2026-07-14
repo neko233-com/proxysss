@@ -12036,7 +12036,11 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        // One balanced owner covers four data-plane CPUs. nice +5 left
+        // measurable CPU idle while its WebSocket/game/TCP queues were
+        // runnable under the full mixed matrix. Restore bounded wake budget
+        // without outranking the nice-0 HTTP/UDP shards or adding workers.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12066,7 +12070,9 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        // H2/rustls has one crypto owner per four CPUs in balanced mode. Keep
+        // it below plain HTTP/UDP while recovering handshake/request latency.
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12123,7 +12129,9 @@ fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
-        RuntimePerformanceTrafficProfile::Balanced => 6,
+        // Reclaim CFS weight from the zero-copy bulk owner for latency-bound
+        // TLS and realtime queues. It still runs whenever sockets are writable.
+        RuntimePerformanceTrafficProfile::Balanced => 9,
         RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -23822,7 +23830,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23862,7 +23870,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            2
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23953,7 +23961,7 @@ mod tests {
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            6
+            9
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
