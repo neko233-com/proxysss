@@ -43,6 +43,8 @@ DURATION_SECS="${DURATION_SECS:-10}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-3}"
 LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 EXTENDED_REALTIME="${EXTENDED_REALTIME:-1}"
+SCENARIO_FILTER="${SCENARIO_FILTER:-}"
+RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
 COMMIT="$(git rev-parse HEAD)"
 RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${COMMIT:0:12}}"
@@ -54,11 +56,17 @@ OUTPUT_REL=".benchmark/direct-ubuntu24-amd64/$RUN_ID"
 OUTPUT_ROOT="$ROOT/$OUTPUT_REL"
 CURRENT_BENCH_ROOT="/work/$OUTPUT_REL/current"
 TARGET_DIR="/work/.benchmark/ubuntu24-amd64-target"
+CARGO_HOME_DIR="/work/.benchmark/ubuntu24-amd64-cargo-home"
+VENDOR_DIR="/work/.benchmark/ubuntu24-amd64-vendors"
 
 require_positive_integer DURATION_SECS "$DURATION_SECS"
 require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
 if [[ "$EXTENDED_REALTIME" != "0" && "$EXTENDED_REALTIME" != "1" ]]; then
   echo "EXTENDED_REALTIME must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$RUN_ORDER" != "nginx proxysss" && "$RUN_ORDER" != "proxysss nginx" ]]; then
+  echo "RUN_ORDER must be 'nginx proxysss' or 'proxysss nginx'" >&2
   exit 1
 fi
 for scale in $LOAD_SCALES; do
@@ -75,7 +83,10 @@ restore_ownership() {
   docker run --rm --platform linux/amd64 \
     -v "$ROOT:/work" \
     "$IMAGE" \
-    chown -R "$(id -u):$(id -g)" "/work/$OUTPUT_REL" /work/.benchmark/ubuntu24-amd64-target \
+    chown -R "$(id -u):$(id -g)" "/work/$OUTPUT_REL" \
+      /work/.benchmark/ubuntu24-amd64-target \
+      /work/.benchmark/ubuntu24-amd64-cargo-home \
+      /work/.benchmark/ubuntu24-amd64-vendors \
     >/dev/null 2>&1 || true
 }
 trap restore_ownership EXIT
@@ -119,6 +130,8 @@ fi
   echo "duration_secs=$DURATION_SECS"
   echo "repetitions=$BENCHMARK_REPETITIONS"
   echo "extended_realtime=$EXTENDED_REALTIME"
+  echo "scenario_filter=$SCENARIO_FILTER"
+  echo "run_order=$RUN_ORDER"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
   for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
     docker run --rm --platform linux/amd64 "$IMAGE" sysctl "$key" 2>/dev/null || true
@@ -129,6 +142,7 @@ echo "==> building current checkout as optimized x86_64 Linux release"
 docker run --rm --platform linux/amd64 \
   -v "$ROOT:/work" \
   -w /work \
+  -e CARGO_HOME="$CARGO_HOME_DIR" \
   -e CARGO_TARGET_DIR="$TARGET_DIR" \
   "$IMAGE" \
   cargo build --locked --release
@@ -149,6 +163,7 @@ for scale in $LOAD_SCALES; do
     -v "$ROOT:/work" \
     -w /work \
     -e BENCH_ROOT="$CURRENT_BENCH_ROOT" \
+    -e VENDOR_DIR="$VENDOR_DIR" \
     -e PROXY_BIN="$TARGET_DIR/release/proxysss" \
     -e FORCE_BUILD=0 \
     -e CPU_CORES="$CPU_CORES" \
@@ -162,6 +177,8 @@ for scale in $LOAD_SCALES; do
     -e SSE_CONCURRENCY="$sse_concurrency" \
     -e STREAM_CONNECTIONS="$stream_connections" \
     -e EXTENDED_REALTIME="$EXTENDED_REALTIME" \
+    -e SCENARIO_FILTER="$SCENARIO_FILTER" \
+    -e RUN_ORDER="$RUN_ORDER" \
     -e STRICT_SUPERIORITY=1 \
     -e REQUIRE_ZERO_ERRORS=1 \
     -e REQUIRE_LATENCY_PERCENTILES=1 \

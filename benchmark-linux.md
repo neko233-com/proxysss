@@ -174,6 +174,8 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
 - `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 benchmark 容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
+
+这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home`、`.benchmark/ubuntu24-amd64-target` 与 `.benchmark/ubuntu24-amd64-vendors` 复用 Cargo registry/target 和同版本优化 nginx 产物；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`SCENARIO_FILTER='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；正式证据必须清空 filter、保留全部场景并使用多轮交错顺序。
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测

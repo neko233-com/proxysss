@@ -126,7 +126,7 @@ if [[ "$REQUIRE_ZERO_ERRORS" != "1" && -z "$UDP_ERROR_TOLERANCE_SET" && ! -e /pr
 fi
 
 BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
-VENDOR_DIR="$BENCH_ROOT/vendors"
+VENDOR_DIR="${VENDOR_DIR:-$BENCH_ROOT/vendors}"
 RUN_DIR="$BENCH_ROOT/runs/all-scenarios"
 WWW_DIR="$RUN_DIR/www"
 PROXY_DIR="$RUN_DIR/proxysss"
