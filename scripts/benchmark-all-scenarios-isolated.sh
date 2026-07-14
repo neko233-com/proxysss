@@ -25,13 +25,14 @@ done
 GATEWAY_CPUSET="${GATEWAY_CPUSET:-0-3}"
 BACKEND_CPUSET="${BACKEND_CPUSET:-4-7}"
 CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
-# Each scenario already has its own client process. Letting every process
-# inherit the whole cpuset as Tokio's worker count creates 11 * N runnable
-# runtime threads and makes equal-load timers skip ticks in the generator.
-# One I/O owner is enough for small-message clients; static-large keeps two
-# owners because its response-body copy path can exceed one client CPU.
-CLIENT_TOKIO_WORKERS="${CLIENT_TOKIO_WORKERS:-1}"
-STATIC_LARGE_CLIENT_TOKIO_WORKERS="${STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
+# Each scenario already has its own client process. During fixed-rate equal
+# load, letting every process inherit the whole cpuset as Tokio's worker count
+# creates 11 * N runnable threads and makes generator timers skip ticks. One
+# I/O owner is enough there; static-large keeps two for response-body copying.
+# Saturation continues using the whole client cpuset so it cannot cap a faster
+# gateway before the gateway's own CPU is full.
+EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
+EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 # CPU isolation is mandatory for fair throughput attribution. Memory is
 # measured in every run, but left uncapped by default so a synthetic cgroup
 # ceiling does not turn a safe memory-for-performance trade into a false fail.
@@ -115,7 +116,7 @@ for value_name in BENCHMARK_REPETITIONS ISOLATED_REPETITIONS; do
     exit 1
   }
 done
-for value_name in CLIENT_TOKIO_WORKERS STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
+for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$value_name must be a positive integer" >&2
@@ -478,9 +479,15 @@ launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
   local name="$PREFIX-client-$phase-$kind-$scenario"
-  local runtime_workers="$CLIENT_TOKIO_WORKERS"
-  if [[ "$scenario" == "static-large" ]]; then
-    runtime_workers="$STATIC_LARGE_CLIENT_TOKIO_WORKERS"
+  # Saturation must be able to drive the faster gateway to full capacity, so
+  # it may use the whole client cpuset. Fixed-rate latency needs fewer runnable
+  # timer owners: one normally and two for static-large response copying.
+  local runtime_workers="$CLIENT_CPU_CORES"
+  if [[ "$phase" == "equal-load" ]]; then
+    runtime_workers="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
+    if [[ "$scenario" == "static-large" ]]; then
+      runtime_workers="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
+    fi
   fi
   if (( runtime_workers > CLIENT_CPU_CORES )); then
     runtime_workers="$CLIENT_CPU_CORES"
@@ -732,8 +739,9 @@ gateway_cpu_cores=$GATEWAY_CPU_CORES
 gateway_memory=${GATEWAY_MEMORY:-unlimited}
 backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
-client_tokio_workers=$CLIENT_TOKIO_WORKERS
-static_large_client_tokio_workers=$STATIC_LARGE_CLIENT_TOKIO_WORKERS
+saturation_client_tokio_workers=$CLIENT_CPU_CORES
+equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS
+equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS
 nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM
