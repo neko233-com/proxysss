@@ -1536,6 +1536,8 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+#[cfg(target_os = "linux")]
+const H2_MIXED_PER_CORE_OPS: u64 = 3_000;
 
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
@@ -10929,11 +10931,10 @@ async fn apply_h2_mixed_fairness() {
         return;
     }
 
-    const PER_CORE_OPS: u64 = 2_000;
     const BURST_REQUESTS: u64 = 64;
     let limit = (data_plane_cpu_ids().len() as u64)
-        .saturating_mul(PER_CORE_OPS)
-        .max(PER_CORE_OPS);
+        .saturating_mul(H2_MIXED_PER_CORE_OPS)
+        .max(H2_MIXED_PER_CORE_OPS);
     let interval_ns = 1_000_000_000_u64 / limit;
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12035,7 +12036,7 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 12,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23821,7 +23822,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            12
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
