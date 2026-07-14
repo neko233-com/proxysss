@@ -1526,7 +1526,10 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
+static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
+static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
@@ -1613,6 +1616,37 @@ fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runt
     &runtimes[worker_index % runtimes.len()]
 }
 
+fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+    UDP_CONNECTION_RUNTIMES.get_or_init(|| {
+        let worker_count = udp_runtime_workers_for(
+            adaptive_data_plane_workers(1),
+            UDP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
+        );
+        let scheduler_nice = UDP_RUNTIME_NICE.load(Ordering::Relaxed);
+        tracing::info!(
+            runtime_workers = worker_count,
+            scheduler_nice,
+            "starting weighted UDP data runtime"
+        );
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(worker_count)
+            .thread_name("proxysss-udp")
+            .global_queue_interval(2)
+            .event_interval(3)
+            .on_thread_start(move || set_current_thread_nice(scheduler_nice))
+            .enable_all();
+        vec![builder
+            .build()
+            .expect("failed to build proxysss UDP data runtime")]
+    })
+}
+
+fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    let runtimes = dedicated_udp_connection_runtimes();
+    &runtimes[worker_index % runtimes.len()]
+}
+
 #[cfg(target_os = "linux")]
 fn data_plane_cpu_ids() -> &'static [usize] {
     DATA_PLANE_CPU_IDS.get_or_init(|| {
@@ -1657,6 +1691,18 @@ fn pin_current_data_plane_thread(worker_index: usize) {
 #[cfg(not(target_os = "linux"))]
 fn pin_current_data_plane_thread(_worker_index: usize) {}
 
+#[cfg(target_os = "linux")]
+fn set_current_thread_nice(nice: i32) {
+    if nice > 0 {
+        unsafe {
+            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, nice.clamp(0, 19));
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_thread_nice(_nice: i32) {}
+
 fn spawn_http_connection<Connection>(
     performance_enabled: bool,
     worker_index: usize,
@@ -1688,6 +1734,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
         TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
             tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        UDP_RUNTIME_CPU_DIVISOR.store(
+            udp_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        UDP_RUNTIME_NICE.store(
+            udp_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         STATIC_SENDFILE_QOS_ENABLED.store(
@@ -6535,10 +6589,15 @@ impl Gateway {
         let prune_state = Arc::new(UdpPruneState::new());
         let state = self.current_state().await;
         let worker_count = udp_listener_worker_count(&state.config);
+        let weighted_runtime =
+            cfg!(target_os = "linux") && state.config.runtime.performance.enabled;
+        if weighted_runtime {
+            let _ = dedicated_udp_connection_runtimes();
+        }
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
             let listener_socket = match bind_udp_listener_socket(bind_addr, "udp listener").await {
-                Ok(socket) => Arc::new(socket),
+                Ok(socket) => socket,
                 Err(error) if worker_index > 0 => {
                     tracing::warn!(
                         ?error,
@@ -6565,18 +6624,46 @@ impl Gateway {
             let associations = associations.clone();
             let pending_sessions = pending_sessions.clone();
             let prune_state = prune_state.clone();
-            workers.spawn(async move {
-                gateway
-                    .run_udp_listener_recv_loop(
-                        listener_socket,
-                        listener_config,
-                        associations,
-                        prune_state,
-                        worker_index,
-                        pending_sessions,
-                    )
-                    .await
-            });
+            if weighted_runtime {
+                let listener_socket = listener_socket
+                    .into_std()
+                    .context("failed detaching UDP listener for weighted runtime")?;
+                let recv_task = dedicated_udp_connection_runtime(worker_index).spawn(async move {
+                    let listener_socket = Arc::new(
+                        UdpSocket::from_std(listener_socket)
+                            .context("failed registering UDP listener on weighted runtime")?,
+                    );
+                    gateway
+                        .run_udp_listener_recv_loop(
+                            listener_socket,
+                            listener_config,
+                            associations,
+                            prune_state,
+                            worker_index,
+                            pending_sessions,
+                        )
+                        .await
+                });
+                workers.spawn(async move {
+                    recv_task
+                        .await
+                        .context("UDP weighted-runtime receive task failed")?
+                });
+            } else {
+                let listener_socket = Arc::new(listener_socket);
+                workers.spawn(async move {
+                    gateway
+                        .run_udp_listener_recv_loop(
+                            listener_socket,
+                            listener_config,
+                            associations,
+                            prune_state,
+                            worker_index,
+                            pending_sessions,
+                        )
+                        .await
+                });
+            }
         }
 
         while let Some(result) = workers.join_next().await {
@@ -11904,7 +11991,7 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 7,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11917,12 +12004,34 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 2,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
 fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     cores.max(1).div_ceil(cpu_divisor.max(1))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
+    }
+}
+
+fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
+    cores.max(1).div_ceil(cpu_divisor.max(1))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
+        RuntimePerformanceTrafficProfile::Bulk => 7,
+    }
 }
 
 fn balanced_sendfile_mid_yield_for_next_response(sequence: &mut usize, enabled: bool) -> bool {
@@ -11956,7 +12065,7 @@ fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -23620,7 +23729,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            7
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23634,15 +23743,44 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            4
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
-            2
+            4
         );
         assert_eq!(tls_http_runtime_workers_for(1, 2), 1);
         assert_eq!(tls_http_runtime_workers_for(4, 2), 2);
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
+        assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
+        assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
+        assert_eq!(
+            udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
+            1
+        );
+        assert_eq!(
+            udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
+            2
+        );
+        assert_eq!(
+            udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
+            4
+        );
+        assert_eq!(udp_runtime_workers_for(1, 2), 1);
+        assert_eq!(udp_runtime_workers_for(4, 2), 2);
+        assert_eq!(udp_runtime_workers_for(96, 2), 48);
+        assert_eq!(
+            udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
+            0
+        );
+        assert_eq!(
+            udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            5
+        );
+        assert_eq!(
+            udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
+            7
+        );
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
@@ -23701,7 +23839,7 @@ mod tests {
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            3
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
