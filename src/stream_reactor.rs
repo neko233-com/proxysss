@@ -32,7 +32,7 @@ const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 // consecutive full epoll batches on its pinned CPU. Yield once per completed
 // batch after this many pairs so the co-located HTTP accept shard gets a
 // scheduling point. Sparse realtime traffic retains the lower-latency path.
-const MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER: usize = 32;
+const MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER: usize = 16;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -265,7 +265,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
                 close_pair(epoll_fd, &mut sockets, fd);
             }
         }
-        if sockets.len() / 2 >= MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER {
+        if should_yield_after_batch(sockets.len()) {
             thread::yield_now();
         }
     }
@@ -273,6 +273,10 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
     unsafe {
         libc::close(epoll_fd);
     }
+}
+
+fn should_yield_after_batch(socket_count: usize) -> bool {
+    socket_count / 2 >= MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER
 }
 
 fn register_pair(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, pair: SocketPair) {
@@ -593,6 +597,12 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::time::Duration;
+
+    #[test]
+    fn mixed_fairness_counts_socket_pairs_per_worker() {
+        assert!(!should_yield_after_batch(31));
+        assert!(should_yield_after_batch(32));
+    }
 
     #[test]
     fn reactor_preserves_bidirectional_half_close() {
