@@ -63,6 +63,7 @@ PROXY_BIN="${PROXY_BIN:-$ROOT/target/release/proxysss}"
 IMAGE="${IMAGE:-proxysss-isolated-all-bench:local}"
 NETWORK="proxysss-all-isolated-$RUN_ID"
 PREFIX="proxysss-all-isolated-$RUN_ID"
+SYNC_VOLUME="$PREFIX-sync"
 SUBNET="${BENCH_SUBNET:-172.31.0.0/16}"
 BACKEND_IP="${BACKEND_IP:-172.31.10.10}"
 GATEWAY_IP="${GATEWAY_IP:-172.31.20.20}"
@@ -193,9 +194,11 @@ cleanup() {
   set +e
   docker ps -aq --filter "name=^/${PREFIX}" | xargs -r docker rm -f >/dev/null 2>&1
   docker network rm "$NETWORK" >/dev/null 2>&1
+  docker volume rm "$SYNC_VOLUME" >/dev/null 2>&1
 }
 trap cleanup EXIT
 docker network create --driver bridge --subnet "$SUBNET" "$NETWORK" >/dev/null
+docker volume create "$SYNC_VOLUME" >/dev/null
 
 write_proxy_config() {
   cat >"$RUN_DIR/proxysss.yaml" <<YAML
@@ -470,12 +473,16 @@ launch_client() {
       set -- "$@" --operation-interval-micros "$interval"
     fi
   fi
-  set -- "$@" --start-at-unix-ms "$WAVE_START_AT_UNIX_MS"
   docker create --name "$name" --network "$NETWORK" \
     --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-    "$IMAGE" proxysss bench "$@" >/dev/null
+    --mount "type=volume,src=$SYNC_VOLUME,dst=/run/proxysss-bench-sync,readonly" \
+    "$IMAGE" bash -ec '
+      while [[ ! -s /run/proxysss-bench-sync/start-at-unix-ms ]]; do sleep 0.05; done
+      start_at="$(cat /run/proxysss-bench-sync/start-at-unix-ms)"
+      exec proxysss bench "$@" --start-at-unix-ms "$start_at"
+    ' bench-client "$@" >/dev/null
   CLIENT_NAMES+=("$name")
   printf '%s|%s|%s|%s|%s|%s|%s\n' "$name" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
 }
@@ -487,7 +494,9 @@ run_candidate() {
   start_backend
   start_gateway "$kind"
   wait_gateway "$kind"
-  WAVE_START_AT_UNIX_MS=$(( $(date +%s%3N) + CLIENT_START_LEAD_SECS * 1000 ))
+  docker run --rm --platform "$BENCH_PLATFORM" \
+    --mount "type=volume,src=$SYNC_VOLUME,dst=/sync" \
+    "$IMAGE" rm -f /sync/start-at-unix-ms
 
   local http="http://${GATEWAY_IP}:18080" https="https://${GATEWAY_IP}:18443"
   scenario_requested "$only_scenario" static-small && launch_client "$phase" "$kind" static-small http "$http/bench/small.html" "$HTTP_CONCURRENCY" http --url "$http/bench/small.html" --concurrency "$HTTP_CONCURRENCY" --duration-secs "$DURATION_SECS"
@@ -507,6 +516,13 @@ run_candidate() {
     docker start "$client_name" >/dev/null &
   done
   wait
+  WAVE_START_AT_UNIX_MS="$(docker run --rm --platform "$BENCH_PLATFORM" \
+    -e CLIENT_START_LEAD_SECS="$CLIENT_START_LEAD_SECS" \
+    --mount "type=volume,src=$SYNC_VOLUME,dst=/sync" \
+    "$IMAGE" bash -ec '
+      start_at=$(( $(date +%s%3N) + CLIENT_START_LEAD_SECS * 1000 ))
+      printf "%s\n" "$start_at" | tee /sync/start-at-unix-ms
+    ')"
   local sample_at_ms now_ms sample_wait_secs
   sample_at_ms=$((WAVE_START_AT_UNIX_MS + SAMPLE_AFTER_SECS * 1000))
   now_ms="$(date +%s%3N)"

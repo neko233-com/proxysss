@@ -151,9 +151,9 @@ if [[ "$docker_server_arch" != "amd64" ]]; then
 fi
 if [[ -z "$CLIENT_START_LEAD_SECS" ]]; then
   if [[ "$execution_mode" == "emulated-amd64" ]]; then
-    CLIENT_START_LEAD_SECS=20
+    CLIENT_START_LEAD_SECS=10
   else
-    CLIENT_START_LEAD_SECS=8
+    CLIENT_START_LEAD_SECS=5
   fi
 fi
 require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
