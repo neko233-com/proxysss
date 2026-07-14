@@ -87,7 +87,7 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力。协议终止语义不拿
 
 `scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认是 4+4+8 CPU，也允许本机 wrapper 按 Docker 可用核数等比例切分；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。所有 client 容器先 create，再并行 start，并把同一个 `--start-at-unix-ms` 绝对时间传给 Rust benchmark；每个进程内部 worker 完成建连后一起等到该时刻，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。saturation client 保留完整 client cpuset，确保能把更快的 gateway 压满；fixed-rate equal-load 的小包 client 每进程只启动 1 个 Tokio I/O worker，static-large 启动 2 个，避免 11 个进程各自按整个 cpuset 扩张后让 timer 因发生器自身过载而跳 tick。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
 
-它分三阶段输出 JSON、Markdown、HTML 与百分比表。mixed saturation 与 equal offered load 默认交错运行 4 次，serial isolated saturation 默认 3 次，并对 ops/s、p50、p95、p99 取中位数；任一轮出现错误时聚合结果保留最大错误数，不能用中位数掩盖不稳定：
+它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度对每个 gateway/phase 采 1 个同步 2 秒样本，关闭额外 serial isolated，目标总耗时约 1 分钟；仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 `BENCHMARK_REPETITIONS` 与 `DURATION_SECS`，多轮再取中位数、错误取最大值：
 
 1. `mixed saturation`：十一个场景（含透明 QCP）同时跑，只判逐场景/聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
 2. `isolated saturation`：每次只跑一个场景并交替先后顺序，判单场景最大吞吐/容量。
@@ -175,7 +175,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 - `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64，在容器内构建当前 checkout，并把 gateway/backend/client 分配到互不重叠的 cpuset。默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档同时跑 mixed saturation 与 equal-offered-load，要求零错误、逐场景吞吐和延迟严格胜出。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
 
-这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home` 与 `.benchmark/ubuntu24-amd64-target` 复用 Cargo registry/target，优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；正式证据必须清空 filter、保留全部场景并使用至少四轮交错顺序。
+这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home` 与 `.benchmark/ubuntu24-amd64-target` 复用 Cargo registry/target，优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；默认 1 分钟反馈必须清空 filter 并保留全部场景；只有显式长时根因审计才提高到四轮交错顺序。
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测

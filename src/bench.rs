@@ -323,7 +323,11 @@ impl BenchmarkSchedule {
                 interval
             };
             let mut ticker = tokio::time::interval_at(measurement_start + first_offset, interval);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Equal-load must deliver the declared rate even when the client
+            // runtime is scheduled a little late (notably under amd64 Docker
+            // emulation). Burst only catches up timer slots; each worker still
+            // has at most one request in flight, so concurrency remains bounded.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
             ticker
         });
         (measurement_start + self.duration, ticker)
@@ -630,11 +634,10 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 tokio::time::interval_at(measurement_start + interval, interval)
             });
             if let Some(ticker) = ticker.as_mut() {
-                // Drop missed ticks instead of generating a catch-up burst.
-                // Every connection creates its ticker immediately after the
-                // shared barrier, intentionally preserving synchronized game
-                // tick bursts while holding offered rate equal for gateways.
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                // Preserve the declared game-tick count if the client runtime
+                // wakes late. One exchange per connection remains in flight,
+                // so catch-up cannot create unbounded client concurrency.
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
             }
 
             while tokio::time::Instant::now() < deadline {
