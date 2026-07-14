@@ -1535,9 +1535,9 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 4;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
-const H2_MIXED_PER_CORE_OPS: u64 = 3_600;
+const H2_MIXED_PER_CORE_OPS: u64 = 3_200;
 
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
@@ -12019,18 +12019,9 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
     // Keep native relay ownership proportional to the allowed cpuset without
     // running a permanently-ready reactor alongside every HTTP shard. Small
     // is realtime-first at one owner per two CPUs; balanced/bulk use one per
-    // four so mixed HTTP/TLS/UDP retains scheduler capacity. A dual-worker
-    // floor on multi-core cpusets prevents one owner from serializing every
-    // long connection. Both scale without imposing a fixed high-core cap.
-    sparse_runtime_workers_for(cores, cpu_divisor)
-}
-
-fn sparse_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
-    let cores = cores.max(1);
-    cores
-        .div_ceil(cpu_divisor.max(1))
-        .max(cores.min(2))
-        .min(cores)
+    // four so mixed HTTP/TLS/UDP retains scheduler capacity. Both scale with
+    // the full cpuset rather than imposing a fixed high-core cap.
+    cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12068,7 +12059,7 @@ fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> us
 }
 
 fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
-    sparse_runtime_workers_for(cores, cpu_divisor)
+    cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12126,7 +12117,7 @@ fn balanced_sendfile_reactor_density_reached(active: usize, cores: usize) -> boo
 
 #[cfg(any(test, target_os = "linux"))]
 fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
-    sparse_runtime_workers_for(cores, 4)
+    cores.max(1).div_ceil(4)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23809,10 +23800,9 @@ mod tests {
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
-        assert_eq!(realtime_stream_reactor_workers_for(2, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
-        assert_eq!(realtime_stream_reactor_workers_for(4, 4), 2);
+        assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
         assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
@@ -23862,10 +23852,9 @@ mod tests {
             4
         );
         assert_eq!(tls_http_runtime_workers_for(1, 2), 1);
-        assert_eq!(tls_http_runtime_workers_for(2, 4), 2);
         assert_eq!(tls_http_runtime_workers_for(4, 2), 2);
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
-        assert_eq!(tls_http_runtime_workers_for(4, 4), 2);
+        assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
@@ -23956,8 +23945,7 @@ mod tests {
         assert!(!balanced_sendfile_reactor_density_reached(95, 96));
         assert!(balanced_sendfile_reactor_density_reached(96, 96));
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
-        assert_eq!(balanced_sendfile_reactor_workers_for(2), 2);
-        assert_eq!(balanced_sendfile_reactor_workers_for(4), 2);
+        assert_eq!(balanced_sendfile_reactor_workers_for(4), 1);
         assert_eq!(balanced_sendfile_reactor_workers_for(96), 24);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
