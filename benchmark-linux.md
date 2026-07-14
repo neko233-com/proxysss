@@ -169,11 +169,11 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 ## 5. CI 和 benchmark 的边界
 
-默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact。GitHub Actions 中禁止自动或手动 workflow 运行 test、smoke 或性能 benchmark；性能验证必须直连专用 Linux 主机或 Ubuntu 24 x86_64 Docker 容器。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
+默认 GitHub Actions CI 已经按发布要求收敛为纯打包：六个平台 release binary 构建、打包、上传 artifact。GitHub Actions 中禁止自动或手动 workflow 运行 test、smoke 或性能 benchmark；性能验证必须在本机 Docker、原生 Linux 主机或 Ubuntu 24 x86_64 Docker 容器直接运行。tag 发布则额外校验版本化性能证据清单；没有严格 Linux 原始证据就不会发布 release assets。
 
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
-- `scripts/benchmark-ubuntu24-amd64-docker.sh`：直连 Ubuntu 24.04 x86_64 专机入口；硬校验宿主/镜像架构，在容器内构建当前 checkout，默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`
+- `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 benchmark 容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
@@ -195,7 +195,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 这里要把话说清楚：
 
-- **GitHub-hosted Linux benchmark 禁止使用**；诊断和正式证据都必须来自直连专机，Actions 只做打包
+- **GitHub-hosted Linux benchmark 禁止使用**；诊断可以来自本机 Ubuntu 24 amd64 Docker，原生生产证据来自专机，Actions 只做打包
 - `KCP`、`QCP` 是 proxysss 独立 UDP listener 能力，不进入当前 nginx 对标性能矩阵
 - 真正的 `realtime UDP` 强门槛，仍然应该看专门调优过的 Linux 主机
 - Docker / WSL2 容器如果缺 `/proc/sys/net/core/rmem_max`，脚本会自动把 UDP error tolerance 放宽到 `proxysss <= nginx + 16` 并在 summary 明示；真 Linux 主机默认仍是 `+4`

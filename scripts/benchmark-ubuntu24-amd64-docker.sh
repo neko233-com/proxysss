@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Dedicated-host Ubuntu 24 x86_64 Docker superiority matrix.
+# Local-or-native Ubuntu 24 x86_64 Docker superiority matrix.
 #
-# This entry point intentionally has no GitHub Actions integration. It builds
-# the current checkout inside the same Ubuntu 24 image used by the benchmark,
-# then scales every comparable gateway path together at 1x/2x/4x. Transparent
+# This entry point intentionally has no GitHub Actions integration. It accepts
+# a native amd64 Docker daemon or a local arm64 daemon with linux/amd64
+# emulation, but always builds and benchmarks inside an Ubuntu 24 x86_64
+# container. Every comparable path scales together at 1x/2x/4x. Transparent
 # QCP forwarding is enabled by default as extended realtime evidence.
 set -euo pipefail
 
@@ -28,7 +29,6 @@ require_positive_integer() {
 
 require_cmd docker
 require_cmd git
-require_cmd nproc
 require_cmd tee
 
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
@@ -36,23 +36,9 @@ if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   exit 1
 fi
 
-if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "this strict matrix requires an x86_64 Linux host" >&2
-  exit 1
-fi
-if [[ ! -r /etc/os-release ]]; then
-  echo "cannot verify Ubuntu 24.04: /etc/os-release is missing" >&2
-  exit 1
-fi
-# shellcheck disable=SC1091
-. /etc/os-release
-if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
-  echo "this strict matrix requires an Ubuntu 24.04 host (found ${ID:-unknown} ${VERSION_ID:-unknown})" >&2
-  exit 1
-fi
 docker version >/dev/null
 
-CPU_CORES="${CPU_CORES:-$(nproc)}"
+CPU_CORES="${CPU_CORES:-}"
 DURATION_SECS="${DURATION_SECS:-10}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-3}"
 LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
@@ -69,7 +55,6 @@ OUTPUT_ROOT="$ROOT/$OUTPUT_REL"
 CURRENT_BENCH_ROOT="/work/$OUTPUT_REL/current"
 TARGET_DIR="/work/.benchmark/ubuntu24-amd64-target"
 
-require_positive_integer CPU_CORES "$CPU_CORES"
 require_positive_integer DURATION_SECS "$DURATION_SECS"
 require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
 if [[ "$EXTENDED_REALTIME" != "0" && "$EXTENDED_REALTIME" != "1" ]]; then
@@ -81,21 +66,6 @@ for scale in $LOAD_SCALES; do
 done
 
 mkdir -p "$OUTPUT_ROOT"
-{
-  echo "commit=$COMMIT"
-  echo "host_kernel=$(uname -sr)"
-  echo "host_arch=$(uname -m)"
-  echo "host_os=$ID $VERSION_ID"
-  echo "cpu_cores=$CPU_CORES"
-  echo "load_scales=$LOAD_SCALES"
-  echo "duration_secs=$DURATION_SECS"
-  echo "repetitions=$BENCHMARK_REPETITIONS"
-  echo "extended_realtime=$EXTENDED_REALTIME"
-  docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
-  for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
-    sysctl "$key" 2>/dev/null || true
-  done
-} >"$OUTPUT_ROOT/host-fingerprint.txt"
 
 image_ready=0
 restore_ownership() {
@@ -126,6 +96,34 @@ docker run --rm --platform linux/amd64 "$IMAGE" bash -lc '
   test "$ID" = ubuntu
   test "$VERSION_ID" = 24.04
 '
+
+if [[ -z "$CPU_CORES" ]]; then
+  CPU_CORES="$(docker run --rm --platform linux/amd64 "$IMAGE" nproc)"
+fi
+require_positive_integer CPU_CORES "$CPU_CORES"
+docker_server_arch="$(docker version --format '{{.Server.Arch}}')"
+execution_mode="native-amd64"
+if [[ "$docker_server_arch" != "amd64" ]]; then
+  execution_mode="emulated-amd64"
+fi
+{
+  echo "commit=$COMMIT"
+  echo "host_kernel=$(uname -sr)"
+  echo "host_arch=$(uname -m)"
+  echo "docker_server_arch=$docker_server_arch"
+  echo "container_arch=x86_64"
+  echo "container_os=ubuntu-24.04"
+  echo "execution_mode=$execution_mode"
+  echo "cpu_cores=$CPU_CORES"
+  echo "load_scales=$LOAD_SCALES"
+  echo "duration_secs=$DURATION_SECS"
+  echo "repetitions=$BENCHMARK_REPETITIONS"
+  echo "extended_realtime=$EXTENDED_REALTIME"
+  docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
+  for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
+    docker run --rm --platform linux/amd64 "$IMAGE" sysctl "$key" 2>/dev/null || true
+  done
+} >"$OUTPUT_ROOT/host-fingerprint.txt"
 
 echo "==> building current checkout as optimized x86_64 Linux release"
 docker run --rm --platform linux/amd64 \

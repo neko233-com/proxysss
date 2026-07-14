@@ -387,7 +387,7 @@ proxysss 的性能优化和迁移结论都要遵循同一条纪律：
 - 后续所有性能优化都要压测
 - 必须是无副作用优化
 - SSE、static、HTTP reverse proxy、TCP、UDP、KCP-style、QCP 要一起看
-- 直连 Ubuntu 24 x86_64 Docker 专机时用 `scripts/benchmark-ubuntu24-amd64-docker.sh`，严格同时放大通用场景与透明 QCP；KCP 专用封装不拿 Caddy/nginx 做伪语义对标
+- 本机或原生 Docker 用 `scripts/benchmark-ubuntu24-amd64-docker.sh`，硬校验 Ubuntu 24 x86_64 容器并严格同时放大通用场景与透明 QCP；arm64 daemon 的模拟结果不能冒充物理 x86，KCP 专用封装不拿 Caddy/nginx 做伪语义对标
 - 涉及公网/NIC 延迟时必须用 `scripts/benchmark-cross-host-wss.sh` 在独立 client/gateway/backend 主机复跑，Docker cpuset 数据不能冒充跨机结果
 
 ## 5. 一句迁移建议

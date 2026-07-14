@@ -700,7 +700,7 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 proxysss token show</code></pre>
 
-          <p class="subtle">性能相关的判断也应该按这个顺序做：先 `proxysss tune linux --apply`，再确认能力、热重载边界和 warm-up，最后在直连 Ubuntu 24.04 x86_64 Docker 专机运行 `benchmark-ubuntu24-amd64-docker.sh`，把通用场景与透明 QCP 按 1x/2x/4x 一起放大；涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh`，由 systemd cgroup 强制 4 CPU / 300k nofile 并记录内存峰值与每连接成本后保存原始证据。GitHub Actions 只做打包，不得运行性能压测；内存上限仅在声明生产预算时设置，而不是只截一张单场景好看的图。</p>
+          <p class="subtle">性能相关的判断也应该按这个顺序做：先确认能力、热重载边界和 warm-up，再在本机 Docker 或原生 amd64 Docker 运行 `benchmark-ubuntu24-amd64-docker.sh`，由脚本硬校验 Ubuntu 24.04 x86_64 容器并把通用场景与透明 QCP 按 1x/2x/4x 一起放大；arm64 daemon 的结果明确标记为 emulated-amd64，不能冒充物理 x86。涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh`，由 systemd cgroup 强制 4 CPU / 300k nofile 并记录内存峰值与每连接成本后保存原始证据。GitHub Actions 只做打包，不得运行性能压测；内存上限仅在声明生产预算时设置，而不是只截一张单场景好看的图。</p>
         </section>
 
         <section id="more" class="panel">

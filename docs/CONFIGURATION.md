@@ -568,7 +568,7 @@ proxysss config reload-plan
 scripts/benchmark-ubuntu24-amd64-docker.sh
 ```
 
-默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。上面的 benchmark 必须直连 Ubuntu 24.04 x86_64 Docker 专机手动运行；它在容器内构建当前 checkout，并默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠，物理网络 WSS 结论还要从独立 client 主机运行 `scripts/benchmark-cross-host-wss.sh`：它会检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制网关 `4 CPU / 300k nofile`，保存同 SHA、`nginx -V`、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 `GATEWAY_MEMORY_MAX` 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
+默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。上面的 benchmark 在本机 Docker 或原生 amd64 Docker 运行，硬校验容器为 Ubuntu 24.04 x86_64；它在容器内构建当前 checkout，并默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`。arm64 daemon 的结果会标记 `emulated-amd64`，不能冒充物理 x86。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠，物理网络 WSS 结论还要从独立 client 主机运行 `scripts/benchmark-cross-host-wss.sh`：它会检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制网关 `4 CPU / 300k nofile`，保存同 SHA、`nginx -V`、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 `GATEWAY_MEMORY_MAX` 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 的当前专项结果是 `udp-stream 4.045x`：`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。
 
 如果要先在 Docker 里验证“全场景配置面没有退化”，运行：
 

@@ -425,7 +425,7 @@ proxysss config explain
 proxysss config capabilities
 proxysss config reload-plan
 scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
-        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移后的性能判断必须直连专机跑上面的 mixed-load。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
+        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移后的性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
       </section>
     </main>
 
