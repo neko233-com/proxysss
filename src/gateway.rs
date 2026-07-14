@@ -1525,7 +1525,7 @@ static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> =
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static SHARED_BALANCED_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -1615,19 +1615,8 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
-        return dedicated_http_connection_runtime(worker_index);
-    }
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
-}
-
-fn initialize_tls_connection_runtimes() {
-    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
-        let _ = dedicated_http_connection_runtimes();
-    } else {
-        let _ = dedicated_tls_connection_runtimes();
-    }
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1657,7 +1646,7 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
         return dedicated_http_connection_runtime(worker_index);
     }
     let runtimes = dedicated_udp_connection_runtimes();
@@ -1665,7 +1654,7 @@ fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runt
 }
 
 fn initialize_udp_connection_runtimes() {
-    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
         let _ = dedicated_http_connection_runtimes();
     } else {
         let _ = dedicated_udp_connection_runtimes();
@@ -1757,9 +1746,9 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
-        SHARED_BALANCED_DATA_RUNTIMES.store(
+        SHARED_BALANCED_UDP_RUNTIMES.store(
             config.runtime.performance.enabled
-                && shared_data_runtime_profile(config.runtime.performance.traffic_profile),
+                && shared_udp_runtime_profile(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
@@ -5534,7 +5523,7 @@ impl Gateway {
                 1
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
-            initialize_tls_connection_runtimes();
+            let _ = dedicated_tls_connection_runtimes();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -12006,18 +11995,20 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
-    // running a permanently-ready reactor alongside every HTTP shard. Small
-    // is realtime-first at one owner per two CPUs; balanced/bulk use one per
-    // four so mixed HTTP/TLS/UDP retains scheduler capacity. Both scale with
-    // the full cpuset rather than imposing a fixed high-core cap.
+    // running a permanently-ready reactor alongside every HTTP shard. The
+    // mixed balanced profile gives realtime traffic one event-driven owner per
+    // CPU; nice weighting protects HTTP while every owner blocks in epoll when
+    // idle. Small uses one per two CPUs and bulk one per four. All profiles
+    // scale with the full cpuset rather than imposing a fixed high-core cap.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -12035,7 +12026,7 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn shared_data_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
@@ -23764,7 +23755,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23784,13 +23775,13 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
-        assert!(!shared_data_runtime_profile(
+        assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(shared_data_runtime_profile(
+        assert!(shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
-        assert!(!shared_data_runtime_profile(
+        assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Bulk
         ));
         assert_eq!(
