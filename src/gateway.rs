@@ -181,8 +181,10 @@ impl RawHttpUpstreamPool {
     }
 
     async fn checkout(&self) -> Result<TcpStream> {
-        if let Some(stream) = self.idle.pop() {
-            return Ok(stream);
+        while let Some(stream) = self.idle.pop() {
+            if raw_http_idle_stream_reusable(&stream) {
+                return Ok(stream);
+            }
         }
 
         let stream = TcpStream::connect((self.host.as_str(), self.port))
@@ -201,6 +203,14 @@ impl RawHttpUpstreamPool {
     fn checkin(&self, stream: TcpStream) {
         let _ = self.idle.push(stream);
     }
+}
+
+fn raw_http_idle_stream_reusable(stream: &TcpStream) -> bool {
+    let mut probe = [0_u8; 1];
+    matches!(
+        stream.try_read(&mut probe),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
 }
 
 fn raw_http_pool_idle_capacity() -> usize {
@@ -1506,7 +1516,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead every 8 requests. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
@@ -2279,14 +2289,18 @@ impl Gateway {
                 continue;
             };
             let pool = self.raw_http_pool_for_parts(key, host, port);
+            let mut warmed = Vec::with_capacity(2);
             for _ in 0..2 {
                 match tokio::time::timeout(Duration::from_millis(250), pool.checkout()).await {
                     Ok(Ok(stream)) => {
-                        pool.checkin(stream);
+                        warmed.push(stream);
                         predialed = predialed.saturating_add(1);
                     }
                     _ => break,
                 }
+            }
+            for stream in warmed {
+                pool.checkin(stream);
             }
         }
         predialed
@@ -12031,8 +12045,8 @@ fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -22611,6 +22625,41 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn raw_http_pool_discards_upstream_socket_closed_while_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw pool fixture");
+        let address = listener.local_addr().expect("raw pool fixture address");
+        let (replacement_accepted_tx, replacement_accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_replacement_tx, release_replacement_rx) = tokio::sync::oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.expect("accept first raw socket");
+            drop(first);
+            let (_second, _) = listener.accept().await.expect("accept replacement socket");
+            replacement_accepted_tx
+                .send(())
+                .expect("report replacement socket");
+            let _ = release_replacement_rx.await;
+        });
+        let pool = RawHttpUpstreamPool::new(address.ip().to_string(), address.port());
+        let first = pool.checkout().await.expect("connect first raw socket");
+        first.readable().await.expect("observe closed raw socket");
+        pool.checkin(first);
+
+        let replacement = pool
+            .checkout()
+            .await
+            .expect("connect replacement raw socket");
+        replacement_accepted_rx
+            .await
+            .expect("replacement socket reached fixture");
+        assert!(raw_http_idle_stream_reusable(&replacement));
+        let _ = release_replacement_tx.send(());
+        drop(replacement);
+        fixture.await.expect("raw pool fixture task");
+    }
+
+    #[tokio::test]
     async fn pooled_bidirectional_copy_preserves_game_session_half_close() {
         let (mut client, mut proxy_client) = tokio::io::duplex(1024);
         let (mut proxy_upstream, mut upstream) = tokio::io::duplex(1024);
@@ -23788,7 +23837,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),

@@ -58,6 +58,7 @@ SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-5}"
 CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
+EQUAL_LOAD_FRACTION="${EQUAL_LOAD_FRACTION:-0.50}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
 COMMIT="$(git rev-parse HEAD)"
 RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${COMMIT:0:12}}"
@@ -179,6 +180,7 @@ require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
   echo "run_serial_isolated=$RUN_SERIAL_ISOLATED"
   echo "client_start_lead_secs=$CLIENT_START_LEAD_SECS"
   echo "run_order=$RUN_ORDER"
+  echo "equal_load_fraction=$EQUAL_LOAD_FRACTION"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
   for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
     docker run --rm --platform linux/amd64 "$IMAGE" sysctl "$key" 2>/dev/null || true
@@ -231,6 +233,7 @@ for scale in $LOAD_SCALES; do
     -e STREAM_CONNECTIONS="$stream_connections" \
     -e MIXED_SCENARIOS="$MIXED_SCENARIOS" \
     -e RUN_ORDER="$RUN_ORDER" \
+    -e EQUAL_LOAD_FRACTION="$EQUAL_LOAD_FRACTION" \
     -e RUN_MIXED_MATRIX=1 \
     -e RUN_ISOLATED_SATURATION="$RUN_SERIAL_ISOLATED" \
     -e STRICT_SUPERIORITY=1 \
