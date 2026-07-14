@@ -25,6 +25,13 @@ done
 GATEWAY_CPUSET="${GATEWAY_CPUSET:-0-3}"
 BACKEND_CPUSET="${BACKEND_CPUSET:-4-7}"
 CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
+# Each scenario already has its own client process. Letting every process
+# inherit the whole cpuset as Tokio's worker count creates 11 * N runnable
+# runtime threads and makes equal-load timers skip ticks in the generator.
+# One I/O owner is enough for small-message clients; static-large keeps two
+# owners because its response-body copy path can exceed one client CPU.
+CLIENT_TOKIO_WORKERS="${CLIENT_TOKIO_WORKERS:-1}"
+STATIC_LARGE_CLIENT_TOKIO_WORKERS="${STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 # CPU isolation is mandatory for fair throughput attribution. Memory is
 # measured in every run, but left uncapped by default so a synthetic cgroup
 # ceiling does not turn a safe memory-for-performance trade into a false fail.
@@ -108,6 +115,13 @@ for value_name in BENCHMARK_REPETITIONS ISOLATED_REPETITIONS; do
     exit 1
   }
 done
+for value_name in CLIENT_TOKIO_WORKERS STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
+  value="${!value_name}"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "$value_name must be a positive integer" >&2
+    exit 1
+  }
+done
 
 cpuset_cpu_ids() {
   local cpuset="$1" item first last cpu
@@ -166,6 +180,11 @@ validate_role_cpusets
 GATEWAY_CPU_CORES="$(cpuset_cpu_ids "$GATEWAY_CPUSET" | wc -l | tr -d '[:space:]')"
 [[ "$GATEWAY_CPU_CORES" =~ ^[1-9][0-9]*$ ]] || {
   echo "cannot determine gateway CPU count from $GATEWAY_CPUSET" >&2
+  exit 1
+}
+CLIENT_CPU_CORES="$(cpuset_cpu_ids "$CLIENT_CPUSET" | wc -l | tr -d '[:space:]')"
+[[ "$CLIENT_CPU_CORES" =~ ^[1-9][0-9]*$ ]] || {
+  echo "cannot determine client CPU count from $CLIENT_CPUSET" >&2
   exit 1
 }
 case "$TRAFFIC_PROFILE" in
@@ -459,6 +478,13 @@ launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
   local name="$PREFIX-client-$phase-$kind-$scenario"
+  local runtime_workers="$CLIENT_TOKIO_WORKERS"
+  if [[ "$scenario" == "static-large" ]]; then
+    runtime_workers="$STATIC_LARGE_CLIENT_TOKIO_WORKERS"
+  fi
+  if (( runtime_workers > CLIENT_CPU_CORES )); then
+    runtime_workers="$CLIENT_CPU_CORES"
+  fi
   local memory_args=()
   memory_limit_enabled "$CLIENT_MEMORY" && memory_args=(--memory "$CLIENT_MEMORY")
   if [[ "$phase" == "equal-load" ]]; then
@@ -476,6 +502,7 @@ launch_client() {
   docker create --name "$name" --network "$NETWORK" \
     --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
+    -e "TOKIO_WORKER_THREADS=$runtime_workers" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     --mount "type=volume,src=$SYNC_VOLUME,dst=/run/proxysss-bench-sync,readonly" \
     "$IMAGE" bash -ec '
@@ -705,6 +732,8 @@ gateway_cpu_cores=$GATEWAY_CPU_CORES
 gateway_memory=${GATEWAY_MEMORY:-unlimited}
 backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
+client_tokio_workers=$CLIENT_TOKIO_WORKERS
+static_large_client_tokio_workers=$STATIC_LARGE_CLIENT_TOKIO_WORKERS
 nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM

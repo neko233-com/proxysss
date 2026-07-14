@@ -59,6 +59,8 @@ CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 EQUAL_LOAD_FRACTION="${EQUAL_LOAD_FRACTION:-0.25}"
+CLIENT_TOKIO_WORKERS="${CLIENT_TOKIO_WORKERS:-1}"
+STATIC_LARGE_CLIENT_TOKIO_WORKERS="${STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
 COMMIT="$(git rev-parse HEAD)"
 RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${COMMIT:0:12}}"
@@ -74,6 +76,8 @@ CARGO_HOME_DIR="/work/.benchmark/ubuntu24-amd64-cargo-home"
 
 require_positive_integer DURATION_SECS "$DURATION_SECS"
 require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
+require_positive_integer CLIENT_TOKIO_WORKERS "$CLIENT_TOKIO_WORKERS"
+require_positive_integer STATIC_LARGE_CLIENT_TOKIO_WORKERS "$STATIC_LARGE_CLIENT_TOKIO_WORKERS"
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "0" && "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]]; then
   echo "ALLOW_UNBALANCED_REPETITIONS must be 0 or 1" >&2
   exit 1
@@ -181,6 +185,8 @@ require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
   echo "client_start_lead_secs=$CLIENT_START_LEAD_SECS"
   echo "run_order=$RUN_ORDER"
   echo "equal_load_fraction=$EQUAL_LOAD_FRACTION"
+  echo "client_tokio_workers=$CLIENT_TOKIO_WORKERS"
+  echo "static_large_client_tokio_workers=$STATIC_LARGE_CLIENT_TOKIO_WORKERS"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
   for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
     docker run --rm --platform linux/amd64 "$IMAGE" sysctl "$key" 2>/dev/null || true
@@ -234,6 +240,8 @@ for scale in $LOAD_SCALES; do
     -e MIXED_SCENARIOS="$MIXED_SCENARIOS" \
     -e RUN_ORDER="$RUN_ORDER" \
     -e EQUAL_LOAD_FRACTION="$EQUAL_LOAD_FRACTION" \
+    -e CLIENT_TOKIO_WORKERS="$CLIENT_TOKIO_WORKERS" \
+    -e STATIC_LARGE_CLIENT_TOKIO_WORKERS="$STATIC_LARGE_CLIENT_TOKIO_WORKERS" \
     -e RUN_MIXED_MATRIX=1 \
     -e RUN_ISOLATED_SATURATION="$RUN_SERIAL_ISOLATED" \
     -e STRICT_SUPERIORITY=1 \
