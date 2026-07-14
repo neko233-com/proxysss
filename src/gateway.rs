@@ -1490,6 +1490,8 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(test, target_os = "linux"))]
+const STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE: usize = 4;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1529,6 +1531,10 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_BALANCED_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_RESPONSES_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
@@ -1680,6 +1686,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_BALANCED_REACTOR_ENABLED.store(
+            config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Balanced
+                ),
             Ordering::Relaxed,
         );
         let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
@@ -11604,15 +11618,19 @@ async fn sendfile_all_async(
     } else {
         configured_chunk_bytes
     };
+    let active_sendfile = ActiveSendfileResponseGuard::enter();
+    let reactor_workers = adaptive_data_plane_workers(1);
+    let dynamic_balanced_reactor = STATIC_SENDFILE_BALANCED_REACTOR_ENABLED.load(Ordering::Relaxed)
+        && balanced_sendfile_reactor_density_exceeded(active_sendfile.active, reactor_workers);
 
-    if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+    if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) || dynamic_balanced_reactor {
         match crate::sendfile_reactor::dispatch(
             out_fd,
             in_fd,
             0,
             len,
             max_chunk_bytes,
-            adaptive_data_plane_workers(1),
+            reactor_workers,
         ) {
             Ok(completion) => {
                 return completion.await.map_err(|_| {
@@ -11674,6 +11692,27 @@ async fn sendfile_all_async(
     }
 
     Ok(sent)
+}
+
+#[cfg(target_os = "linux")]
+struct ActiveSendfileResponseGuard {
+    active: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl ActiveSendfileResponseGuard {
+    fn enter() -> Self {
+        Self {
+            active: STATIC_SENDFILE_RESPONSES_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ActiveSendfileResponseGuard {
+    fn drop(&mut self) {
+        STATIC_SENDFILE_RESPONSES_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn bind_tcp_listener(bind_addr: SocketAddr, label: &str) -> Result<TcpListener> {
@@ -11844,6 +11883,14 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
     // the three response phases across connections so large-file owners do
     // not all hit the 8 MiB cooperative yield in the same scheduler wave.
     usize::from(remote_addr.port()) % 3
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn balanced_sendfile_reactor_density_exceeded(active: usize, cores: usize) -> bool {
+    active
+        > cores
+            .max(1)
+            .saturating_mul(STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23529,6 +23576,10 @@ mod tests {
             ),
             2
         );
+        assert!(!balanced_sendfile_reactor_density_exceeded(16, 4));
+        assert!(balanced_sendfile_reactor_density_exceeded(17, 4));
+        assert!(!balanced_sendfile_reactor_density_exceeded(384, 96));
+        assert!(balanced_sendfile_reactor_density_exceeded(385, 96));
     }
 
     #[test]
