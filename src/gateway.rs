@@ -1526,6 +1526,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
@@ -1586,7 +1587,10 @@ fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::run
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     TLS_CONNECTION_RUNTIMES.get_or_init(|| {
-        let worker_count = adaptive_data_plane_workers(1);
+        let worker_count = tls_http_runtime_workers_for(
+            adaptive_data_plane_workers(1),
+            TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
+        );
         tracing::info!(
             runtime_workers = worker_count,
             "starting work-stealing TLS HTTP data runtime"
@@ -1682,6 +1686,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
+        TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
+            tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
         STATIC_SENDFILE_QOS_ENABLED.store(
             config.runtime.performance.enabled
                 && matches!(
@@ -11887,8 +11895,8 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => 2,
-        RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Small => 2,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -11903,6 +11911,18 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 2,
+    }
+}
+
+fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
+    cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 fn balanced_sendfile_mid_yield_for_next_response(sequence: &mut usize, enabled: bool) -> bool {
@@ -11930,7 +11950,7 @@ fn balanced_sendfile_reactor_density_reached(active: usize, cores: usize) -> boo
 
 #[cfg(any(test, target_os = "linux"))]
 fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
-    cores.max(1).div_ceil(2)
+    cores.max(1).div_ceil(4)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23588,7 +23608,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            4
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23608,6 +23628,21 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert_eq!(
+            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
+            1
+        );
+        assert_eq!(
+            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
+            2
+        );
+        assert_eq!(
+            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
+            2
+        );
+        assert_eq!(tls_http_runtime_workers_for(1, 2), 1);
+        assert_eq!(tls_http_runtime_workers_for(4, 2), 2);
+        assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
@@ -23658,8 +23693,8 @@ mod tests {
         assert!(!balanced_sendfile_reactor_density_reached(191, 96));
         assert!(balanced_sendfile_reactor_density_reached(192, 96));
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
-        assert_eq!(balanced_sendfile_reactor_workers_for(4), 2);
-        assert_eq!(balanced_sendfile_reactor_workers_for(96), 48);
+        assert_eq!(balanced_sendfile_reactor_workers_for(4), 1);
+        assert_eq!(balanced_sendfile_reactor_workers_for(96), 24);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
