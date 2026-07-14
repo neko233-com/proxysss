@@ -1499,8 +1499,9 @@ const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
 // Socket reads/writes already yield when the peer is not ready. Amortize the
-// explicit cooperative yield over a larger batch so tiny cached objects and
-// raw reverse-proxy responses do not pay scheduler overhead every 8 requests.
+// explicit cooperative yield over a larger batch so tiny cached objects do not
+// pay scheduler overhead every 8 requests. Raw reverse requests cross their
+// own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -4767,7 +4768,7 @@ impl Gateway {
         let mut static_response_cache: Option<ConnectionStaticFastPathCache> = None;
         let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
         let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
-        let mut raw_reverse_response_buffer = Vec::with_capacity(4096);
+        let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
         let mut balanced_sendfile_response_sequence = 0_usize;
         let outcome = 'fast_lane: loop {
             read_fast_lane_http_prefix(&mut stream, &mut prefix)
@@ -4940,7 +4941,7 @@ impl Gateway {
                                 cached_prepared_route,
                                 serialized_upstream_request: &mut serialized_upstream_request,
                                 prepared_route: &mut prepared_route,
-                                response_buffer: &mut raw_reverse_response_buffer,
+                                upstream_response_buffer: &mut raw_reverse_upstream_response_buffer,
                                 lane_upstream: &mut raw_reverse_upstream,
                             },
                         )
@@ -4966,11 +4967,11 @@ impl Gateway {
                             });
                         }
                         discard_fast_lane_http_head(&mut prefix, head_end);
-                        served_since_yield = served_since_yield.saturating_add(1);
-                        if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
-                            served_since_yield = 0;
-                            tokio::task::yield_now().await;
-                        }
+                        // A raw reverse request already crosses upstream and
+                        // downstream readiness points. Reset the amortized
+                        // static-lane counter instead of adding a redundant
+                        // cooperative yield on every 32nd response.
+                        served_since_yield = 0;
                         continue;
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
@@ -8599,7 +8600,7 @@ impl Gateway {
             cached_prepared_route,
             serialized_upstream_request,
             prepared_route,
-            response_buffer,
+            upstream_response_buffer,
             lane_upstream,
         } = options;
         let host = request.host.as_deref().unwrap_or("localhost");
@@ -8680,53 +8681,46 @@ impl Gateway {
             .await
             .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
-        let response_head = read_raw_fast_http_response_head(&mut upstream_io, false)
-            .await
-            .with_context(|| {
-                format!("failed reading plain raw reverse response from {upstream}")
-            })?;
-        let upstream_keep_alive = !response_head.connection_close;
-        let content_length = response_head.content_length;
-        let transfer_chunked = response_head.transfer_chunked;
-        let response_head_bytes = response_head.raw_head.clone();
-        if request.method == Method::HEAD || status_has_no_body(response_head.status) {
+        let response =
+            read_raw_reverse_http_response_into(&mut upstream_io, upstream_response_buffer)
+                .await
+                .with_context(|| {
+                    format!("failed reading plain raw reverse response from {upstream}")
+                })?;
+        let upstream_keep_alive = !response.connection_close;
+        let buffered_body_len = upstream_response_buffer.len() - response.head_end;
+        if request.method == Method::HEAD || status_has_no_body(response.status) {
             downstream
-                .write_all(&response_head_bytes)
+                .write_all(&upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
-            if upstream_keep_alive {
+            if upstream_keep_alive && buffered_body_len == 0 {
                 *lane_upstream = Some(RawReverseLaneUpstream {
                     key: pool_key.clone(),
                     pool: pool.clone(),
                     stream: upstream_io,
                 });
             }
-        } else if let Some(len) = content_length {
-            let reusable = if let Some(leftover) = response_head.leftover {
-                let leftover_len = leftover.len() as u64;
-                if leftover_len >= len {
-                    response_buffer.clear();
-                    response_buffer.reserve(response_head_bytes.len() + len as usize);
-                    response_buffer.extend_from_slice(&response_head_bytes);
-                    response_buffer.extend_from_slice(&leftover[..len as usize]);
-                    downstream
-                        .write_all(response_buffer)
-                        .await
-                        .context("failed writing raw HTTP response head/body")?;
-                    leftover_len == len
-                } else {
-                    downstream
-                        .write_all(&response_head_bytes)
-                        .await
-                        .context("failed writing raw HTTP response head")?;
-                    relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
-                }
+        } else if let Some(len) = response.content_length {
+            let buffered_body_len_u64 = buffered_body_len as u64;
+            let buffered_to_write = buffered_body_len_u64.min(len) as usize;
+            downstream
+                .write_all(
+                    &upstream_response_buffer
+                        [..response.head_end.saturating_add(buffered_to_write)],
+                )
+                .await
+                .context("failed writing raw HTTP response head/body")?;
+            let reusable = if buffered_body_len_u64 > len {
+                false
             } else {
-                downstream
-                    .write_all(&response_head_bytes)
-                    .await
-                    .context("failed writing raw HTTP response head")?;
-                relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
+                relay_fixed_http_body(
+                    &mut upstream_io,
+                    downstream,
+                    None,
+                    len - buffered_body_len_u64,
+                )
+                .await?
             };
             if reusable && upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
@@ -8735,17 +8729,15 @@ impl Gateway {
                     stream: upstream_io,
                 });
             }
-        } else if transfer_chunked {
+        } else if response.transfer_chunked {
+            let leftover = (buffered_body_len > 0)
+                .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
             downstream
-                .write_all(&response_head_bytes)
+                .write_all(&upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
-            let reusable = relay_passthrough_chunked_http_body(
-                &mut upstream_io,
-                downstream,
-                response_head.leftover,
-            )
-            .await?;
+            let reusable =
+                relay_passthrough_chunked_http_body(&mut upstream_io, downstream, leftover).await?;
             if reusable && upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
                     key: pool_key.clone(),
@@ -8754,11 +8746,13 @@ impl Gateway {
                 });
             }
         } else {
+            let leftover = (buffered_body_len > 0)
+                .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
             downstream
-                .write_all(&response_head_bytes)
+                .write_all(&upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
-            relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover).await?;
+            relay_raw_http_body(&mut upstream_io, downstream, leftover).await?;
         }
         Ok(true)
     }
@@ -11007,7 +11001,7 @@ struct RawReverseFastLaneOptions<'a> {
     cached_prepared_route: Option<Arc<RawReversePreparedRoute>>,
     serialized_upstream_request: &'a mut Option<Bytes>,
     prepared_route: &'a mut Option<Arc<RawReversePreparedRoute>>,
-    response_buffer: &'a mut Vec<u8>,
+    upstream_response_buffer: &'a mut Vec<u8>,
     lane_upstream: &'a mut Option<RawReverseLaneUpstream>,
 }
 
@@ -21501,6 +21495,80 @@ struct RawFastHttpResponseHead {
     leftover: Option<Bytes>,
 }
 
+struct RawReverseHttpResponse {
+    status: StatusCode,
+    head_end: usize,
+    content_length: Option<u64>,
+    transfer_chunked: bool,
+    connection_close: bool,
+}
+
+async fn read_raw_reverse_http_response_into(
+    upstream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Result<RawReverseHttpResponse> {
+    buffer.clear();
+
+    loop {
+        if let Some(position) = find_header_end(buffer) {
+            let head_end = position + 4;
+            let mut headers = [httparse::EMPTY_HEADER; 64];
+            let mut response = httparse::Response::new(&mut headers);
+            let status = response
+                .parse(&buffer[..head_end])
+                .context("failed parsing upstream raw reverse response")?;
+            if !matches!(status, httparse::Status::Complete(_)) {
+                return Err(anyhow!("incomplete upstream raw reverse response"));
+            }
+
+            let status = StatusCode::from_u16(
+                response
+                    .code
+                    .ok_or_else(|| anyhow!("missing upstream status code"))?,
+            )?;
+            let mut content_length = None;
+            let mut transfer_chunked = false;
+            let mut connection_close = false;
+            for header in response.headers.iter() {
+                if header.name.eq_ignore_ascii_case("content-length") {
+                    content_length = std::str::from_utf8(header.value)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u64>().ok());
+                } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+                    transfer_chunked = std::str::from_utf8(header.value).ok().is_some_and(|raw| {
+                        raw.split(',')
+                            .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
+                    });
+                } else if header.name.eq_ignore_ascii_case("connection") {
+                    connection_close = std::str::from_utf8(header.value).ok().is_some_and(|raw| {
+                        raw.split(',')
+                            .any(|item| item.trim().eq_ignore_ascii_case("close"))
+                    });
+                }
+            }
+
+            return Ok(RawReverseHttpResponse {
+                status,
+                head_end,
+                content_length,
+                transfer_chunked,
+                connection_close,
+            });
+        }
+
+        if buffer.len() > 64 * 1024 {
+            return Err(anyhow!("upstream response headers exceeded 64KiB"));
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = upstream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(anyhow!("upstream closed during handshake"));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
 async fn read_raw_fast_http_response_head(
     upstream: &mut TcpStream,
     filter_hop_headers: bool,
@@ -22284,6 +22352,53 @@ mod tests {
 
         assert_eq!(&prefix[..], second);
         assert_eq!(prefix.capacity(), original_capacity);
+    }
+
+    #[tokio::test]
+    async fn raw_reverse_response_reader_reuses_connection_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind response fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept response fixture");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong",
+                )
+                .await
+                .expect("write first response");
+            continue_rx.await.expect("continue fixture");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write second response");
+        });
+
+        let mut stream = TcpStream::connect(address).await.expect("connect fixture");
+        let mut buffer = Vec::with_capacity(4096);
+        let allocation = buffer.as_ptr();
+        let first = read_raw_reverse_http_response_into(&mut stream, &mut buffer)
+            .await
+            .expect("read first response");
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.content_length, Some(4));
+        assert!(!first.transfer_chunked);
+        assert!(!first.connection_close);
+        assert_eq!(&buffer[first.head_end..], b"pong");
+        assert_eq!(buffer.as_ptr(), allocation);
+
+        continue_tx.send(()).expect("continue response fixture");
+        let second = read_raw_reverse_http_response_into(&mut stream, &mut buffer)
+            .await
+            .expect("read second response");
+        assert_eq!(second.status, StatusCode::NO_CONTENT);
+        assert!(second.content_length.is_none());
+        assert!(second.connection_close);
+        assert_eq!(buffer.len(), second.head_end);
+        assert_eq!(buffer.as_ptr(), allocation);
+        fixture.await.expect("response fixture task");
     }
 
     #[test]
