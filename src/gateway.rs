@@ -1529,6 +1529,13 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
+// Data-plane shards mostly run connection-local tasks. Checking Tokio's global
+// injection queue every two polls and the I/O driver every three polls spends
+// a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
+// polling substantially more frequent than Tokio's throughput-oriented
+// default while amortizing both checks across a useful ready-task batch.
+const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
@@ -1581,8 +1588,8 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
                 builder
                     .worker_threads(1)
                     .thread_name(format!("proxysss-http-{shard_index}"))
-                    .global_queue_interval(2)
-                    .event_interval(3)
+                    .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                    .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
                     .on_thread_start(move || pin_current_data_plane_thread(shard_index))
                     .enable_all();
                 builder
@@ -1614,8 +1621,8 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
         builder
             .worker_threads(worker_count)
             .thread_name("proxysss-tls")
-            .global_queue_interval(2)
-            .event_interval(3)
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
@@ -1645,8 +1652,8 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
         builder
             .worker_threads(worker_count)
             .thread_name("proxysss-udp")
-            .global_queue_interval(2)
-            .event_interval(3)
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
