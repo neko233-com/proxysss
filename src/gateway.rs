@@ -1696,12 +1696,8 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 ),
             Ordering::Relaxed,
         );
-        let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
-            RuntimePerformanceTrafficProfile::Small => 2,
-            RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => {
-                4
-            }
-        };
+        let stream_reactor_divisor =
+            realtime_stream_reactor_cpu_divisor(config.runtime.performance.traffic_profile);
         REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
             RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_CHUNK_BYTES,
@@ -11864,6 +11860,14 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
     // four so mixed HTTP/TLS/UDP retains scheduler capacity. Both scale with
     // the full cpuset rather than imposing a fixed high-core cap.
     cores.max(1).div_ceil(cpu_divisor.max(1))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
+    }
 }
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
@@ -23529,6 +23533,18 @@ mod tests {
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
         assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
         assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
+        assert_eq!(
+            realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
+            2
+        );
+        assert_eq!(
+            realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
+            2
+        );
+        assert_eq!(
+            realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
+            4
+        );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
         assert!(!sendfile_reactor_profile_enabled(
