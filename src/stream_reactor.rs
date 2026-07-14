@@ -152,9 +152,7 @@ impl Reactors {
                 wake_fd,
             });
             let reactor_worker = worker.clone();
-            let cpu = allowed_cpus
-                .get(allowed_cpus.len() - 1 - (index % allowed_cpus.len()))
-                .copied();
+            let cpu = reactor_worker_cpu(index, worker_count, &allowed_cpus);
             thread::Builder::new()
                 .name(format!("proxysss-ws-epoll-{index}"))
                 .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
@@ -166,6 +164,20 @@ impl Reactors {
             next: AtomicUsize::new(0),
         }
     }
+}
+
+fn reactor_worker_cpu(index: usize, worker_count: usize, allowed_cpus: &[usize]) -> Option<usize> {
+    if allowed_cpus.is_empty() || worker_count < allowed_cpus.len() {
+        // A sparse realtime pool must be able to follow whichever data-plane
+        // CPU has spare capacity. Hard-pinning its sole owner to the last CPU
+        // creates a hotspot beside that CPU's HTTP/UDP shard while another CPU
+        // remains idle. Linux will normally keep the thread cache-local and
+        // migrate it only when the runnable imbalance warrants doing so.
+        return None;
+    }
+    allowed_cpus
+        .get(allowed_cpus.len() - 1 - (index % allowed_cpus.len()))
+        .copied()
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -610,6 +622,18 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::time::Duration;
+
+    #[test]
+    fn sparse_reactor_workers_keep_soft_cpu_ownership() {
+        assert_eq!(reactor_worker_cpu(0, 1, &[]), None);
+        assert_eq!(reactor_worker_cpu(0, 1, &[2, 4]), None);
+    }
+
+    #[test]
+    fn per_cpu_reactor_workers_pin_in_reverse_order() {
+        assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), Some(4));
+        assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), Some(2));
+    }
 
     #[test]
     fn reactor_preserves_bidirectional_half_close() {
