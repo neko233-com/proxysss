@@ -1489,6 +1489,8 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -4766,6 +4768,7 @@ impl Gateway {
         let mut raw_reverse_upstream: Option<RawReverseLaneUpstream> = None;
         let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
         let mut raw_reverse_response_buffer = Vec::with_capacity(4096);
+        let mut balanced_sendfile_response_sequence = 0_usize;
         let outcome = 'fast_lane: loop {
             read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -4791,7 +4794,11 @@ impl Gateway {
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -4980,7 +4987,11 @@ impl Gateway {
                 .filter(|cached| cached.matches(&request))
             {
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5033,7 +5044,11 @@ impl Gateway {
                 // keep-alive connections rebuild it on the same TTL boundary.
                 cached.checked_at = Instant::now();
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5085,7 +5100,11 @@ impl Gateway {
                     sendfile: candidate.sendfile.clone(),
                 };
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, &cached).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -5146,6 +5165,7 @@ impl Gateway {
                                 &candidate.path,
                                 candidate.len,
                                 candidate.sendfile.clone(),
+                                false,
                             )
                             .await
                             .map(|_| ())
@@ -11482,6 +11502,7 @@ async fn resolve_large_static_fast_path_candidate(
 async fn send_connection_static_fast_path(
     stream: &mut TcpStream,
     cached: &ConnectionStaticFastPathCache,
+    cooperative_mid_yield: bool,
 ) -> Result<()> {
     if let Some(response) = cached.combined_response.as_ref() {
         return stream
@@ -11513,6 +11534,7 @@ async fn send_connection_static_fast_path(
                 &cached.file_path,
                 cached.len,
                 cached.sendfile.clone(),
+                cooperative_mid_yield,
             )
             .await
             .map(|_| ())
@@ -11533,6 +11555,7 @@ async fn send_static_file_fast(
     path: &Path,
     _len: u64,
     sendfile: Option<Arc<std::fs::File>>,
+    cooperative_mid_yield: bool,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -11542,7 +11565,7 @@ async fn send_static_file_fast(
                 std::fs::File::open(path).context("failed opening static file for sendfile")?,
             ),
         };
-        sendfile_all_async(stream, file.as_raw_fd(), _len)
+        sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
             .await
             .context("sendfile static response failed")?;
         Ok(())
@@ -11551,6 +11574,7 @@ async fn send_static_file_fast(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = sendfile;
+        let _ = cooperative_mid_yield;
         let mut file = tokio::fs::File::open(path)
             .await
             .context("failed opening static file for fast copy")?;
@@ -11566,6 +11590,7 @@ async fn sendfile_all_async(
     stream: &TcpStream,
     in_fd: std::os::fd::RawFd,
     len: u64,
+    cooperative_mid_yield: bool,
 ) -> std::io::Result<u64> {
     if len == 0 {
         return Ok(0);
@@ -11573,7 +11598,12 @@ async fn sendfile_all_async(
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
-    let max_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
+    let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
+    let max_chunk_bytes = if cooperative_mid_yield {
+        configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
+    } else {
+        configured_chunk_bytes
+    };
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
         match crate::sendfile_reactor::dispatch(
@@ -11634,8 +11664,12 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
-        if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
-            tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+        if sent < len {
+            if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
+                tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+            } else if cooperative_mid_yield {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -11795,6 +11829,14 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+fn balanced_sendfile_mid_yield_for_next_response(sequence: &mut usize, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    *sequence = sequence.wrapping_add(1);
+    !sequence.is_multiple_of(3)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23199,6 +23241,24 @@ mod tests {
         assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
+        let mut sendfile_sequence = 0;
+        assert!(balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(!balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(!balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            false
+        ));
+        assert_eq!(sendfile_sequence, 3);
     }
 
     #[test]
