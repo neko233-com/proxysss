@@ -4771,7 +4771,8 @@ impl Gateway {
         let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
         let mut raw_reverse_response_cache: Option<RawReverseResponseCache> = None;
         let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
-        let mut balanced_sendfile_response_sequence = 0_usize;
+        let mut balanced_sendfile_response_sequence =
+            balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
             let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -11836,6 +11837,13 @@ fn balanced_sendfile_mid_yield_for_next_response(sequence: &mut usize, enabled: 
     }
     *sequence = sequence.wrapping_add(1);
     !sequence.is_multiple_of(3)
+}
+
+fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
+    // Linux ephemeral source ports advance across the accept fanout. Spread
+    // the three response phases across connections so large-file owners do
+    // not all hit the 8 MiB cooperative yield in the same scheduler wave.
+    usize::from(remote_addr.port()) % 3
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23503,6 +23511,24 @@ mod tests {
             false
         ));
         assert_eq!(sendfile_sequence, 3);
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30000".parse().expect("phase zero address")
+            ),
+            0
+        );
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30001".parse().expect("phase one address")
+            ),
+            1
+        );
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30002".parse().expect("phase two address")
+            ),
+            2
+        );
     }
 
     #[test]
