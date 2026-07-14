@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -49,6 +49,10 @@ pub struct HttpBenchArgs {
     /// measurement.
     #[arg(long, default_value_t = 0)]
     pub operation_interval_micros: u64,
+    /// Absolute Unix epoch millisecond for synchronizing a mixed wave across
+    /// multiple benchmark processes. Zero keeps the local start barrier.
+    #[arg(long, default_value_t = 0)]
+    pub start_at_unix_ms: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -70,6 +74,8 @@ pub struct SseBenchArgs {
     /// measurement.
     #[arg(long, default_value_t = 0)]
     pub operation_interval_micros: u64,
+    #[arg(long, default_value_t = 0)]
+    pub start_at_unix_ms: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -104,6 +110,8 @@ pub struct WebSocketBenchArgs {
     /// fixtures that use a generated self-signed certificate.
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
+    #[arg(long, default_value_t = 0)]
+    pub start_at_unix_ms: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -119,6 +127,8 @@ pub struct TcpBenchArgs {
     /// Fixed delay between echo exchanges per connection, in microseconds.
     #[arg(long, default_value_t = 0)]
     pub operation_interval_micros: u64,
+    #[arg(long, default_value_t = 0)]
+    pub start_at_unix_ms: u64,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -136,6 +146,8 @@ pub struct UdpBenchArgs {
     /// Fixed delay between datagram exchanges per socket, in microseconds.
     #[arg(long, default_value_t = 0)]
     pub operation_interval_micros: u64,
+    #[arg(long, default_value_t = 0)]
+    pub start_at_unix_ms: u64,
 }
 
 #[derive(Default)]
@@ -255,6 +267,7 @@ struct BenchmarkSchedule {
     scheduled_start: OnceLock<tokio::time::Instant>,
     duration: Duration,
     operation_interval: Option<Duration>,
+    start_at_unix_ms: u64,
     participants: usize,
     stagger_operations: bool,
 }
@@ -265,6 +278,7 @@ impl BenchmarkSchedule {
         duration_secs: u64,
         operation_interval_micros: u64,
         stagger_operations: bool,
+        start_at_unix_ms: u64,
     ) -> Self {
         let participants = participants.max(1);
         Self {
@@ -273,6 +287,7 @@ impl BenchmarkSchedule {
             duration: Duration::from_secs(duration_secs.max(1)),
             operation_interval: (operation_interval_micros > 0)
                 .then(|| Duration::from_micros(operation_interval_micros)),
+            start_at_unix_ms,
             participants,
             stagger_operations,
         }
@@ -284,9 +299,10 @@ impl BenchmarkSchedule {
     ) -> (tokio::time::Instant, Option<tokio::time::Interval>) {
         let barrier_result = self.barrier.wait().await;
         if barrier_result.is_leader() {
-            let _ = self
-                .scheduled_start
-                .set(tokio::time::Instant::now() + Duration::from_millis(250));
+            let _ = self.scheduled_start.set(benchmark_start_instant(
+                self.start_at_unix_ms,
+                Duration::from_millis(250),
+            ));
         }
         self.barrier.wait().await;
         let measurement_start = *self
@@ -312,6 +328,24 @@ impl BenchmarkSchedule {
         });
         (measurement_start + self.duration, ticker)
     }
+}
+
+fn benchmark_start_instant(
+    start_at_unix_ms: u64,
+    fallback_delay: Duration,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if start_at_unix_ms == 0 {
+        return now + fallback_delay;
+    }
+    let current_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if start_at_unix_ms <= current_unix_ms {
+        return now + fallback_delay;
+    }
+    now + Duration::from_millis(start_at_unix_ms - current_unix_ms)
 }
 
 async fn wait_for_operation_slot(
@@ -354,6 +388,7 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
         args.duration_secs,
         args.operation_interval_micros,
         true,
+        args.start_at_unix_ms,
     ));
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
@@ -416,6 +451,7 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
         args.duration_secs,
         args.operation_interval_micros,
         true,
+        args.start_at_unix_ms,
     ));
     // SSE is a long-lived protocol. Keep a generous whole-exchange deadline
     // even when a benchmark reads only the first chunk; a 10-second client
@@ -526,6 +562,7 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     let scheduled_start = Arc::new(OnceLock::<tokio::time::Instant>::new());
     let connect_timeout = Duration::from_millis(args.connect_timeout_ms.max(1));
     let measurement_duration = Duration::from_secs(args.duration_secs.max(1));
+    let start_at_unix_ms = args.start_at_unix_ms;
     let message_interval = (args.message_interval_micros > 0)
         .then(|| Duration::from_micros(args.message_interval_micros));
 
@@ -568,8 +605,10 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 // Give every connection task time to leave the barrier and
                 // register the same future start instant. This removes the
                 // load generator's task-spawn skew from gateway percentiles.
-                let _ =
-                    scheduled_start.set(tokio::time::Instant::now() + Duration::from_millis(250));
+                let _ = scheduled_start.set(benchmark_start_instant(
+                    start_at_unix_ms,
+                    Duration::from_millis(250),
+                ));
             }
             // Tokio barriers are reusable. The second generation publishes
             // the leader's timestamp to every task before any traffic starts.
@@ -793,6 +832,7 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
         args.duration_secs,
         args.operation_interval_micros,
         false,
+        args.start_at_unix_ms,
     ));
 
     let mut tasks = JoinSet::new();
@@ -864,6 +904,7 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
         args.duration_secs,
         args.operation_interval_micros,
         false,
+        args.start_at_unix_ms,
     ));
 
     let mut tasks = JoinSet::new();

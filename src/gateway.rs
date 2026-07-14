@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,8 +75,6 @@ use zstd::stream::encode_all as zstd_encode_all;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicI32;
 use std::sync::OnceLock;
 
 use crate::acme::{acme_challenge_fqdn, DnsProvider};

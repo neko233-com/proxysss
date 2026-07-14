@@ -43,6 +43,7 @@ SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 DURATION_SECS="${DURATION_SECS:-30}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-5}"
+CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-8}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-0}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-3}"
@@ -329,6 +330,7 @@ start_backend() {
   local memory_args=()
   memory_limit_enabled "$BACKEND_MEMORY" && memory_args=(--memory "$BACKEND_MEMORY")
   docker create --name "$name" --network "$NETWORK" --ip "$BACKEND_IP" \
+    --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$BACKEND_CPUSET" "${memory_args[@]}" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" bash -ec '
@@ -350,6 +352,7 @@ start_gateway() {
   memory_limit_enabled "$GATEWAY_MEMORY" && memory_args=(--memory "$GATEWAY_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then
     docker create --name "$name" --network "$NETWORK" --ip "$GATEWAY_IP" \
+      --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       --sysctl net.core.somaxconn=65535 \
@@ -363,6 +366,7 @@ start_gateway() {
     docker cp "$RUN_DIR/proxysss.yaml" "$name:/work/proxysss.yaml"
   else
     docker create --name "$name" --network "$NETWORK" --ip "$GATEWAY_IP" \
+      --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       --sysctl net.core.somaxconn=65535 \
@@ -382,7 +386,7 @@ start_gateway() {
 wait_gateway() {
   local kind="$1"
   for _ in $(seq 1 60); do
-    if docker run --rm --network "$NETWORK" "$IMAGE" proxysss bench http \
+    if docker run --rm --platform "$BENCH_PLATFORM" --network "$NETWORK" "$IMAGE" proxysss bench http \
       --url "http://${GATEWAY_IP}:18080/bench/small.html" --concurrency 1 \
       --duration-secs 1 2>/dev/null | grep -Eq '^success +: [1-9]'; then
       return 0
@@ -466,19 +470,24 @@ launch_client() {
       set -- "$@" --operation-interval-micros "$interval"
     fi
   fi
-  docker run -d --name "$name" --network "$NETWORK" \
+  set -- "$@" --start-at-unix-ms "$WAVE_START_AT_UNIX_MS"
+  docker create --name "$name" --network "$NETWORK" \
+    --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" proxysss bench "$@" >/dev/null
+  CLIENT_NAMES+=("$name")
   printf '%s|%s|%s|%s|%s|%s|%s\n' "$name" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
 }
 
 run_candidate() {
   local phase="$1" kind="$2" only_scenario="${3:-}"
   : >"$RUN_DIR/clients.meta"
+  CLIENT_NAMES=()
   start_backend
   start_gateway "$kind"
   wait_gateway "$kind"
+  WAVE_START_AT_UNIX_MS=$(( $(date +%s%3N) + CLIENT_START_LEAD_SECS * 1000 ))
 
   local http="http://${GATEWAY_IP}:18080" https="https://${GATEWAY_IP}:18443"
   scenario_requested "$only_scenario" static-small && launch_client "$phase" "$kind" static-small http "$http/bench/small.html" "$HTTP_CONCURRENCY" http --url "$http/bench/small.html" --concurrency "$HTTP_CONCURRENCY" --duration-secs "$DURATION_SECS"
@@ -493,7 +502,18 @@ run_candidate() {
   scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${GATEWAY_IP}:18300" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
   scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${GATEWAY_IP}:18310" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
 
-  sleep "$SAMPLE_AFTER_SECS"
+  local client_name
+  for client_name in "${CLIENT_NAMES[@]}"; do
+    docker start "$client_name" >/dev/null &
+  done
+  wait
+  local sample_at_ms now_ms sample_wait_secs
+  sample_at_ms=$((WAVE_START_AT_UNIX_MS + SAMPLE_AFTER_SECS * 1000))
+  now_ms="$(date +%s%3N)"
+  if (( sample_at_ms > now_ms )); then
+    sample_wait_secs=$(((sample_at_ms - now_ms + 999) / 1000))
+    sleep "$sample_wait_secs"
+  fi
   local name row_scenario protocol target concurrency gateway result_phase
   local stat_targets=("$PREFIX-gateway-$kind" "$PREFIX-backend")
   while IFS='|' read -r name _; do stat_targets+=("$name"); done <"$RUN_DIR/clients.meta"
@@ -606,6 +626,7 @@ if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     --require-latency-percentiles=false --require-zero-errors=true \
     --gate-ops=true --gate-latency=false --min-target-achievement=0 --phase=saturation \
     --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
+    --traffic-profile "$TRAFFIC_PROFILE" \
     --samples-per-gateway "$BENCHMARK_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -624,6 +645,7 @@ if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
     --require-latency-percentiles=false --require-zero-errors=true \
     --gate-ops=true --gate-latency=false --min-target-achievement=0 --phase=isolated-saturation \
     --strict-superiority="$strict" --mixed-matrix=false --cpu-cores "$GATEWAY_CPU_CORES" \
+    --traffic-profile "$TRAFFIC_PROFILE" \
     --samples-per-gateway "$ISOLATED_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -641,6 +663,7 @@ if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     --require-latency-percentiles=true --require-zero-errors=true \
     --gate-ops=false --gate-latency=true --min-target-achievement="$MIN_TARGET_ACHIEVEMENT" --phase=equal-offered-load \
     --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
+    --traffic-profile "$TRAFFIC_PROFILE" \
     --samples-per-gateway "$BENCHMARK_REPETITIONS" \
     --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
     --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
@@ -669,6 +692,7 @@ client_cpuset=$CLIENT_CPUSET
 nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM
+client_start_lead_secs=$CLIENT_START_LEAD_SECS
 role_isolation=docker-cgroup-cpuset-network-namespace
 role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
 gateway_memory_samples=cgroup-v2-current-and-peak
