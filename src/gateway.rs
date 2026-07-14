@@ -1537,7 +1537,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
-const H2_MIXED_PER_CORE_OPS: u64 = 3_400;
+const H2_MIXED_PER_CORE_OPS: u64 = 3_800;
 
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
