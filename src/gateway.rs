@@ -11995,20 +11995,18 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
-    // running a permanently-ready reactor alongside every HTTP shard. The
-    // mixed balanced profile gives realtime traffic one event-driven owner per
-    // CPU; nice weighting protects HTTP while every owner blocks in epoll when
-    // idle. Small uses one per two CPUs and bulk one per four. All profiles
-    // scale with the full cpuset rather than imposing a fixed high-core cap.
+    // running a permanently-ready reactor alongside every HTTP shard. Small
+    // is realtime-first at one owner per two CPUs; balanced/bulk use one per
+    // four so mixed HTTP/TLS/UDP retains scheduler capacity. Both scale with
+    // the full cpuset rather than imposing a fixed high-core cap.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -23755,7 +23753,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            4
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
