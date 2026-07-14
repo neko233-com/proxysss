@@ -1485,7 +1485,7 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -1525,8 +1525,6 @@ static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "linux")]
-static STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
@@ -1678,13 +1676,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
-            Ordering::Relaxed,
-        );
-        STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED.store(
-            config.runtime.performance.enabled
-                && sendfile_cooperative_yield_profile_enabled(
-                    config.runtime.performance.traffic_profile,
-                ),
             Ordering::Relaxed,
         );
         let stream_reactor_divisor = match config.runtime.performance.traffic_profile {
@@ -11609,12 +11600,8 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
-        if sent < len {
-            if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
-                tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
-            } else if STATIC_SENDFILE_COOPERATIVE_YIELD_ENABLED.load(Ordering::Relaxed) {
-                tokio::task::yield_now().await;
-            }
+        if sent < len && STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
+            tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
         }
     }
 
@@ -11779,11 +11766,6 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn sendfile_cooperative_yield_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(target_os = "linux")]
@@ -23194,12 +23176,6 @@ mod tests {
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
-            RuntimePerformanceTrafficProfile::Bulk
-        ));
-        assert!(sendfile_cooperative_yield_profile_enabled(
-            RuntimePerformanceTrafficProfile::Balanced
-        ));
-        assert!(!sendfile_cooperative_yield_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
     }
