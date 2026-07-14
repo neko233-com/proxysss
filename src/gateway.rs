@@ -11615,9 +11615,14 @@ async fn sendfile_all_async(
         configured_chunk_bytes
     };
     let active_sendfile = ActiveSendfileResponseGuard::enter();
-    let reactor_workers = adaptive_data_plane_workers(1);
+    let data_plane_cores = adaptive_data_plane_workers(1);
     let dynamic_balanced_reactor = STATIC_SENDFILE_BALANCED_REACTOR_ENABLED.load(Ordering::Relaxed)
-        && balanced_sendfile_reactor_density_exceeded(active_sendfile.active, reactor_workers);
+        && balanced_sendfile_reactor_density_exceeded(active_sendfile.active, data_plane_cores);
+    let reactor_workers = if dynamic_balanced_reactor {
+        balanced_sendfile_reactor_workers_for(data_plane_cores)
+    } else {
+        data_plane_cores
+    };
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) || dynamic_balanced_reactor {
         match crate::sendfile_reactor::dispatch(
@@ -11895,6 +11900,11 @@ fn balanced_sendfile_reactor_density_exceeded(active: usize, cores: usize) -> bo
         > cores
             .max(1)
             .saturating_mul(STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
+    cores.max(1).div_ceil(2)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23596,6 +23606,9 @@ mod tests {
         assert!(balanced_sendfile_reactor_density_exceeded(17, 4));
         assert!(!balanced_sendfile_reactor_density_exceeded(384, 96));
         assert!(balanced_sendfile_reactor_density_exceeded(385, 96));
+        assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
+        assert_eq!(balanced_sendfile_reactor_workers_for(4), 2);
+        assert_eq!(balanced_sendfile_reactor_workers_for(96), 48);
     }
 
     #[test]
