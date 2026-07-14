@@ -1516,7 +1516,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead every 8 requests. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
