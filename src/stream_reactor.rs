@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 const REGISTRATION_QUEUE_CAPACITY: usize = 131_072;
 const EVENT_BATCH: usize = 1_024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
+const RELAY_READ_BATCH: usize = 8;
 const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // Low-density realtime traffic gets a very short reply spin. Once each worker
 // owns more than four pairs, rely entirely on epoll batching: spinning after
@@ -284,7 +285,12 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
                     continue;
                 }
             }
-            if pair_finished(&sockets, fd) {
+            // Both halves must be read-closed before a pair can finish. Avoid
+            // two extra hash lookups on every ordinary data event; only enter
+            // the full pair check after this side has actually observed EOF.
+            if sockets.get(&fd).is_some_and(|state| state.read_closed)
+                && pair_finished(&sockets, fd)
+            {
                 close_pair(epoll_fd, &mut sockets, fd);
             }
         }
@@ -395,45 +401,52 @@ fn relay_read(
         return pause_reader(epoll_fd, sockets, fd);
     }
 
-    let read = loop {
-        let result = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-        if result >= 0 {
-            break result as usize;
+    // Level-triggered epoll may coalesce several small WebSocket/game frames
+    // behind one readiness notification. Drain a bounded batch so those
+    // frames amortize epoll dispatch and hash-table lookups, while the bound
+    // preserves fairness between long-lived connections.
+    for _ in 0..RELAY_READ_BATCH {
+        let read = loop {
+            let result = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+            if result >= 0 {
+                break result as usize;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return true;
+            }
+            return false;
+        };
+        if read == 0 {
+            return mark_read_closed(epoll_fd, sockets, fd);
         }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
+
+        let sent = match send_nonblocking(peer_fd, &buffer[..read]) {
+            Ok(sent) => sent,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(_) => return false,
+        };
+        if sent == read {
             continue;
         }
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return true;
+
+        let Some(peer) = sockets.get_mut(&peer_fd) else {
+            return false;
+        };
+        let mut pending = peer.pending.take().unwrap_or_else(acquire_pending_buffer);
+        pending.clear();
+        pending.extend_from_slice(&buffer[sent..read]);
+        peer.pending = Some(pending);
+        peer.pending_offset = 0;
+        if !modify_socket(epoll_fd, peer_fd, peer) {
+            return false;
         }
-        return false;
-    };
-    if read == 0 {
-        return mark_read_closed(epoll_fd, sockets, fd);
+        return pause_reader(epoll_fd, sockets, fd);
     }
-
-    let sent = match send_nonblocking(peer_fd, &buffer[..read]) {
-        Ok(sent) => sent,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
-        Err(_) => return false,
-    };
-    if sent == read {
-        return true;
-    }
-
-    let Some(peer) = sockets.get_mut(&peer_fd) else {
-        return false;
-    };
-    let mut pending = peer.pending.take().unwrap_or_else(acquire_pending_buffer);
-    pending.clear();
-    pending.extend_from_slice(&buffer[sent..read]);
-    peer.pending = Some(pending);
-    peer.pending_offset = 0;
-    if !modify_socket(epoll_fd, peer_fd, peer) {
-        return false;
-    }
-    pause_reader(epoll_fd, sockets, fd)
+    true
 }
 
 fn flush_pending(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
