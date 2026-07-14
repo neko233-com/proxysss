@@ -1525,6 +1525,7 @@ static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> =
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static SHARED_BALANCED_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -1614,8 +1615,19 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        return dedicated_http_connection_runtime(worker_index);
+    }
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn initialize_tls_connection_runtimes() {
+    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        let _ = dedicated_http_connection_runtimes();
+    } else {
+        let _ = dedicated_tls_connection_runtimes();
+    }
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1645,8 +1657,19 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        return dedicated_http_connection_runtime(worker_index);
+    }
     let runtimes = dedicated_udp_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn initialize_udp_connection_runtimes() {
+    if SHARED_BALANCED_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        let _ = dedicated_http_connection_runtimes();
+    } else {
+        let _ = dedicated_udp_connection_runtimes();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1734,6 +1757,11 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
+        SHARED_BALANCED_DATA_RUNTIMES.store(
+            config.runtime.performance.enabled
+                && shared_data_runtime_profile(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
         TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
             tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -5506,7 +5534,7 @@ impl Gateway {
                 1
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
-            let _ = dedicated_tls_connection_runtimes();
+            initialize_tls_connection_runtimes();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -6598,7 +6626,7 @@ impl Gateway {
         let weighted_runtime =
             cfg!(target_os = "linux") && state.config.runtime.performance.enabled;
         if weighted_runtime {
-            let _ = dedicated_udp_connection_runtimes();
+            initialize_udp_connection_runtimes();
         }
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
@@ -12004,6 +12032,11 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn shared_data_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23751,6 +23784,15 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert!(!shared_data_runtime_profile(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(shared_data_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!shared_data_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
             1
