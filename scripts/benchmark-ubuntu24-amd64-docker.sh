@@ -202,7 +202,7 @@ if [[ "$build_mode" == "native-host-zig-cross" ]]; then
     echo "arm64 Docker feedback requires zig for a sub-minute native cross build" >&2
     exit 1
   }
-  cargo zigbuild --version >/dev/null 2>&1 || {
+  command -v cargo-zigbuild >/dev/null 2>&1 || {
     echo "arm64 Docker feedback requires cargo-zigbuild" >&2
     exit 1
   }
