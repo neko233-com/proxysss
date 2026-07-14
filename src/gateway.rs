@@ -4773,7 +4773,7 @@ impl Gateway {
         let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
         let mut balanced_sendfile_response_sequence = 0_usize;
         let outcome = 'fast_lane: loop {
-            read_fast_lane_http_prefix(&mut stream, &mut prefix)
+            let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
                 .context("failed reading plain http fast-lane request")?;
             if prefix.is_empty() {
@@ -4783,7 +4783,7 @@ impl Gateway {
                     PlainHttpFastLaneDecision::Fallback(prefix.freeze())
                 };
             }
-            let Some(head_end) = memmem::find(&prefix, b"\r\n\r\n").map(|index| index + 4) else {
+            let Some(head_end) = head_end else {
                 tracing::debug!(%remote_addr, bytes = prefix.len(), "plain http fast path header incomplete");
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
@@ -5307,7 +5307,7 @@ impl Gateway {
         let mut response = Vec::with_capacity(4096);
         let mut served = 0_usize;
         loop {
-            read_fast_lane_http_prefix(downstream, &mut prefix)
+            let head_end = read_fast_lane_http_prefix(downstream, &mut prefix)
                 .await
                 .context("failed reading TLS static fast-lane request")?;
             if prefix.is_empty() {
@@ -5317,7 +5317,7 @@ impl Gateway {
                     TlsStaticFastLaneAttempt::Fallback(Bytes::new())
                 });
             }
-            let Some(head_end) = memmem::find(&prefix, b"\r\n\r\n").map(|index| index + 4) else {
+            let Some(head_end) = head_end else {
                 return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
             };
             let Some(request) = parse_static_fast_path_request(&prefix[..head_end]) else {
@@ -11326,10 +11326,6 @@ fn parse_plain_websocket_fast_lane_request(buffer: &[u8]) -> Option<PlainWebSock
     })
 }
 
-fn http_head_complete(buffer: &[u8]) -> bool {
-    memmem::find(buffer, b"\r\n\r\n").is_some()
-}
-
 const TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES: usize = 64 * 1024;
 
 async fn read_tls_fast_lane_http_prefix<Stream>(stream: &mut Stream) -> std::io::Result<Bytes>
@@ -11337,28 +11333,31 @@ where
     Stream: AsyncRead + Unpin + ?Sized,
 {
     let mut prefix = BytesMut::with_capacity(4096);
-    read_fast_lane_http_prefix(stream, &mut prefix).await?;
+    let _ = read_fast_lane_http_prefix(stream, &mut prefix).await?;
     Ok(prefix.freeze())
 }
 
 async fn read_fast_lane_http_prefix<Stream>(
     stream: &mut Stream,
     prefix: &mut BytesMut,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<usize>>
 where
     Stream: AsyncRead + Unpin + ?Sized,
 {
-    let mut buffer = [0_u8; 4096];
-    while prefix.len() < TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES && !http_head_complete(prefix) {
-        let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
-        let read_target = remaining.min(buffer.len());
-        let read = stream.read(&mut buffer[..read_target]).await?;
-        if read == 0 {
-            break;
+    loop {
+        if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
+            return Ok(Some(index + 4));
         }
-        prefix.extend_from_slice(&buffer[..read]);
+        if prefix.len() >= TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES {
+            return Ok(None);
+        }
+        let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
+        prefix.reserve(remaining.min(4096));
+        let read = stream.read_buf(prefix).await?;
+        if read == 0 {
+            return Ok(None);
+        }
     }
-    Ok(())
 }
 
 fn discard_fast_lane_http_head(prefix: &mut BytesMut, head_end: usize) {
@@ -22408,6 +22407,36 @@ mod tests {
 
         assert_eq!(&prefix[..], second);
         assert_eq!(prefix.capacity(), original_capacity);
+    }
+
+    #[tokio::test]
+    async fn fast_lane_reader_returns_head_end_and_reuses_pipelined_buffer() {
+        let first = b"GET /bench/a HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let second = b"GET /bench/b HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        writer.write_all(first).await.expect("write first request");
+        writer
+            .write_all(second)
+            .await
+            .expect("write second request");
+
+        let mut prefix = BytesMut::with_capacity(4096);
+        let allocation = prefix.as_ptr();
+        let first_end = read_fast_lane_http_prefix(&mut reader, &mut prefix)
+            .await
+            .expect("read pipelined requests")
+            .expect("first request head");
+        assert_eq!(first_end, first.len());
+        assert_eq!(&prefix[..first_end], first);
+        discard_fast_lane_http_head(&mut prefix, first_end);
+
+        let second_end = read_fast_lane_http_prefix(&mut reader, &mut prefix)
+            .await
+            .expect("reuse pipelined request")
+            .expect("second request head");
+        assert_eq!(second_end, second.len());
+        assert_eq!(&prefix[..second_end], second);
+        assert_eq!(prefix.as_ptr(), allocation);
     }
 
     #[tokio::test]
