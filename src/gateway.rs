@@ -1540,10 +1540,6 @@ static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
-static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_os = "linux")]
-static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
@@ -1600,27 +1596,34 @@ fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::run
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     TLS_CONNECTION_RUNTIMES.get_or_init(|| {
-        let worker_count = tls_http_runtime_workers_for(
+        let shard_count = tls_http_runtime_workers_for(
             adaptive_data_plane_workers(1),
             TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
         );
         let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
         tracing::info!(
-            runtime_workers = worker_count,
+            runtime_shards = shard_count,
             scheduler_nice,
-            "starting work-stealing TLS HTTP data runtime"
+            "starting pinned TLS HTTP data runtime shards"
         );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(worker_count)
-            .thread_name("proxysss-tls")
-            .global_queue_interval(2)
-            .event_interval(3)
-            .on_thread_start(move || set_current_thread_nice(scheduler_nice))
-            .enable_all();
-        vec![builder
-            .build()
-            .expect("failed to build proxysss TLS data runtime")]
+        (0..shard_count)
+            .map(|shard_index| {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
+                    .worker_threads(1)
+                    .thread_name(format!("proxysss-tls-{shard_index}"))
+                    .global_queue_interval(2)
+                    .event_interval(3)
+                    .on_thread_start(move || {
+                        pin_current_data_plane_thread(shard_index);
+                        set_current_thread_nice(scheduler_nice);
+                    })
+                    .enable_all();
+                builder
+                    .build()
+                    .expect("failed to build proxysss TLS data runtime shard")
+            })
+            .collect()
     })
 }
 
@@ -2009,21 +2012,6 @@ struct ActiveConnectionGuard(Arc<AtomicUsize>);
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct ActivePlainHyperConnectionGuard;
-
-impl ActivePlainHyperConnectionGuard {
-    fn enter() -> Self {
-        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ActivePlainHyperConnectionGuard {
-    fn drop(&mut self) {
-        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -4833,7 +4821,6 @@ impl Gateway {
         remote_addr: SocketAddr,
         worker_index: usize,
     ) {
-        let _active_plain_hyper = ActivePlainHyperConnectionGuard::enter();
         let gateway = self.clone();
         let service = service_fn(move |request| {
             let gateway = gateway.clone();
@@ -5803,9 +5790,6 @@ impl Gateway {
         let service = service_fn(move |request| {
             let gateway = gateway.clone();
             async move {
-                if is_http2 {
-                    apply_h2_mixed_fairness().await;
-                }
                 gateway
                     .handle_hyper_request(request, remote_addr, "https")
                     .await
@@ -6123,8 +6107,6 @@ impl Gateway {
             self.stats
                 .tcp_sessions_active
                 .fetch_add(1, Ordering::Relaxed);
-            TCP_STREAMS_ACTIVE.fetch_add(1, Ordering::Relaxed);
-
             let session = async move {
                 let mut inbound = inbound;
                 let request_id = Uuid::new_v4().to_string();
@@ -6448,7 +6430,6 @@ impl Gateway {
                     .stats
                     .tcp_sessions_active
                     .fetch_sub(1, Ordering::Relaxed);
-                TCP_STREAMS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
             };
             std::mem::drop(tokio::spawn(session));
         }
@@ -10912,47 +10893,6 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
         .max_send_buf_size(HTTP2_MAX_SEND_BUF_BYTES);
     builder
 }
-
-#[cfg(target_os = "linux")]
-async fn apply_h2_mixed_fairness() {
-    if PLAIN_HYPER_CONNECTIONS_ACTIVE.load(Ordering::Relaxed) == 0
-        && TCP_STREAMS_ACTIVE.load(Ordering::Relaxed) == 0
-    {
-        H2_MIXED_NEXT_SLOT_NS.store(0, Ordering::Relaxed);
-        return;
-    }
-
-    const PER_CORE_OPS: u64 = 2_000;
-    const BURST_REQUESTS: u64 = 64;
-    let limit = (data_plane_cpu_ids().len() as u64)
-        .saturating_mul(PER_CORE_OPS)
-        .max(PER_CORE_OPS);
-    let interval_ns = 1_000_000_000_u64 / limit;
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64;
-    let floor = now_ns.saturating_sub(interval_ns.saturating_mul(BURST_REQUESTS));
-
-    let scheduled_ns = loop {
-        let current = H2_MIXED_NEXT_SLOT_NS.load(Ordering::Relaxed);
-        let scheduled = current.max(floor).saturating_add(interval_ns);
-        if H2_MIXED_NEXT_SLOT_NS
-            .compare_exchange_weak(current, scheduled, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            break scheduled;
-        }
-    };
-
-    if scheduled_ns > now_ns {
-        tokio::time::sleep(Duration::from_nanos(scheduled_ns - now_ns)).await;
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn apply_h2_mixed_fairness() {}
 
 fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
     let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
