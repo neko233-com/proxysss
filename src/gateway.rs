@@ -11627,7 +11627,7 @@ async fn sendfile_all_async(
     let active_sendfile = ActiveSendfileResponseGuard::enter();
     let data_plane_cores = adaptive_data_plane_workers(1);
     let dynamic_balanced_reactor = STATIC_SENDFILE_BALANCED_REACTOR_ENABLED.load(Ordering::Relaxed)
-        && balanced_sendfile_reactor_density_exceeded(active_sendfile.active, data_plane_cores);
+        && balanced_sendfile_reactor_density_reached(active_sendfile.active, data_plane_cores);
     let reactor_workers = if dynamic_balanced_reactor {
         balanced_sendfile_reactor_workers_for(data_plane_cores)
     } else {
@@ -11914,9 +11914,9 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn balanced_sendfile_reactor_density_exceeded(active: usize, cores: usize) -> bool {
+fn balanced_sendfile_reactor_density_reached(active: usize, cores: usize) -> bool {
     active
-        > cores
+        >= cores
             .max(1)
             .saturating_mul(STATIC_SENDFILE_REACTOR_ACTIVE_PER_CORE)
 }
@@ -23638,10 +23638,10 @@ mod tests {
             ),
             2
         );
-        assert!(!balanced_sendfile_reactor_density_exceeded(8, 4));
-        assert!(balanced_sendfile_reactor_density_exceeded(9, 4));
-        assert!(!balanced_sendfile_reactor_density_exceeded(192, 96));
-        assert!(balanced_sendfile_reactor_density_exceeded(193, 96));
+        assert!(!balanced_sendfile_reactor_density_reached(7, 4));
+        assert!(balanced_sendfile_reactor_density_reached(8, 4));
+        assert!(!balanced_sendfile_reactor_density_reached(191, 96));
+        assert!(balanced_sendfile_reactor_density_reached(192, 96));
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
         assert_eq!(balanced_sendfile_reactor_workers_for(4), 2);
         assert_eq!(balanced_sendfile_reactor_workers_for(96), 48);
