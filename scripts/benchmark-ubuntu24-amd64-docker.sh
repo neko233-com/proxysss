@@ -55,6 +55,7 @@ LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
+CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -82,6 +83,10 @@ require_positive_integer EQUAL_LOAD_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_CLIENT_TOK
 require_positive_integer EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "0" && "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]]; then
   echo "ALLOW_UNBALANCED_REPETITIONS must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$CAPTURE_DOCKER_STATS" != "0" && "$CAPTURE_DOCKER_STATS" != "1" ]]; then
+  echo "CAPTURE_DOCKER_STATS must be 0 or 1" >&2
   exit 1
 fi
 if [[ "$RUN_SERIAL_ISOLATED" != "0" && "$RUN_SERIAL_ISOLATED" != "1" ]]; then
@@ -188,6 +193,7 @@ require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
   echo "client_start_lead_secs=$CLIENT_START_LEAD_SECS"
   echo "run_order=$RUN_ORDER"
   echo "equal_load_fraction=$EQUAL_LOAD_FRACTION"
+  echo "capture_docker_stats=$CAPTURE_DOCKER_STATS"
   echo "equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
   echo "equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
@@ -259,6 +265,7 @@ for scale in $LOAD_SCALES; do
     -e ALLOW_UNBALANCED_REPETITIONS="$ALLOW_UNBALANCED_REPETITIONS" \
     -e DURATION_SECS="$DURATION_SECS" \
     -e SAMPLE_AFTER_SECS="$SAMPLE_AFTER_SECS" \
+    -e CAPTURE_DOCKER_STATS="$CAPTURE_DOCKER_STATS" \
     -e CLIENT_START_LEAD_SECS="$CLIENT_START_LEAD_SECS" \
     -e HTTP_CONCURRENCY="$http_concurrency" \
     -e HTTPS_CONCURRENCY="$https_concurrency" \

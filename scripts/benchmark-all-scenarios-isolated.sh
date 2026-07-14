@@ -51,6 +51,7 @@ SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 DURATION_SECS="${DURATION_SECS:-2}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
+CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-1}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
@@ -75,6 +76,7 @@ SYNC_VOLUME="$PREFIX-sync"
 SUBNET="${BENCH_SUBNET:-172.31.0.0/16}"
 BACKEND_IP="${BACKEND_IP:-172.31.10.10}"
 GATEWAY_IP="${GATEWAY_IP:-172.31.20.20}"
+PROXYSSS_GATEWAY_IP="${PROXYSSS_GATEWAY_IP:-172.31.20.21}"
 HELPER="$RUN_DIR/benchmark-helper"
 CONTEXT_DIR="$RUN_DIR/image-context"
 WWW_DIR="$RUN_DIR/www"
@@ -123,6 +125,10 @@ for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT
     exit 1
   }
 done
+[[ "$CAPTURE_DOCKER_STATS" == "0" || "$CAPTURE_DOCKER_STATS" == "1" ]] || {
+  echo "CAPTURE_DOCKER_STATS must be 0 or 1" >&2
+  exit 1
+}
 
 cpuset_cpu_ids() {
   local cpuset="$1" item first last cpu
@@ -368,13 +374,23 @@ start_backend() {
   docker start "$name" >/dev/null
 }
 
+gateway_ip_for() {
+  if [[ "$1" == "proxysss" ]]; then
+    printf '%s\n' "$PROXYSSS_GATEWAY_IP"
+  else
+    printf '%s\n' "$GATEWAY_IP"
+  fi
+}
+
 start_gateway() {
   local kind="$1"
   local name="$PREFIX-gateway-$kind"
+  local gateway_ip
+  gateway_ip="$(gateway_ip_for "$kind")"
   local memory_args=()
   memory_limit_enabled "$GATEWAY_MEMORY" && memory_args=(--memory "$GATEWAY_MEMORY")
   if [[ "$kind" == "proxysss" ]]; then
-    docker create --name "$name" --network "$NETWORK" --ip "$GATEWAY_IP" \
+    docker create --name "$name" --network "$NETWORK" --ip "$gateway_ip" \
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
@@ -388,7 +404,7 @@ start_gateway() {
       ' >/dev/null
     docker cp "$RUN_DIR/proxysss.yaml" "$name:/work/proxysss.yaml"
   else
-    docker create --name "$name" --network "$NETWORK" --ip "$GATEWAY_IP" \
+    docker create --name "$name" --network "$NETWORK" --ip "$gateway_ip" \
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" "${memory_args[@]}" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
@@ -408,9 +424,11 @@ start_gateway() {
 
 wait_gateway() {
   local kind="$1"
+  local gateway_ip
+  gateway_ip="$(gateway_ip_for "$kind")"
   for _ in $(seq 1 60); do
     if docker run --rm --platform "$BENCH_PLATFORM" --network "$NETWORK" "$IMAGE" proxysss bench http \
-      --url "http://${GATEWAY_IP}:18080/bench/small.html" --concurrency 1 \
+      --url "http://${gateway_ip}:18080/bench/small.html" --concurrency 1 \
       --duration-secs 1 2>/dev/null | grep -Eq '^success +: [1-9]'; then
       return 0
     fi
@@ -418,6 +436,19 @@ wait_gateway() {
   done
   docker logs "$PREFIX-gateway-$kind" >&2 || true
   return 1
+}
+
+activate_gateway() {
+  local kind="$1" other
+  if [[ "$kind" == "nginx" ]]; then
+    other="proxysss"
+  else
+    other="nginx"
+  fi
+  docker unpause "$PREFIX-gateway-$kind" >/dev/null 2>&1 || true
+  docker pause "$PREFIX-gateway-$other" >/dev/null 2>&1 || true
+  # Let resumed timers/readiness settle before releasing the synchronized wave.
+  sleep 0.2
 }
 
 declare -a SATURATION_ROWS=()
@@ -478,7 +509,6 @@ capture_gateway_memory() {
 launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
-  local name="$PREFIX-client-$phase-$kind-$scenario"
   # Saturation must be able to drive the faster gateway to full capacity, so
   # it may use the whole client cpuset. Fixed-rate latency needs fewer runnable
   # timer owners: one normally and two for static-large response copying.
@@ -492,8 +522,6 @@ launch_client() {
   if (( runtime_workers > CLIENT_CPU_CORES )); then
     runtime_workers="$CLIENT_CPU_CORES"
   fi
-  local memory_args=()
-  memory_limit_enabled "$CLIENT_MEMORY" && memory_args=(--memory "$CLIENT_MEMORY")
   if [[ "$phase" == "equal-load" ]]; then
     local interval="${LATENCY_INTERVALS[$scenario]:-}"
     [[ "$interval" =~ ^[1-9][0-9]*$ ]] || {
@@ -506,50 +534,75 @@ launch_client() {
       set -- "$@" --operation-interval-micros "$interval"
     fi
   fi
-  docker create --name "$name" --network "$NETWORK" \
-    --platform "$BENCH_PLATFORM" \
-    --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
-    -e "TOKIO_WORKER_THREADS=$runtime_workers" \
-    --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-    --mount "type=volume,src=$SYNC_VOLUME,dst=/run/proxysss-bench-sync,readonly" \
-    "$IMAGE" bash -ec '
-      while [[ ! -s /run/proxysss-bench-sync/start-at-unix-ms ]]; do sleep 0.05; done
-      start_at="$(cat /run/proxysss-bench-sync/start-at-unix-ms)"
-      exec proxysss bench "$@" --start-at-unix-ms "$start_at"
-    ' bench-client "$@" >/dev/null
-  CLIENT_NAMES+=("$name")
-  printf '%s|%s|%s|%s|%s|%s|%s\n' "$name" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
+  {
+    printf 'TOKIO_WORKER_THREADS=%q proxysss bench' "$runtime_workers"
+    printf ' %q' "$@"
+    # shellcheck disable=SC2016
+    printf ' --start-at-unix-ms "$start_at" > %q 2>&1 &\n' "/tmp/proxysss-bench-results/$scenario.txt"
+    printf 'pids+=("$!")\n'
+  } >>"$WAVE_SCRIPT"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
 }
 
 run_candidate() {
   local phase="$1" kind="$2" only_scenario="${3:-}"
   : >"$RUN_DIR/clients.meta"
-  CLIENT_NAMES=()
-  start_backend
-  start_gateway "$kind"
-  wait_gateway "$kind"
+  activate_gateway "$kind"
   docker run --rm --platform "$BENCH_PLATFORM" \
     --mount "type=volume,src=$SYNC_VOLUME,dst=/sync" \
     "$IMAGE" rm -f /sync/start-at-unix-ms
 
-  local http="http://${GATEWAY_IP}:18080" https="https://${GATEWAY_IP}:18443"
+  local gateway_ip
+  gateway_ip="$(gateway_ip_for "$kind")"
+  local http="http://${gateway_ip}:18080" https="https://${gateway_ip}:18443"
+  WAVE_CLIENT_NAME="$PREFIX-client-$phase-$kind"
+  if [[ -n "$only_scenario" ]]; then
+    WAVE_CLIENT_NAME="$WAVE_CLIENT_NAME-$only_scenario"
+  fi
+  WAVE_SCRIPT="$RUN_DIR/$WAVE_CLIENT_NAME.sh"
+  WAVE_RESULTS_DIR="$RUN_DIR/$WAVE_CLIENT_NAME-results"
+  rm -rf "$WAVE_RESULTS_DIR"
+  mkdir -p "$WAVE_RESULTS_DIR"
+  cat >"$WAVE_SCRIPT" <<'CLIENT_WAVE'
+#!/usr/bin/env bash
+set -u
+start_at="$1"
+mkdir -p /tmp/proxysss-bench-results
+pids=()
+CLIENT_WAVE
   scenario_requested "$only_scenario" static-small && launch_client "$phase" "$kind" static-small http "$http/bench/small.html" "$HTTP_CONCURRENCY" http --url "$http/bench/small.html" --concurrency "$HTTP_CONCURRENCY" --duration-secs "$DURATION_SECS"
   scenario_requested "$only_scenario" static-large && launch_client "$phase" "$kind" static-large http "$http/bench/large.bin" "$STATIC_LARGE_CONCURRENCY" http --url "$http/bench/large.bin" --concurrency "$STATIC_LARGE_CONCURRENCY" --duration-secs "$DURATION_SECS"
   scenario_requested "$only_scenario" cdn-hot-update && launch_client "$phase" "$kind" cdn-hot-update http "$http/bench/hot.dat" "$HTTP_CONCURRENCY" http --url "$http/bench/hot.dat" --concurrency "$HTTP_CONCURRENCY" --duration-secs "$DURATION_SECS"
   scenario_requested "$only_scenario" https-static-small && launch_client "$phase" "$kind" https-static-small http "$https/bench/small.html" "$HTTPS_CONCURRENCY" http --url "$https/bench/small.html" --concurrency "$HTTPS_CONCURRENCY" --duration-secs "$DURATION_SECS" --insecure
   scenario_requested "$only_scenario" reverse-proxy && launch_client "$phase" "$kind" reverse-proxy http "$http/proxy/ping" "$HTTP_CONCURRENCY" http --url "$http/proxy/ping" --concurrency "$HTTP_CONCURRENCY" --duration-secs "$DURATION_SECS"
   scenario_requested "$only_scenario" generic-sse && launch_client "$phase" "$kind" generic-sse sse "$http/sse" "$SSE_CONCURRENCY" sse --url "$http/sse" --concurrency "$SSE_CONCURRENCY" --duration-secs "$DURATION_SECS" --max-chunks 1
-  scenario_requested "$only_scenario" websocket-long-connection && launch_client "$phase" "$kind" websocket-long-connection websocket "ws://${GATEWAY_IP}:18080/ws/" "$STREAM_CONNECTIONS" websocket --url "ws://${GATEWAY_IP}:18080/ws/" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
-  scenario_requested "$only_scenario" game-long-connection && launch_client "$phase" "$kind" game-long-connection tcp "${GATEWAY_IP}:18200" "$STREAM_CONNECTIONS" tcp --addr "${GATEWAY_IP}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
-  scenario_requested "$only_scenario" tcp-stream && launch_client "$phase" "$kind" tcp-stream tcp "${GATEWAY_IP}:18200" "$STREAM_CONNECTIONS" tcp --addr "${GATEWAY_IP}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024
-  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${GATEWAY_IP}:18300" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
-  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${GATEWAY_IP}:18310" "$STREAM_CONNECTIONS" udp --addr "${GATEWAY_IP}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
+  scenario_requested "$only_scenario" websocket-long-connection && launch_client "$phase" "$kind" websocket-long-connection websocket "ws://${gateway_ip}:18080/ws/" "$STREAM_CONNECTIONS" websocket --url "ws://${gateway_ip}:18080/ws/" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
+  scenario_requested "$only_scenario" game-long-connection && launch_client "$phase" "$kind" game-long-connection tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
+  scenario_requested "$only_scenario" tcp-stream && launch_client "$phase" "$kind" tcp-stream tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024
+  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${gateway_ip}:18300" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
+  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${gateway_ip}:18310" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
+  cat >>"$WAVE_SCRIPT" <<'CLIENT_WAVE'
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+exit "$status"
+CLIENT_WAVE
 
-  local client_name
-  for client_name in "${CLIENT_NAMES[@]}"; do
-    docker start "$client_name" >/dev/null &
-  done
-  wait
+  local memory_args=()
+  memory_limit_enabled "$CLIENT_MEMORY" && memory_args=(--memory "$CLIENT_MEMORY")
+  docker create --name "$WAVE_CLIENT_NAME" --network "$NETWORK" \
+    --platform "$BENCH_PLATFORM" \
+    --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
+    --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
+    --mount "type=volume,src=$SYNC_VOLUME,dst=/run/proxysss-bench-sync,readonly" \
+    "$IMAGE" bash -ec '
+      while [[ ! -s /run/proxysss-bench-sync/start-at-unix-ms ]]; do sleep 0.05; done
+      start_at="$(cat /run/proxysss-bench-sync/start-at-unix-ms)"
+      exec bash /tmp/proxysss-client-wave.sh "$start_at"
+    ' >/dev/null
+  docker cp "$WAVE_SCRIPT" "$WAVE_CLIENT_NAME:/tmp/proxysss-client-wave.sh"
+  docker start "$WAVE_CLIENT_NAME" >/dev/null
   WAVE_START_AT_UNIX_MS="$(docker run --rm --platform "$BENCH_PLATFORM" \
     -e CLIENT_START_LEAD_SECS="$CLIENT_START_LEAD_SECS" \
     --mount "type=volume,src=$SYNC_VOLUME,dst=/sync" \
@@ -557,32 +610,37 @@ run_candidate() {
       start_at=$(( $(date +%s%3N) + CLIENT_START_LEAD_SECS * 1000 ))
       printf "%s\n" "$start_at" | tee /sync/start-at-unix-ms
     ')"
-  local sample_at_ms now_ms sample_wait_secs
-  sample_at_ms=$((WAVE_START_AT_UNIX_MS + SAMPLE_AFTER_SECS * 1000))
-  now_ms="$(date +%s%3N)"
-  if (( sample_at_ms > now_ms )); then
-    sample_wait_secs=$(((sample_at_ms - now_ms + 999) / 1000))
-    sleep "$sample_wait_secs"
-  fi
   local name row_scenario protocol target concurrency gateway result_phase
-  local stat_targets=("$PREFIX-gateway-$kind" "$PREFIX-backend")
-  while IFS='|' read -r name _; do stat_targets+=("$name"); done <"$RUN_DIR/clients.meta"
   local stats_name="$phase-$kind"
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
-  docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
-    "${stat_targets[@]}" | tee "$RUN_DIR/$stats_name-stats.txt"
+  if [[ "$CAPTURE_DOCKER_STATS" == "1" ]]; then
+    local sample_at_ms now_ms sample_wait_secs
+    sample_at_ms=$((WAVE_START_AT_UNIX_MS + SAMPLE_AFTER_SECS * 1000))
+    now_ms="$(date +%s%3N)"
+    if (( sample_at_ms > now_ms )); then
+      sample_wait_secs=$(((sample_at_ms - now_ms + 999) / 1000))
+      sleep "$sample_wait_secs"
+    fi
+    local stat_targets=("$PREFIX-gateway-$kind" "$PREFIX-backend" "$WAVE_CLIENT_NAME")
+    docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
+      "${stat_targets[@]}" | tee "$RUN_DIR/$stats_name-stats.txt"
+  else
+    printf 'disabled_for_one_minute_feedback=true\n' >"$RUN_DIR/$stats_name-stats.txt"
+  fi
   capture_gateway_memory "$stats_name" "$kind" sample
 
+  local exit_code
+  exit_code="$(docker wait "$WAVE_CLIENT_NAME")"
+  docker cp "$WAVE_CLIENT_NAME:/tmp/proxysss-bench-results/." "$WAVE_RESULTS_DIR"
+  if [[ "$exit_code" != "0" ]]; then
+    docker logs "$WAVE_CLIENT_NAME" >&2 || true
+    echo "client wave $WAVE_CLIENT_NAME failed with exit $exit_code" >&2
+    return 1
+  fi
   while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase; do
-    local exit_code output
-    exit_code="$(docker wait "$name")"
-    output="$(docker logs "$name" 2>&1)"
+    local output
+    output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
-    if [[ "$exit_code" != "0" ]]; then
-      echo "$output" >&2
-      echo "client $name failed with exit $exit_code" >&2
-      return 1
-    fi
     local row
     row="$(printf '%s\n' "$output" | "$HELPER" parse-bench \
       --scenario "$row_scenario" --gateway "$gateway" --protocol "$protocol" \
@@ -594,12 +652,10 @@ run_candidate() {
     else
       LATENCY_ROWS+=("$row")
     fi
-    docker rm "$name" >/dev/null
   done <"$RUN_DIR/clients.meta"
+  docker rm "$WAVE_CLIENT_NAME" >/dev/null
 
   capture_gateway_memory "$stats_name" "$kind" final
-
-  docker rm -f "$PREFIX-gateway-$kind" "$PREFIX-backend" >/dev/null
 }
 
 order_for_repetition() {
@@ -612,6 +668,16 @@ order_for_repetition() {
     printf '%s\n' "nginx proxysss"
   fi
 }
+
+# One backend and both gateway candidates stay warm for the whole scale run.
+# The inactive gateway is paused on the shared gateway cpuset, so it consumes
+# no CPU while its peer is measured. This removes container startup from every
+# 2-second sample without allowing the candidates to run concurrently.
+start_backend
+start_gateway nginx
+wait_gateway nginx
+start_gateway proxysss
+wait_gateway proxysss
 
 if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
   for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
@@ -656,6 +722,8 @@ if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
   printf '%s\n' "${ISOLATED_ROWS[@]}" >"$ISOLATED_RESULTS_JSONL"
   "$HELPER" aggregate-bench-medians --in "$ISOLATED_RESULTS_JSONL" --out "$ISOLATED_RESULTS_JSON"
 fi
+
+docker rm -f "$PREFIX-gateway-nginx" "$PREFIX-gateway-proxysss" "$PREFIX-backend" >/dev/null
 
 strict=false
 mixed_min_ratio=0
@@ -730,12 +798,15 @@ benchmark_repetitions=$BENCHMARK_REPETITIONS
 isolated_repetitions=$ISOLATED_REPETITIONS
 equal_load_fraction=$EQUAL_LOAD_FRACTION
 min_target_achievement=$MIN_TARGET_ACHIEVEMENT
+capture_docker_stats=$CAPTURE_DOCKER_STATS
 run_isolated_saturation=$RUN_ISOLATED_SATURATION
 run_mixed_matrix=$RUN_MIXED_MATRIX
 mixed_scenarios=${MIXED_SCENARIOS:-all}
 isolated_scenarios=${ISOLATED_SCENARIOS:-all}
 gateway_cpuset=$GATEWAY_CPUSET
 gateway_cpu_cores=$GATEWAY_CPU_CORES
+nginx_gateway_ip=$GATEWAY_IP
+proxysss_gateway_ip=$PROXYSSS_GATEWAY_IP
 gateway_memory=${GATEWAY_MEMORY:-unlimited}
 backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
