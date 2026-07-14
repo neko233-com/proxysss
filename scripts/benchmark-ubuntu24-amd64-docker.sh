@@ -55,6 +55,7 @@ LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-0}"
 RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-5}"
+CLIENT_START_LEAD_SECS="${CLIENT_START_LEAD_SECS:-}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
@@ -148,6 +149,14 @@ execution_mode="native-amd64"
 if [[ "$docker_server_arch" != "amd64" ]]; then
   execution_mode="emulated-amd64"
 fi
+if [[ -z "$CLIENT_START_LEAD_SECS" ]]; then
+  if [[ "$execution_mode" == "emulated-amd64" ]]; then
+    CLIENT_START_LEAD_SECS=20
+  else
+    CLIENT_START_LEAD_SECS=8
+  fi
+fi
+require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
 {
   echo "commit=$COMMIT"
   echo "host_kernel=$(uname -sr)"
@@ -168,6 +177,7 @@ fi
   echo "repetitions=$BENCHMARK_REPETITIONS"
   echo "mixed_scenarios=${MIXED_SCENARIOS:-all}"
   echo "run_serial_isolated=$RUN_SERIAL_ISOLATED"
+  echo "client_start_lead_secs=$CLIENT_START_LEAD_SECS"
   echo "run_order=$RUN_ORDER"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
   for key in net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_max_syn_backlog fs.file-max; do
@@ -213,6 +223,7 @@ for scale in $LOAD_SCALES; do
     -e ALLOW_UNBALANCED_REPETITIONS="$ALLOW_UNBALANCED_REPETITIONS" \
     -e DURATION_SECS="$DURATION_SECS" \
     -e SAMPLE_AFTER_SECS="$SAMPLE_AFTER_SECS" \
+    -e CLIENT_START_LEAD_SECS="$CLIENT_START_LEAD_SECS" \
     -e HTTP_CONCURRENCY="$http_concurrency" \
     -e HTTPS_CONCURRENCY="$https_concurrency" \
     -e STATIC_LARGE_CONCURRENCY="$static_large_concurrency" \
