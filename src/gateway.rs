@@ -1508,7 +1508,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead every 8 requests. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
@@ -1528,6 +1528,7 @@ static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLo
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
+static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -1594,8 +1595,10 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             adaptive_data_plane_workers(1),
             TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
         );
+        let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
         tracing::info!(
             runtime_workers = worker_count,
+            scheduler_nice,
             "starting work-stealing TLS HTTP data runtime"
         );
         let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -1604,6 +1607,7 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-tls")
             .global_queue_interval(2)
             .event_interval(3)
+            .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
             .build()
@@ -1734,6 +1738,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
         TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
             tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        TLS_HTTP_RUNTIME_NICE.store(
+            tls_http_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         UDP_RUNTIME_CPU_DIVISOR.store(
@@ -11991,7 +11999,7 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 7,
+        RuntimePerformanceTrafficProfile::Balanced => 12,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12013,6 +12021,15 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
+fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Bulk => 5,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
@@ -12029,8 +12046,7 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 5,
-        RuntimePerformanceTrafficProfile::Bulk => 7,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
 
@@ -12065,7 +12081,7 @@ fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 6,
         RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -23729,7 +23745,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            7
+            12
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23755,6 +23771,18 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
         assert_eq!(
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
+            0
+        );
+        assert_eq!(
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            3
+        );
+        assert_eq!(
+            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
+            5
+        );
+        assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
             1
         );
@@ -23775,11 +23803,11 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            12
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
-            7
+            12
         );
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
@@ -23839,7 +23867,7 @@ mod tests {
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            6
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
