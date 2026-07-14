@@ -28,11 +28,6 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // every event at mixed-load density steals CPU from HTTP/TLS/UDP siblings.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-// At mixed-load density the native owner can otherwise remain runnable across
-// consecutive full epoll batches on its pinned CPU. Yield once per completed
-// batch after this many pairs so the co-located HTTP accept shard gets a
-// scheduling point. Sparse realtime traffic retains the lower-latency path.
-const MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER: usize = 16;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -89,8 +84,15 @@ pub(crate) fn dispatch(
     downstream_fd: RawFd,
     upstream_fd: RawFd,
     requested_workers: usize,
+    scheduler_nice: i32,
 ) -> io::Result<()> {
-    dispatch_inner(downstream_fd, upstream_fd, requested_workers, None)
+    dispatch_inner(
+        downstream_fd,
+        upstream_fd,
+        requested_workers,
+        scheduler_nice,
+        None,
+    )
 }
 
 /// Like [`dispatch`], but returns a completion receiver for control-plane
@@ -99,9 +101,16 @@ pub(crate) fn dispatch_with_completion(
     downstream_fd: RawFd,
     upstream_fd: RawFd,
     requested_workers: usize,
+    scheduler_nice: i32,
 ) -> io::Result<oneshot::Receiver<()>> {
     let (sender, receiver) = oneshot::channel();
-    dispatch_inner(downstream_fd, upstream_fd, requested_workers, Some(sender))?;
+    dispatch_inner(
+        downstream_fd,
+        upstream_fd,
+        requested_workers,
+        scheduler_nice,
+        Some(sender),
+    )?;
     Ok(receiver)
 }
 
@@ -109,9 +118,10 @@ fn dispatch_inner(
     downstream_fd: RawFd,
     upstream_fd: RawFd,
     requested_workers: usize,
+    scheduler_nice: i32,
     completion: Option<oneshot::Sender<()>>,
 ) -> io::Result<()> {
-    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers));
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
     let downstream = duplicate_stream(downstream_fd)?;
     let upstream = duplicate_stream(upstream_fd)?;
     let pair = SocketPair {
@@ -130,7 +140,7 @@ fn dispatch_inner(
 }
 
 impl Reactors {
-    fn start(requested_workers: usize) -> Self {
+    fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
@@ -147,7 +157,7 @@ impl Reactors {
                 .copied();
             thread::Builder::new()
                 .name(format!("proxysss-ws-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu))
+                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
                 .expect("failed spawning WebSocket epoll reactor");
             workers.push(worker);
         }
@@ -173,10 +183,11 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
+fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i32) {
     if let Some(cpu) = cpu {
         pin_current_thread(cpu);
     }
+    set_current_thread_nice(scheduler_nice);
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating WebSocket epoll instance");
     let mut wake_event = libc::epoll_event {
@@ -265,9 +276,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
                 close_pair(epoll_fd, &mut sockets, fd);
             }
         }
-        if should_yield_after_batch(sockets.len()) {
-            thread::yield_now();
-        }
     }
 
     unsafe {
@@ -275,8 +283,13 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>) {
     }
 }
 
-fn should_yield_after_batch(socket_count: usize) -> bool {
-    socket_count / 2 >= MIXED_FAIRNESS_MIN_PAIRS_PER_WORKER
+fn set_current_thread_nice(nice: i32) {
+    let nice = nice.clamp(0, 19);
+    if nice > 0 {
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+        }
+    }
 }
 
 fn register_pair(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, pair: SocketPair) {
@@ -599,12 +612,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn mixed_fairness_counts_socket_pairs_per_worker() {
-        assert!(!should_yield_after_batch(31));
-        assert!(should_yield_after_batch(32));
-    }
-
-    #[test]
     fn reactor_preserves_bidirectional_half_close() {
         let downstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(downstream_listener.local_addr().unwrap()).unwrap();
@@ -620,7 +627,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
 
-        dispatch(downstream.as_raw_fd(), upstream.as_raw_fd(), 1).unwrap();
+        dispatch(downstream.as_raw_fd(), upstream.as_raw_fd(), 1, 0).unwrap();
         drop(downstream);
         drop(upstream);
 

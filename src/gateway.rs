@@ -75,6 +75,8 @@ use zstd::stream::encode_all as zstd_encode_all;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicI32;
 use std::sync::OnceLock;
 
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
@@ -811,6 +813,7 @@ async fn copy_tcp_bidirectional_adaptive(
             left.as_raw_fd(),
             right.as_raw_fd(),
             realtime_stream_reactor_workers(),
+            realtime_stream_reactor_nice(),
         ) {
             Ok(completion) => {
                 // The reactor owns duplicated descriptors now. Dropping the
@@ -1541,6 +1544,8 @@ static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
 #[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
+static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1699,6 +1704,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         let stream_reactor_divisor =
             realtime_stream_reactor_cpu_divisor(config.runtime.performance.traffic_profile);
         REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
+        REALTIME_STREAM_REACTOR_NICE.store(
+            realtime_stream_reactor_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
         let sendfile_chunk_bytes = match config.runtime.performance.traffic_profile {
             RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_CHUNK_BYTES,
             RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_CHUNK_BYTES,
@@ -8905,6 +8914,7 @@ impl Gateway {
                 downstream_fd,
                 upstream_io.as_raw_fd(),
                 realtime_stream_reactor_workers(),
+                realtime_stream_reactor_nice(),
             ) {
                 Ok(()) => {
                     *downstream_detached = true;
@@ -11875,6 +11885,15 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
+fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Bulk => 5,
+    }
+}
+
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
 }
@@ -11918,6 +11937,11 @@ fn realtime_stream_reactor_workers() -> usize {
         adaptive_data_plane_workers(1),
         REALTIME_STREAM_REACTOR_CPU_DIVISOR.load(Ordering::Relaxed),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn realtime_stream_reactor_nice() -> i32 {
+    REALTIME_STREAM_REACTOR_NICE.load(Ordering::Relaxed)
 }
 
 fn adaptive_stream_runtime_workers_for(cores: usize) -> usize {
@@ -23554,6 +23578,18 @@ mod tests {
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
             4
+        );
+        assert_eq!(
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
+            0
+        );
+        assert_eq!(
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            3
+        );
+        assert_eq!(
+            realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
+            5
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
