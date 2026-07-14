@@ -719,8 +719,8 @@ proxysss config capabilities
 proxysss config reload-plan
 scripts/verify-docker-scenarios.sh
 .\scripts\verify-docker-scenarios.ps1
-scripts/benchmark-all-scenarios.sh</code></pre>
-              <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。Docker 场景验证与 benchmark 必须直连专机手动运行；前者检查全场景样例、Range、注册中心配置和能力矩阵，后者用于性能验证。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠；物理网络 WSS 结论还要从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>：它检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制 <code>4 CPU / 300k nofile</code>，保存同 SHA、<code>nginx -V</code>、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 <code>GATEWAY_MEMORY_MAX</code> 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>，<code>proxysss 127742.75 ops/s</code> vs <code>nginx 31577.33 ops/s</code>，两边 0 错误。</p>
+scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
+              <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。Docker 场景验证与 benchmark 必须直连专机手动运行；严格性能入口会硬校验 Ubuntu 24.04 x86_64 宿主/amd64 镜像，在容器内构建当前 checkout，并把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠；物理网络 WSS 结论还要从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>：它检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制 <code>4 CPU / 300k nofile</code>，保存同 SHA、<code>nginx -V</code>、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 <code>GATEWAY_MEMORY_MAX</code> 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>，<code>proxysss 127742.75 ops/s</code> vs <code>nginx 31577.33 ops/s</code>，两边 0 错误。</p>
             </article>
 
             <article class="card">

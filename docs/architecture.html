@@ -892,11 +892,12 @@ proxysss config capabilities
 proxysss config reload-plan
 scripts/verify-docker-scenarios.sh
 .\scripts\verify-docker-scenarios.ps1
+scripts/benchmark-ubuntu24-amd64-docker.sh
 scripts/benchmark-all-scenarios.sh
 scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
-          <p class="subtle">`benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次抖动决定结论。GitHub Actions 只允许六平台打包，不得承载或手动触发性能压测；Ubuntu 24 x86_64 Docker 严格矩阵必须在直连专机运行，并把 HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大，禁止只扩大优势路径。static-large 严格基线从每核 2 条流开始，双方完全相同，避免每核仅 1 条时 `SO_REUSEPORT` hash placement 主导稀疏样本。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
+          <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 是禁止 GitHub Actions 性能压测后的直连专机入口：先硬校验 Ubuntu 24.04 x86_64 宿主与 amd64 镜像，在容器内构建当前 checkout，再把 HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大，逐档要求零错误和严格 `>1.0`，原始证据保存在 `.benchmark/direct-ubuntu24-amd64/`。底层 `benchmark-all-scenarios.sh` 支持 `BENCHMARK_REPETITIONS` 与交替 `RUN_ORDER`；多轮 mixed saturation 对吞吐和 percentile 取中位数，对错误取最大值，避免单次抖动决定结论。static-large 严格基线从每核 2 条流开始，双方完全相同，避免每核仅 1 条时 `SO_REUSEPORT` hash placement 主导稀疏样本。`benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup，默认 4+4+8 CPU 分配先做 16-core 预检，并用 nginx 1.31.2 mainline 做同配置对照。mixed/equal-load 默认交错运行 4 次，isolated saturation 跑 3 次并取中位数，任一轮错误取最大值；equal-offered-load 使用较慢一方饱和吞吐的固定比例严格比较 p50/p95/p99 与目标完成率。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。`MemoryMax` 是显式生产预算，不是任意硬门槛。Docker role isolation 不能冒充三台物理机。</p>
           <p class="subtle">默认 nginx 对照矩阵不含 KCP/QCP 协议专用封装；`EXTENDED_REALTIME=1` 只把 `protocol: qcp` 的透明 UDP 转发加入同一 mixed wave，与 nginx 等价 UDP stream 接受同一严格门禁。该结果证明 edge forwarding，不代表 proxysss 在热路径解析或终止 QCP frame。</p>
         </section>
 

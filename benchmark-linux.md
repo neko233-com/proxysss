@@ -173,6 +173,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 性能 benchmark 仍然保留在脚本里，但从默认 CI 移到手动/专机路径：
 
+- `scripts/benchmark-ubuntu24-amd64-docker.sh`：直连 Ubuntu 24.04 x86_64 专机入口；硬校验宿主/镜像架构，在容器内构建当前 checkout，默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档要求零错误和严格 `>1.0`
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
@@ -207,6 +208,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 ```bash
 proxysss tune linux --apply --profile latency --max-connections 200000
+bash scripts/benchmark-ubuntu24-amd64-docker.sh
 PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
   bash scripts/benchmark-all-scenarios.sh
 ```

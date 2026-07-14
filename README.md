@@ -447,13 +447,14 @@ Production validation flow:
 
 ```bash
 proxysss tune linux --apply
+bash scripts/benchmark-ubuntu24-amd64-docker.sh
 STRICT_SUPERIORITY=1 PROXY_BIN=target/release/proxysss \
   scripts/benchmark-all-scenarios-isolated.sh
 PROXY_BIN=target/release/proxysss \
   scripts/benchmark-production-scale-matrix.sh
 ```
 
-The role-isolated gate pins a 4c gateway, backend, and clients to disjoint CPU sets/cgroups (the default allocation needs a 16-core Linux host), compares against nginx 1.31.2 mainline, and keeps three measurements separate: mixed aggregate saturation, per-scenario isolated saturation, and equal-offered-load p50/p95/p99. Memory is observed and reported by default; set a Docker or systemd memory limit only for a real declared production envelope. Mixed/equal-load phases default to four order-balanced samples; isolated saturation uses three. Metrics use medians while retaining the maximum observed error count. Fixed-load rows must complete at least 98% of the declared target; reports include both ratios and percentage improvements. The scale driver repeats the complete gate at 1x/2x/4x workload.
+`benchmark-ubuntu24-amd64-docker.sh` refuses any host other than Ubuntu 24.04 x86_64 and any image other than amd64, builds the current checkout in that container, then runs strict 1x/2x/4x mixed waves. Every scale expands HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP together, enables transparent QCP forwarding, takes three interleaved medians, requires zero errors, and retains raw evidence under `.benchmark/direct-ubuntu24-amd64/`. The role-isolated gate then pins a 4c gateway, backend, and clients to disjoint CPU sets/cgroups (the default allocation needs a 16-core Linux host), compares against nginx 1.31.2 mainline, and keeps three measurements separate: mixed aggregate saturation, per-scenario isolated saturation, and equal-offered-load p50/p95/p99. Memory is observed and reported by default; set a Docker or systemd memory limit only for a real declared production envelope. Mixed/equal-load phases default to four order-balanced samples; isolated saturation uses three. Metrics use medians while retaining the maximum observed error count. Fixed-load rows must complete at least 98% of the declared target; reports include both ratios and percentage improvements. The scale driver repeats the complete gate at 1x/2x/4x workload.
 
 For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, then uses a remote systemd cgroup to enforce `AllowedCPUs=0-3` and `LimitNOFILE=300000` for both nginx and proxysss. It records cgroup current/peak memory plus per-connection cost, host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. `GATEWAY_MEMORY_MAX` is optional (default `infinity`); set it to `8G` only when that is the declared production envelope. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
 
