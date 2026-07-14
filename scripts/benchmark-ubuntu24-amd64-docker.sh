@@ -72,6 +72,8 @@ OUTPUT_REL=".benchmark/direct-ubuntu24-amd64/$RUN_ID"
 OUTPUT_ROOT="$ROOT/$OUTPUT_REL"
 CURRENT_BENCH_ROOT="/work/$OUTPUT_REL/current"
 TARGET_DIR="/work/.benchmark/ubuntu24-amd64-target"
+CROSS_TARGET_REL=".benchmark/ubuntu24-amd64-cross-target"
+CROSS_TARGET_DIR="$ROOT/$CROSS_TARGET_REL"
 CARGO_HOME_DIR="/work/.benchmark/ubuntu24-amd64-cargo-home"
 
 require_positive_integer DURATION_SECS "$DURATION_SECS"
@@ -154,6 +156,10 @@ execution_mode="native-amd64"
 if [[ "$docker_server_arch" != "amd64" ]]; then
   execution_mode="emulated-amd64"
 fi
+build_mode="native-amd64-container"
+if [[ "$execution_mode" == "emulated-amd64" ]]; then
+  build_mode="native-host-zig-cross"
+fi
 if [[ -z "$CLIENT_START_LEAD_SECS" ]]; then
   CLIENT_START_LEAD_SECS=1
 fi
@@ -168,6 +174,7 @@ require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
   echo "container_arch=x86_64"
   echo "container_os=ubuntu-24.04"
   echo "execution_mode=$execution_mode"
+  echo "build_mode=$build_mode"
   echo "total_cpus=$TOTAL_CPUS"
   echo "gateway_cpu_cores=$CPU_CORES"
   echo "gateway_cpuset=$GATEWAY_CPUSET"
@@ -190,13 +197,38 @@ require_positive_integer CLIENT_START_LEAD_SECS "$CLIENT_START_LEAD_SECS"
 } >"$OUTPUT_ROOT/host-fingerprint.txt"
 
 echo "==> building current checkout as optimized x86_64 Linux release"
+if [[ "$build_mode" == "native-host-zig-cross" ]]; then
+  command -v zig >/dev/null 2>&1 || {
+    echo "arm64 Docker feedback requires zig for a sub-minute native cross build" >&2
+    exit 1
+  }
+  cargo zigbuild --version >/dev/null 2>&1 || {
+    echo "arm64 Docker feedback requires cargo-zigbuild" >&2
+    exit 1
+  }
+  rustup target list --installed | grep -qx 'x86_64-unknown-linux-gnu' || {
+    echo "missing Rust target x86_64-unknown-linux-gnu" >&2
+    exit 1
+  }
+  CARGO_TARGET_DIR="$CROSS_TARGET_DIR" \
+    cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.17
+  PROXY_BIN_PATH="/work/$CROSS_TARGET_REL/x86_64-unknown-linux-gnu/release/proxysss"
+else
+  docker run --rm --platform linux/amd64 \
+    -v "$ROOT:/work" \
+    -w /work \
+    -e CARGO_HOME="$CARGO_HOME_DIR" \
+    -e CARGO_TARGET_DIR="$TARGET_DIR" \
+    "$IMAGE" \
+    cargo build --locked --release
+  PROXY_BIN_PATH="$TARGET_DIR/release/proxysss"
+fi
+
+# Cross compilation is only a build acceleration. The produced ELF still has
+# to execute inside the same Ubuntu 24 amd64 image before any benchmark starts.
 docker run --rm --platform linux/amd64 \
-  -v "$ROOT:/work" \
-  -w /work \
-  -e CARGO_HOME="$CARGO_HOME_DIR" \
-  -e CARGO_TARGET_DIR="$TARGET_DIR" \
-  "$IMAGE" \
-  cargo build --locked --release
+  -v "$ROOT:/work:ro" \
+  "$IMAGE" "$PROXY_BIN_PATH" --version >/dev/null
 
 for scale in $LOAD_SCALES; do
   http_concurrency=$((CPU_CORES * 16 * scale))
@@ -215,7 +247,7 @@ for scale in $LOAD_SCALES; do
     -w /work \
     -e BENCH_ROOT="$CURRENT_BENCH_ROOT" \
     -e RUN_ID="scale-$scale" \
-    -e PROXY_BIN="$TARGET_DIR/release/proxysss" \
+    -e PROXY_BIN="$PROXY_BIN_PATH" \
     -e IMAGE="proxysss-isolated-ubuntu24-amd64:$RUN_ID-$scale" \
     -e BENCH_PLATFORM=linux/amd64 \
     -e GATEWAY_CPUSET="$GATEWAY_CPUSET" \

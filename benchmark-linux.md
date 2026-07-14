@@ -175,7 +175,7 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 - `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64，在容器内构建当前 checkout，并把 gateway/backend/client 分配到互不重叠的 cpuset。默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档同时跑 mixed saturation 与 equal-offered-load，要求零错误、逐场景吞吐和延迟严格胜出。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
 
-这个本机 wrapper 会在 `.benchmark/ubuntu24-amd64-cargo-home` 与 `.benchmark/ubuntu24-amd64-target` 复用 Cargo registry/target，优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；默认 1 分钟反馈必须清空 filter 并保留全部场景；只有显式长时根因审计才提高到四轮交错顺序。
+这个本机 wrapper 在 amd64 daemon 复用 `.benchmark/ubuntu24-amd64-target`；arm64 daemon 必须安装 Zig、cargo-zigbuild 与 Rust `x86_64-unknown-linux-gnu` target，并复用 `.benchmark/ubuntu24-amd64-cross-target` 做本机原生速度交叉编译，再把同一个 ELF 放进 Ubuntu 24 amd64 容器执行校验，禁止回退到数分钟的 QEMU 编译。优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；默认 1 分钟反馈必须清空 filter 并保留全部场景；只有显式长时根因审计才提高到四轮交错顺序。
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
