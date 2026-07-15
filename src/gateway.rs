@@ -5416,6 +5416,7 @@ impl Gateway {
         let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
         prefix.extend_from_slice(&initial_prefix);
         let mut header = String::with_capacity(160);
+        let mut response_cache: Option<ConnectionTlsStaticFastPathCache> = None;
         let mut served = 0_usize;
         loop {
             let head_end = read_fast_lane_http_prefix(downstream, &mut prefix)
@@ -5431,7 +5432,38 @@ impl Gateway {
             let Some(head_end) = head_end else {
                 return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
             };
-            let Some(request) = parse_static_fast_path_request(&prefix[..head_end]) else {
+            let request_head = &prefix[..head_end];
+            if let Some(cached) = response_cache
+                .as_ref()
+                .filter(|cached| cached.raw_request_matches(request_head))
+            {
+                write_static_response_vectored(
+                    downstream,
+                    &cached.header,
+                    cached.body.as_deref().unwrap_or_default(),
+                )
+                .await
+                .context("failed writing cached vectored TLS static response")?;
+                self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+                if config.logging.access_log {
+                    tracing::info!(
+                        target: "access",
+                        method = %cached.method,
+                        path = %cached.path,
+                        status = 200,
+                        upstream = "proxysss://tls-static-cache",
+                        remote_addr = %remote_addr,
+                        "access"
+                    );
+                }
+                discard_fast_lane_http_head(&mut prefix, head_end);
+                served = served.saturating_add(1);
+                if served.is_multiple_of(PLAIN_FAST_LANE_FAIRNESS_BATCH) {
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+            let Some(request) = parse_static_fast_path_request(request_head) else {
                 return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
             };
             let Some(target) = self
@@ -5479,6 +5511,16 @@ impl Gateway {
             write_static_response_vectored(downstream, header.as_bytes(), response_body)
                 .await
                 .context("failed writing vectored TLS static fast-lane response")?;
+            if keep_alive {
+                response_cache = Some(ConnectionTlsStaticFastPathCache {
+                    request_head: Bytes::copy_from_slice(request_head),
+                    checked_at: Instant::now(),
+                    header: Bytes::copy_from_slice(header.as_bytes()),
+                    body: (request.method == "GET").then(|| body.clone()),
+                    method: request.method,
+                    path: request.path.to_string(),
+                });
+            }
             self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
             if config.logging.access_log {
                 tracing::info!(
@@ -11645,6 +11687,22 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
+}
+
+struct ConnectionTlsStaticFastPathCache {
+    request_head: Bytes,
+    checked_at: Instant,
+    header: Bytes,
+    body: Option<Bytes>,
+    method: &'static str,
+    path: String,
+}
+
+impl ConnectionTlsStaticFastPathCache {
+    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
+        self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            && self.request_head.as_ref() == request_head
+    }
 }
 
 async fn write_static_response_vectored<Stream>(
@@ -22814,6 +22872,25 @@ mod tests {
         assert_eq!(&received[..header.len()], header);
         assert_eq!(received.len(), header.len() + body_len);
         assert!(received[header.len()..].iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn tls_connection_static_cache_requires_exact_fresh_request_head() {
+        let mut cache = ConnectionTlsStaticFastPathCache {
+            request_head: Bytes::from_static(b"GET /asset.js HTTP/1.1\r\n\r\n"),
+            checked_at: Instant::now(),
+            header: Bytes::from_static(b"HTTP/1.1 200 OK\r\n\r\n"),
+            body: Some(Bytes::from_static(b"body")),
+            method: "GET",
+            path: "/asset.js".to_string(),
+        };
+        assert!(cache.raw_request_matches(b"GET /asset.js HTTP/1.1\r\n\r\n"));
+        assert!(!cache.raw_request_matches(b"GET /other.js HTTP/1.1\r\n\r\n"));
+
+        cache.checked_at = Instant::now()
+            .checked_sub(Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS + 1))
+            .expect("construct stale TLS connection cache timestamp");
+        assert!(!cache.raw_request_matches(b"GET /asset.js HTTP/1.1\r\n\r\n"));
     }
 
     #[test]
