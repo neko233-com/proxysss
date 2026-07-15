@@ -1140,11 +1140,11 @@ fn shutdown_fd_write(fd: std::os::fd::RawFd) {
     }
 }
 
-fn dedicated_tcp_stream_runtimes() -> &'static [tokio::runtime::Runtime] {
+fn dedicated_tcp_stream_runtimes() -> &'static [tokio::runtime::Handle] {
     dedicated_http_connection_runtimes()
 }
 
-fn dedicated_tcp_stream_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+fn dedicated_tcp_stream_runtime(worker_index: usize) -> &'static tokio::runtime::Handle {
     dedicated_http_connection_runtime(worker_index)
 }
 
@@ -1539,7 +1539,7 @@ const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
-static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Handle>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
@@ -1566,12 +1566,12 @@ static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
-fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Handle] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
         // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
-        // one reactor thread. This avoids work-stealing and global-queue costs
-        // under sustained static/reverse-proxy load. TLS connections remain on
-        // the accepting shard so rustls sockets are never migrated mid-flight.
+        // one current-thread reactor. A one-worker multi-thread scheduler still
+        // carries work-stealing bookkeeping; the basic scheduler cannot migrate
+        // a connection and has a smaller wake/task dispatch path.
         let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
         tracing::info!(
             runtime_shards = shard_count,
@@ -1579,23 +1579,35 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
         );
         (0..shard_count)
             .map(|shard_index| {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder
-                    .worker_threads(1)
-                    .thread_name(format!("proxysss-http-{shard_index}"))
-                    .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                    .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
-                    .enable_all();
-                builder
-                    .build()
-                    .expect("failed to build proxysss HTTP runtime shard")
+                let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name(format!("proxysss-http-{shard_index}"))
+                    .spawn(move || {
+                        pin_current_data_plane_thread(shard_index);
+                        let mut builder = tokio::runtime::Builder::new_current_thread();
+                        builder
+                            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                            .thread_name(format!("proxysss-http-blocking-{shard_index}"))
+                            .enable_all();
+                        let runtime = builder
+                            .build()
+                            .expect("failed to build proxysss HTTP runtime shard");
+                        handle_tx
+                            .send(runtime.handle().clone())
+                            .expect("failed publishing proxysss HTTP runtime handle");
+                        runtime.block_on(std::future::pending::<()>());
+                    })
+                    .expect("failed starting proxysss HTTP runtime shard");
+                handle_rx
+                    .recv()
+                    .expect("proxysss HTTP runtime shard stopped during startup")
             })
             .collect()
     })
 }
 
-fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Handle {
     let runtimes = dedicated_http_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
 }
@@ -1657,12 +1669,12 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     })
 }
 
-fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Handle {
     if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
         return dedicated_http_connection_runtime(worker_index);
     }
     let runtimes = dedicated_udp_connection_runtimes();
-    &runtimes[worker_index % runtimes.len()]
+    runtimes[worker_index % runtimes.len()].handle()
 }
 
 fn initialize_udp_connection_runtimes() {
