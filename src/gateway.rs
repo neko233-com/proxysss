@@ -1529,6 +1529,7 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
+const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 16;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
@@ -1543,6 +1544,7 @@ const H2_MIXED_PER_CORE_OPS: u64 = 3_800;
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static TLS_OVERFLOW_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -1636,6 +1638,42 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn dedicated_tls_overflow_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    TLS_OVERFLOW_RUNTIME
+        .get_or_init(|| {
+            let cores = adaptive_data_plane_workers(1);
+            let base_workers = tls_http_runtime_workers_for(
+                cores,
+                TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
+            );
+            let overflow_workers = tls_http_overflow_workers_for(cores, base_workers);
+            if overflow_workers == 0 {
+                return None;
+            }
+            let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
+            tracing::info!(
+                runtime_workers = overflow_workers,
+                activation_connections = tls_http_overflow_connection_threshold(base_workers),
+                scheduler_nice,
+                "starting elastic TLS HTTP overflow runtime"
+            );
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder
+                .worker_threads(overflow_workers)
+                .thread_name("proxysss-tls-overflow")
+                .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                .on_thread_start(move || set_current_thread_nice(scheduler_nice))
+                .enable_all();
+            Some(
+                builder
+                    .build()
+                    .expect("failed to build proxysss TLS overflow runtime"),
+            )
+        })
+        .as_ref()
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -5547,6 +5585,7 @@ impl Gateway {
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
             let _ = dedicated_tls_connection_runtimes();
+            let _ = dedicated_tls_overflow_runtime();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -5675,12 +5714,25 @@ impl Gateway {
                     .fetch_add(1, Ordering::Relaxed)
                     .saturating_add(1);
                 let connection_guard = ActiveConnectionGuard(active_connections.clone());
-                std::mem::drop(tokio::spawn(async move {
+                let connection = async move {
                     let _connection_guard = connection_guard;
                     gateway
                         .serve_tls_http_connection(stream, acceptor, remote_addr, worker_index)
                         .await;
-                }));
+                };
+                let base_workers = tls_http_runtime_workers_for(
+                    adaptive_data_plane_workers(1),
+                    TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
+                );
+                if active_connection_count > tls_http_overflow_connection_threshold(base_workers) {
+                    if let Some(runtime) = dedicated_tls_overflow_runtime() {
+                        std::mem::drop(runtime.spawn(connection));
+                    } else {
+                        std::mem::drop(tokio::spawn(connection));
+                    }
+                } else {
+                    std::mem::drop(tokio::spawn(connection));
+                }
                 accepted_since_yield += 1;
                 let handshake_batch = if active_connection_count > TLS_ACCEPT_HIGH_DENSITY_PER_SHARD
                 {
@@ -12066,6 +12118,19 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
+fn tls_http_overflow_workers_for(cores: usize, base_workers: usize) -> usize {
+    cores
+        .max(1)
+        .saturating_sub(base_workers.max(1))
+        .min(base_workers.max(1))
+}
+
+fn tls_http_overflow_connection_threshold(base_workers: usize) -> usize {
+    base_workers
+        .max(1)
+        .saturating_mul(TLS_OVERFLOW_CONNECTIONS_PER_WORKER)
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
@@ -12123,7 +12188,7 @@ fn balanced_sendfile_reactor_density_reached(active: usize, cores: usize) -> boo
 
 #[cfg(any(test, target_os = "linux"))]
 fn balanced_sendfile_reactor_workers_for(cores: usize) -> usize {
-    cores.max(1).div_ceil(4)
+    cores.max(1)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23864,6 +23929,13 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
+        assert_eq!(tls_http_overflow_workers_for(1, 1), 0);
+        assert_eq!(tls_http_overflow_workers_for(2, 1), 1);
+        assert_eq!(tls_http_overflow_workers_for(4, 1), 1);
+        assert_eq!(tls_http_overflow_workers_for(96, 24), 24);
+        assert_eq!(tls_http_overflow_workers_for(96, 96), 0);
+        assert_eq!(tls_http_overflow_connection_threshold(1), 16);
+        assert_eq!(tls_http_overflow_connection_threshold(24), 384);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
@@ -23953,8 +24025,8 @@ mod tests {
         assert!(!balanced_sendfile_reactor_density_reached(95, 96));
         assert!(balanced_sendfile_reactor_density_reached(96, 96));
         assert_eq!(balanced_sendfile_reactor_workers_for(1), 1);
-        assert_eq!(balanced_sendfile_reactor_workers_for(4), 1);
-        assert_eq!(balanced_sendfile_reactor_workers_for(96), 24);
+        assert_eq!(balanced_sendfile_reactor_workers_for(4), 4);
+        assert_eq!(balanced_sendfile_reactor_workers_for(96), 96);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
