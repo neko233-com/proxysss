@@ -23,7 +23,8 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
@@ -1517,6 +1518,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
+const PLAIN_HTTP_ACCEPT_OWNERS_PER_SHARD: usize = 4;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -4743,18 +4745,29 @@ impl Gateway {
         worker_index: usize,
         accept_on_data_runtime: bool,
     ) -> Result<()> {
+        let mut owned_connections: FuturesUnordered<
+            Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        > = FuturesUnordered::new();
         loop {
-            let (stream, remote_addr) = listener
-                .accept()
-                .await
-                .context("plain http accept failed")?;
+            let accepted = if accept_on_data_runtime {
+                tokio::select! {
+                    accepted = listener.accept() => Some(accepted),
+                    _ = owned_connections.next(), if !owned_connections.is_empty() => None,
+                }
+            } else {
+                Some(listener.accept().await)
+            };
+            let Some(accepted) = accepted else {
+                continue;
+            };
+            let (stream, remote_addr) = accepted.context("plain http accept failed")?;
             tune_tcp_stream_for_latency(&stream);
             if accept_on_data_runtime {
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
                 let gateway = self.clone();
-                std::mem::drop(tokio::spawn(async move {
+                owned_connections.push(Box::pin(async move {
                     gateway
                         .serve_plain_http_connection(
                             stream,
@@ -5524,7 +5537,12 @@ impl Gateway {
             self.on_demand_trigger.clone(),
             default_tls_alpn_protocols(),
         )?));
-        let base_worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let base_worker_count =
+            if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
+                http_data_plane_workers_for(adaptive_data_plane_workers(1))
+            } else {
+                1
+            };
         let max_worker_count =
             if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
                 adaptive_data_plane_workers(1)
@@ -11899,7 +11917,11 @@ fn plain_http_accept_worker_count(config: &GatewayConfig) -> usize {
     if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
         return 1;
     }
-    http_data_plane_workers_for(adaptive_data_plane_workers(1))
+    plain_http_accept_owners_for(adaptive_data_plane_workers(1))
+}
+
+fn plain_http_accept_owners_for(cores: usize) -> usize {
+    http_data_plane_workers_for(cores).saturating_mul(PLAIN_HTTP_ACCEPT_OWNERS_PER_SHARD)
 }
 
 fn udp_listener_worker_count(config: &GatewayConfig) -> usize {
@@ -23788,6 +23810,8 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert_eq!(plain_http_accept_owners_for(4), 16);
+        assert_eq!(plain_http_accept_owners_for(96), 384);
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
