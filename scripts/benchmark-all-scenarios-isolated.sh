@@ -114,7 +114,7 @@ CONTEXT_DIR="$BASE_RUN_DIR/image-context"
 WWW_DIR="$BASE_RUN_DIR/www"
 ROLE_MACHINE_ID_HASH="$(printf '%s' "$(docker info --format '{{.ID}}')" | sha256sum | awk '{print $1}')"
 
-[[ -x "$PROXY_BIN" ]] || {
+[[ -f "$PROXY_BIN" ]] || {
   echo "missing Linux proxysss binary: $PROXY_BIN" >&2
   exit 1
 }
