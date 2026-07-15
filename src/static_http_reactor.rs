@@ -6,6 +6,7 @@
 //! metadata change hands the owned socket and every unconsumed byte back to
 //! Tokio, so this lane never substitutes for routing or policy evaluation.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::mem;
@@ -27,6 +28,7 @@ const EVENT_BATCH: usize = 1_024;
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_RESPONSES_PER_EVENT: usize = 32;
+const FILE_OBSERVATION_CAPACITY: usize = 4_096;
 const REVALIDATE_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_TOKEN: u64 = u64::MAX;
 
@@ -82,7 +84,6 @@ struct Connection {
     file_path: PathBuf,
     file_len: u64,
     file_modified: Option<SystemTime>,
-    checked_at: Instant,
     config_epoch: Arc<AtomicU64>,
     expected_epoch: u64,
     pending: bool,
@@ -91,6 +92,12 @@ struct Connection {
     file_offset: libc::off_t,
     corked: bool,
     fallback: Option<oneshot::Sender<Fallback>>,
+}
+
+struct FileObservation {
+    checked_at: Instant,
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Default)]
@@ -198,6 +205,7 @@ fn run_worker(worker: Arc<Worker>, cpu: Option<usize>) {
     );
 
     let mut connections = ConnectionTable::default();
+    let mut file_observations = HashMap::new();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut read_buffer = [0_u8; READ_BUFFER_BYTES];
     loop {
@@ -213,7 +221,12 @@ fn run_worker(worker: Arc<Worker>, cpu: Option<usize>) {
             if event.u64 == WAKE_TOKEN {
                 drain_wake(worker.wake_fd);
                 while let Some(registration) = worker.registrations.pop() {
-                    register(epoll_fd, &mut connections, registration);
+                    register(
+                        epoll_fd,
+                        &mut connections,
+                        &mut file_observations,
+                        registration,
+                    );
                 }
                 continue;
             }
@@ -223,12 +236,20 @@ fn run_worker(worker: Arc<Worker>, cpu: Option<usize>) {
                 close(epoll_fd, &mut connections, fd);
                 continue;
             }
-            if flags & libc::EPOLLOUT != 0 && !flush(epoll_fd, &mut connections, fd) {
+            if flags & libc::EPOLLOUT != 0
+                && !flush(epoll_fd, &mut connections, &mut file_observations, fd)
+            {
                 close(epoll_fd, &mut connections, fd);
                 continue;
             }
             if flags & libc::EPOLLIN != 0
-                && !read_ready(epoll_fd, &mut connections, fd, &mut read_buffer)
+                && !read_ready(
+                    epoll_fd,
+                    &mut connections,
+                    &mut file_observations,
+                    fd,
+                    &mut read_buffer,
+                )
             {
                 close(epoll_fd, &mut connections, fd);
                 continue;
@@ -241,7 +262,12 @@ fn run_worker(worker: Arc<Worker>, cpu: Option<usize>) {
     unsafe { libc::close(epoll_fd) };
 }
 
-fn register(epoll_fd: RawFd, table: &mut ConnectionTable, registration: Registration) {
+fn register(
+    epoll_fd: RawFd,
+    table: &mut ConnectionTable,
+    file_observations: &mut HashMap<PathBuf, FileObservation>,
+    registration: Registration,
+) {
     let request = registration.request;
     let fd = request.stream.as_raw_fd();
     table.insert(
@@ -257,7 +283,6 @@ fn register(epoll_fd: RawFd, table: &mut ConnectionTable, registration: Registra
             file_path: request.file_path,
             file_len: request.file_len,
             file_modified: request.file_modified,
-            checked_at: Instant::now(),
             config_epoch: request.config_epoch,
             expected_epoch: request.expected_epoch,
             pending: false,
@@ -268,27 +293,31 @@ fn register(epoll_fd: RawFd, table: &mut ConnectionTable, registration: Registra
             fallback: Some(registration.fallback),
         },
     );
-    if !prepare_next(table.get_mut(fd).expect("static connection registered"))
-        || !add_or_modify(
-            epoll_fd,
-            fd,
-            table.get_mut(fd).expect("static connection registered"),
-            true,
-        )
-    {
+    if !prepare_next(
+        table.get_mut(fd).expect("static connection registered"),
+        file_observations,
+    ) || !add_or_modify(
+        epoll_fd,
+        fd,
+        table.get_mut(fd).expect("static connection registered"),
+        true,
+    ) {
         close(epoll_fd, table, fd);
         return;
     }
     if table
         .get_mut(fd)
         .is_some_and(|connection| connection.pending)
-        && !flush(epoll_fd, table, fd)
+        && !flush(epoll_fd, table, file_observations, fd)
     {
         close(epoll_fd, table, fd);
     }
 }
 
-fn prepare_next(connection: &mut Connection) -> bool {
+fn prepare_next(
+    connection: &mut Connection,
+    file_observations: &mut HashMap<PathBuf, FileObservation>,
+) -> bool {
     if connection.pending {
         return true;
     }
@@ -297,7 +326,7 @@ fn prepare_next(connection: &mut Connection) -> bool {
     };
     if connection.config_epoch.load(Ordering::Acquire) != connection.expected_epoch
         || connection.input[..head_end] != *connection.exact_request_head
-        || !file_is_current(connection)
+        || !file_is_current(connection, file_observations)
     {
         return fallback(connection);
     }
@@ -313,15 +342,39 @@ fn prepare_next(connection: &mut Connection) -> bool {
     true
 }
 
-fn file_is_current(connection: &mut Connection) -> bool {
-    if connection.checked_at.elapsed() < REVALIDATE_INTERVAL {
+fn file_is_current(
+    connection: &Connection,
+    observations: &mut HashMap<PathBuf, FileObservation>,
+) -> bool {
+    let Some(observation) = observations.get_mut(&connection.file_path) else {
+        if observations.len() >= FILE_OBSERVATION_CAPACITY {
+            observations.clear();
+        }
+        observations.insert(
+            connection.file_path.clone(),
+            FileObservation {
+                checked_at: Instant::now(),
+                len: connection.file_len,
+                modified: connection.file_modified,
+            },
+        );
+        return true;
+    };
+    if observation.len != connection.file_len || observation.modified != connection.file_modified {
+        return false;
+    }
+    if observation.checked_at.elapsed() < REVALIDATE_INTERVAL {
         return true;
     }
-    connection.checked_at = Instant::now();
-    std::fs::metadata(&connection.file_path).is_ok_and(|metadata| {
-        metadata.len() == connection.file_len
-            && metadata.modified().ok() == connection.file_modified
-    })
+    observation.checked_at = Instant::now();
+    let Ok(metadata) = std::fs::metadata(&connection.file_path) else {
+        observation.len = u64::MAX;
+        observation.modified = None;
+        return false;
+    };
+    observation.len = metadata.len();
+    observation.modified = metadata.modified().ok();
+    observation.len == connection.file_len && observation.modified == connection.file_modified
 }
 
 fn fallback(connection: &mut Connection) -> bool {
@@ -343,7 +396,13 @@ fn fallback(connection: &mut Connection) -> bool {
     false
 }
 
-fn read_ready(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd, buffer: &mut [u8]) -> bool {
+fn read_ready(
+    epoll_fd: RawFd,
+    table: &mut ConnectionTable,
+    file_observations: &mut HashMap<PathBuf, FileObservation>,
+    fd: RawFd,
+    buffer: &mut [u8],
+) -> bool {
     loop {
         let read = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
         if read > 0 {
@@ -354,11 +413,11 @@ fn read_ready(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd, buffer: &
                 return true;
             }
             connection.input.extend_from_slice(&buffer[..read as usize]);
-            if !prepare_next(connection) {
+            if !prepare_next(connection, file_observations) {
                 return false;
             }
             if connection.pending {
-                return flush(epoll_fd, table, fd);
+                return flush(epoll_fd, table, file_observations, fd);
             }
             continue;
         }
@@ -373,7 +432,12 @@ fn read_ready(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd, buffer: &
     }
 }
 
-fn flush(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd) -> bool {
+fn flush(
+    epoll_fd: RawFd,
+    table: &mut ConnectionTable,
+    file_observations: &mut HashMap<PathBuf, FileObservation>,
+    fd: RawFd,
+) -> bool {
     for _ in 0..MAX_RESPONSES_PER_EVENT {
         let Some(connection) = table.get_mut(fd) else {
             return false;
@@ -388,7 +452,7 @@ fn flush(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd) -> bool {
                     connection.corked = false;
                 }
                 connection.pending = false;
-                if !prepare_next(connection) {
+                if !prepare_next(connection, file_observations) {
                     return false;
                 }
             }
