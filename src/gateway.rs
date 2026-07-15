@@ -11978,7 +11978,8 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 10,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23772,7 +23773,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            10
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
