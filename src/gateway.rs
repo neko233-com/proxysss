@@ -1516,8 +1516,10 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_SATURATED_BATCH: usize = 64;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
+const PLAIN_FAST_LANE_SATURATED_CONNECTIONS: usize = 700;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = false;
@@ -12000,7 +12002,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12021,8 +12023,10 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
     if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
         PLAIN_FAST_LANE_LOW_DENSITY_BATCH
-    } else {
+    } else if active_connections < PLAIN_FAST_LANE_SATURATED_CONNECTIONS {
         PLAIN_FAST_LANE_FAIRNESS_BATCH
+    } else {
+        PLAIN_FAST_LANE_SATURATED_BATCH
     }
 }
 
@@ -15092,7 +15096,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 2;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
 
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
@@ -23822,7 +23826,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23846,7 +23850,9 @@ mod tests {
         assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
         assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
         assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(699), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(700), 64);
+        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 64);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0

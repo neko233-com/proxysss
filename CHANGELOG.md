@@ -8,7 +8,7 @@
 - Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, kept balanced UDP on the proven per-core fast path, and reduced TLS/sendfile/realtime owner contention under mixed load.
 - Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.
 - Added bounded UDP cooperative fairness, lower-weight realtime owners, a cache-local TLS owner profile, and fat-LTO release builds to preserve per-protocol latency under saturated mixed traffic.
-- Tightened balanced-mode UDP and native stream batch fairness so their large saturation margin cannot starve HTTP/static siblings at higher mixed load scales.
+- Added a 700+ connection plain fast-lane density tier that amortizes cooperative scheduler handoff over 64 responses while retaining the proven balanced UDP/realtime/TLS ownership weights.
 
 ## v1.3.5 - 2026-07-01
 

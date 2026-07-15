@@ -738,7 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
-          <p class="subtle">Linux 性能模式按 cpuset 建立 `SO_REUSEPORT` worker。plain HTTP 与 balanced UDP 复用每核一个 nice 0 shard；UDP 热关联每 2 包 cooperative yield。TLS 使用 `ceil(cpuset cores / 8)`、nice +5 runtime；WebSocket/TCP epoll relay 每 4 CPU 一个 nice +5 owner并在连续 2 个 ready batch 后让出。hot reload 通过 ArcSwap 原子发布。</p>
+          <p class="subtle">Linux 性能模式按 cpuset 建立 `SO_REUSEPORT` worker。plain HTTP 与 balanced UDP 复用每核一个 nice 0 shard；UDP 热关联每 8 包 cooperative yield。TLS 使用 `ceil(cpuset cores / 8)`、nice 0 runtime；WebSocket/TCP epoll relay 每 4 CPU 一个 nice +5 owner并在连续 8 个 ready batch 后让出。plain fast lane 在 700+ 活跃连接时把让出批次从 32 扩到 64。hot reload 通过 ArcSwap 原子发布。</p>
           <p class="subtle">每次 level-triggered readiness 最多连续 drain 8 个 16 KiB read batch，合并已排队 WebSocket/game/TCP 小帧的 epoll/hash dispatch；达到上限就归还 event loop，partial write 立即进入显式 pending/backpressure。普通数据事件只在本端已经观察到 EOF 后才做完整 pair-finished 查询，去掉每帧两端状态查找。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用全核 CPU 自适应 `SO_REUSEPORT` socket fanout并复用有界 UDP buffer pool；balanced recv loop 与 association reader 留在对应的 per-core HTTP data shard。无 policy worker 本地缓存 upstream/config 快照；pending 去重使用分片集合，association prune 按时间、创建数量和容量压力节流。</p>
         </section>
@@ -883,7 +883,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder；TLS 全程留在 `ceil(cpuset cores / 8)`、nice +5 crypto runtime。H2 小静态热对象使用 immutable `Bytes` 与 ArcSwap 快照。balanced 大文件在固定 HTTP owner 上 drain `sendfile`，bulk 才启用 reactor；release 使用 fat LTO。任何 profile 变更都必须重跑完整 mixed gate。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder；TLS 全程留在 `ceil(cpuset cores / 8)`、nice 0 crypto runtime。H2 小静态热对象使用 immutable `Bytes` 与 ArcSwap 快照。balanced 大文件在固定 HTTP owner 上 drain `sendfile`，bulk 才启用 reactor；release 使用 fat LTO。任何 profile 变更都必须重跑完整 mixed gate。</p>
             </article>
           </div>
 
