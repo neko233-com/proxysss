@@ -29,8 +29,6 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // every event at mixed-load density steals CPU from HTTP/TLS/UDP siblings.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_SPIN_POLLS: usize = 2;
-const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 16;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -255,7 +253,11 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
                 continue;
             }
             let pair_count = sockets.len() / 2;
-            active_spin_polls = active_spin_polls_for(pair_count);
+            active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
+                ACTIVE_SPIN_POLLS
+            } else {
+                0
+            };
             let flags = event.events as i32;
             if flags & libc::EPOLLERR != 0 {
                 close_pair(epoll_fd, &mut sockets, fd);
@@ -296,16 +298,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
 
     unsafe {
         libc::close(epoll_fd);
-    }
-}
-
-fn active_spin_polls_for(pair_count: usize) -> usize {
-    if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
-        ACTIVE_SPIN_POLLS
-    } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
-        DENSE_SPIN_POLLS
-    } else {
-        0
     }
 }
 
@@ -654,14 +646,6 @@ mod tests {
     fn per_cpu_reactor_workers_pin_in_reverse_order() {
         assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), Some(4));
         assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), Some(2));
-    }
-
-    #[test]
-    fn spin_budget_tapers_before_dense_mixed_load() {
-        assert_eq!(active_spin_polls_for(4), ACTIVE_SPIN_POLLS);
-        assert_eq!(active_spin_polls_for(8), DENSE_SPIN_POLLS);
-        assert_eq!(active_spin_polls_for(16), DENSE_SPIN_POLLS);
-        assert_eq!(active_spin_polls_for(17), 0);
     }
 
     #[test]
