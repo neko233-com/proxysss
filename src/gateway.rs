@@ -1500,7 +1500,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -11890,7 +11890,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11899,9 +11899,10 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // A sparse balanced relay owner keeps HTTP/TLS/UDP on the per-core
-        // Tokio loops while retaining an allocation-free native fast path.
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        // Per-core owners remove a shared synchronized-tick queue. The low CFS
+        // weight preserves HTTP/TLS/UDP saturation throughput, while idle CPU
+        // remains fully available for fixed-load realtime latency.
+        RuntimePerformanceTrafficProfile::Balanced => 6,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23652,7 +23653,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23664,7 +23665,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            6
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
