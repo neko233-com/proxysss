@@ -54,7 +54,11 @@ LOAD_SCALES="${LOAD_SCALES:-1}"
 DURATION_SECS="${DURATION_SECS:-2}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
+# The persistent controller still execs eleven amd64 client processes per
+# wave. Give QEMU enough time to start every process before the shared absolute
+# timestamp; otherwise late processes independently enter the 250 ms fallback
+# window and the workload is no longer concurrent.
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-750}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
