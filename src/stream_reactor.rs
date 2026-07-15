@@ -200,7 +200,7 @@ fn dispatch_inner(
 impl Reactors {
     fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
         let worker_count = requested_workers.max(1);
-        let allowed_cpus = allowed_cpu_ids();
+        let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -662,30 +662,6 @@ fn drain_wake(fd: RawFd) {
         }
         break;
     }
-}
-
-fn allowed_cpu_ids() -> Vec<usize> {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    let result = unsafe {
-        libc::sched_getaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &mut set as *mut libc::cpu_set_t,
-        )
-    };
-    if result != 0 {
-        return vec![0];
-    }
-    let mut cpus = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
-        if unsafe { libc::CPU_ISSET(cpu, &set) } {
-            cpus.push(cpu);
-        }
-    }
-    if cpus.is_empty() {
-        cpus.push(0);
-    }
-    cpus
 }
 
 fn pin_current_thread(cpu: usize) {

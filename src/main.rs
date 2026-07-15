@@ -6,6 +6,8 @@ mod demo;
 mod filecloud;
 mod gateway;
 mod install;
+#[cfg(target_os = "linux")]
+mod linux_cpu;
 mod linux_tune;
 mod script;
 mod security;

@@ -1564,9 +1564,6 @@ static STATIC_SENDFILE_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
-#[cfg(target_os = "linux")]
-static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
-
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
         // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
@@ -1676,28 +1673,7 @@ fn initialize_udp_connection_runtimes() {
 
 #[cfg(target_os = "linux")]
 fn data_plane_cpu_ids() -> &'static [usize] {
-    DATA_PLANE_CPU_IDS.get_or_init(|| {
-        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-        let result = unsafe {
-            libc::sched_getaffinity(
-                0,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &mut set as *mut libc::cpu_set_t,
-            )
-        };
-        let mut cpus = Vec::new();
-        if result == 0 {
-            for cpu in 0..libc::CPU_SETSIZE as usize {
-                if unsafe { libc::CPU_ISSET(cpu, &set) } {
-                    cpus.push(cpu);
-                }
-            }
-        }
-        if cpus.is_empty() {
-            cpus.push(0);
-        }
-        cpus
-    })
+    crate::linux_cpu::allowed_cpu_ids()
 }
 
 #[cfg(target_os = "linux")]
@@ -5257,6 +5233,7 @@ impl Gateway {
                         match crate::static_http_reactor::dispatch(
                             request,
                             adaptive_data_plane_workers(1),
+                            _worker_index,
                         ) {
                             Ok(fallback) => {
                                 let gateway = self.clone();

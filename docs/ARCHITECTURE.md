@@ -37,7 +37,7 @@ Clients ──► proxysss core (Rust/async)
 
 ## Stream path (TCP, UDP, KCP, and QCP datagrams)
 
-1. 在配置的 `tcp.listeners[]` / `udp.listeners[]` bind 接收连接或数据报。Linux 性能模式按 cpuset 建立 `SO_REUSEPORT` worker。balanced 原生 WebSocket/TCP epoll relay 每 4 CPU 一个 nice +5 owner，持续 8 个 ready batch 后让出；UDP 与 plain HTTP 复用 per-core shard，并在每 8 个热关联数据报后 cooperative yield。TLS 使用 `ceil(cpuset cores / 8)`、nice 0 的单/少 owner crypto runtime。配置通过 ArcSwap 原子发布；balanced 大文件留在 HTTP owner，bulk 才启用 sendfile reactor。
+1. 在配置的 `tcp.listeners[]` / `udp.listeners[]` bind 接收连接或数据报。Linux 性能模式从 cgroup effective cpuset（而非可能已被 pin 的当前线程）发现完整 CPU 集，并据此建立 `SO_REUSEPORT` worker 与 native reactor owners。balanced 原生 WebSocket/TCP epoll relay 每 4 CPU 一个 nice +5 owner，持续 8 个 ready batch 后让出；UDP 与 plain HTTP 复用 per-core shard，并在每 8 个热关联数据报后 cooperative yield。TLS 使用 `ceil(cpuset cores / 8)`、nice 0 的单/少 owner crypto runtime。配置通过 ArcSwap 原子发布；balanced 大文件留在 HTTP owner，bulk 才启用 sendfile reactor。
 2. Enforce stream access control and shared-zone rate limits where configured.
 3. Select an upstream from `upstream` / `upstreams` using the active load-balancing and health state, or use the direct single-upstream TCP fast path when scripts, affinity, active health, passive health, and extra upstream candidates are all disabled.
 4. TCP 默认关闭 Nagle（`nodelay: true`）并应用 `connect_timeout_ms`。Linux 性能模式下，游戏、MQTT/tool 与通用实时流优先使用 CPU 自适应分片的原生 `epoll` relay，并保留有界 buffer pool 的 Tokio 回退路径；明确的 bulk/file 协议才使用带 `SPLICE_F_MORE` 的 Linux `splice` 零拷贝。
