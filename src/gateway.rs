@@ -1549,8 +1549,6 @@ static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
-static DATA_PLANE_HARD_PIN_ENABLED: AtomicBool = AtomicBool::new(true);
-#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -1701,9 +1699,6 @@ fn data_plane_cpu_ids() -> &'static [usize] {
 
 #[cfg(target_os = "linux")]
 fn pin_current_data_plane_thread(worker_index: usize) {
-    if !DATA_PLANE_HARD_PIN_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
     let cpus = data_plane_cpu_ids();
     let cpu = cpus[worker_index % cpus.len()];
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
@@ -1780,10 +1775,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         );
         UDP_RUNTIME_NICE.store(
             udp_runtime_nice_for(config.runtime.performance.traffic_profile),
-            Ordering::Relaxed,
-        );
-        DATA_PLANE_HARD_PIN_ENABLED.store(
-            data_plane_hard_pin_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         STATIC_SENDFILE_QOS_ENABLED.store(
@@ -12083,11 +12074,6 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn data_plane_hard_pin_for(profile: RuntimePerformanceTrafficProfile) -> bool {
-    !matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -24014,15 +24000,6 @@ mod tests {
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
-            RuntimePerformanceTrafficProfile::Bulk
-        ));
-        assert!(data_plane_hard_pin_for(
-            RuntimePerformanceTrafficProfile::Small
-        ));
-        assert!(!data_plane_hard_pin_for(
-            RuntimePerformanceTrafficProfile::Balanced
-        ));
-        assert!(data_plane_hard_pin_for(
             RuntimePerformanceTrafficProfile::Bulk
         ));
         assert_eq!(
