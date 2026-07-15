@@ -1492,7 +1492,7 @@ impl HyperBody for GatewayBody {
     }
 }
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
-const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -11894,7 +11894,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11903,9 +11903,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Per-core owners drain one bounded epoll batch and then yield to the
-        // sibling HTTP shard. Normal CFS weight keeps synchronized ticks from
-        // queueing while explicit batch boundaries preserve mixed fairness.
+        // One movable owner per four CPUs avoids a permanently-runnable CFS
+        // sibling on every HTTP shard. The count still scales with the full
+        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
         RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
@@ -23657,7 +23657,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            4
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
