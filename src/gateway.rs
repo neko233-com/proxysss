@@ -4754,7 +4754,7 @@ impl Gateway {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
                 let gateway = self.clone();
-                std::mem::drop(tokio::spawn(async move {
+                std::mem::drop(tokio::spawn(tokio::task::unconstrained(async move {
                     gateway
                         .serve_plain_http_connection(
                             stream,
@@ -4763,7 +4763,7 @@ impl Gateway {
                             Bytes::new(),
                         )
                         .await;
-                }));
+                })));
                 continue;
             }
             let stream = match stream.into_std() {
@@ -5090,11 +5090,15 @@ impl Gateway {
                             });
                         }
                         discard_fast_lane_http_head(&mut prefix, head_end);
-                        // A raw reverse request already crosses upstream and
-                        // downstream readiness points. Reset the amortized
-                        // static-lane counter instead of adding a redundant
-                        // cooperative yield on every 32nd response.
-                        served_since_yield = 0;
+                        // The outer connection task deliberately disables
+                        // Tokio's duplicate cooperative I/O budget. Preserve
+                        // a bounded explicit fairness point for a continuously
+                        // ready upstream/downstream pair.
+                        served_since_yield = served_since_yield.saturating_add(1);
+                        if plain_fast_lane_should_yield(served_since_yield) {
+                            served_since_yield = 0;
+                            tokio::task::yield_now().await;
+                        }
                         continue;
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
