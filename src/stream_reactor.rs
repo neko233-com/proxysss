@@ -64,6 +64,13 @@ struct SocketState {
     completion: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayReadOutcome {
+    Open,
+    ReadClosed,
+    Failed,
+}
+
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
 static PENDING_BUFFERS: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
 fn pending_buffer_pool() -> &'static ArrayQueue<Vec<u8>> {
@@ -261,9 +268,12 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             }
 
             let fd = token as RawFd;
-            if !sockets.contains_key(&fd) {
+            let Some((peer_fd, read_enabled)) = sockets
+                .get(&fd)
+                .map(|state| (state.peer_fd, state.read_enabled))
+            else {
                 continue;
-            }
+            };
             let pair_count = sockets.len() / 2;
             active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
                 ACTIVE_SPIN_POLLS
@@ -281,30 +291,34 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
                 close_pair(epoll_fd, &mut sockets, fd);
                 continue;
             }
-            if flags & libc::EPOLLIN != 0
-                && !relay_read(epoll_fd, &mut sockets, fd, &mut relay_buffer)
-            {
-                close_pair(epoll_fd, &mut sockets, fd);
-                continue;
+            let mut read_closed_observed = false;
+            if flags & libc::EPOLLIN != 0 && read_enabled {
+                match relay_read(epoll_fd, &mut sockets, fd, peer_fd, &mut relay_buffer) {
+                    RelayReadOutcome::Open => {}
+                    RelayReadOutcome::ReadClosed => read_closed_observed = true,
+                    RelayReadOutcome::Failed => {
+                        close_pair(epoll_fd, &mut sockets, fd);
+                        continue;
+                    }
+                }
             }
             // HUP/RDHUP can arrive together with EPOLLIN while the peer's
             // final bytes are still queued. Drain readable data before
             // propagating half-close so tail frames cannot be discarded.
             if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) != 0
                 && flags & libc::EPOLLIN == 0
-                && sockets.get(&fd).is_some_and(|state| state.read_enabled)
+                && read_enabled
             {
                 if !mark_read_closed(epoll_fd, &mut sockets, fd) {
                     close_pair(epoll_fd, &mut sockets, fd);
                     continue;
                 }
+                read_closed_observed = true;
             }
             // Both halves must be read-closed before a pair can finish. Avoid
             // two extra hash lookups on every ordinary data event; only enter
             // the full pair check after this side has actually observed EOF.
-            if sockets.get(&fd).is_some_and(|state| state.read_closed)
-                && pair_finished(&sockets, fd)
-            {
+            if read_closed_observed && pair_finished(&sockets, fd) {
                 close_pair(epoll_fd, &mut sockets, fd);
             }
         }
@@ -406,23 +420,9 @@ fn relay_read(
     epoll_fd: RawFd,
     sockets: &mut FxHashMap<RawFd, SocketState>,
     fd: RawFd,
+    peer_fd: RawFd,
     buffer: &mut [u8],
-) -> bool {
-    let Some(peer_fd) = sockets.get(&fd).map(|state| state.peer_fd) else {
-        return false;
-    };
-    if sockets
-        .get(&peer_fd)
-        .map(|peer| {
-            peer.pending
-                .as_ref()
-                .is_some_and(|pending| peer.pending_offset < pending.len())
-        })
-        .unwrap_or(true)
-    {
-        return pause_reader(epoll_fd, sockets, fd);
-    }
-
+) -> RelayReadOutcome {
     // Level-triggered epoll may coalesce several small WebSocket/game frames
     // behind one readiness notification. Drain a bounded batch so those
     // frames amortize epoll dispatch and hash-table lookups, while the bound
@@ -438,25 +438,29 @@ fn relay_read(
                 continue;
             }
             if error.kind() == io::ErrorKind::WouldBlock {
-                return true;
+                return RelayReadOutcome::Open;
             }
-            return false;
+            return RelayReadOutcome::Failed;
         };
         if read == 0 {
-            return mark_read_closed(epoll_fd, sockets, fd);
+            return if mark_read_closed(epoll_fd, sockets, fd) {
+                RelayReadOutcome::ReadClosed
+            } else {
+                RelayReadOutcome::Failed
+            };
         }
 
         let sent = match send_nonblocking(peer_fd, &buffer[..read]) {
             Ok(sent) => sent,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
-            Err(_) => return false,
+            Err(_) => return RelayReadOutcome::Failed,
         };
         if sent == read {
             continue;
         }
 
         let Some(peer) = sockets.get_mut(&peer_fd) else {
-            return false;
+            return RelayReadOutcome::Failed;
         };
         let mut pending = peer.pending.take().unwrap_or_else(acquire_pending_buffer);
         pending.clear();
@@ -464,11 +468,15 @@ fn relay_read(
         peer.pending = Some(pending);
         peer.pending_offset = 0;
         if !modify_socket(epoll_fd, peer_fd, peer) {
-            return false;
+            return RelayReadOutcome::Failed;
         }
-        return pause_reader(epoll_fd, sockets, fd);
+        return if pause_reader(epoll_fd, sockets, fd) {
+            RelayReadOutcome::Open
+        } else {
+            RelayReadOutcome::Failed
+        };
     }
-    true
+    RelayReadOutcome::Open
 }
 
 fn flush_pending(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
