@@ -1499,8 +1499,8 @@ const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(test, target_os = "linux"))]
+const STATIC_SENDFILE_BALANCED_DENSE_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1530,12 +1530,11 @@ const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
-// injection queue every two polls and the I/O driver every three polls spends
-// a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
-// polling substantially more frequent than Tokio's throughput-oriented
-// default while amortizing both checks across a useful ready-task batch.
+// injection queue on every poll is expensive, but a mixed gateway must return
+// to epoll quickly after CPU-ready TLS/static work. Four task polls bounds
+// synchronized game/UDP/WebSocket tail latency while retaining batching.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 4;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
@@ -11658,7 +11657,10 @@ async fn sendfile_all_async(
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
     let max_chunk_bytes = if cooperative_mid_yield {
-        configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
+        configured_chunk_bytes.min(balanced_sendfile_fair_chunk_bytes_for(
+            PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+            configured_chunk_bytes,
+        ))
     } else {
         configured_chunk_bytes
     };
@@ -11890,7 +11892,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11899,9 +11901,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // A sparse balanced relay owner keeps HTTP/TLS/UDP on the per-core
-        // Tokio loops while retaining an allocation-free native fast path.
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        // Per-core epoll owners sleep whenever no relay event is ready, so they
+        // can match synchronized realtime ticks without a CFS penalty.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11942,6 +11944,18 @@ fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
             >= plain_fast_lane_fairness_batch_for(
                 PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
             )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn balanced_sendfile_fair_chunk_bytes_for(
+    active_plain_connections: usize,
+    configured_chunk_bytes: u64,
+) -> u64 {
+    if active_plain_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
+        configured_chunk_bytes
+    } else {
+        STATIC_SENDFILE_BALANCED_DENSE_FAIR_CHUNK_BYTES
+    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23652,7 +23666,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23664,7 +23678,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            0
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23700,6 +23714,14 @@ mod tests {
         assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
         assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
         assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
+        assert_eq!(
+            balanced_sendfile_fair_chunk_bytes_for(299, 16 << 20),
+            16 << 20
+        );
+        assert_eq!(
+            balanced_sendfile_fair_chunk_bytes_for(300, 16 << 20),
+            8 << 20
+        );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
