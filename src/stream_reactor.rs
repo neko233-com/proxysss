@@ -24,12 +24,12 @@ const EVENT_BATCH: usize = 1_024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_READ_BATCH: usize = 8;
 const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
-// Only nearly-idle reactors use a short reply spin. Mixed-load reactors return
-// directly to epoll after each event batch so their per-core owners do not
-// monopolize HTTP/TLS/UDP siblings.
+// Low-density realtime traffic gets a short reply spin. Mixed-load density
+// keeps only two follow-up polls through the 4x reference wave, then relies
+// entirely on epoll so realtime work cannot monopolize HTTP/TLS/UDP siblings.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_SPIN_POLLS: usize = 0;
+const DENSE_SPIN_POLLS: usize = 2;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const WAKE_TOKEN: u64 = u64::MAX;
 
