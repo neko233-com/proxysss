@@ -69,6 +69,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "now-unix-ms":
+		fmt.Println(time.Now().UnixMilli())
 	case "write-large-file":
 		err = runWriteLargeFile(os.Args[2:])
 	case "serve-sse":
