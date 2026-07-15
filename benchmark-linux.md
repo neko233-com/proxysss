@@ -85,7 +85,7 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力。协议终止语义不拿
 
 ### 4.1 三阶段公平判定，不能混用吞吐与延迟口径
 
-`scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认是 4+4+8 CPU，也允许本机 wrapper 按 Docker 可用核数等比例切分；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。每个 wave 只创建 1 个 client 容器，内部 11 个独立协议进程共享 client cpuset 与同一个 `--start-at-unix-ms`；每尺度只启动 1 个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause，切换时 resume 并等待 readiness 稳定，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。saturation client 保留完整 client cpuset，确保能把更快的 gateway 压满；fixed-rate equal-load 的小包 client 每进程只启动 1 个 Tokio I/O worker，static-large 启动 2 个，避免 11 个进程各自按整个 cpuset 扩张后让 timer 因发生器自身过载而跳 tick。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
+`scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。完整 mixed gate 至少需要 24 个 Docker CPU；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。每个 wave 只创建 1 个 client 容器，内部 11 个独立协议进程使用同一个 `--start-at-unix-ms`，但每场景通过 `taskset` 获得互不重叠的 CPU 分区。backend 的 HTTP、SSE、WebSocket、TCP、UDP、QCP echo 进程同样分区，UDP 与 QCP 使用独立 upstream listener。这样更快的 proxysss stream client/backend 不会抢走同轮 HTTP 的发生器或后端 CPU。每尺度只启动 1 个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause，切换时 resume 并等待 readiness 稳定，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。serial isolated saturation 显式启用时仍使用完整 client cpuset。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
 
 它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度对每个 gateway/phase 采 1 个同步 3 秒样本，关闭额外 serial isolated；`validation_elapsed_secs` 只覆盖候选就绪后的严格矩阵，排除 build/setup/warm-up，并硬限制为 60 秒。这个 deadline 下传到每个 client wave；超时直接停止容器内发生器并失败，不再只做事后检查。默认统一启动 lead 为 100 ms，UDP/QCP 尾部等待 500 ms。仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 `BENCHMARK_REPETITIONS` 与 `DURATION_SECS`，多轮再取中位数、错误取最大值：
 
@@ -99,7 +99,7 @@ STRICT_SUPERIORITY=1 DURATION_SECS=30 \
 bash scripts/benchmark-all-scenarios-isolated.sh
 ```
 
-Docker role isolation 解决的是同进程、同 cgroup、同 CPU 抢占混淆，不等于三台物理机。脚本会先拒绝角色 cpuset 重叠或默认 16 核包络之外的机器；公网 RTT、NIC/IRQ/RSS、跨机丢包结论仍要在独立 gateway/backend/client 主机复跑。
+Docker role isolation 解决的是同进程、同 cgroup、同 CPU 抢占混淆，不等于三台物理机。脚本会先拒绝角色 cpuset 重叠或少于 24 个 Docker CPU 的机器；公网 RTT、NIC/IRQ/RSS、跨机丢包结论仍要在独立 gateway/backend/client 主机复跑。
 
 ### 4.2 WebSocket 容量与延迟要分开验证
 

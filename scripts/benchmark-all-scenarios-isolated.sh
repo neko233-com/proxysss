@@ -241,6 +241,55 @@ CLIENT_CPU_CORES="$(cpuset_cpu_ids "$CLIENT_CPUSET" | wc -l | tr -d '[:space:]')
   echo "cannot determine client CPU count from $CLIENT_CPUSET" >&2
   exit 1
 }
+ALL_SCENARIOS=(
+  static-small static-large cdn-hot-update https-static-small reverse-proxy
+  generic-sse websocket-long-connection game-long-connection tcp-stream udp-stream
+  qcp-transparent
+)
+
+mapfile -t BACKEND_CPU_IDS < <(cpuset_cpu_ids "$BACKEND_CPUSET")
+if (( ${#BACKEND_CPU_IDS[@]} < 6 )); then
+  echo "strict mixed benchmark needs at least 6 backend CPUs for protocol isolation" >&2
+  exit 1
+fi
+BACKEND_HTTP_CPUSET="${BACKEND_CPU_IDS[0]}"; BACKEND_HTTP_CPU_COUNT=1
+BACKEND_SSE_CPUSET="${BACKEND_CPU_IDS[1]}"; BACKEND_SSE_CPU_COUNT=1
+BACKEND_WS_CPUSET="${BACKEND_CPU_IDS[2]}"; BACKEND_WS_CPU_COUNT=1
+BACKEND_TCP_CPUSET="${BACKEND_CPU_IDS[3]}"; BACKEND_TCP_CPU_COUNT=1
+BACKEND_UDP_CPUSET="${BACKEND_CPU_IDS[4]}"; BACKEND_UDP_CPU_COUNT=1
+BACKEND_QCP_CPUSET="${BACKEND_CPU_IDS[5]}"; BACKEND_QCP_CPU_COUNT=1
+for ((cpu_index = 6; cpu_index < ${#BACKEND_CPU_IDS[@]}; cpu_index++)); do
+  cpu="${BACKEND_CPU_IDS[$cpu_index]}"
+  if (( (cpu_index - 6) % 2 == 0 )); then
+    BACKEND_HTTP_CPUSET+=",$cpu"
+    BACKEND_HTTP_CPU_COUNT=$((BACKEND_HTTP_CPU_COUNT + 1))
+  else
+    BACKEND_TCP_CPUSET+=",$cpu"
+    BACKEND_TCP_CPU_COUNT=$((BACKEND_TCP_CPU_COUNT + 1))
+  fi
+done
+
+mapfile -t CLIENT_CPU_IDS < <(cpuset_cpu_ids "$CLIENT_CPUSET")
+if (( ${#CLIENT_CPU_IDS[@]} < ${#ALL_SCENARIOS[@]} )); then
+  echo "strict mixed benchmark needs at least ${#ALL_SCENARIOS[@]} client CPUs for per-scenario isolation" >&2
+  exit 1
+fi
+declare -A CLIENT_SCENARIO_CPUSET=()
+declare -A CLIENT_SCENARIO_CPU_COUNT=()
+for scenario_index in "${!ALL_SCENARIOS[@]}"; do
+  scenario="${ALL_SCENARIOS[$scenario_index]}"
+  CLIENT_SCENARIO_CPUSET["$scenario"]="${CLIENT_CPU_IDS[$scenario_index]}"
+  CLIENT_SCENARIO_CPU_COUNT["$scenario"]=1
+done
+CLIENT_EXTRA_CPU_PRIORITY=(
+  static-small static-large cdn-hot-update https-static-small reverse-proxy
+)
+for ((cpu_index = ${#ALL_SCENARIOS[@]}; cpu_index < ${#CLIENT_CPU_IDS[@]}; cpu_index++)); do
+  priority_index=$(((cpu_index - ${#ALL_SCENARIOS[@]}) % ${#CLIENT_EXTRA_CPU_PRIORITY[@]}))
+  scenario="${CLIENT_EXTRA_CPU_PRIORITY[$priority_index]}"
+  CLIENT_SCENARIO_CPUSET["$scenario"]+=",${CLIENT_CPU_IDS[$cpu_index]}"
+  CLIENT_SCENARIO_CPU_COUNT["$scenario"]=$((CLIENT_SCENARIO_CPU_COUNT["$scenario"] + 1))
+done
 case "$TRAFFIC_PROFILE" in
   small|balanced|bulk) ;;
   *) echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2; exit 1 ;;
@@ -344,7 +393,7 @@ udp:
       max_associations: 65536
     - name: qcp-transparent
       bind: 0.0.0.0:18310
-      upstream: ${BACKEND_IP}:18301
+      upstream: ${BACKEND_IP}:18311
       protocol: qcp
       session_ttl_secs: 30
       max_associations: 65536
@@ -387,8 +436,9 @@ stream {
   upstream tcp_echo { server ${BACKEND_IP}:18201; }
   server { listen 0.0.0.0:18200 backlog=65536 reuseport; proxy_pass tcp_echo; proxy_connect_timeout 1s; proxy_timeout 30s; tcp_nodelay on; }
   upstream udp_echo { server ${BACKEND_IP}:18301; }
+  upstream qcp_echo { server ${BACKEND_IP}:18311; }
   server { listen 0.0.0.0:18300 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
-  server { listen 0.0.0.0:18310 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
+  server { listen 0.0.0.0:18310 udp reuseport; proxy_pass qcp_echo; proxy_responses 1; proxy_timeout 30s; }
 }
 NGINX
 }
@@ -417,6 +467,15 @@ write_fairness_manifest() {
     echo 'shared_ports=http:18080,https-h2:18443,tcp:18200,udp:18300,qcp-transparent:18310'
     echo 'nginx_optimizations=epoll,multi_accept,reuseport,sendfile,tcp_nopush,tcp_nodelay,upstream_keepalive,tls_session_cache'
     echo 'proxysss_optimizations=adaptive_system,socket_extreme,reuseport,preload,pools,h2'
+    echo "backend_partition_http=$BACKEND_HTTP_CPUSET"
+    echo "backend_partition_sse=$BACKEND_SSE_CPUSET"
+    echo "backend_partition_websocket=$BACKEND_WS_CPUSET"
+    echo "backend_partition_tcp=$BACKEND_TCP_CPUSET"
+    echo "backend_partition_udp=$BACKEND_UDP_CPUSET"
+    echo "backend_partition_qcp=$BACKEND_QCP_CPUSET"
+    for scenario in "${ALL_SCENARIOS[@]}"; do
+      echo "client_partition_${scenario}=${CLIENT_SCENARIO_CPUSET[$scenario]}"
+    done
     echo "proxysss_config_sha256=$(sha256sum "$RUN_DIR/proxysss.yaml" | awk '{print $1}')"
     echo "nginx_config_sha256=$(sha256sum "$RUN_DIR/nginx.conf" | awk '{print $1}')"
   } >"$RUN_DIR/fairness-config.txt"
@@ -436,14 +495,15 @@ start_backend() {
     --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$BACKEND_CPUSET" ${memory_arg:+"$memory_arg"} \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-    "$IMAGE" bash -ec '
-      proxysss demo http-echo --listen 0.0.0.0:18190 &
-      proxysss demo ws-echo --listen 0.0.0.0:18192 &
-      proxysss demo tcp-echo --listen 0.0.0.0:18201 &
-      proxysss demo udp-echo --listen 0.0.0.0:18301 &
-      /usr/local/bin/benchmark-helper serve-sse --listen 0.0.0.0:18191 --chunks 1 &
+    "$IMAGE" bash -ec "
+      taskset -c '$BACKEND_HTTP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_HTTP_CPU_COUNT' proxysss demo http-echo --listen 0.0.0.0:18190 &
+      taskset -c '$BACKEND_WS_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_WS_CPU_COUNT' proxysss demo ws-echo --listen 0.0.0.0:18192 &
+      taskset -c '$BACKEND_TCP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_TCP_CPU_COUNT' proxysss demo tcp-echo --listen 0.0.0.0:18201 &
+      taskset -c '$BACKEND_UDP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_UDP_CPU_COUNT' proxysss demo udp-echo --listen 0.0.0.0:18301 &
+      taskset -c '$BACKEND_QCP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_QCP_CPU_COUNT' proxysss demo udp-echo --listen 0.0.0.0:18311 &
+      taskset -c '$BACKEND_SSE_CPUSET' env GOMAXPROCS='$BACKEND_SSE_CPU_COUNT' /usr/local/bin/benchmark-helper serve-sse --listen 0.0.0.0:18191 --chunks 1 &
       wait -n
-    ' >/dev/null
+    " >/dev/null
   docker cp "$LINUX_HELPER" "$name:/usr/local/bin/benchmark-helper"
   docker start "$name" >/dev/null
 }
@@ -529,11 +589,6 @@ activate_gateway() {
 declare -a SATURATION_ROWS=()
 declare -a ISOLATED_ROWS=()
 declare -a LATENCY_ROWS=()
-ALL_SCENARIOS=(
-  static-small static-large cdn-hot-update https-static-small reverse-proxy
-  generic-sse websocket-long-connection game-long-connection tcp-stream udp-stream
-  qcp-transparent
-)
 SCENARIOS=("${ALL_SCENARIOS[@]}")
 if [[ -n "$ISOLATED_SCENARIOS" ]]; then
   read -r -a SCENARIOS <<<"$ISOLATED_SCENARIOS"
@@ -594,18 +649,24 @@ start_client_controller() {
 launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
-  # Saturation must be able to drive the faster gateway to full capacity, so
-  # it may use the whole client cpuset. Fixed-rate latency needs fewer runnable
-  # timer owners: one normally and two for static-large response copying.
-  local runtime_workers="$CLIENT_CPU_CORES"
+  # Mixed waves pin each generator to a disjoint CPU partition. Otherwise a
+  # faster TCP/UDP/WebSocket candidate consumes more client CPU and can make
+  # its own HTTP sibling look slower. Serial isolated waves keep the full set.
+  local client_affinity="${CLIENT_SCENARIO_CPUSET[$scenario]}"
+  local client_cpu_cores="${CLIENT_SCENARIO_CPU_COUNT[$scenario]}"
+  if [[ "$phase" == "isolated-saturation" ]]; then
+    client_affinity="$CLIENT_CPUSET"
+    client_cpu_cores="$CLIENT_CPU_CORES"
+  fi
+  local runtime_workers="$client_cpu_cores"
   if [[ "$phase" == "equal-load" ]]; then
     runtime_workers="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
     if [[ "$scenario" == "static-large" ]]; then
       runtime_workers="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
     fi
   fi
-  if (( runtime_workers > CLIENT_CPU_CORES )); then
-    runtime_workers="$CLIENT_CPU_CORES"
+  if (( runtime_workers > client_cpu_cores )); then
+    runtime_workers="$client_cpu_cores"
   fi
   if [[ "$phase" == "equal-load" ]]; then
     local interval
@@ -621,7 +682,8 @@ launch_client() {
     fi
   fi
   {
-    printf 'TOKIO_WORKER_THREADS=%q proxysss bench' "$runtime_workers"
+    printf 'taskset -c %q env TOKIO_WORKER_THREADS=%q proxysss bench' \
+      "$client_affinity" "$runtime_workers"
     printf ' %q' "$@"
     # shellcheck disable=SC2016
     printf ' --start-at-unix-ms "$start_at" > %q 2>&1 &\n' "/tmp/proxysss-bench-results/$scenario.txt"

@@ -191,8 +191,8 @@ if [[ -z "$TOTAL_CPUS" ]]; then
   TOTAL_CPUS="$(printf '%s\n' "$container_probe" | sed -n 's/^detected_nproc=//p')"
 fi
 require_positive_integer TOTAL_CPUS "$TOTAL_CPUS"
-if (( TOTAL_CPUS < 4 )); then
-  echo "role-isolated benchmark requires at least 4 Docker CPUs, found $TOTAL_CPUS" >&2
+if (( TOTAL_CPUS < 24 )); then
+  echo "strict mixed benchmark requires at least 24 Docker CPUs for gateway/backend/client protocol isolation, found $TOTAL_CPUS" >&2
   exit 1
 fi
 if [[ -z "$CPU_CORES" ]]; then
