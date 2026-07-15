@@ -11980,7 +11980,7 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> bool {
-    false
+    matches!(_profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23791,7 +23791,7 @@ mod tests {
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!shared_udp_runtime_profile(
+        assert!(shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
