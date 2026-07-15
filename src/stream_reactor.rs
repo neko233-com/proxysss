@@ -31,7 +31,7 @@ const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
-const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
+const CONTINUOUS_BATCH_YIELD_AFTER: usize = 2;
 const BLOCKED_WAIT_RESET: Duration = Duration::from_micros(100);
 const WAKE_TOKEN: u64 = u64::MAX;
 
