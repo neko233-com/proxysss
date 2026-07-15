@@ -12,6 +12,8 @@ mod security;
 #[cfg(target_os = "linux")]
 mod sendfile_reactor;
 #[cfg(target_os = "linux")]
+mod static_http_reactor;
+#[cfg(target_os = "linux")]
 mod stream_reactor;
 mod stream_routes;
 mod ts_transpile;
