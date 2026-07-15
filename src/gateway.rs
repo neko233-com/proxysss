@@ -106,6 +106,7 @@ pub struct Gateway {
     bootstrap_config: GatewayConfig,
     bootstrap_fast_lane: FastLaneState,
     dynamic: Arc<ArcSwap<DynamicState>>,
+    config_epoch: Arc<AtomicU64>,
     stats: Arc<GatewayStats>,
     sticky_affinity: Arc<DashMap<String, StickyEntry>>,
     round_robin_state: Arc<DashMap<String, u64>>,
@@ -2184,6 +2185,7 @@ impl Gateway {
             bootstrap_config: config,
             bootstrap_fast_lane,
             dynamic: Arc::new(ArcSwap::from(dynamic)),
+            config_epoch: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(GatewayStats::default()),
             sticky_affinity: Arc::new(DashMap::new()),
             round_robin_state: Arc::new(DashMap::new()),
@@ -4079,6 +4081,7 @@ impl Gateway {
 
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
         self.dynamic.store(new_state);
+        self.config_epoch.fetch_add(1, Ordering::Release);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
         self.warm_up(&new_config).await;
@@ -4780,7 +4783,12 @@ impl Gateway {
         let _active_plain_http = ActivePlainHttpConnectionGuard::enter();
         let (stream, prefix) = if self.plain_http_data_fast_lane_enabled().await {
             match self
-                .try_plain_http_large_static_fast_path(stream, remote_addr, initial_prefix)
+                .try_plain_http_large_static_fast_path(
+                    stream,
+                    remote_addr,
+                    worker_index,
+                    initial_prefix,
+                )
                 .await
             {
                 Ok(PlainHttpFastLaneAttempt::Served) => return,
@@ -4825,9 +4833,10 @@ impl Gateway {
     }
 
     async fn try_plain_http_large_static_fast_path(
-        &self,
+        self: &Arc<Self>,
         mut stream: TcpStream,
         remote_addr: SocketAddr,
+        _worker_index: usize,
         initial_prefix: Bytes,
     ) -> Result<PlainHttpFastLaneAttempt> {
         let dynamic_state;
@@ -5199,6 +5208,66 @@ impl Gateway {
                     len: candidate.len,
                     sendfile: candidate.sendfile.clone(),
                 };
+                #[cfg(target_os = "linux")]
+                if config.runtime.performance.enabled && !config.logging.access_log {
+                    if let Ok(metadata) = std::fs::metadata(&cached.file_path) {
+                        let exact_request_head = Bytes::copy_from_slice(request_head);
+                        let initial_prefix = prefix.freeze();
+                        let native_stream = stream
+                            .into_std()
+                            .context("failed detaching static HTTP socket for epoll reactor")?;
+                        let request = crate::static_http_reactor::DispatchRequest {
+                            stream: native_stream,
+                            initial_prefix,
+                            exact_request_head,
+                            response_head: cached.header.clone(),
+                            combined_response: cached.combined_response.clone(),
+                            body: cached.body.clone(),
+                            sendfile: cached.sendfile.clone(),
+                            file_path: cached.file_path.clone(),
+                            file_len: cached.len,
+                            file_modified: metadata.modified().ok(),
+                            config_epoch: self.config_epoch.clone(),
+                            expected_epoch: self.config_epoch.load(Ordering::Acquire),
+                        };
+                        match crate::static_http_reactor::dispatch(
+                            request,
+                            adaptive_data_plane_workers(1),
+                            _worker_index,
+                        ) {
+                            Ok(fallback) => {
+                                let gateway = self.clone();
+                                std::mem::drop(tokio::spawn(async move {
+                                    let Ok(fallback) = fallback.await else {
+                                        return;
+                                    };
+                                    let stream = match TcpStream::from_std(fallback.stream) {
+                                        Ok(stream) => stream,
+                                        Err(error) => {
+                                            tracing::debug!(?error, %remote_addr, "failed restoring static HTTP reactor fallback socket");
+                                            return;
+                                        }
+                                    };
+                                    gateway
+                                        .serve_plain_hyper_connection(
+                                            stream,
+                                            fallback.prefix,
+                                            remote_addr,
+                                            _worker_index,
+                                        )
+                                        .await;
+                                }));
+                                return Ok(PlainHttpFastLaneAttempt::Served);
+                            }
+                            Err(failure) => {
+                                stream = TcpStream::from_std(failure.stream).context(
+                                    "failed restoring saturated static HTTP reactor socket",
+                                )?;
+                                prefix = BytesMut::from(failure.prefix.as_ref());
+                            }
+                        }
+                    }
+                }
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
@@ -24138,6 +24207,7 @@ mod tests {
                     .build(HttpConnector::new()),
                 script: None,
             }))),
+            config_epoch: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(GatewayStats::default()),
             sticky_affinity: Arc::new(DashMap::new()),
             round_robin_state: Arc::new(DashMap::new()),

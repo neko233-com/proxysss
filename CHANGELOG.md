@@ -9,7 +9,8 @@
 - Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.
 - Added bounded UDP cooperative fairness, lower-weight realtime owners, a cache-local TLS owner profile, and fat-LTO release builds to preserve per-protocol latency under saturated mixed traffic.
 - Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
-- Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
+- Added a Linux native `epoll` lane for policy-validated exact static keep-alive traffic: combined small responses use one `send`, large responses use `TCP_CORK` plus `sendfile`, file metadata checks are coalesced per owner/path, and configuration/file/request changes transfer the socket and unread bytes back to Tokio/Hyper without semantic drift.
+- Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread, preventing static, WebSocket/TCP, or sendfile owners from collapsing onto one CPU; exact static sockets stay aligned with their accepting HTTP shard, while sparse stream owners regain the full mask for soft CFS ownership.
 - Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
 
 ## v1.3.5 - 2026-07-01
