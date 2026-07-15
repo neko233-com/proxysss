@@ -1585,6 +1585,7 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
                     .thread_name(format!("proxysss-http-{shard_index}"))
                     .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
                     .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
                     .enable_all();
                 builder
                     .build()
@@ -1697,6 +1698,24 @@ fn data_plane_cpu_ids() -> &'static [usize] {
         cpus
     })
 }
+
+#[cfg(target_os = "linux")]
+fn pin_current_data_plane_thread(worker_index: usize) {
+    let cpus = data_plane_cpu_ids();
+    let cpu = cpus[worker_index % cpus.len()];
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_data_plane_thread(_worker_index: usize) {}
 
 #[cfg(target_os = "linux")]
 fn set_current_thread_nice(nice: i32) {
