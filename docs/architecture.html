@@ -738,7 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
-          <p class="subtle">Linux 性能模式下，listener 按 cpuset 建立 `SO_REUSEPORT` worker。plain HTTP 与 balanced UDP 复用每核一个 nice 0 runtime shard；TLS 使用 `ceil(cpuset cores / 4)`、nice +3 的 crypto runtime；plain WebSocket/TCP 的 balanced epoll relay 每 4 CPU 一个 nice +3 owner。hot reload 先构建完整 DynamicState，再用 ArcSwap 原子发布；数据面 lock-free 读取 Arc 快照，旧请求持有旧快照到结束。</p>
+          <p class="subtle">Linux 性能模式按 cpuset 建立 `SO_REUSEPORT` worker。plain HTTP 与 balanced UDP 复用每核一个 nice 0 shard；UDP 热关联每 8 包 cooperative yield。TLS 使用 `ceil(cpuset cores / 8)`、nice 0 runtime；WebSocket/TCP epoll relay 每 4 CPU 一个 nice +5 owner。hot reload 通过 ArcSwap 原子发布。</p>
           <p class="subtle">每次 level-triggered readiness 最多连续 drain 8 个 16 KiB read batch，合并已排队 WebSocket/game/TCP 小帧的 epoll/hash dispatch；达到上限就归还 event loop，partial write 立即进入显式 pending/backpressure。普通数据事件只在本端已经观察到 EOF 后才做完整 pair-finished 查询，去掉每帧两端状态查找。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用全核 CPU 自适应 `SO_REUSEPORT` socket fanout并复用有界 UDP buffer pool；balanced recv loop 与 association reader 留在对应的 per-core HTTP data shard。无 policy worker 本地缓存 upstream/config 快照；pending 去重使用分片集合，association prune 按时间、创建数量和容量压力节流。</p>
         </section>
@@ -883,7 +883,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder；TLS 全程留在 `ceil(cpuset cores / 4)`、nice +3 的 crypto runtime。H2 小静态热对象使用 immutable `Bytes` 与 lock-free ArcSwap 配置快照。balanced 大文件由固定 HTTP owner 在 writable readiness 上 drain `sendfile`；bulk 才启用全核 nice 0 epoll sendfile reactor。任何 profile 变更都必须重跑完整 mixed gate。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder；TLS 全程留在 `ceil(cpuset cores / 8)`、nice 0 crypto runtime。H2 小静态热对象使用 immutable `Bytes` 与 ArcSwap 快照。balanced 大文件在固定 HTTP owner 上 drain `sendfile`，bulk 才启用 reactor；release 使用 fat LTO。任何 profile 变更都必须重跑完整 mixed gate。</p>
             </article>
           </div>
 
@@ -899,7 +899,7 @@ scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
           <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 是禁止 GitHub Actions 性能压测后的本机/原生 Docker 入口：硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64；Windows Docker Desktop 可从 Git Bash 使用本地 `npipe://`，Linux/macOS 使用 Unix socket。脚本在容器内构建当前 checkout，并把 gateway、backend、load client 固定到互不重叠的 cpuset/cgroup。每尺度只启动一个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause；每个 wave 只创建一个 client 容器，内部仍运行 11 个独立协议进程。这样更快的 closed-loop TCP/UDP 不会让 client/backend 多消耗 CPU、反向饿死同轮 HTTP。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大；逐档同时判 mixed saturation 吞吐和 equal-offered-load p50/p95/p99，要求零错误、逐场景与聚合严格胜出。equal-load 默认取双方较慢 saturation 的 25%，为 11 个并行 client 保留真实 latency headroom；双方仍须完成至少 98% target。arm64 daemon 明确记录 `execution_mode=emulated-amd64`，不能冒充物理 x86；release ELF 使用 Zig + cargo-zigbuild 在宿主原生速度交叉编译，并在 Ubuntu 24 amd64 容器执行校验，禁止用 QEMU 编译拖慢反馈。底层 `benchmark-all-scenarios-isolated.sh` 默认按 4+4+8 CPU 分配，也允许本机 wrapper 按 Docker 可用核数等比例切分，报告从实际 gateway cpuset 计算核数。每个 wave 的单一 client 容器内，11 个独立协议进程先等待共享 volume；确认容器运行后，控制器写入统一绝对时间，各进程再把它作为 `--start-at-unix-ms` 交给进程内 worker barrier。测量窗口不会被 Docker create/start（包括 amd64 模拟启动）缩短或错开。saturation client 使用完整 client cpuset 以压满更快的 gateway；fixed-rate equal-load 的小包 client 每进程使用 1 个 Tokio I/O worker，static-large 使用 2 个，防止 11 个进程各自按完整 cpuset 扩张；迟到的 fixed-rate slot 在每 worker 单 in-flight 的边界内补齐，不静默丢请求。nginx 1.31.2 mainline 使用 `-O3 -fno-plt`、相同 gateway cpuset 与等价协议配置。mixed/equal-load 默认每尺度各运行 1 个同步 3 秒样本；`validation_elapsed_secs` 排除 build/setup/warm-up，完整严格矩阵硬限制 60 秒。显式多轮时取中位数，任一轮错误取最大值；serial isolated saturation 默认关闭，可显式单样本运行做诊断，但不能替代 mixed gate。`benchmark-websocket-production-gate.sh` 以四轮 Latin-square 逐级验证 256/1024/4096 active WSS 与 5k/10k/20k idle WSS。`benchmark-cross-host-wss.sh` 再从独立 client host 对独立 gateway/backend 复跑，并用远端 systemd cgroup 强制 4 CPU、300k nofile，保存同 SHA binary、cgroup current/peak 与每连接内存成本、主机指纹、nginx -V 与原始样本。Docker role isolation 不能冒充三台物理机。</p>
-          <p class="subtle">60 秒 validation deadline 会下传到每个 client wave，由 GNU `timeout` 按剩余预算硬终止；超时同时停止容器内发生器并失败，不再只做事后检查。默认统一启动 lead 为 100 ms，UDP/QCP 尾部等待 1 秒，3 秒测量窗口不缩短。</p>
+          <p class="subtle">60 秒 validation deadline 会下传到每个 client wave，由 GNU `timeout` 按剩余预算硬终止。默认启动 lead 为 100 ms，UDP/QCP 尾部等待 500 ms，3 秒测量窗口不缩短。</p>
           <p class="subtle">严格矩阵中的 `protocol: qcp` 是透明 UDP edge forwarding：proxysss 与 nginx 等价 UDP listener 接受相同负载和门禁。该结果不代表 proxysss 在热路径解析或终止 QCP frame；KCP 专用封装仍不进入默认 nginx head-to-head 矩阵。</p>
         </section>
 

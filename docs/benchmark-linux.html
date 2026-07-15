@@ -463,7 +463,7 @@ bash scripts/benchmark-websocket-production-gate.sh</code></pre>
           </div>
           <div class="note">
             <strong>手动 benchmark：</strong>
-            <p>60 秒 deadline 会下传到每个 client wave；GNU <code>timeout</code> 按剩余预算停止容器内发生器并让运行失败，不再只做事后超时检查。默认统一启动 lead 为 100 ms，UDP/QCP 尾部等待 1 秒，3 秒测量窗口不缩短。</p>
+            <p>60 秒 deadline 会下传到每个 client wave；GNU <code>timeout</code> 按剩余预算停止容器内发生器并让运行失败，不再只做事后超时检查。默认统一启动 lead 为 100 ms，UDP/QCP 尾部等待 500 ms，3 秒测量窗口不缩短。</p>
             <p><code>scripts/benchmark-ubuntu24-amd64-docker.sh</code> 是本机或原生 Docker 严格 1x/2x/4x+QCP 入口；它硬校验 Ubuntu 24.04 x86_64 容器并记录 native/emulated amd64；Windows Docker Desktop 可从 Git Bash 使用本地 <code>npipe://</code>，Linux/macOS 使用 Unix socket。arm64 daemon 通过 Zig + cargo-zigbuild 本机交叉编译 release ELF，再在 Ubuntu 24 amd64 容器执行校验，避免 QEMU 编译进入反馈时间。底层 <code>scripts/benchmark-all-scenarios-isolated.sh</code> 把 gateway、backend、client 固定到互不重叠的 cpuset；每尺度常驻一个 backend 与两边 gateway、pause 非被测方，每个 wave 的单一 client 容器内运行 11 个独立协议进程并共享同一绝对开始时间；saturation client 使用完整 client cpuset；fixed-rate equal-load 的小包 client 各用 1 个 Tokio I/O worker、static-large 用 2 个，避免发生器自身 thread oversubscription；迟到 tick 在单 in-flight 边界内补齐。mixed saturation 与 equal-offered-load 默认在每个 1x/2x/4x 尺度对每个 gateway/phase 各跑 1 个同步 3 秒样本；<code>validation_elapsed_secs</code> 排除 build/setup/warm-up，完整严格矩阵硬限制 60 秒。显式多轮时才取中位数；equal-load 使用双方较慢 saturation 的 25%，为 11 个并行 generator 保留 latency headroom，要求双方完成至少 98% target，proxysss 还必须逐项严格胜出吞吐和 p50/p95/p99。<code>scripts/benchmark-all-scenarios.sh</code> 保留为旧 mixed 诊断入口，<code>SCENARIO_FILTER=udp-stream</code> 只用于定位 UDP fast path。</p>
           </div>
         </div>

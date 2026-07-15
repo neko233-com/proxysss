@@ -6717,6 +6717,7 @@ impl Gateway {
         let mut local_associations = FxHashMap::<SocketAddr, LocalUdpAssociation>::default();
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
+        let mut shared_udp_packets_since_yield = 0_usize;
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
@@ -6824,6 +6825,13 @@ impl Gateway {
                     existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
                     associations.remove(&client_addr);
+                } else if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+                    shared_udp_packets_since_yield =
+                        shared_udp_packets_since_yield.saturating_add(1);
+                    if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
+                        shared_udp_packets_since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 continue;
             }
@@ -11961,7 +11969,7 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
         // One movable owner per four CPUs avoids a permanently-runnable CFS
         // sibling on every HTTP shard. The count still scales with the full
         // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11979,7 +11987,7 @@ fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> boo
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 8,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11992,7 +12000,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -15084,6 +15092,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
 
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
@@ -23771,7 +23780,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23794,7 +23803,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            8
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23805,13 +23814,15 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
+        assert_eq!(tls_http_runtime_workers_for(8, 8), 1);
+        assert_eq!(tls_http_runtime_workers_for(96, 8), 12);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),

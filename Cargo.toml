@@ -65,7 +65,7 @@ tikv-jemallocator = "0.6"
 futures-util = "0.3"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
