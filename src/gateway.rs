@@ -11930,9 +11930,8 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
     // running a fixed worker cap. The profile-selected divisor scales with the
-    // full cpuset. Balanced mode splits wake queues slightly more finely while
-    // lowering each owner's CFS weight, keeping aggregate relay weight bounded
-    // without queueing unrelated long connections behind one shared owner.
+    // full cpuset, and balanced mode uses a low-CFS-weight per-core lane to
+    // avoid queueing unrelated long connections behind one shared owner.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
@@ -11940,7 +11939,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11949,10 +11948,10 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Three movable owners on an eight-CPU gateway have approximately the
-        // same aggregate CFS weight as two nice-5 owners, but split sparse
-        // frame wake queues more finely and reduce head-of-line latency.
-        RuntimePerformanceTrafficProfile::Balanced => 7,
+        // One movable owner per four CPUs avoids a permanently-runnable CFS
+        // sibling on every HTTP shard. The count still scales with the full
+        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23756,7 +23755,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            4
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23768,7 +23767,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            7
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
