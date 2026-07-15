@@ -1140,12 +1140,12 @@ fn shutdown_fd_write(fd: std::os::fd::RawFd) {
     }
 }
 
-fn dedicated_tcp_stream_runtimes() -> &'static [tokio::runtime::Runtime] {
+fn dedicated_tcp_stream_runtimes() -> &'static [HttpDataRuntimeShard] {
     dedicated_http_connection_runtimes()
 }
 
-fn dedicated_tcp_stream_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    dedicated_http_connection_runtime(worker_index)
+fn dedicated_tcp_stream_runtime(worker_index: usize) -> &'static tokio::runtime::Handle {
+    &dedicated_http_connection_runtime(worker_index).handle
 }
 
 fn tune_tcp_stream_for_gateway(stream: &TcpStream) {
@@ -1539,7 +1539,14 @@ const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
-static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+type LocalDataTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct HttpDataRuntimeShard {
+    handle: tokio::runtime::Handle,
+    local_tasks: tokio::sync::mpsc::UnboundedSender<LocalDataTask>,
+}
+
+static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<HttpDataRuntimeShard>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
@@ -1566,7 +1573,7 @@ static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
 static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
 
-fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
+fn dedicated_http_connection_runtimes() -> &'static [HttpDataRuntimeShard] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
         // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
         // one reactor thread. This avoids work-stealing and global-queue costs
@@ -1579,25 +1586,57 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
         );
         (0..shard_count)
             .map(|shard_index| {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder
-                    .worker_threads(1)
-                    .thread_name(format!("proxysss-http-{shard_index}"))
-                    .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                    .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
-                    .enable_all();
-                builder
-                    .build()
-                    .expect("failed to build proxysss HTTP runtime shard")
+                let (local_tasks, mut local_task_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<LocalDataTask>();
+                let (shard_tx, shard_rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name(format!("proxysss-http-{shard_index}"))
+                    .spawn(move || {
+                        pin_current_data_plane_thread(shard_index);
+                        let mut builder = tokio::runtime::Builder::new_current_thread();
+                        builder
+                            .thread_name(format!("proxysss-http-blocking-{shard_index}"))
+                            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                            .enable_all();
+                        let runtime = builder
+                            .build()
+                            .expect("failed to build proxysss HTTP runtime shard");
+                        shard_tx
+                            .send(HttpDataRuntimeShard {
+                                handle: runtime.handle().clone(),
+                                local_tasks,
+                            })
+                            .expect("failed publishing proxysss HTTP runtime shard");
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&runtime, async move {
+                            while let Some(task) = local_task_rx.recv().await {
+                                std::mem::drop(tokio::task::spawn_local(task));
+                            }
+                        });
+                    })
+                    .expect("failed starting proxysss HTTP runtime shard");
+                shard_rx
+                    .recv()
+                    .expect("proxysss HTTP runtime shard stopped during startup")
             })
             .collect()
     })
 }
 
-fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+fn dedicated_http_connection_runtime(worker_index: usize) -> &'static HttpDataRuntimeShard {
     let runtimes = dedicated_http_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn spawn_local_http_data_task<Task>(worker_index: usize, task: Task)
+where
+    Task: Future<Output = ()> + Send + 'static,
+{
+    dedicated_http_connection_runtime(worker_index)
+        .local_tasks
+        .send(Box::pin(task))
+        .expect("proxysss HTTP local runtime stopped");
 }
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1657,12 +1696,12 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     })
 }
 
-fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Handle {
     if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
-        return dedicated_http_connection_runtime(worker_index);
+        return &dedicated_http_connection_runtime(worker_index).handle;
     }
     let runtimes = dedicated_udp_connection_runtimes();
-    &runtimes[worker_index % runtimes.len()]
+    runtimes[worker_index % runtimes.len()].handle()
 }
 
 fn initialize_udp_connection_runtimes() {
@@ -1737,7 +1776,7 @@ fn spawn_http_connection<Connection>(
     Connection: Future<Output = ()> + Send + 'static,
 {
     if cfg!(target_os = "linux") && performance_enabled {
-        std::mem::drop(dedicated_http_connection_runtime(worker_index).spawn(connection));
+        spawn_local_http_data_task(worker_index, connection);
     } else {
         std::mem::drop(tokio::spawn(connection));
     }
@@ -4705,18 +4744,22 @@ impl Gateway {
                 let listener = listener
                     .into_std()
                     .context("failed detaching plain HTTP listener for data runtime")?;
-                let accept_task =
-                    dedicated_http_connection_runtime(worker_index).spawn(async move {
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                spawn_local_http_data_task(worker_index, async move {
+                    let result = async move {
                         let listener = TcpListener::from_std(listener)
                             .context("failed registering plain HTTP listener on data runtime")?;
                         gateway
                             .run_plain_http_accept_loop(listener, bind_addr, worker_index, true)
                             .await
-                    });
+                    }
+                    .await;
+                    let _ = result_tx.send(result);
+                });
                 workers.spawn(async move {
-                    accept_task
+                    result_rx
                         .await
-                        .context("plain HTTP data-runtime accept task failed")?
+                        .context("plain HTTP local data-runtime accept task stopped")?
                 });
             } else {
                 workers.spawn(async move {
@@ -4754,7 +4797,7 @@ impl Gateway {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
                 let gateway = self.clone();
-                std::mem::drop(tokio::spawn(async move {
+                std::mem::drop(tokio::task::spawn_local(async move {
                     gateway
                         .serve_plain_http_connection(
                             stream,
