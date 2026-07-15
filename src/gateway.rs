@@ -1500,7 +1500,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1514,7 +1514,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
@@ -4876,7 +4876,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5070,7 +5070,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5127,7 +5127,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5184,7 +5184,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -11901,7 +11901,7 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
         RuntimePerformanceTrafficProfile::Small => 0,
         // A sparse balanced relay owner keeps HTTP/TLS/UDP on the per-core
         // Tokio loops while retaining an allocation-free native fast path.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23664,7 +23664,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            1
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23698,8 +23698,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
         assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(300), 64);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 64);
+        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0

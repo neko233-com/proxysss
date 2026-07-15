@@ -652,6 +652,7 @@ func runParseBench(args []string) error {
 	target := fs.String("target", "", "target")
 	concurrency := fs.Int("concurrency", 0, "concurrency")
 	duration := fs.Int("duration", 0, "duration secs")
+	targetOpsPerSec := fs.Float64("target-ops-per-sec", -1, "executable fixed-rate target override")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -673,6 +674,9 @@ func runParseBench(args []string) error {
 	row.Concurrency = *concurrency
 	row.DurationSecs = *duration
 	row.URL = *target
+	if *targetOpsPerSec > 0 {
+		row.TargetOpsPerSec = targetOpsPerSec
+	}
 	payload, err := json.Marshal(row)
 	if err != nil {
 		return err

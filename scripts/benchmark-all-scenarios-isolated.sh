@@ -51,11 +51,11 @@ STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-4}"
 SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 LOAD_SCALES="${LOAD_SCALES:-1}"
-DURATION_SECS="${DURATION_SECS:-1}"
+DURATION_SECS="${DURATION_SECS:-2}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
-BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-2}"
+BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -439,13 +439,17 @@ wait_gateway() {
 }
 
 activate_gateway() {
-  local kind="$1"
-  # Always cross a fully-paused boundary, including when the balanced sample
-  # order places the same candidate on both sides of a repetition boundary.
-  # This prevents one gateway from retaining runnable cleanup work while the
-  # other candidate gets a clean activation.
-  docker pause "$PREFIX-gateway-nginx" "$PREFIX-gateway-proxysss" >/dev/null 2>&1 || true
+  local kind="$1" other
+  if [[ "$kind" == "nginx" ]]; then
+    other="proxysss"
+  else
+    other="nginx"
+  fi
+  # Keep the selected candidate warm while atomically removing its peer from
+  # the shared gateway cpuset. A pause-both boundary cold-starts CFS and QEMU
+  # scheduling on every one-second wave and distorts p95/p99.
   docker unpause "$PREFIX-gateway-$kind" >/dev/null 2>&1 || true
+  docker pause "$PREFIX-gateway-$other" >/dev/null 2>&1 || true
 }
 
 declare -a SATURATION_ROWS=()
@@ -632,10 +636,20 @@ CLIENT_WAVE
     local output
     output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
-    local row
+    local row planned_target=""
+    local -a target_args=()
+    if [[ "$result_phase" == "equal-load" ]]; then
+      planned_target="$(awk -F'|' -v scenario="$row_scenario" '$1 == scenario { print $3; exit }' "$EQUAL_LOAD_PLAN")"
+      [[ "$planned_target" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        echo "missing executable equal-load target for $row_scenario" >&2
+        return 1
+      }
+      target_args=(--target-ops-per-sec "$planned_target")
+    fi
     row="$(printf '%s\n' "$output" | "$HELPER" parse-bench \
       --scenario "$row_scenario" --gateway "$gateway" --protocol "$protocol" \
-      --target "$target" --concurrency "$concurrency" --duration "$DURATION_SECS")"
+      --target "$target" --concurrency "$concurrency" --duration "$DURATION_SECS" \
+      "${target_args[@]}")"
     if [[ "$result_phase" == "saturation" ]]; then
       SATURATION_ROWS+=("$row")
     elif [[ "$result_phase" == "isolated-saturation" ]]; then
