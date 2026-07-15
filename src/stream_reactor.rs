@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 use rustc_hash::FxHashMap;
@@ -31,6 +32,8 @@ const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
+const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
+const BLOCKED_WAIT_RESET: Duration = Duration::from_micros(100);
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -223,9 +226,11 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut active_spin_polls = 0_usize;
+    let mut continuous_batches = 0_usize;
 
     loop {
         let timeout = if active_spin_polls > 0 { 0 } else { -1 };
+        let wait_started = Instant::now();
         let ready = unsafe {
             libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, timeout)
         };
@@ -239,6 +244,11 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             active_spin_polls = active_spin_polls.saturating_sub(1);
             std::hint::spin_loop();
             continue;
+        }
+        if wait_started.elapsed() >= BLOCKED_WAIT_RESET {
+            continuous_batches = 0;
+        } else {
+            continuous_batches = continuous_batches.saturating_add(1);
         }
         for event in events.iter().take(ready as usize) {
             let token = event.u64;
@@ -298,10 +308,13 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
                 close_pair(epoll_fd, &mut sockets, fd);
             }
         }
-        if sockets.len() / 2 > ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
-            // Finish every ready fd from this bounded batch, then hand the CPU
-            // to the colocated HTTP/TLS/UDP shard before polling again.
+        if sockets.len() / 2 > ACTIVE_SPIN_MAX_PAIRS_PER_WORKER
+            && continuous_batches >= CONTINUOUS_BATCH_YIELD_AFTER
+        {
+            // A blocked wait marks a new fixed-rate tick and receives a prompt
+            // burst. Only sustained saturation reaches this boundary.
             thread::yield_now();
+            continuous_batches = 0;
         }
     }
 

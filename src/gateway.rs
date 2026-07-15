@@ -5173,6 +5173,8 @@ impl Gateway {
                     file_path: candidate.path.clone(),
                     len: candidate.len,
                     sendfile: candidate.sendfile.clone(),
+                    #[cfg(target_os = "linux")]
+                    gateway_socket_tuned: AtomicBool::new(false),
                 };
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
@@ -10896,6 +10898,8 @@ struct ConnectionStaticFastPathCache {
     file_path: PathBuf,
     len: u64,
     sendfile: Option<Arc<std::fs::File>>,
+    #[cfg(target_os = "linux")]
+    gateway_socket_tuned: AtomicBool,
 }
 
 impl ConnectionStaticFastPathCache {
@@ -11573,6 +11577,9 @@ async fn send_connection_static_fast_path(
     let cork_static = cached.len > 0;
     #[cfg(target_os = "linux")]
     if cork_static {
+        if cached.sendfile.is_some() && !cached.gateway_socket_tuned.swap(true, Ordering::Relaxed) {
+            tune_tcp_stream_for_gateway(stream);
+        }
         set_tcp_cork(stream, true);
     }
 
