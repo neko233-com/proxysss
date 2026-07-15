@@ -5257,7 +5257,8 @@ impl Gateway {
                 small_static_response.reserve(static_header.len() + body.len());
                 small_static_response.extend_from_slice(static_header.as_bytes());
                 small_static_response.extend_from_slice(body);
-                write_all_tcp_fast(&stream, &small_static_response)
+                stream
+                    .write_all(&small_static_response)
                     .await
                     .context("failed writing combined static fast path response")
             } else {
@@ -5270,14 +5271,16 @@ impl Gateway {
                     set_tcp_cork(&stream, true);
                 }
 
-                let header_result = write_all_tcp_fast(&stream, static_header.as_bytes())
+                let header_result = stream
+                    .write_all(static_header.as_bytes())
                     .await
                     .context("failed writing plain http fast path response head");
 
                 let body_result =
                     if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
                         if let Some(body) = candidate.cached_body.as_ref() {
-                            write_all_tcp_fast(&stream, body)
+                            stream
+                                .write_all(body)
                                 .await
                                 .context("failed writing cached static fast path body")
                         } else {
@@ -11618,7 +11621,8 @@ async fn send_connection_static_fast_path(
     cooperative_mid_yield: bool,
 ) -> Result<()> {
     if let Some(response) = cached.combined_response.as_ref() {
-        return write_all_tcp_fast(stream, response)
+        return stream
+            .write_all(response)
             .await
             .context("failed writing cached combined static response");
     }
@@ -11630,12 +11634,14 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, true);
     }
 
-    let header_result = write_all_tcp_fast(stream, &cached.header)
+    let header_result = stream
+        .write_all(&cached.header)
         .await
         .context("failed writing cached static response head");
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
-            write_all_tcp_fast(stream, body)
+            stream
+                .write_all(body)
                 .await
                 .context("failed writing cached static response body")
         } else {
@@ -11658,26 +11664,6 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
-}
-
-async fn write_all_tcp_fast(stream: &TcpStream, bytes: &[u8]) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < bytes.len() {
-        match stream.try_write(&bytes[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write buffered TCP response",
-                ));
-            }
-            Ok(count) => written += count,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                stream.writable().await?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 async fn send_static_file_fast(
