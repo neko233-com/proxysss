@@ -6694,7 +6694,6 @@ impl Gateway {
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
         let mut shared_udp_packets_since_yield = 0_usize;
-        let mut shared_udp_batch_started = Instant::now();
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
@@ -6806,13 +6805,8 @@ impl Gateway {
                     shared_udp_packets_since_yield =
                         shared_udp_packets_since_yield.saturating_add(1);
                     if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
-                        let sustained =
-                            balanced_udp_batch_is_sustained(shared_udp_batch_started.elapsed());
                         shared_udp_packets_since_yield = 0;
-                        shared_udp_batch_started = Instant::now();
-                        if sustained {
-                            tokio::task::yield_now().await;
-                        }
+                        tokio::task::yield_now().await;
                     }
                 }
                 continue;
@@ -11930,8 +11924,8 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
     // running a fixed worker cap. The profile-selected divisor scales with the
-    // full cpuset; saturated owners use explicit bounded batch yields instead
-    // of imposing low CFS weight on latency-sensitive sparse traffic.
+    // full cpuset, and balanced mode uses a low-CFS-weight per-core lane to
+    // avoid queueing unrelated long connections behind one shared owner.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
@@ -11949,9 +11943,9 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         // One movable owner per four CPUs avoids a permanently-runnable CFS
-        // sibling on every HTTP shard. Busy owners yield by epoll batch while
-        // sparse frames retain nice 0 wake latency.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // sibling on every HTTP shard. The count still scales with the full
+        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -15074,12 +15068,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
-const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(4);
-
-fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
-    elapsed <= BALANCED_UDP_FAIRNESS_WINDOW
-}
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
 
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
@@ -23767,7 +23756,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23846,8 +23835,6 @@ mod tests {
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             12
         );
-        assert!(balanced_udp_batch_is_sustained(Duration::from_millis(4)));
-        assert!(!balanced_udp_batch_is_sustained(Duration::from_millis(5)));
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
