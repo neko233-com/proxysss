@@ -4,129 +4,125 @@
 
 分支：`main`
 
-当前性能候选父提交：`1995e1a Rebalance TLS weight against mixed throughput`
+当前代码候选：`6580c82 Cache exact H2 static routes per connection`
 
-该提交已经通过：
+相对 `origin/main` 的性能实现主线：
+
+- `c67dad7`：data runtime 使用 `global_queue_interval=31`、`event_interval=8`；TLS HTTP/1 静态快路径用 rustls vectored writer 同时提交 header 与共享 `Bytes`，不再复制正文。
+- `e553c48`：预加载的 H2 static route 合并为一次 `DashMap` lookup，正文通过 `ArcSwap` 无锁共享并 stale-while-revalidate。
+- `47a9a18`：默认 `balanced` 在共享 256 MiB/256-entry 上限内预载 32 MiB 以下静态正文；strict matrix 的约 16 MiB large fixture 在配置加载阶段准备，正式样本不支付首次加载成本。
+- `6580c82`：同一 H2 connection 的首个 exact-path stream 完成 route lookup，后续同路径 stream 命中 connection-local `OnceLock`；没有引入全局锁。
+
+当前默认 `balanced` 数据面：
+
+- `LINUX_STREAM_REACTOR_ENABLED=false`：plain WebSocket 与 realtime TCP 留在 CPU 自适应的 per-core Tokio HTTP/I/O shard，减少额外 CFS runnable 实体与跨 runtime wake。
+- HTTP/TCP/UDP runtime：每核 shard，`global_queue_interval=31`、`event_interval=8`。
+- TLS runtime：`ceil(cpuset cores / 2)` workers、nice +7；2 核 gateway cpuset 下为 1 worker。
+- balanced sendfile reactor 关闭；32 MiB 及以上对象由 connection owner 按 Tokio writable readiness 流式发送，显式 `bulk` profile 才启用独立 reactor。
+
+`6580c82` 已完成：
 
 ```bash
 cargo fmt --all
-cargo test --locked --no-run
+cargo test --locked lock_free_h2_route_cache_shares_body_and_coalesces_revalidation -- --nocapture
 git diff --check
 ```
 
-但它在本轮交接前**尚未运行 Docker benchmark**。不要把它当成已通过候选。它基于以下结构：
+H2 connection-local cache 尚未完成 Docker matrix，不能写成已验证结果。
 
-- `LINUX_STREAM_REACTOR_ENABLED=false`：plain WebSocket 与 realtime TCP 不再交给额外原生 epoll 线程，改为留在 CPU 自适应的每核 Tokio HTTP/I/O 分片，减少 CFS 调度实体和短样本尾延迟。
-- HTTP/UDP/realtime 使用每核 I/O 分片；TLS 使用有界、低权重的独立 Tokio runtime，避免 HTTPS 被普通/实时任务完全饿死。
-- 2 核 gateway cpuset 下，balanced TLS runtime 使用 `ceil(cores / 2)=1` 个 worker。
-- 当前 balanced TLS worker 为 `nice 7`；数据 runtime `event_interval=16`。
-- 约 16 MiB benchmark 静态文件走 32 MiB 以下的共享、256 MiB 有界静态缓存；32 MiB 及以上继续走流式/sendfile。
+## 权威严格矩阵
 
-新电脑开始后先执行：
+入口：
 
 ```bash
-git switch main
-git pull --ff-only origin main
-git status --short --branch
-rustup target add x86_64-unknown-linux-gnu
-cargo install cargo-zigbuild
-zig version
-docker version
+scripts/benchmark-ubuntu24-amd64-docker.sh
 ```
 
-确保 Docker 至少提供 4 个 CPU；当前本机典型分配为 gateway `0-1`、backend `2-3`、client `4-7`。
-
-## 已确认的权威事实
-
-### 一分钟反馈链路已经完成
-
-`scripts/benchmark-ubuntu24-amd64-docker.sh` 当前默认使用：
+当前脚本默认：
 
 - `DURATION_SECS=3`
 - `BENCHMARK_REPETITIONS=1`
 - `LOAD_SCALES="1 2 4"`
 - `CLIENT_START_LEAD_MS=750`
 - `EQUAL_LOAD_FRACTION=0.25`
+- `MIN_TARGET_ACHIEVEMENT=0.98`
 - `MAX_VALIDATION_SECS=60`
-- serial isolated saturation 默认关闭
+- serial isolated saturation 关闭
 
-完整 1x/2x/4x 严格矩阵已多次稳定在 `51-52s` validation time；交叉编译和镜像准备不计入该计时。部分旧文档仍写“2 秒样本”，这是陈旧口径，最终收敛后必须改成与脚本一致的 3 秒。
+proxysss 是 AOT binary，不做 JIT warm-up。构建、镜像/容器准备、确定性的配置加载缓存准备与 readiness 在 strict validation timer 之前完成；计时内只包含正式 mixed saturation、equal-load 和报告/gate，完整 1×/2×/4× 必须不超过 60 秒。
 
-arm64 Docker 路径使用 Zig + cargo-zigbuild 在宿主交叉编译 `x86_64-unknown-linux-gnu` release ELF，再在 Ubuntu 24 amd64 容器执行同一二进制；不要退回 QEMU 内编译。
+本轮工作机是 Windows x86_64 + Docker Desktop Linux/amd64，而 `TARGET.md` 的唯一完成标准明确要求本机 Mac arm64 Docker + `execution_mode=emulated-amd64`。因此这里的 Ubuntu 24 amd64 结果可用于实现收敛和回归诊断，但即使三尺度全绿，也不能冒充最终 TARGET 证据；最后仍需在目标 Mac arm64 上对同一提交复跑并归档原始报告。
 
-### 当前最重要的性能证据
+## 最近有效证据
 
-以下数据均来自本机 Docker、Ubuntu 24 x86_64 容器、2 核 gateway cpuset、scale 1 全 11 场景并发。完整筛选报告已归档到 `performance-evidence/development/local-docker/`。
+### `c67dad7`：vectored TLS static + event interval 8
 
-#### `2be6ba4`：统一 realtime 到每核 I/O 分片
+scale 1、Ubuntu 24 amd64 Docker、11 场景并发：
 
-- saturation：除 HTTPS 外的 10 个场景吞吐均领先 nginx `1.291x-1.740x`，聚合 `1.424x`。
-- HTTPS saturation：`0.395x`，说明统一分片时 TLS 被普通/实时任务饿死。
-- equal-load：大多数 p95/p99 明显领先；仍有轻微 p50 缺口：game `1.027x`、SSE `1.032x`、HTTPS `1.157x`、reverse `1.034x`、TCP `1.004x`、WebSocket `1.048x`。
-- 结论：减少数据面线程是正确主方向，剩余核心是给 TLS 一个受控份额。
+- saturation 11 行全部领先；聚合 `1.582x`。
+- 代表性比例：CDN `1.241x`、game `2.332x`、SSE `2.152x`、HTTPS `1.577x`、QCP `1.894x`、reverse `1.664x`、static-large `1.009x`、static-small `1.207x`、TCP `2.240x`、UDP `2.175x`、WebSocket `2.193x`。
+- equal-load 只剩 HTTPS p50 `1.181x`、reverse p50 `1.008x` 未过；其他 percentile 通过。
+- 零错误，validation 约 19 秒，proxysss memory 明显低于 nginx。
 
-#### `3bf5b54`：TLS 独立 worker，nice 0（已证伪）
+### `e553c48`：H2 route/payload 无锁合并
 
-- HTTPS saturation 达到 `18.609x`。
-- 其他 10 个场景仅 `0.165x-0.414x`。
-- 结论：TLS 独立队列有效，但 nice 0 会垄断 2 核混合负载，禁止恢复该权重。
+一次较干净的 scale 1：
 
-#### `3005fde`：TLS 独立 worker，nice 10，event interval 8
+- saturation 仅 static-large `0.929x` 未过；聚合 `1.334x`。
+- equal-load 仅 HTTPS p50 `1.113x`、UDP p99 `1.047x`、WebSocket p99 `1.154x` 未过。
+- proxysss current/peak 约 26/76 MiB，nginx 约 182/240 MiB，远低于 2x 内存边界。
 
-- 除 HTTPS 外的 10 个 saturation 场景全部领先，最低 static-large `1.008x`，其余 `1.022x-1.162x`，聚合 `1.051x`。
-- HTTPS saturation `0.570x`。
-- equal-load 的 p50 全部领先；仅剩 p95：game `1.438x`、static-large `1.016x`、TCP `1.097x`。
-- validation time `17s`（只跑 scale 1）。
-- 结论：nice 10 已保护普通路径，但 TLS 份额不足。
+### `47a9a18`：balanced 预载 16 MiB fixture
 
-#### 当前 `1995e1a`：nice 7，event interval 16
+- 后续两次 scale 1 均受到宿主 `wasm-opt`/Tuanjie/Weixin 构建负载干扰；不能作为最终证据。
+- 在相对较轻的一次中 static-large 已过线，只有 static-small saturation `0.995x`；说明预载方向有效，但仍需在宿主安静时复跑同一 commit。
 
-- 这是由上述数据推导的下一候选：Linux CFS nice 10 到 nice 7 的权重约增加 1.95 倍，理论上可把 HTTPS 从 `0.570x` 推向约 `1.11x`。
-- event interval 从 8 恢复到 16，目的是补回普通路径至少约 5% 的 saturation 余量。
-- 该推导必须由 Docker 实测确认；若失败，以实测为准，不要把理论写成结果。
+## 已证伪方案
 
-## 已证伪方案，禁止重复浪费时间
+不要重复恢复下列候选：
 
-1. 共享缓存大 body 交给两条 nice 0 原生 epoll 写线程（`502a5c1`）：scale 1 realtime/TLS 吞吐退到约 `0.70-0.88x`，CPU 争抢加重。
-2. TLS 使用每核两条独立 worker、nice 5 的旧方案（`52b3e01`）：小文件、CDN、SSE、反代整体下降，scale 1 聚合仅 `0.972x`。
-3. balanced 大文件启用独立 native sendfile reactor（`cf562e2`）：static-large 没有稳定过线，同时明显抢 TLS CPU。
-4. realtime 每核 nice 0 owner 会明显拖慢 HTTP；每批无条件 `thread::yield_now()` 又会把 realtime saturation 砍半。
-5. realtime 每核 nice 5/6 owner 的 p99 有改善，但 p50 与总体 CFS 竞争变差；统一到现有 I/O 分片的结果更好。
-6. 对大文件连接应用完整 `tune_tcp_stream_for_gateway`：显式 `SO_SNDBUF` 会破坏 Linux autotune，static-large 反而退化。
-7. 只修某一个场景再跑一小时的流程不可接受。修改必须针对共享根因，快速先跑 scale 1 全混合，只有 scale 1 全部接近或通过才跑默认三尺度。
+1. balanced TLS nice `7 -> 6`（`e895b8f`，后由 `8085769` 回退）：TLS 抢占兄弟路径，整体更差。
+2. TLS H2 `event_interval 8 -> 4`（`2836212`，后由 `6b73263` 回退）：H2 p50 略有改善，但 static/realtime 吞吐被抢走。
+3. TLS global queue interval `31 -> 8`（`06fe7d0`，后由 `83318f1` 回退）：增加注入队列检查开销，没有形成全矩阵收益。
+4. exact TLS HTTP/1 connection cache（`3cc2f91`，后由 `1983fd3` 回退）：不是 H2 benchmark 路径，且 mixed 结果退化。
+5. TLS 两 worker/nice 6（`aa2ecfa`，后由 `a77e0e2` 回退）：2 核包络中增加 scheduler 竞争。
+6. balanced 独立 native sendfile reactor：static-large 没有稳定过线，并抢占 TLS/realtime CPU。
+7. 额外 realtime native epoll owner：短样本的 p50/p99 与兄弟吞吐不如统一 per-core Tokio I/O shard。
 
-## 新电脑执行顺序
+所有单场景、单尺度与受宿主构建负载污染的结果只作诊断，不能替代 strict matrix。
 
-### Step A：先验证当前 nice 7 候选
+## 下一步执行顺序
+
+### Step A：完成文档口径并提交
+
+当前工作树中的文档变更已把陈旧样本时长统一为脚本真实的 3 秒，明确 AOT 无 JIT warm-up、strict timer 排除 build/setup/readiness，并同步当前 per-core Tokio relay、TLS nice +7、balanced preload 与 sendfile 边界。
+
+提交前检查：
+
+检查所有官方 benchmark 入口不再保留旧时长口径，并运行 `git diff --check`。
+
+### Step B：宿主安静后先跑 scale 1
+
+不要终止用户的后台构建进程。先确认没有多核 `wasm-opt`、`wasm-emscripten-finalize`、`emcc/python` 或类似编译任务，再运行：
 
 ```bash
-LOAD_SCALES=1 scripts/benchmark-ubuntu24-amd64-docker.sh
+LOAD_SCALES=1 MAX_VALIDATION_SECS=60 scripts/benchmark-ubuntu24-amd64-docker.sh
 ```
 
-记录 saturation 每行 ratio、equal-load 每行 p50/p95/p99 ratio、错误数和 `validation_elapsed_secs`。
+同一提交至少连续复跑一次；第二次复用 AOT release artifact，不重复把 build 噪声带进判断。记录：
 
-决策规则：
+- saturation 11 行 ratio 与 aggregate；
+- equal-load 11 行 p50/p95/p99 与双方完成率；
+- 零错误；
+- cgroup current/peak/每连接成本；
+- `validation_elapsed_secs`。
 
-- 如果 HTTPS 与其他 10 条 saturation 全部 `>1.0`，不要再调 TLS 权重，直接修剩余 latency 行。
-- 如果 HTTPS 仍低于 1，而普通路径有足够余量，按 `nice 7 -> 6` 小步增加 TLS 权重；每次只接受全 11 场景同时改善的结果。
-- 如果 HTTPS 过线但 static-large/static-small/TCP/UDP 下降到 1 以下，不能放宽 gate；应限制 TLS 每轮连续处理预算，而不是增加更多线程。
-- scale 1 未通过时不要浪费时间跑 2x/4x。
+只有 scale 1 所有严格 gate 都过，才跑三尺度。若 H2 p50 仍未过，不再改变 TLS runtime 权重/轮询间隔；优先从 H2 response 构造中的 per-stream header/state 成本继续消除，且每次都用 11 场景 mixed 回归。
 
-### Step B：收敛剩余 p95 根因
-
-nice 10 的最近证据只剩 game、TCP、static-large p95。优先检查共享根因：
-
-1. game/TCP 在 `LINUX_STREAM_REACTOR_ENABLED=false` 时走 `tokio::io::copy_bidirectional`，与 HTTP/TLS 共用每核 runtime。检查 `DATA_RUNTIME_EVENT_INTERVAL`、relay task 自唤醒和读写 batch；目标是降低 p95，不新增常驻高权重线程。
-2. game 与 TCP 同时打到 `18200`，payload 分别为 256 B 和 1024 B。任何优化都要同时验证两行，避免只偏向一种帧大小。
-3. static-large 约 16 MiB，具有 4/8/16 条并发连接。共享 `Bytes` 缓存能让 saturation 接近或超过 nginx，但单个 `write_all` 可能形成长尾。若切片，只允许在同一 Tokio task 内有限 cooperative yield；新增 native body writer 已证伪。
-4. p95/p99 在 3 秒 amd64 模拟样本中有噪声。不能放宽 `<1.0` gate；最终通过后连续复跑一次完整矩阵确认不是偶然。
-
-### Step C：跑最终默认矩阵
-
-scale 1 全部通过后运行：
+### Step C：完整 1×/2×/4×
 
 ```bash
-scripts/benchmark-ubuntu24-amd64-docker.sh
+MAX_VALIDATION_SECS=60 scripts/benchmark-ubuntu24-amd64-docker.sh
 ```
 
 必须看到：
@@ -135,35 +131,15 @@ scripts/benchmark-ubuntu24-amd64-docker.sh
 ==> all strict Ubuntu 24 x86_64 Docker scales passed in ...s
 ```
 
-检查完整报告：
+三档每一行 throughput 和 p50/p95/p99 都严格通过、双方完成率至少 98%、零错误、validation `<=60s`、proxysss memory current/peak/每连接成本都 `<=2x nginx`。通过后立即用同一提交连续复跑完整 matrix，排除 3 秒样本偶然噪声。
 
-```bash
-latest=$(ls -dt .benchmark/direct-ubuntu24-amd64/* | head -1)
-cat "$latest/host-fingerprint.txt"
-for scale in 1 2 4; do
-  cat "$latest/scale-$scale/saturation-summary.md"
-  cat "$latest/scale-$scale/equal-load-summary.md"
-  cat "$latest/scale-$scale/scale-$scale-nginx-gateway-memory-final.txt"
-  cat "$latest/scale-$scale/scale-$scale-proxysss-gateway-memory-final.txt"
-done
-```
+### Step D：目标 Mac arm64 最终复现
 
-完整 validation 必须 `<=60s`；三档每一行严格通过；内存 current/peak 不超过 nginx 2 倍。
+在 `TARGET.md` 指定的 Mac arm64 Docker 上，对同一提交运行默认入口。必须记录 `execution_mode=emulated-amd64`，使用 Zig + cargo-zigbuild 在宿主原生速度交叉编译 release ELF，再在 Ubuntu 24 amd64 容器运行；禁止 QEMU 内编译，禁止 SSH 远程主机。
 
-### Step D：同步文档和完整验证
+### Step E：归档、全量测试与推送
 
-架构最终确定后，至少同步：
-
-- `AGENTS.md`
-- `README.md`
-- `docs/ARCHITECTURE.md`
-- `docs/architecture.html`
-- `docs/BENCHMARK-ubuntu24-vs-nginx.md`
-- `docs/benchmark-linux.html`
-
-把仍写“2 秒样本”的内容改为脚本真实默认 `3 秒`，并说明 timer 排除 build/setup/warm-up、完整矩阵实测不超过 60 秒。
-
-最终运行：
+筛选同一最终提交的原始报告到 `performance-evidence/development/local-docker/`，不提交 `.benchmark/`、镜像上下文、binary、密钥或日志。然后运行：
 
 ```bash
 cargo fmt --all -- --check
@@ -173,20 +149,8 @@ bash -n scripts/benchmark-ubuntu24-amd64-docker.sh
 bash -n scripts/benchmark-all-scenarios-isolated.sh
 git diff --check
 git status --short --ignored
-```
-
-最后提交并推送：
-
-```bash
 git fetch origin
-git status --short --branch
 git push origin main
 ```
 
-## 提交与证据纪律
-
-- benchmark 只接受干净工作树；每个 `.benchmark/direct-ubuntu24-amd64/<run-id>` 必须映射到唯一提交。
-- `.benchmark/`、`.ssh/`、`target/`、证书、日志和本地 `proxysss.yaml` 不提交。
-- 筛选后的历史报告必须更新到 `performance-evidence/development/local-docker/`；不提交 9 GiB 交叉编译产物、镜像上下文和临时二进制。
-- 不删除失败证据来制造成功叙述；不把 scale 1 诊断写成完整通过；不把 emulated-amd64 写成 native x86。
-- 最终 push 前确认 `origin/main` 没有新提交；若有，只允许 `git pull --ff-only` 或明确处理冲突，禁止 destructive reset。
+只有同一最终提交的 Mac arm64 原始报告满足 `TARGET.md` 全部条目、全量测试通过、工作树干净并已推送 `origin/main`，才能更新 goal 为 complete 并宣称“全面超过 nginx”。
