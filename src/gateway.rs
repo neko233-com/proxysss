@@ -1500,7 +1500,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1515,6 +1515,8 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
+const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
@@ -1539,6 +1541,7 @@ static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> =
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
@@ -1952,6 +1955,21 @@ struct ActiveConnectionGuard(Arc<AtomicUsize>);
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ActivePlainHttpConnectionGuard;
+
+impl ActivePlainHttpConnectionGuard {
+    fn enter() -> Self {
+        PLAIN_HTTP_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActivePlainHttpConnectionGuard {
+    fn drop(&mut self) {
+        PLAIN_HTTP_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -4734,6 +4752,7 @@ impl Gateway {
         worker_index: usize,
         initial_prefix: Bytes,
     ) {
+        let _active_plain_http = ActivePlainHttpConnectionGuard::enter();
         let (stream, prefix) = if self.plain_http_data_fast_lane_enabled().await {
             match self
                 .try_plain_http_large_static_fast_path(stream, remote_addr, initial_prefix)
@@ -4857,7 +4876,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5051,7 +5070,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5108,7 +5127,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5165,7 +5184,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if force_yield || plain_fast_lane_should_yield(served_since_yield) {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5255,7 +5274,7 @@ impl Gateway {
             }
             discard_fast_lane_http_head(&mut prefix, head_end);
             served_since_yield = served_since_yield.saturating_add(1);
-            if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+            if plain_fast_lane_should_yield(served_since_yield) {
                 served_since_yield = 0;
                 tokio::task::yield_now().await;
             }
@@ -11907,6 +11926,22 @@ fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
 
 fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     cores.max(1).div_ceil(cpu_divisor.max(1))
+}
+
+fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
+    if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
+        PLAIN_FAST_LANE_LOW_DENSITY_BATCH
+    } else {
+        PLAIN_FAST_LANE_FAIRNESS_BATCH
+    }
+}
+
+fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
+    served_since_yield >= PLAIN_FAST_LANE_LOW_DENSITY_BATCH
+        && served_since_yield
+            >= plain_fast_lane_fairness_batch_for(
+                PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+            )
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23661,6 +23696,10 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(1, 2), 1);
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
+        assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
