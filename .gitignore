@@ -1,20 +1,58 @@
-target/
-dist/
-certs/
-.ssh/
-.DS_Store
-Thumbs.db
-logs/
-runtime/
-.cache/
-*.pid
+# Build outputs and language tool caches.
+/target/
+/dist/
+/build/
+/node_modules/
+/.vite/
+/.cache/
+/.cargo-cache/
+/.zig-cache/
+/zig-out/
+*.test
+*.profraw
+*.profdata
+perf.data
+perf.data.*
+flamegraph.svg
+coverage/
+coverage.out
 
-# Local one-off benchmark, smoke-test, and gateway scratch files.
-.tmp-*/
-.tmp-*.exe
-tmp-*
-benchmark-helper.exe
+# Local gateway state, generated credentials, and operator-only files.
+/.ssh/
+/certs/
+/logs/
+/runtime/
+/data/
+/proxysss.yaml
+/proxysss.local.yaml
+/.env
+/.env.*
+!/.env.example
+!/.env.*.example
+*.pid
+*.pid.lock
 proxy-key.pem
 
-# Gateway benchmark + deep verify reports (vendor downloads, run artifacts, HTML/MD output)
-.benchmark/
+# Local benchmark, verification, and one-off scratch artifacts.
+/.benchmark/
+/.tmp-*/
+/.tmp-*.exe
+/tmp-*
+/benchmark-helper
+/benchmark-helper.exe
+*.log
+!/performance-evidence/development/**/*.log
+*.tmp
+*.bak
+*.orig
+
+# IDE, editor, and operating-system metadata.
+/.idea/
+/.vscode/
+/.codex/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

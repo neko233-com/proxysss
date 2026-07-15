@@ -1,0 +1,2 @@
+memory_current_bytes=78614528
+memory_peak_bytes=94556160

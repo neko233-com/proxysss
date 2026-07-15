@@ -1,0 +1,6 @@
+cdn-hot-update|1340|23880.597015
+generic-sse|4411|453.411925
+qcp-transparent|4493|1780.547518
+reverse-proxy|2634|12148.823083
+static-small|1326|24132.730015
+udp-stream|4514|1772.264067

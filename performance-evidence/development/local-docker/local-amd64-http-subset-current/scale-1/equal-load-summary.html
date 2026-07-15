@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>proxysss all-scenarios benchmark</title>
+  <style>
+    body { font-family: Segoe UI, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e8eefc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    table { width: 100%; border-collapse: collapse; background: #121a2f; }
+    th, td { border: 1px solid #24304f; padding: 0.7rem 0.8rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    h1 { color: #5eead4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>balanced</strong></p>
+    <p>Aggregate proxysss/nginx ratio: <strong>0.999x</strong></p>
+    <table>
+      <thead>
+		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+      </thead>
+      <tbody><tr><td>cdn-hot-update</td><td>12942.35</td><td>12941.50</td><td>1.000x</td><td>+0.01%</td><td>0.850x</td><td>+15.01%</td><td>0.902x</td><td>+9.81%</td><td>0.916x</td><td>+8.40%</td></tr><tr><td>generic-sse</td><td>276.45</td><td>276.80</td><td>0.999x</td><td>-0.13%</td><td>0.904x</td><td>+9.61%</td><td>0.798x</td><td>+20.20%</td><td>0.736x</td><td>+26.39%</td></tr><tr><td>https-static-small</td><td>3054.70</td><td>3071.00</td><td>0.995x</td><td>-0.53%</td><td>1.091x</td><td>-9.08%</td><td>1.006x</td><td>-0.57%</td><td>0.874x</td><td>+12.64%</td></tr><tr><td>reverse-proxy</td><td>6955.50</td><td>6940.80</td><td>1.002x</td><td>+0.21%</td><td>0.889x</td><td>+11.10%</td><td>0.875x</td><td>+12.54%</td><td>0.843x</td><td>+15.65%</td></tr><tr><td>static-small</td><td>13055.00</td><td>13094.80</td><td>0.997x</td><td>-0.30%</td><td>0.837x</td><td>+16.27%</td><td>0.912x</td><td>+8.80%</td><td>0.910x</td><td>+8.99%</td></tr></tbody>
+    </table>
+  </main>
+</body>
+</html>

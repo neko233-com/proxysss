@@ -1,0 +1,5 @@
+cdn-hot-update|1366|23426.061493
+generic-sse|4069|491.521258
+reverse-proxy|2919|10962.658445
+static-large|56023|71.399247
+static-small|1355|23616.236162

@@ -1,0 +1,11 @@
+cdn-hot-update|23356|5480.390478
+game-long-connection|26703|1198.367225
+generic-sse|55556|143.998848
+https-static-small|29264|1093.493712
+qcp-transparent|20183|1585.492741
+reverse-proxy|46995|2723.694010
+static-large|805032|19.874986
+static-small|26056|4912.496162
+tcp-stream|29258|1093.717957
+udp-stream|25768|1241.850357
+websocket-long-connection|31861|1004.362700

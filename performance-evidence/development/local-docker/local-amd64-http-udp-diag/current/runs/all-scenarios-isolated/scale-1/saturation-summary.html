@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>proxysss all-scenarios benchmark</title>
+  <style>
+    body { font-family: Segoe UI, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e8eefc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    table { width: 100%; border-collapse: collapse; background: #121a2f; }
+    th, td { border: 1px solid #24304f; padding: 0.7rem 0.8rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    h1 { color: #5eead4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>balanced</strong></p>
+    <p>Aggregate proxysss/nginx ratio: <strong>0.973x</strong></p>
+    <table>
+      <thead>
+		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+      </thead>
+      <tbody><tr><td>cdn-hot-update</td><td>34132.75</td><td>34512.75</td><td>0.989x</td><td>-1.10%</td><td>0.909x</td><td>+9.06%</td><td>1.486x</td><td>-48.62%</td><td>1.542x</td><td>-54.20%</td></tr><tr><td>generic-sse</td><td>796.75</td><td>647.75</td><td>1.230x</td><td>+23.00%</td><td>0.676x</td><td>+32.45%</td><td>1.208x</td><td>-20.83%</td><td>1.195x</td><td>-19.53%</td></tr><tr><td>qcp-transparent</td><td>2544.00</td><td>5532.50</td><td>0.460x</td><td>-54.02%</td><td>1.793x</td><td>-79.29%</td><td>3.371x</td><td>-237.10%</td><td>2.999x</td><td>-199.92%</td></tr><tr><td>reverse-proxy</td><td>20446.50</td><td>17357.75</td><td>1.178x</td><td>+17.79%</td><td>0.722x</td><td>+27.79%</td><td>1.296x</td><td>-29.63%</td><td>1.304x</td><td>-30.41%</td></tr><tr><td>static-small</td><td>34927.75</td><td>34500.50</td><td>1.012x</td><td>+1.24%</td><td>0.882x</td><td>+11.76%</td><td>1.491x</td><td>-49.13%</td><td>1.613x</td><td>-61.29%</td></tr><tr><td>udp-stream</td><td>2532.25</td><td>5426.00</td><td>0.467x</td><td>-53.33%</td><td>1.764x</td><td>-76.40%</td><td>3.431x</td><td>-243.06%</td><td>2.749x</td><td>-174.89%</td></tr></tbody>
+    </table>
+  </main>
+</body>
+</html>

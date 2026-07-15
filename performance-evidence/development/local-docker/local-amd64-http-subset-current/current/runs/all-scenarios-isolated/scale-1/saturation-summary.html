@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>proxysss all-scenarios benchmark</title>
+  <style>
+    body { font-family: Segoe UI, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e8eefc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    table { width: 100%; border-collapse: collapse; background: #121a2f; }
+    th, td { border: 1px solid #24304f; padding: 0.7rem 0.8rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    h1 { color: #5eead4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>balanced</strong></p>
+    <p>Aggregate proxysss/nginx ratio: <strong>0.760x</strong></p>
+    <table>
+      <thead>
+		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+      </thead>
+      <tbody><tr><td>cdn-hot-update</td><td>26580.80</td><td>35162.35</td><td>0.756x</td><td>-24.41%</td><td>0.955x</td><td>+4.50%</td><td>2.090x</td><td>-109.00%</td><td>2.413x</td><td>-141.33%</td></tr><tr><td>generic-sse</td><td>563.35</td><td>665.45</td><td>0.847x</td><td>-15.34%</td><td>0.933x</td><td>+6.66%</td><td>1.774x</td><td>-77.36%</td><td>2.539x</td><td>-153.90%</td></tr><tr><td>https-static-small</td><td>6378.45</td><td>8129.80</td><td>0.785x</td><td>-21.54%</td><td>0.824x</td><td>+17.56%</td><td>2.159x</td><td>-115.93%</td><td>1.855x</td><td>-85.54%</td></tr><tr><td>reverse-proxy</td><td>14225.45</td><td>18406.20</td><td>0.773x</td><td>-22.71%</td><td>0.983x</td><td>+1.70%</td><td>1.951x</td><td>-95.08%</td><td>2.604x</td><td>-160.44%</td></tr><tr><td>static-small</td><td>26856.65</td><td>35817.45</td><td>0.750x</td><td>-25.02%</td><td>0.955x</td><td>+4.50%</td><td>2.149x</td><td>-114.93%</td><td>2.539x</td><td>-153.91%</td></tr></tbody>
+    </table>
+  </main>
+</body>
+</html>

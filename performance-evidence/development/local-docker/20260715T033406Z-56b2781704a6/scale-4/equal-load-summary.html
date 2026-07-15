@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>proxysss all-scenarios benchmark</title>
+  <style>
+    body { font-family: Segoe UI, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e8eefc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    table { width: 100%; border-collapse: collapse; background: #121a2f; }
+    th, td { border: 1px solid #24304f; padding: 0.7rem 0.8rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    h1 { color: #5eead4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>balanced</strong></p>
+    <p>Aggregate proxysss/nginx ratio: <strong>1.000x</strong></p>
+    <table>
+      <thead>
+		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+      </thead>
+      <tbody><tr><td>cdn-hot-update</td><td>6236.50</td><td>6235.00</td><td>1.000x</td><td>+0.02%</td><td>0.793x</td><td>+20.65%</td><td>1.404x</td><td>-40.42%</td><td>1.066x</td><td>-6.64%</td></tr><tr><td>game-long-connection</td><td>960.00</td><td>960.00</td><td>1.000x</td><td>+0.00%</td><td>1.552x</td><td>-55.24%</td><td>2.680x</td><td>-167.98%</td><td>1.569x</td><td>-56.94%</td></tr><tr><td>generic-sse</td><td>141.50</td><td>141.50</td><td>1.000x</td><td>+0.00%</td><td>0.985x</td><td>+1.51%</td><td>1.929x</td><td>-92.86%</td><td>1.986x</td><td>-98.59%</td></tr><tr><td>https-static-small</td><td>1301.50</td><td>1301.00</td><td>1.000x</td><td>+0.04%</td><td>0.964x</td><td>+3.60%</td><td>1.249x</td><td>-24.90%</td><td>1.408x</td><td>-40.76%</td></tr><tr><td>qcp-transparent</td><td>960.00</td><td>960.00</td><td>1.000x</td><td>+0.00%</td><td>0.839x</td><td>+16.07%</td><td>2.075x</td><td>-107.51%</td><td>0.692x</td><td>+30.83%</td></tr><tr><td>reverse-proxy</td><td>3108.50</td><td>3108.50</td><td>1.000x</td><td>+0.00%</td><td>1.017x</td><td>-1.66%</td><td>1.246x</td><td>-24.59%</td><td>0.521x</td><td>+47.90%</td></tr><tr><td>static-large</td><td>22.50</td><td>22.50</td><td>1.000x</td><td>+0.00%</td><td>1.006x</td><td>-0.63%</td><td>1.042x</td><td>-4.25%</td><td>1.017x</td><td>-1.69%</td></tr><tr><td>static-small</td><td>6216.00</td><td>6214.50</td><td>1.000x</td><td>+0.02%</td><td>0.797x</td><td>+20.33%</td><td>1.872x</td><td>-87.22%</td><td>1.078x</td><td>-7.75%</td></tr><tr><td>tcp-stream</td><td>1040.00</td><td>1040.00</td><td>1.000x</td><td>+0.00%</td><td>1.710x</td><td>-70.96%</td><td>1.954x</td><td>-95.38%</td><td>1.053x</td><td>-5.29%</td></tr><tr><td>udp-stream</td><td>928.00</td><td>928.00</td><td>1.000x</td><td>+0.00%</td><td>0.733x</td><td>+26.68%</td><td>0.963x</td><td>+3.67%</td><td>1.888x</td><td>-88.81%</td></tr><tr><td>websocket-long-connection</td><td>928.00</td><td>928.00</td><td>1.000x</td><td>+0.00%</td><td>1.381x</td><td>-38.10%</td><td>1.401x</td><td>-40.14%</td><td>1.897x</td><td>-89.74%</td></tr></tbody>
+    </table>
+  </main>
+</body>
+</html>

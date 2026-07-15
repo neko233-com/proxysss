@@ -1,1 +1,4 @@
 *.sh text eol=lf
+# Historical reports are copied byte-for-byte from benchmark output. Preserve
+# intentional terminal blank records instead of rewriting evidence on archive.
+performance-evidence/development/** whitespace=-blank-at-eof

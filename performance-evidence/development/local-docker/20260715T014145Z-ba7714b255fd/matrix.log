@@ -1,0 +1,17 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+==> persistent strict matrix scale=1x http=32 https=8 static-large=4 sse=2 realtime=8
+benchmark gate failed: ratios: https-static-small ratio=0.847
+all-scenarios benchmark gate passed (22 rows, aggregate ratio 1.000x)
+scale 1 failed: mixed_saturation=1 isolated_saturation=0 latency=0
+==> persistent strict matrix scale=2x http=64 https=16 static-large=8 sse=4 realtime=16
+benchmark gate failed: ratios: qcp-transparent ratio=0.959; reverse-proxy ratio=0.760; static-large ratio=0.941; static-small ratio=0.973
+benchmark gate failed: fixed offered-load: static-large proxysss target achievement 0.950 < 0.980 (actual=19.00 target=20.00) | latency: static-small p99 latency ratio=1.078x >= 1.00x (proxysss=23.782ms nginx=22.058ms); tcp-stream p99 latency ratio=1.355x >= 1.00x (proxysss=5.795ms nginx=4.276ms)
+scale 2 failed: mixed_saturation=1 isolated_saturation=0 latency=1
+==> persistent strict matrix scale=4x http=128 https=32 static-large=16 sse=8 realtime=32
+benchmark gate failed: ratios: cdn-hot-update ratio=0.853; https-static-small ratio=0.014; static-large ratio=0.722
+benchmark gate failed: fixed offered-load: https-static-small proxysss target achievement 0.875 < 0.980 (actual=7.00 target=8.00); qcp-transparent proxysss target achievement 0.968 < 0.980 (actual=864.00 target=892.23); websocket-long-connection proxysss target achievement 0.979 < 0.980 (actual=800.00 target=817.24) | latency: static-large p50 latency ratio=1.059x >= 1.00x (proxysss=14.228ms nginx=13.439ms)
+scale 4 failed: mixed_saturation=1 isolated_saturation=0 latency=1
+isolated benchmark matrix failed; all scale reports retained under /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T014145Z-ba7714b255fd/current/runs/all-scenarios-isolated/matrix

@@ -1,0 +1,29 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+{"timestamp":"2026-07-15T03:51:25.047330Z","level":"INFO","fields":{"message":"startup banner emitted","version":"1.3.5","config":"/work/proxysss.yaml","plain_bind":"http://0.0.0.0:18080","tls_bind":"https://0.0.0.0:18443","h3_bind":"disabled","admin_bind":"disabled"},"target":"proxysss"}
+runtime performance: enabled, os=linux, distro=ubuntu 24.04, profile=Edge, socket_level=Ubuntu24Extreme
+runtime performance enabled: Linux TCP_NODELAY/TCP_QUICKACK runtime socket tuning
+runtime performance enabled: large per-stream send/receive socket buffers
+runtime performance enabled: Ubuntu 24.x extreme socket path: TCP_NOTSENT_LOWAT + TCP_USER_TIMEOUT
+{"timestamp":"2026-07-15T03:51:25.049889Z","level":"INFO","fields":{"message":"runtime performance plan","enabled":true,"os":"linux","distro":"Ubuntu2404","distro_id":"ubuntu","version_id":"24.04","major_version":"Some(24)","profile":"Edge","socket_level":"Ubuntu24Extreme","enabled_features":"[\"Linux TCP_NODELAY/TCP_QUICKACK runtime socket tuning\", \"large per-stream send/receive socket buffers\", \"Ubuntu 24.x extreme socket path: TCP_NOTSENT_LOWAT + TCP_USER_TIMEOUT\"]","skipped_features":"[]"},"target":"proxysss"}
+{"timestamp":"2026-07-15T03:51:25.050388Z","level":"INFO","fields":{"message":"starting gateway","config":"/work/proxysss.yaml"},"target":"proxysss"}
+{"timestamp":"2026-07-15T03:51:25.067148Z","level":"INFO","fields":{"message":"static fast lane cache preloaded","files":3,"traffic_profile":"Balanced"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.070371Z","level":"INFO","fields":{"message":"gateway warm-up complete","upstream_predial":4,"elapsed_ms":11},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.072673Z","level":"INFO","fields":{"message":"listener started","listener":"http:0.0.0.0:18080"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.072835Z","level":"INFO","fields":{"message":"listener started","listener":"https:0.0.0.0:18443:1:/run/proxysss/bench.crt:474595345208238618:12102603001354800334"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.073214Z","level":"INFO","fields":{"message":"starting sharded plain HTTP data runtimes","runtime_shards":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.074181Z","level":"INFO","fields":{"message":"listener started","listener":"tcp:tcp-echo:0.0.0.0:18200"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.074366Z","level":"INFO","fields":{"message":"listener started","listener":"udp:udp-echo:0.0.0.0:18300"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.074376Z","level":"INFO","fields":{"message":"listener started","listener":"udp:qcp-transparent:0.0.0.0:18310"},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.075675Z","level":"INFO","fields":{"message":"tcp listener ready","listener":"tcp-echo","bind":"0.0.0.0:18200","worker":0,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.075896Z","level":"INFO","fields":{"message":"udp listener ready","listener":"qcp-transparent","bind":"0.0.0.0:18310","worker":0,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.076695Z","level":"INFO","fields":{"message":"tcp listener ready","listener":"tcp-echo","bind":"0.0.0.0:18200","worker":1,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.079115Z","level":"INFO","fields":{"message":"udp listener ready","listener":"qcp-transparent","bind":"0.0.0.0:18310","worker":1,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.079547Z","level":"INFO","fields":{"message":"plain http listener ready","bind":"0.0.0.0:18080","worker":0,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.079915Z","level":"INFO","fields":{"message":"plain http listener ready","bind":"0.0.0.0:18080","worker":1,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.122388Z","level":"INFO","fields":{"message":"tls http listener ready","bind":"0.0.0.0:18443","worker":0,"workers":2,"max_workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.122968Z","level":"INFO","fields":{"message":"tls http listener ready","bind":"0.0.0.0:18443","worker":1,"workers":2,"max_workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.123456Z","level":"INFO","fields":{"message":"udp listener ready","listener":"udp-echo","bind":"0.0.0.0:18300","worker":0,"workers":2},"target":"proxysss::gateway"}
+{"timestamp":"2026-07-15T03:51:25.123492Z","level":"INFO","fields":{"message":"udp listener ready","listener":"udp-echo","bind":"0.0.0.0:18300","worker":1,"workers":2},"target":"proxysss::gateway"}

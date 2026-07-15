@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>proxysss all-scenarios benchmark</title>
+  <style>
+    body { font-family: Segoe UI, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e8eefc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    table { width: 100%; border-collapse: collapse; background: #121a2f; }
+    th, td { border: 1px solid #24304f; padding: 0.7rem 0.8rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    h1 { color: #5eead4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>proxysss all-scenarios benchmark</h1>
+    <p>Runtime traffic profile: <strong>balanced</strong></p>
+    <p>Aggregate proxysss/nginx ratio: <strong>0.828x</strong></p>
+    <table>
+      <thead>
+		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+      </thead>
+      <tbody><tr><td>cdn-hot-update</td><td>18619.25</td><td>22989.00</td><td>0.810x</td><td>-19.01%</td><td>1.327x</td><td>-32.71%</td><td>3.410x</td><td>-241.01%</td><td>4.507x</td><td>-350.67%</td></tr><tr><td>generic-sse</td><td>384.25</td><td>443.00</td><td>0.867x</td><td>-13.26%</td><td>1.840x</td><td>-83.99%</td><td>3.191x</td><td>-219.15%</td><td>3.629x</td><td>-262.86%</td></tr><tr><td>qcp-transparent</td><td>1586.50</td><td>1774.75</td><td>0.894x</td><td>-10.61%</td><td>3.017x</td><td>-201.73%</td><td>4.456x</td><td>-345.57%</td><td>4.310x</td><td>-330.97%</td></tr><tr><td>reverse-proxy</td><td>9878.50</td><td>11733.00</td><td>0.842x</td><td>-15.81%</td><td>1.811x</td><td>-81.10%</td><td>3.496x</td><td>-249.58%</td><td>4.549x</td><td>-354.93%</td></tr><tr><td>static-small</td><td>19242.25</td><td>23267.25</td><td>0.827x</td><td>-17.30%</td><td>1.265x</td><td>-26.49%</td><td>3.303x</td><td>-230.29%</td><td>4.277x</td><td>-327.70%</td></tr><tr><td>udp-stream</td><td>1588.75</td><td>1767.00</td><td>0.899x</td><td>-10.09%</td><td>3.128x</td><td>-212.84%</td><td>4.669x</td><td>-366.93%</td><td>3.914x</td><td>-291.44%</td></tr></tbody>
+    </table>
+  </main>
+</body>
+</html>

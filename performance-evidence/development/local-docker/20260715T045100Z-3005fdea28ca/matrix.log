@@ -1,0 +1,9 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+==> persistent strict matrix scale=1x http=32 https=8 static-large=4 sse=2 realtime=8
+benchmark gate failed: ratios: https-static-small ratio=0.570
+benchmark gate failed: latency: game-long-connection p95 latency ratio=1.438x >= 1.00x (proxysss=1.353ms nginx=0.941ms); static-large p95 latency ratio=1.016x >= 1.00x (proxysss=13.041ms nginx=12.838ms); tcp-stream p95 latency ratio=1.097x >= 1.00x (proxysss=1.170ms nginx=1.067ms)
+scale 1 failed: mixed_saturation=1 isolated_saturation=0 latency=1
+isolated benchmark matrix failed; all scale reports retained under /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T045100Z-3005fdea28ca/current/runs/all-scenarios-isolated/matrix

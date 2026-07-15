@@ -1,0 +1,6 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+==> persistent strict matrix scale=1x http=32 https=8 static-large=4 sse=2 realtime=8
+benchmark gate failed: ratios: https-static-small ratio=0.395

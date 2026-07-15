@@ -1,0 +1,96 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+==> persistent strict matrix scale=1x http=32 https=8 static-large=4 sse=2 realtime=8
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+scripts/benchmark-all-scenarios-isolated.sh: line 652: target_args[@]: unbound variable
+median aggregation received no rows
+open /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/saturation-results.json: no such file or directory
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for static-small
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for static-large
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for cdn-hot-update
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for https-static-small
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for reverse-proxy
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for generic-sse
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for websocket-long-connection
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for game-long-connection
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for tcp-stream
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for udp-stream
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for qcp-transparent
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for static-small
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for static-large
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for cdn-hot-update
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for https-static-small
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for reverse-proxy
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for generic-sse
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for websocket-long-connection
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for game-long-connection
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for tcp-stream
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for udp-stream
+awk: can't open file /Users/solarisneko/Desktop/Code/neko233-Projects/proxysss/.benchmark/direct-ubuntu24-amd64/20260715T030416Z-74e13b4d6b34/current/runs/all-scenarios-isolated/matrix/scale-1/equal-load-plan.txt
+ source line number 1
+missing equal-load interval for qcp-transparent
+scripts/benchmark-all-scenarios-isolated.sh: line 825: LATENCY_ROWS[@]: unbound variable

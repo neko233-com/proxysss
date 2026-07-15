@@ -1,0 +1,19 @@
+commit=fbd01806e0d89fd7c22bc6a19e31765ab0012739
+host_kernel=Darwin 25.5.0
+host_arch=arm64
+docker_server_arch=arm64
+container_arch=x86_64
+container_os=ubuntu-24.04
+execution_mode=emulated-amd64
+cpu_cores=4
+load_scales=1
+duration_secs=4
+repetitions=1
+extended_realtime=1
+scenario_filter=
+run_order=nginx proxysss
+docker_client=29.6.1 docker_server=29.5.2
+net.core.somaxconn = 4096
+net.ipv4.ip_local_port_range = 32768	60999
+net.ipv4.tcp_max_syn_backlog = 512
+fs.file-max = 9223372036854775807
