@@ -1544,7 +1544,6 @@ static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLoc
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static PLAIN_HTTP_NEXT_CONNECTION_SHARD: AtomicUsize = AtomicUsize::new(0);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -1599,19 +1598,6 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_http_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
-}
-
-fn plain_http_connection_shard(sequence: usize, shard_count: usize) -> usize {
-    debug_assert!(shard_count > 0);
-    sequence % shard_count
-}
-
-fn next_plain_http_connection_shard() -> usize {
-    let shard_count = dedicated_http_connection_runtimes().len();
-    plain_http_connection_shard(
-        PLAIN_HTTP_NEXT_CONNECTION_SHARD.fetch_add(1, Ordering::Relaxed),
-        shard_count,
-    )
 }
 
 fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -4767,47 +4753,17 @@ impl Gateway {
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
-                let connection_worker = next_plain_http_connection_shard();
                 let gateway = self.clone();
-                if connection_worker == worker_index {
-                    std::mem::drop(tokio::spawn(async move {
-                        gateway
-                            .serve_plain_http_connection(
-                                stream,
-                                remote_addr,
-                                connection_worker,
-                                Bytes::new(),
-                            )
-                            .await;
-                    }));
-                    continue;
-                }
-                let stream = match stream.into_std() {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        tracing::warn!(?error, %remote_addr, worker = worker_index, target_worker = connection_worker, "failed detaching plain HTTP socket for balanced shard dispatch");
-                        continue;
-                    }
-                };
-                std::mem::drop(dedicated_http_connection_runtime(connection_worker).spawn(
-                    async move {
-                        let stream = match TcpStream::from_std(stream) {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                tracing::warn!(?error, %remote_addr, worker = connection_worker, "failed registering balanced plain HTTP socket on target shard");
-                                return;
-                            }
-                        };
-                        gateway
-                            .serve_plain_http_connection(
-                                stream,
-                                remote_addr,
-                                connection_worker,
-                                Bytes::new(),
-                            )
-                            .await;
-                    },
-                ));
+                std::mem::drop(tokio::spawn(async move {
+                    gateway
+                        .serve_plain_http_connection(
+                            stream,
+                            remote_addr,
+                            worker_index,
+                            Bytes::new(),
+                        )
+                        .await;
+                }));
                 continue;
             }
             let stream = match stream.into_std() {
@@ -23799,12 +23755,6 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert_eq!(
-            (0..16)
-                .map(|sequence| plain_http_connection_shard(sequence, 4))
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
-        );
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
