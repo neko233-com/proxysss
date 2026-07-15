@@ -1502,6 +1502,10 @@ const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const STATIC_CACHED_BODY_REACTOR_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_CACHED_BODY_REACTOR_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -1548,6 +1552,8 @@ static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_CACHED_BODY_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
@@ -1745,6 +1751,14 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        STATIC_CACHED_BODY_REACTOR_ENABLED.store(
+            config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Balanced
+                ),
             Ordering::Relaxed,
         );
         let stream_reactor_divisor =
@@ -11582,10 +11596,7 @@ async fn send_connection_static_fast_path(
         .context("failed writing cached static response head");
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
-            stream
-                .write_all(body)
-                .await
-                .context("failed writing cached static response body")
+            send_cached_static_body(stream, body).await
         } else {
             send_static_file_fast(
                 stream,
@@ -11606,6 +11617,43 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
+}
+
+async fn send_cached_static_body(stream: &mut TcpStream, body: &Bytes) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if STATIC_CACHED_BODY_REACTOR_ENABLED.load(Ordering::Relaxed)
+        && body.len() >= STATIC_CACHED_BODY_REACTOR_THRESHOLD_BYTES
+    {
+        match crate::sendfile_reactor::dispatch_bytes(
+            stream.as_raw_fd(),
+            body.clone(),
+            STATIC_CACHED_BODY_REACTOR_CHUNK_BYTES,
+            adaptive_data_plane_workers(1),
+            0,
+        ) {
+            Ok(completion) => {
+                let sent = completion
+                    .await
+                    .map_err(|_| anyhow::anyhow!("static body reactor stopped before completion"))?
+                    .context("static body reactor write failed")?;
+                if sent != body.len() as u64 {
+                    anyhow::bail!("static body reactor wrote {sent} of {} bytes", body.len());
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "static body reactor unavailable; using Tokio readiness"
+                );
+            }
+        }
+    }
+
+    stream
+        .write_all(body)
+        .await
+        .context("failed writing cached static response body")
 }
 
 async fn send_static_file_fast(

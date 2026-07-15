@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
+use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
 use rustc_hash::FxHashMap;
 use tokio::sync::oneshot;
@@ -28,8 +29,7 @@ const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SendfileJob {
     socket: TcpStream,
-    file: File,
-    offset: u64,
+    source: StaticBodySource,
     len: u64,
     max_chunk_bytes: u64,
     completion: oneshot::Sender<io::Result<u64>>,
@@ -37,12 +37,16 @@ struct SendfileJob {
 
 struct SendfileState {
     _socket: TcpStream,
-    file: File,
-    offset: libc::off_t,
+    source: StaticBodySource,
     sent: u64,
     len: u64,
     max_chunk_bytes: u64,
     completion: Option<oneshot::Sender<io::Result<u64>>>,
+}
+
+enum StaticBodySource {
+    File { file: File, offset: libc::off_t },
+    Bytes(Bytes),
 }
 
 struct ReactorWorker {
@@ -82,8 +86,10 @@ pub(crate) fn dispatch(
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
         socket,
-        file,
-        offset,
+        source: StaticBodySource::File {
+            file,
+            offset: offset as libc::off_t,
+        },
         len,
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
@@ -94,6 +100,39 @@ pub(crate) fn dispatch(
         .registrations
         .push(job)
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "sendfile reactor queue full"))?;
+    wake(worker.wake_fd);
+    Ok(receiver)
+}
+
+pub(crate) fn dispatch_bytes(
+    socket_fd: RawFd,
+    body: Bytes,
+    max_chunk_bytes: u64,
+    requested_workers: usize,
+    scheduler_nice: i32,
+) -> io::Result<oneshot::Receiver<io::Result<u64>>> {
+    if body.is_empty() {
+        let (sender, receiver) = oneshot::channel();
+        let _ = sender.send(Ok(0));
+        return Ok(receiver);
+    }
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+    let socket = duplicate_stream(socket_fd)?;
+    let len = body.len() as u64;
+    let (sender, receiver) = oneshot::channel();
+    let job = SendfileJob {
+        socket,
+        source: StaticBodySource::Bytes(body),
+        len,
+        max_chunk_bytes: max_chunk_bytes.max(1),
+        completion: sender,
+    };
+    let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let worker = &reactors.workers[index];
+    worker
+        .registrations
+        .push(job)
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "static body reactor queue full"))?;
     wake(worker.wake_fd);
     Ok(receiver)
 }
@@ -240,8 +279,7 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
         fd,
         SendfileState {
             _socket: job.socket,
-            file: job.file,
-            offset: job.offset as libc::off_t,
+            source: job.source,
             sent: 0,
             len: job.len,
             max_chunk_bytes: job.max_chunk_bytes,
@@ -263,8 +301,22 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
         let remaining_budget = event_budget - (state.sent - event_start);
         let remaining_file = state.len - state.sent;
         let count = remaining_budget.min(remaining_file) as usize;
-        let written =
-            unsafe { libc::sendfile(fd, state.file.as_raw_fd(), &mut state.offset, count) };
+        let written = match &mut state.source {
+            StaticBodySource::File { file, offset } => unsafe {
+                libc::sendfile(fd, file.as_raw_fd(), offset, count)
+            },
+            StaticBodySource::Bytes(body) => {
+                let start = state.sent as usize;
+                unsafe {
+                    libc::send(
+                        fd,
+                        body.as_ptr().add(start).cast(),
+                        count,
+                        libc::MSG_NOSIGNAL,
+                    )
+                }
+            }
+        };
         if written > 0 {
             state.sent = state.sent.saturating_add(written as u64);
             if state.sent >= state.len {
@@ -275,7 +327,7 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
         if written == 0 {
             return DriveResult::Complete(Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "sendfile source ended before configured length",
+                "static response source ended before configured length",
             )));
         }
 
@@ -427,6 +479,34 @@ mod tests {
             completion.blocking_recv().unwrap().unwrap(),
             (64 * 1024 - start) as u64
         );
+        let (received, expected) = reader.join().unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn reactor_sends_exact_cached_bytes() {
+        let expected = Bytes::from(
+            (0..64 * 1024)
+                .map(|index| (index % 239) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let completion =
+            dispatch_bytes(server.as_raw_fd(), expected.clone(), 8 * 1024, 1, 0).unwrap();
+        drop(server);
+
+        let reader = thread::spawn(move || {
+            let mut received = vec![0_u8; expected.len()];
+            client.read_exact(&mut received).unwrap();
+            (received, expected.to_vec())
+        });
+        assert_eq!(completion.blocking_recv().unwrap().unwrap(), 64 * 1024);
         let (received, expected) = reader.join().unwrap();
         assert_eq!(received, expected);
     }
