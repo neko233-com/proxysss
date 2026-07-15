@@ -1537,6 +1537,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // HTTPS/realtime tail latency. Both remain bounded below Tokio's defaults.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
+const DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK: usize = 256;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
@@ -1583,6 +1584,7 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
                     .thread_name(format!("proxysss-http-{shard_index}"))
                     .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
                     .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                    .max_io_events_per_tick(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK)
                     .on_thread_start(move || pin_current_data_plane_thread(shard_index))
                     .enable_all();
                 builder
@@ -1616,6 +1618,7 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-tls")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
             .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .max_io_events_per_tick(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
@@ -1647,6 +1650,7 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-udp")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
             .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .max_io_events_per_tick(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
@@ -23993,6 +23997,7 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
+        assert_eq!(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK, 256);
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
