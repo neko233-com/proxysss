@@ -1537,11 +1537,8 @@ const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
-static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
-static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
@@ -1591,37 +1588,6 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 
 fn dedicated_http_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_http_connection_runtimes();
-    &runtimes[worker_index % runtimes.len()]
-}
-
-fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
-    TLS_CONNECTION_RUNTIMES.get_or_init(|| {
-        let worker_count = tls_http_runtime_workers_for(
-            adaptive_data_plane_workers(1),
-            TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
-        );
-        let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
-        tracing::info!(
-            runtime_workers = worker_count,
-            scheduler_nice,
-            "starting work-stealing TLS HTTP data runtime"
-        );
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(worker_count)
-            .thread_name("proxysss-tls")
-            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-            .on_thread_start(move || set_current_thread_nice(scheduler_nice))
-            .enable_all();
-        vec![builder
-            .build()
-            .expect("failed to build proxysss TLS data runtime")]
-    })
-}
-
-fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
 }
 
@@ -1755,14 +1721,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         SHARED_BALANCED_UDP_RUNTIMES.store(
             config.runtime.performance.enabled
                 && shared_udp_runtime_profile(config.runtime.performance.traffic_profile),
-            Ordering::Relaxed,
-        );
-        TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
-            tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
-            Ordering::Relaxed,
-        );
-        TLS_HTTP_RUNTIME_NICE.store(
-            tls_http_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         UDP_RUNTIME_CPU_DIVISOR.store(
@@ -5506,7 +5464,7 @@ impl Gateway {
                 1
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
-            let _ = dedicated_tls_connection_runtimes();
+            let _ = dedicated_http_connection_runtimes();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -5527,7 +5485,7 @@ impl Gateway {
                     .into_std()
                     .context("failed detaching TLS HTTP listener for data runtime")?;
                 let accept_task =
-                    dedicated_tls_connection_runtime(worker_index).spawn(async move {
+                    dedicated_http_connection_runtime(worker_index).spawn(async move {
                         let listener = TcpListener::from_std(listener)
                             .context("failed registering TLS HTTP listener on data runtime")?;
                         gateway
@@ -5581,7 +5539,7 @@ impl Gateway {
                 let listener = listener
                     .into_std()
                     .context("failed detaching elastic TLS listener for data runtime")?;
-                let accept_task = dedicated_tls_connection_runtime(worker_index).spawn({
+                let accept_task = dedicated_http_connection_runtime(worker_index).spawn({
                     let active_connections = active_connections.clone();
                     async move {
                         let listener = TcpListener::from_std(listener)
@@ -11913,7 +11871,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11922,9 +11880,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Per-core nice +6 lanes preserve bounded CFS ownership while removing
-        // a shared relay queue from p95/p99.
-        RuntimePerformanceTrafficProfile::Balanced => 6,
+        // A sparse balanced relay owner keeps HTTP/TLS/UDP on the per-core
+        // Tokio loops while retaining an allocation-free native fast path.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11936,30 +11894,6 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
-    match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 1,
-        RuntimePerformanceTrafficProfile::Bulk => 4,
-    }
-}
-
-fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
-    cores.max(1).div_ceil(cpu_divisor.max(1))
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
-    match profile {
-        RuntimePerformanceTrafficProfile::Small => 0,
-        // Per-core nice +5 crypto workers preserve bounded CFS ownership while
-        // avoiding one shared handshake/H2 queue.
-        RuntimePerformanceTrafficProfile::Balanced => 5,
-        RuntimePerformanceTrafficProfile::Bulk => 5,
-    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23683,7 +23617,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            4
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23695,7 +23629,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            6
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23712,35 +23646,6 @@ mod tests {
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Bulk
         ));
-        assert_eq!(
-            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            1
-        );
-        assert_eq!(
-            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            1
-        );
-        assert_eq!(
-            tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
-            4
-        );
-        assert_eq!(tls_http_runtime_workers_for(1, 2), 1);
-        assert_eq!(tls_http_runtime_workers_for(4, 2), 2);
-        assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
-        assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
-        assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
-        assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
-            0
-        );
-        assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
-        );
-        assert_eq!(
-            tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
-            5
-        );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
             1
