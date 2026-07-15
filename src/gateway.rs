@@ -11966,7 +11966,11 @@ fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        // Consolidate balanced TLS work onto fewer, higher-share workers. At
+        // six CPUs this changes three nice +7 workers into two nice +6
+        // workers: aggregate TLS CFS weight falls while each crypto queue is
+        // serviced sooner. The worker count still scales with the cpuset.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11979,7 +11983,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 7,
+        RuntimePerformanceTrafficProfile::Balanced => 6,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23756,7 +23760,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            3
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23765,6 +23769,8 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(1, 2), 1);
         assert_eq!(tls_http_runtime_workers_for(4, 2), 2);
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
+        assert_eq!(tls_http_runtime_workers_for(6, 3), 2);
+        assert_eq!(tls_http_runtime_workers_for(96, 3), 32);
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
         assert_eq!(
@@ -23773,7 +23779,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            7
+            6
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
