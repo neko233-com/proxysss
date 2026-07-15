@@ -504,6 +504,14 @@ fn relay_read(
             Err(_) => return RelayReadOutcome::Failed,
         };
         if sent == read {
+            // A short stream read normally consumed every byte currently
+            // queued for latency-sized frames. Return to level-triggered
+            // epoll instead of paying a guaranteed second recv/EAGAIN syscall
+            // on the common sparse path. If more bytes raced in, EPOLLIN stays
+            // asserted and the next batch drains them without starvation.
+            if read < buffer.len() {
+                return RelayReadOutcome::Open;
+            }
             continue;
         }
 

@@ -11,6 +11,7 @@
 - Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
 - Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
 - Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
+- Removed the native realtime relay's second `recv`/`EAGAIN` syscall after a successful short frame read; level-triggered epoll reasserts readiness for raced bytes, preserving correctness while cutting sparse TCP/WebSocket wake latency.
 
 ## v1.3.5 - 2026-07-01
 
