@@ -12000,7 +12000,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -15092,7 +15092,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 2;
 
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
@@ -23822,7 +23822,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            5
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
