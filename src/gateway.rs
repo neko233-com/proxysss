@@ -23,7 +23,8 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
@@ -4743,18 +4744,29 @@ impl Gateway {
         worker_index: usize,
         accept_on_data_runtime: bool,
     ) -> Result<()> {
+        let mut owned_connections: FuturesUnordered<
+            Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        > = FuturesUnordered::new();
         loop {
-            let (stream, remote_addr) = listener
-                .accept()
-                .await
-                .context("plain http accept failed")?;
+            let accepted = if accept_on_data_runtime {
+                tokio::select! {
+                    accepted = listener.accept() => Some(accepted),
+                    _ = owned_connections.next(), if !owned_connections.is_empty() => None,
+                }
+            } else {
+                Some(listener.accept().await)
+            };
+            let Some(accepted) = accepted else {
+                continue;
+            };
+            let (stream, remote_addr) = accepted.context("plain http accept failed")?;
             tune_tcp_stream_for_latency(&stream);
             if accept_on_data_runtime {
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
                 let gateway = self.clone();
-                std::mem::drop(tokio::spawn(async move {
+                owned_connections.push(Box::pin(async move {
                     gateway
                         .serve_plain_http_connection(
                             stream,
