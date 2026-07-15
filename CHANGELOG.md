@@ -8,7 +8,6 @@
 - Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, kept balanced UDP on the proven per-core fast path, and reduced TLS/sendfile/realtime owner contention under mixed load.
 - Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.
 - Added bounded UDP cooperative fairness, lower-weight realtime owners, a cache-local TLS owner profile, and fat-LTO release builds to preserve per-protocol latency under saturated mixed traffic.
-- Moved performance-mode plain HTTP onto pinned current-thread shards with per-connection `LocalSet` tasks, retaining fair readiness-driven scheduling while removing cross-thread Send-task state and work-stealing queues.
 - Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
 
 ## v1.3.5 - 2026-07-01
