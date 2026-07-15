@@ -11951,7 +11951,7 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
         // One movable owner per four CPUs avoids a permanently-runnable CFS
         // sibling on every HTTP shard. The count still scales with the full
         // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23767,7 +23767,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
