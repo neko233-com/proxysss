@@ -15,6 +15,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use base64::Engine;
 use brotli::CompressorWriter;
 use bytes::{Buf, Bytes, BytesMut};
@@ -65,7 +66,7 @@ use tokio::io::{
     BufReader as TokioBufReader, ReadBuf,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::io::ReaderStream;
@@ -104,7 +105,7 @@ pub struct Gateway {
     config_path: PathBuf,
     bootstrap_config: GatewayConfig,
     bootstrap_fast_lane: FastLaneState,
-    dynamic: Arc<RwLock<Arc<DynamicState>>>,
+    dynamic: Arc<ArcSwap<DynamicState>>,
     stats: Arc<GatewayStats>,
     sticky_affinity: Arc<DashMap<String, StickyEntry>>,
     round_robin_state: Arc<DashMap<String, u64>>,
@@ -2206,7 +2207,7 @@ impl Gateway {
             config_path,
             bootstrap_config: config,
             bootstrap_fast_lane,
-            dynamic: Arc::new(RwLock::new(dynamic)),
+            dynamic: Arc::new(ArcSwap::from(dynamic)),
             stats: Arc::new(GatewayStats::default()),
             sticky_affinity: Arc::new(DashMap::new()),
             round_robin_state: Arc::new(DashMap::new()),
@@ -4101,10 +4102,7 @@ impl Gateway {
         prepare_tls_material(&new_config)?;
 
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
-        {
-            let mut state = self.dynamic.write().await;
-            *state = new_state;
-        }
+        self.dynamic.store(new_state);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
         self.warm_up(&new_config).await;
@@ -6725,8 +6723,9 @@ impl Gateway {
         let mut next_local_prune_epoch = cached_now_secs.saturating_add(local_prune_interval_secs);
         let mut direct_udp_cache = DirectUdpRouteCache::new();
         // A policy-free listener's upstream identity only changes after a
-        // control-plane reload. Do not acquire the dynamic config RwLock for
-        // every game datagram; refresh the worker-local snapshot once a second
+        // control-plane reload. Keep the ArcSwap snapshot outside the packet
+        // loop instead of reloading it for every game datagram; refresh the
+        // worker-local snapshot once a second
         // together with the association clock.
         let mut direct_udp_state = self.current_state().await;
         let mut direct_udp_state_refreshed = Instant::now();
@@ -9197,7 +9196,7 @@ impl Gateway {
     }
 
     async fn current_state(&self) -> Arc<DynamicState> {
-        self.dynamic.read().await.clone()
+        self.dynamic.load_full()
     }
 
     async fn plain_http_data_fast_lane_enabled(&self) -> bool {
@@ -11993,7 +11992,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12053,10 +12052,7 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(
-        profile,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
-    )
+    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23815,7 +23811,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            1
+            3
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23855,7 +23851,7 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(sendfile_reactor_profile_enabled(
+        assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
@@ -24134,7 +24130,7 @@ mod tests {
             config_path: PathBuf::from("proxysss.yaml"),
             bootstrap_config: GatewayConfig::default(),
             bootstrap_fast_lane: FastLaneState::compile(&GatewayConfig::default()),
-            dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
+            dynamic: Arc::new(ArcSwap::from(Arc::new(DynamicState {
                 config: GatewayConfig::default(),
                 fast_lane: FastLaneState::compile(&GatewayConfig::default()),
                 http_client: reqwest::Client::new(),
