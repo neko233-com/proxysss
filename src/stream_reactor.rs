@@ -213,7 +213,7 @@ impl Reactors {
             let cpu = reactor_worker_cpu(index, worker_count, &allowed_cpus);
             thread::Builder::new()
                 .name(format!("proxysss-ws-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
+                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice, allowed_cpus))
                 .expect("failed spawning WebSocket epoll reactor");
             workers.push(worker);
         }
@@ -253,10 +253,13 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i32) {
-    if let Some(cpu) = cpu {
-        pin_current_thread(cpu);
-    }
+fn run_reactor(
+    worker: Arc<ReactorWorker>,
+    cpu: Option<usize>,
+    scheduler_nice: i32,
+    allowed_cpus: &[usize],
+) {
+    set_current_thread_affinity(cpu, allowed_cpus);
     set_current_thread_nice(scheduler_nice);
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating WebSocket epoll instance");
@@ -664,10 +667,16 @@ fn drain_wake(fd: RawFd) {
     }
 }
 
-fn pin_current_thread(cpu: usize) {
+fn set_current_thread_affinity(cpu: Option<usize>, allowed_cpus: &[usize]) {
     let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
     unsafe {
-        libc::CPU_SET(cpu, &mut set);
+        if let Some(cpu) = cpu {
+            libc::CPU_SET(cpu, &mut set);
+        } else {
+            for &allowed_cpu in allowed_cpus {
+                libc::CPU_SET(allowed_cpu, &mut set);
+            }
+        }
         let _ = libc::sched_setaffinity(
             0,
             mem::size_of::<libc::cpu_set_t>(),
