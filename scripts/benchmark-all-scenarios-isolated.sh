@@ -636,20 +636,18 @@ CLIENT_WAVE
     local output
     output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
-    local row planned_target=""
-    local -a target_args=()
+    local row planned_target="-1"
     if [[ "$result_phase" == "equal-load" ]]; then
       planned_target="$(awk -F'|' -v scenario="$row_scenario" '$1 == scenario { print $3; exit }' "$EQUAL_LOAD_PLAN")"
       [[ "$planned_target" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
         echo "missing executable equal-load target for $row_scenario" >&2
         return 1
       }
-      target_args=(--target-ops-per-sec "$planned_target")
     fi
     row="$(printf '%s\n' "$output" | "$HELPER" parse-bench \
       --scenario "$row_scenario" --gateway "$gateway" --protocol "$protocol" \
       --target "$target" --concurrency "$concurrency" --duration "$DURATION_SECS" \
-      "${target_args[@]}")"
+      --target-ops-per-sec "$planned_target")"
     if [[ "$result_phase" == "saturation" ]]; then
       SATURATION_ROWS+=("$row")
     elif [[ "$result_phase" == "isolated-saturation" ]]; then
