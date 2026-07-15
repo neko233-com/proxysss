@@ -863,7 +863,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Warm-up</span>
               <h3>配置加载后先自我预热</h3>
-              <p class="subtle">静态热文件、sendfile 描述符、反向代理 keepalive 池都会先准备好，避免首个真实请求承担冷启动成本。</p>
+              <p class="subtle">静态热文件、sendfile 描述符、反向代理 keepalive 池都会先准备好，避免首个真实请求承担冷启动成本。`small` 预载不超过 1 MiB 的热正文；默认 `balanced` 预载低于 32 MiB 流式边界的可缓存热正文；两者共同受 256 MiB/256 项硬上限约束，`bulk` 优先准备 sendfile 状态。这是 AOT 进程启动时的确定性配置加载，不依赖 JIT 预热轮次。</p>
             </article>
             <article class="card">
               <span class="tag expert">Validation</span>

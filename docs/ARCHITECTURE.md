@@ -52,7 +52,7 @@ MQTT/IoT traffic uses the same stream path: MQTT TCP on `1883`, MQTT TLS passthr
 - **Passive quarantine**: consecutive proxy failures trip `quarantine_secs` cooldown.
 - **Manual drain**: admin API marks upstreams disabled; state can persist in `runtime.maintenance_state`.
 - **Runtime watchdog**: supervised background loops emit heartbeat metrics and can restart after unexpected task failure.
-- **Runtime performance plan**: startup reads `runtime.performance`, detects the OS/distro, logs the selected policy once per process start, applies Linux socket tuning on accepted HTTP/TLS/admin/stream sockets and stream upstream sockets, and preloads eligible static hot files/sendfile descriptors according to `traffic_profile`.
+- **Runtime performance plan**: startup reads `runtime.performance`, detects the OS/distro, logs the selected policy once per process start, applies Linux socket tuning on accepted HTTP/TLS/admin/stream sockets and stream upstream sockets, and preloads eligible static hot files/sendfile descriptors according to `traffic_profile`. `small` 预载不超过 1 MiB 的热正文；默认 `balanced` 预载低于 32 MiB 流式边界的可缓存热正文；两者共同受 256 MiB/256 项硬上限约束，`bulk` 则优先准备 sendfile 状态。
 
 ## Configuration model
 

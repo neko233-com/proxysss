@@ -1510,7 +1510,7 @@ const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
-const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
+const STATIC_PRELOAD_SMALL_PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // Socket reads/writes already yield when the peer is not ready. Amortize the
 // explicit cooperative yield over a larger batch so tiny cached objects do not
@@ -18217,6 +18217,14 @@ struct CachedStaticResponse {
     revalidate: bool,
 }
 
+fn static_preload_body_max_bytes(profile: RuntimePerformanceTrafficProfile) -> u64 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => STATIC_PRELOAD_SMALL_PROFILE_MAX_BYTES,
+        RuntimePerformanceTrafficProfile::Balanced => STATIC_STREAM_THRESHOLD_BYTES,
+        RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
+}
+
 fn cached_h2_static_response(route: &CachedH2StaticRoute) -> (GatewayResponse, bool) {
     let payload = route.payload.load_full();
     let revalidate = payload.checked_at.elapsed()
@@ -18504,10 +18512,21 @@ async fn preload_static_site_fast_lane_cache(
         };
         static_route_cache.insert(request_path.clone(), target.clone());
 
-        let should_cache_body = matches!(
-            traffic_profile,
-            RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
-        ) && metadata.len() <= STATIC_PRELOAD_SMALL_MAX_BYTES;
+        let preload_body_max_bytes = static_preload_body_max_bytes(traffic_profile);
+        let existing_body_bytes = static_file_cache
+            .get(target.to_string_lossy().as_ref())
+            .map(|entry| entry.body.len() as u64);
+        let entry_slot_available = existing_body_bytes.is_some()
+            || static_file_cache.len() < STATIC_FILE_CACHE_MAX_ENTRIES;
+        let projected_cache_bytes = static_file_cache_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(existing_body_bytes.unwrap_or(0))
+            .saturating_add(metadata.len());
+        let body_fits_cache_budget =
+            entry_slot_available && projected_cache_bytes <= STATIC_FILE_CACHE_MAX_BYTES;
+        let should_cache_body = preload_body_max_bytes > 0
+            && metadata.len() <= preload_body_max_bytes
+            && body_fits_cache_budget;
         let should_cache_sendfile = cfg!(target_os = "linux")
             && matches!(
                 traffic_profile,
@@ -23886,6 +23905,18 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
+        assert_eq!(
+            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Small),
+            1024 * 1024
+        );
+        assert_eq!(
+            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Balanced),
+            STATIC_STREAM_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Bulk),
+            0
+        );
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
