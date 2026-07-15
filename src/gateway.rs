@@ -1500,7 +1500,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1514,7 +1514,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
@@ -23698,8 +23698,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
         assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(300), 64);
+        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 64);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0

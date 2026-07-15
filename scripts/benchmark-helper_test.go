@@ -216,6 +216,7 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 		"--results", results,
 		"--out", plan,
 		"--fraction", "0.70",
+		"--duration-secs", "1",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -223,8 +224,33 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(raw), "websocket|14286|559.98") {
+	if !strings.HasPrefix(string(raw), "websocket|14286|552.000000") {
 		t.Fatalf("unexpected equal-load plan: %s", raw)
+	}
+}
+
+func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "static-large", Gateway: "nginx", Concurrency: 4, OpsPerSec: 83.5},
+		{Scenario: "static-large", Gateway: "proxysss", Concurrency: 4, OpsPerSec: 90},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|20.000000\n") {
+		t.Fatalf("one-second target must match the 20 executable operations: %s", raw)
 	}
 }
 

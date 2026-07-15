@@ -850,6 +850,7 @@ func runWriteEqualLoadPlan(args []string) error {
 	resultsPath := fs.String("results", "", "saturation results json path")
 	outPath := fs.String("out", "", "pipe-delimited output path")
 	fraction := fs.Float64("fraction", 0.70, "fraction of the slower gateway saturation rate")
+	durationSecs := fs.Int("duration-secs", 1, "fixed-load sample duration")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -859,6 +860,9 @@ func runWriteEqualLoadPlan(args []string) error {
 	}
 	if *fraction <= 0 || *fraction >= 1 {
 		return errors.New("write-equal-load-plan: --fraction must be between 0 and 1")
+	}
+	if *durationSecs <= 0 {
+		return errors.New("write-equal-load-plan: --duration-secs must be positive")
 	}
 	rows, err := loadResults(*resultsPath)
 	if err != nil {
@@ -896,7 +900,15 @@ func runWriteEqualLoadPlan(args []string) error {
 		if intervalMicros < 1 {
 			intervalMicros = 1
 		}
-		actualTarget := float64(concurrency) * 1_000_000 / float64(intervalMicros)
+		// A short fixed-rate run can only schedule a whole number of operations
+		// per connection. Gate against that executable rate instead of an
+		// asymptotic fractional target that is mathematically unreachable in a
+		// one-second feedback window.
+		scheduledPerConnection := int64(*durationSecs) * 1_000_000 / intervalMicros
+		if scheduledPerConnection < 1 {
+			scheduledPerConnection = 1
+		}
+		actualTarget := float64(scheduledPerConnection*int64(concurrency)) / float64(*durationSecs)
 		lines = append(lines, fmt.Sprintf("%s|%d|%.6f", scenario, intervalMicros, actualTarget))
 	}
 	if len(lines) == 0 {

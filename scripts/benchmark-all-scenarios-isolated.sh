@@ -439,14 +439,13 @@ wait_gateway() {
 }
 
 activate_gateway() {
-  local kind="$1" other
-  if [[ "$kind" == "nginx" ]]; then
-    other="proxysss"
-  else
-    other="nginx"
-  fi
+  local kind="$1"
+  # Always cross a fully-paused boundary, including when the balanced sample
+  # order places the same candidate on both sides of a repetition boundary.
+  # This prevents one gateway from retaining runnable cleanup work while the
+  # other candidate gets a clean activation.
+  docker pause "$PREFIX-gateway-nginx" "$PREFIX-gateway-proxysss" >/dev/null 2>&1 || true
   docker unpause "$PREFIX-gateway-$kind" >/dev/null 2>&1 || true
-  docker pause "$PREFIX-gateway-$other" >/dev/null 2>&1 || true
 }
 
 declare -a SATURATION_ROWS=()
@@ -804,7 +803,7 @@ run_scale() {
     printf '%s\n' "${SATURATION_ROWS[@]}" >"$SATURATION_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$SATURATION_RESULTS_JSONL" --out "$SATURATION_RESULTS_JSON"
     "$HELPER" write-equal-load-plan --results "$SATURATION_RESULTS_JSON" --out "$EQUAL_LOAD_PLAN" \
-      --fraction "$EQUAL_LOAD_FRACTION"
+      --fraction "$EQUAL_LOAD_FRACTION" --duration-secs "$DURATION_SECS"
     for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$LATENCY_RUN_ORDER" "$repetition")"
       for kind in $repetition_order; do run_candidate equal-load "$kind"; done

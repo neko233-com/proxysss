@@ -29,8 +29,8 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // every event at mixed-load density steals CPU from HTTP/TLS/UDP siblings.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_SPIN_POLLS: usize = 2;
-const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 32;
+const DENSE_SPIN_POLLS: usize = 4;
+const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 struct SocketPair {
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
-        assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 32);
+        assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 
     #[test]
