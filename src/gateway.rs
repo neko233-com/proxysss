@@ -1514,9 +1514,9 @@ const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // Socket reads/writes already yield when the peer is not ready. Amortize the
 // explicit cooperative yield over a larger batch so tiny cached objects do not
-// pay scheduler overhead every 8 requests. Raw reverse requests cross their
+// pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = true;
@@ -1529,7 +1529,7 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
-const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 16;
+const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 4;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
@@ -4977,7 +4977,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5145,7 +5145,7 @@ impl Gateway {
                         // A raw reverse request already crosses upstream and
                         // downstream readiness points. Reset the amortized
                         // static-lane counter instead of adding a redundant
-                        // cooperative yield on every 32nd response.
+                        // cooperative yield on every 64th response.
                         served_since_yield = 0;
                         continue;
                     }
@@ -5171,7 +5171,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5228,7 +5228,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -5285,7 +5285,7 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if force_yield || served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
+                if served_since_yield >= PLAIN_FAST_LANE_FAIRNESS_BATCH {
                     served_since_yield = 0;
                     tokio::task::yield_now().await;
                 }
@@ -12088,11 +12088,10 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // One balanced owner covers four data-plane CPUs. nice +5 left
-        // measurable CPU idle while its WebSocket/game/TCP queues were
-        // runnable under the full mixed matrix. Restore bounded wake budget
-        // without outranking the nice-0 HTTP/UDP shards or adding workers.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        // Balanced mixed traffic gates realtime p50/p95/p99 as first-class
+        // production paths, so runnable relay work keeps the same CFS weight
+        // as HTTP instead of accepting scheduler-induced tail spikes.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12135,9 +12134,9 @@ fn tls_http_overflow_connection_threshold(base_workers: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // H2/rustls has one crypto owner per four CPUs in balanced mode. Keep
-        // it below plain HTTP/UDP while recovering handshake/request latency.
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        // TLS latency is a strict mixed-load gate. The bounded base plus
+        // density-triggered overflow worker count controls CPU ownership.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12159,7 +12158,8 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 12,
+        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
 
@@ -12196,7 +12196,7 @@ fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         // Reclaim CFS weight from the zero-copy bulk owner for latency-bound
         // TLS and realtime queues. It still runs whenever sockets are writable.
-        RuntimePerformanceTrafficProfile::Balanced => 9,
+        RuntimePerformanceTrafficProfile::Balanced => 8,
         RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -23895,7 +23895,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            0
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23934,15 +23934,15 @@ mod tests {
         assert_eq!(tls_http_overflow_workers_for(4, 1), 1);
         assert_eq!(tls_http_overflow_workers_for(96, 24), 24);
         assert_eq!(tls_http_overflow_workers_for(96, 96), 0);
-        assert_eq!(tls_http_overflow_connection_threshold(1), 16);
-        assert_eq!(tls_http_overflow_connection_threshold(24), 384);
+        assert_eq!(tls_http_overflow_connection_threshold(1), 4);
+        assert_eq!(tls_http_overflow_connection_threshold(24), 96);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23969,7 +23969,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            12
+            0
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -24033,7 +24033,7 @@ mod tests {
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            9
+            8
         );
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
