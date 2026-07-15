@@ -11994,7 +11994,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 6,
+        RuntimePerformanceTrafficProfile::Balanced => 7,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23820,7 +23820,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            6
+            7
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
