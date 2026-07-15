@@ -11656,6 +11656,7 @@ async fn sendfile_all_async(
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
+    let mut bytes_since_cooperative_yield = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
     let max_chunk_bytes = if cooperative_mid_yield {
         configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
@@ -11724,10 +11725,13 @@ async fn sendfile_all_async(
             break;
         }
         sent = sent.saturating_add(written as u64);
+        bytes_since_cooperative_yield =
+            bytes_since_cooperative_yield.saturating_add(written as u64);
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
-            } else if cooperative_mid_yield {
+            } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
+                bytes_since_cooperative_yield = 0;
                 tokio::task::yield_now().await;
             }
         }

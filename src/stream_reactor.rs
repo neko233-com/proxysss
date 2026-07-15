@@ -29,7 +29,7 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // shared queue without monopolizing HTTP/TLS/UDP siblings.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_SPIN_POLLS: usize = 0;
+const DENSE_SPIN_POLLS: usize = 1;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const WAKE_TOKEN: u64 = u64::MAX;
 
