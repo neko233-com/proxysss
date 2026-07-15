@@ -1519,7 +1519,7 @@ const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
-const LINUX_STREAM_REACTOR_ENABLED: bool = true;
+const LINUX_STREAM_REACTOR_ENABLED: bool = false;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
 // With the Linux fair scheduler enabled, a hot listen backlog can keep
 // `accept()` immediately ready long enough to queue hundreds of TLS tasks
