@@ -87,7 +87,7 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力。协议终止语义不拿
 
 `scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认是 4+4+8 CPU，也允许本机 wrapper 按 Docker 可用核数等比例切分；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。每个 wave 只创建 1 个 client 容器，内部 11 个独立协议进程共享 client cpuset 与同一个 `--start-at-unix-ms`；每尺度只启动 1 个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause，切换时 resume 并等待 readiness 稳定，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。saturation client 保留完整 client cpuset，确保能把更快的 gateway 压满；fixed-rate equal-load 的小包 client 每进程只启动 1 个 Tokio I/O worker，static-large 启动 2 个，避免 11 个进程各自按整个 cpuset 扩张后让 timer 因发生器自身过载而跳 tick。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
 
-它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度对每个 gateway/phase 采 1 个同步 2 秒样本，关闭额外 serial isolated，目标总耗时约 1 分钟；仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 `BENCHMARK_REPETITIONS` 与 `DURATION_SECS`，多轮再取中位数、错误取最大值：
+它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度对每个 gateway/phase 采 1 个同步 3 秒样本，关闭额外 serial isolated；`validation_elapsed_secs` 只覆盖候选就绪后的严格矩阵，排除 build/setup/warm-up，并硬限制为 60 秒。仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 `BENCHMARK_REPETITIONS` 与 `DURATION_SECS`，多轮再取中位数、错误取最大值：
 
 1. `mixed saturation`：十一个场景（含透明 QCP）同时跑，只判逐场景/聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
 2. `isolated saturation`：每次只跑一个场景并交替先后顺序，判单场景最大吞吐/容量。

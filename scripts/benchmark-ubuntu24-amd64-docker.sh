@@ -42,12 +42,31 @@ fi
 
 docker version >/dev/null
 DOCKER_SOCKET="${DOCKER_SOCKET:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}"
-DOCKER_SOCKET="${DOCKER_SOCKET#unix://}"
 DOCKER_DAEMON_SOCKET="${DOCKER_DAEMON_SOCKET:-/var/run/docker.sock}"
-if [[ ! -S "$DOCKER_SOCKET" ]]; then
-  echo "role-isolated controller requires a local Unix Docker socket, found: $DOCKER_SOCKET" >&2
-  exit 1
-fi
+case "$DOCKER_SOCKET" in
+  unix://*)
+    DOCKER_SOCKET="${DOCKER_SOCKET#unix://}"
+    if [[ ! -S "$DOCKER_SOCKET" ]]; then
+      echo "role-isolated controller requires a local Unix Docker socket, found: $DOCKER_SOCKET" >&2
+      exit 1
+    fi
+    ;;
+  npipe://*)
+    case "$(uname -s)" in
+      MINGW* | MSYS* | CYGWIN*) ;;
+      *)
+        echo "Docker named-pipe endpoints are supported only from Windows Git Bash/MSYS/Cygwin: $DOCKER_SOCKET" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    if [[ ! -S "$DOCKER_SOCKET" ]]; then
+      echo "unsupported local Docker endpoint: $DOCKER_SOCKET" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 TOTAL_CPUS="${TOTAL_CPUS:-}"
 CPU_CORES="${CPU_CORES:-}"
