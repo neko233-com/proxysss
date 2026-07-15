@@ -1882,6 +1882,11 @@ struct CachedH2StaticRoute {
     revalidating: AtomicBool,
 }
 
+struct ConnectionH2StaticRouteCache {
+    path: String,
+    route: Arc<CachedH2StaticRoute>,
+}
+
 struct HttpCacheRevalidateRequest<'a> {
     host: &'a str,
     uri: &'a Uri,
@@ -5801,12 +5806,19 @@ impl Gateway {
             prefix
         };
 
+        let h2_static_route_cache = is_http2.then(|| Arc::new(OnceLock::new()));
         let gateway = self.clone();
         let service = service_fn(move |request| {
             let gateway = gateway.clone();
+            let h2_static_route_cache = h2_static_route_cache.clone();
             async move {
                 gateway
-                    .handle_hyper_request(request, remote_addr, "https")
+                    .handle_hyper_request_with_h2_cache(
+                        request,
+                        remote_addr,
+                        "https",
+                        h2_static_route_cache.as_deref(),
+                    )
                     .await
             }
         });
@@ -7227,14 +7239,25 @@ impl Gateway {
 
     async fn handle_hyper_request(
         self: Arc<Self>,
+        request: Request<Incoming>,
+        remote_addr: SocketAddr,
+        scheme: &'static str,
+    ) -> Result<GatewayResponse, Infallible> {
+        self.handle_hyper_request_with_h2_cache(request, remote_addr, scheme, None)
+            .await
+    }
+
+    async fn handle_hyper_request_with_h2_cache(
+        self: Arc<Self>,
         mut request: Request<Incoming>,
         remote_addr: SocketAddr,
         scheme: &'static str,
+        h2_static_route_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Result<GatewayResponse, Infallible> {
         self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
 
         match self
-            .try_http_static_success_fast_path(&request, scheme)
+            .try_http_static_success_fast_path(&request, scheme, h2_static_route_cache)
             .await
         {
             Ok(Some(response)) => return Ok(response),
@@ -7494,6 +7517,7 @@ impl Gateway {
         &self,
         request: &Request<Incoming>,
         scheme: &'static str,
+        h2_static_route_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Result<Option<GatewayResponse>> {
         let method = request.method();
         if method != Method::GET && method != Method::HEAD {
@@ -7512,7 +7536,9 @@ impl Gateway {
             && self.bootstrap_fast_lane.hyper_static_success
             && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
         {
-            if let Some(response) = self.try_h2_cached_static_response(request.uri().path()) {
+            if let Some(response) =
+                self.try_h2_cached_static_response(request.uri().path(), h2_static_route_cache)
+            {
                 return Ok(Some(response));
             }
         }
@@ -7627,11 +7653,28 @@ impl Gateway {
         }
     }
 
-    fn try_h2_cached_static_response(&self, path: &str) -> Option<GatewayResponse> {
-        let route = self
-            .h2_static_route_cache
-            .get(path)
-            .map(|entry| entry.clone())?;
+    fn try_h2_cached_static_response(
+        &self,
+        path: &str,
+        connection_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
+    ) -> Option<GatewayResponse> {
+        let route = connection_cache
+            .and_then(OnceLock::get)
+            .filter(|cached| cached.path == path)
+            .map(|cached| cached.route.clone())
+            .or_else(|| {
+                let route = self
+                    .h2_static_route_cache
+                    .get(path)
+                    .map(|entry| entry.clone())?;
+                if let Some(connection_cache) = connection_cache {
+                    let _ = connection_cache.set(ConnectionH2StaticRouteCache {
+                        path: path.to_string(),
+                        route: route.clone(),
+                    });
+                }
+                Some(route)
+            })?;
         let (response, revalidate) = cached_h2_static_response(&route);
         if revalidate {
             self.spawn_h2_static_cache_revalidation(route.clone());
