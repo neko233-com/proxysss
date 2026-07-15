@@ -9,7 +9,6 @@
 - Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.
 - Added bounded UDP cooperative fairness, lower-weight realtime owners, a cache-local TLS owner profile, and fat-LTO release builds to preserve per-protocol latency under saturated mixed traffic.
 - Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
-- Collapsed plain HTTP connection scheduling into four shard-local ready queues per pinned reactor, with eight-response connection rotation to reduce high-concurrency scheduler CPU while bounding head-of-line latency.
 
 ## v1.3.5 - 2026-07-01
 

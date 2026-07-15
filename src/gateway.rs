@@ -23,8 +23,7 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
@@ -67,7 +66,7 @@ use tokio::io::{
     BufReader as TokioBufReader, ReadBuf,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::io::ReaderStream;
@@ -1518,8 +1517,6 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
-const PLAIN_FAST_LANE_SHARD_OWNER_BATCH: usize = 8;
-const PLAIN_HTTP_OWNER_GROUPS_PER_SHARD: usize = 4;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -1547,7 +1544,6 @@ static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLoc
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static PLAIN_HTTP_SHARD_OWNERS_ENABLED: AtomicBool = AtomicBool::new(false);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -4688,10 +4684,6 @@ impl Gateway {
     async fn run_plain_http(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.plain_bind address")?;
         let worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
-        PLAIN_HTTP_SHARD_OWNERS_ENABLED.store(
-            cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled,
-            Ordering::Relaxed,
-        );
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
             let _ = dedicated_http_connection_runtimes();
         }
@@ -4751,21 +4743,6 @@ impl Gateway {
         worker_index: usize,
         accept_on_data_runtime: bool,
     ) -> Result<()> {
-        let mut owner_senders = Vec::new();
-        if accept_on_data_runtime {
-            owner_senders.reserve(PLAIN_HTTP_OWNER_GROUPS_PER_SHARD);
-            for _ in 0..PLAIN_HTTP_OWNER_GROUPS_PER_SHARD {
-                let (sender, receiver) = mpsc::unbounded_channel();
-                owner_senders.push(sender);
-                let gateway = self.clone();
-                std::mem::drop(tokio::spawn(async move {
-                    gateway
-                        .run_plain_http_connection_owner(receiver, worker_index)
-                        .await;
-                }));
-            }
-        }
-        let mut next_owner = 0_usize;
         loop {
             let (stream, remote_addr) = listener
                 .accept()
@@ -4776,11 +4753,17 @@ impl Gateway {
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(?error, %remote_addr, "failed setting TCP_NODELAY on plain http connection");
                 }
-                let owner_index = next_owner % owner_senders.len();
-                next_owner = next_owner.wrapping_add(1);
-                owner_senders[owner_index]
-                    .send((stream, remote_addr))
-                    .map_err(|_| anyhow!("plain HTTP connection owner stopped"))?;
+                let gateway = self.clone();
+                std::mem::drop(tokio::spawn(async move {
+                    gateway
+                        .serve_plain_http_connection(
+                            stream,
+                            remote_addr,
+                            worker_index,
+                            Bytes::new(),
+                        )
+                        .await;
+                }));
                 continue;
             }
             let stream = match stream.into_std() {
@@ -4808,41 +4791,6 @@ impl Gateway {
                     .serve_plain_http_connection(stream, remote_addr, worker_index, Bytes::new())
                     .await;
             });
-        }
-    }
-
-    async fn run_plain_http_connection_owner(
-        self: Arc<Self>,
-        mut receiver: mpsc::UnboundedReceiver<(TcpStream, SocketAddr)>,
-        worker_index: usize,
-    ) {
-        let mut connections: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> =
-            FuturesUnordered::new();
-        let mut receiver_open = true;
-        loop {
-            if !receiver_open && connections.is_empty() {
-                return;
-            }
-            tokio::select! {
-                accepted = receiver.recv(), if receiver_open => {
-                    let Some((stream, remote_addr)) = accepted else {
-                        receiver_open = false;
-                        continue;
-                    };
-                    let gateway = self.clone();
-                    connections.push(Box::pin(async move {
-                        gateway
-                            .serve_plain_http_connection(
-                                stream,
-                                remote_addr,
-                                worker_index,
-                                Bytes::new(),
-                            )
-                            .await;
-                    }));
-                }
-                _ = connections.next(), if !connections.is_empty() => {}
-            }
         }
     }
 
@@ -12070,13 +12018,8 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
-fn plain_fast_lane_fairness_batch_for(
-    active_connections: usize,
-    shard_owners_enabled: bool,
-) -> usize {
-    if shard_owners_enabled {
-        PLAIN_FAST_LANE_SHARD_OWNER_BATCH
-    } else if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
+fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
+    if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
         PLAIN_FAST_LANE_LOW_DENSITY_BATCH
     } else {
         PLAIN_FAST_LANE_FAIRNESS_BATCH
@@ -12084,11 +12027,11 @@ fn plain_fast_lane_fairness_batch_for(
 }
 
 fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
-    served_since_yield
-        >= plain_fast_lane_fairness_batch_for(
-            PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
-            PLAIN_HTTP_SHARD_OWNERS_ENABLED.load(Ordering::Relaxed),
-        )
+    served_since_yield >= PLAIN_FAST_LANE_LOW_DENSITY_BATCH
+        && served_since_yield
+            >= plain_fast_lane_fairness_batch_for(
+                PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+            )
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23900,12 +23843,10 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(1, 2), 1);
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
-        assert_eq!(plain_fast_lane_fairness_batch_for(1, false), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(299, false), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(300, false), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000, false), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(1, true), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000, true), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
