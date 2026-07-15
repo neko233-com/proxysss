@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Cursor, SeekFrom};
+use std::io::{BufReader, Cursor, IoSlice, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -1529,13 +1529,12 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
-// Data-plane shards mostly run connection-local tasks. Checking Tokio's global
-// injection queue every two polls and the I/O driver every three polls spends
-// a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
-// polling substantially more frequent than Tokio's throughput-oriented
-// default while amortizing both checks across a useful ready-task batch.
+// Data-plane shards mostly run connection-local tasks. Amortize the global
+// injection queue over 31 polls, but drive I/O/timers every eight polls so a
+// three-second mixed sample does not exchange lower bookkeeping cost for
+// HTTPS/realtime tail latency. Both remain bounded below Tokio's defaults.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
@@ -5254,6 +5253,17 @@ impl Gateway {
                     .write_all(&small_static_response)
                     .await
                     .context("failed writing combined static fast path response")
+            } else if request.method == "GET" && candidate.cached_body.is_some() {
+                write_cached_static_response_vectored(
+                    &mut stream,
+                    static_header.as_bytes(),
+                    candidate
+                        .cached_body
+                        .as_ref()
+                        .expect("cached body present for vectored static response"),
+                )
+                .await
+                .context("failed writing vectored cached static response")
             } else {
                 // Coalesce head + body into a single TCP segment (nginx
                 // `tcp_nopush`/TCP_CORK) for sendfile and larger cached bodies.
@@ -5271,22 +5281,15 @@ impl Gateway {
 
                 let body_result =
                     if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
-                        if let Some(body) = candidate.cached_body.as_ref() {
-                            stream
-                                .write_all(body)
-                                .await
-                                .context("failed writing cached static fast path body")
-                        } else {
-                            send_static_file_fast(
-                                &mut stream,
-                                &candidate.path,
-                                candidate.len,
-                                candidate.sendfile.clone(),
-                                false,
-                            )
-                            .await
-                            .map(|_| ())
-                        }
+                        send_static_file_fast(
+                            &mut stream,
+                            &candidate.path,
+                            candidate.len,
+                            candidate.sendfile.clone(),
+                            false,
+                        )
+                        .await
+                        .map(|_| ())
                     } else {
                         Ok(())
                     };
@@ -11611,6 +11614,12 @@ async fn send_connection_static_fast_path(
             .context("failed writing cached combined static response");
     }
 
+    if let Some(body) = cached.body.as_ref() {
+        return write_cached_static_response_vectored(stream, &cached.header, body)
+            .await
+            .context("failed writing vectored cached static response");
+    }
+
     #[cfg(target_os = "linux")]
     let cork_static = cached.len > 0;
     #[cfg(target_os = "linux")]
@@ -11623,22 +11632,15 @@ async fn send_connection_static_fast_path(
         .await
         .context("failed writing cached static response head");
     let body_result = if header_result.is_ok() && cached.len > 0 {
-        if let Some(body) = cached.body.as_ref() {
-            stream
-                .write_all(body)
-                .await
-                .context("failed writing cached static response body")
-        } else {
-            send_static_file_fast(
-                stream,
-                &cached.file_path,
-                cached.len,
-                cached.sendfile.clone(),
-                cooperative_mid_yield,
-            )
-            .await
-            .map(|_| ())
-        }
+        send_static_file_fast(
+            stream,
+            &cached.file_path,
+            cached.len,
+            cached.sendfile.clone(),
+            cooperative_mid_yield,
+        )
+        .await
+        .map(|_| ())
     } else {
         Ok(())
     };
@@ -11648,6 +11650,21 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
+}
+
+async fn write_cached_static_response_vectored(
+    stream: &mut TcpStream,
+    header: &[u8],
+    body: &[u8],
+) -> std::io::Result<()> {
+    let slices = [IoSlice::new(header), IoSlice::new(body)];
+    let written = stream.write_vectored(&slices).await?;
+    if written < header.len() {
+        stream.write_all(&header[written..]).await?;
+        stream.write_all(body).await
+    } else {
+        stream.write_all(&body[written - header.len()..]).await
+    }
 }
 
 async fn send_static_file_fast(
@@ -22767,6 +22784,38 @@ mod tests {
             third.head_end
         );
         fixture.await.expect("response fixture task");
+    }
+
+    #[tokio::test]
+    async fn vectored_cached_static_response_preserves_header_and_large_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind vectored static fixture");
+        let addr = listener.local_addr().expect("vectored fixture address");
+        let header = b"HTTP/1.1 200 OK\r\ncontent-length: 2097152\r\n\r\n";
+        let body_len = 2 * 1024 * 1024;
+        let body = vec![b'x'; body_len];
+        let sender = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept static fixture");
+            write_cached_static_response_vectored(&mut stream, header, &body).await
+        });
+
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("connect static fixture");
+        let mut received = Vec::with_capacity(header.len() + body_len);
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("read vectored static response");
+        sender
+            .await
+            .expect("join vectored static fixture")
+            .expect("write vectored static response");
+
+        assert_eq!(&received[..header.len()], header);
+        assert_eq!(received.len(), header.len() + body_len);
+        assert!(received[header.len()..].iter().all(|byte| *byte == b'x'));
     }
 
     #[test]
