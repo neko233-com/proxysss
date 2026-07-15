@@ -51,14 +51,14 @@ fi
 
 TOTAL_CPUS="${TOTAL_CPUS:-}"
 CPU_CORES="${CPU_CORES:-}"
-DURATION_SECS="${DURATION_SECS:-1}"
+DURATION_SECS="${DURATION_SECS:-2}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-100}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-50}"
 MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-60}}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -250,7 +250,7 @@ stream_connections=$((CPU_CORES * 4))
 log_file="$OUTPUT_ROOT/matrix.log"
 
 echo "==> strict role-isolated persistent matrix scales=[$LOAD_SCALES] gateway-cpus=$CPU_CORES"
-VALIDATION_START_SECS="$(date +%s)"
+VALIDATION_WALL_START_SECS="$(date +%s)"
 set +e
 BENCH_ROOT="$CURRENT_BENCH_ROOT" \
 RUN_ID=matrix \
@@ -280,6 +280,7 @@ RUN_ORDER="$RUN_ORDER" \
 EQUAL_LOAD_FRACTION="$EQUAL_LOAD_FRACTION" \
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS" \
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS" \
+VALIDATION_TIMING_FILE="$OUTPUT_ROOT/validation-timing.txt" \
 RUN_MIXED_MATRIX=1 \
 RUN_ISOLATED_SATURATION="$RUN_SERIAL_ISOLATED" \
 STRICT_SUPERIORITY=1 \
@@ -296,7 +297,13 @@ for scale in $LOAD_SCALES; do
   cp -a "$source_dir" "$archive_dir"
 done
 
-validation_elapsed_secs=$(( $(date +%s) - VALIDATION_START_SECS ))
+validation_elapsed_secs=""
+if [[ -f "$OUTPUT_ROOT/validation-timing.txt" ]]; then
+  validation_elapsed_secs="$(sed -n 's/^validation_elapsed_secs=//p' "$OUTPUT_ROOT/validation-timing.txt" | tail -1)"
+fi
+if ! [[ "$validation_elapsed_secs" =~ ^[0-9]+$ ]]; then
+  validation_elapsed_secs=$(( $(date +%s) - VALIDATION_WALL_START_SECS ))
+fi
 total_elapsed_secs=$(( $(date +%s) - FEEDBACK_START_SECS ))
 {
   echo "validation_elapsed_secs=$validation_elapsed_secs"

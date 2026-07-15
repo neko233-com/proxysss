@@ -33,6 +33,7 @@ CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 # gateway before the gateway's own CPU is full.
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
+VALIDATION_TIMING_FILE="${VALIDATION_TIMING_FILE:-}"
 # CPU isolation is mandatory for fair throughput attribution. Memory is
 # measured in every run, but left uncapped by default so a synthetic cgroup
 # ceiling does not turn a safe memory-for-performance trade into a false fail.
@@ -50,7 +51,7 @@ STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-4}"
 SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 LOAD_SCALES="${LOAD_SCALES:-1}"
-DURATION_SECS="${DURATION_SECS:-1}"
+DURATION_SECS="${DURATION_SECS:-2}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
@@ -842,10 +843,18 @@ start_gateway proxysss
 wait_gateway proxysss
 start_client_controller
 
+matrix_validation_start_secs="$(date +%s)"
 overall_status=0
 for scale in $LOAD_SCALES; do
   if ! run_scale "$scale"; then overall_status=1; fi
 done
+matrix_validation_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))
+if [[ -n "$VALIDATION_TIMING_FILE" ]]; then
+  {
+    echo "validation_start_secs=$matrix_validation_start_secs"
+    echo "validation_elapsed_secs=$matrix_validation_elapsed_secs"
+  } >"$VALIDATION_TIMING_FILE"
+fi
 
 if [[ "$overall_status" != "0" ]]; then
   echo "isolated benchmark matrix failed; all scale reports retained under $BASE_RUN_DIR" >&2

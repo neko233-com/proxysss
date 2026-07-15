@@ -1529,14 +1529,14 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
-const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 4;
+const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 8;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
 #[cfg(target_os = "linux")]
 const H2_MIXED_PER_CORE_OPS: u64 = 3_800;
 
@@ -12088,10 +12088,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Balanced mixed traffic gates realtime p50/p95/p99 as first-class
-        // production paths, so runnable relay work keeps the same CFS weight
-        // as HTTP instead of accepting scheduler-induced tail spikes.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // Keep realtime close to the HTTP owners while leaving them a small
+        // CFS preference under full mixed saturation.
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12134,9 +12133,9 @@ fn tls_http_overflow_connection_threshold(base_workers: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // TLS latency is a strict mixed-load gate. The bounded base plus
-        // density-triggered overflow worker count controls CPU ownership.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // H2/rustls keeps a small CFS discount; the density-triggered overflow
+        // runtime removes queueing without making TLS dominate plain HTTP.
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12158,7 +12157,7 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 9,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
@@ -23895,7 +23894,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            2
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23934,15 +23933,15 @@ mod tests {
         assert_eq!(tls_http_overflow_workers_for(4, 1), 1);
         assert_eq!(tls_http_overflow_workers_for(96, 24), 24);
         assert_eq!(tls_http_overflow_workers_for(96, 96), 0);
-        assert_eq!(tls_http_overflow_connection_threshold(1), 4);
-        assert_eq!(tls_http_overflow_connection_threshold(24), 96);
+        assert_eq!(tls_http_overflow_connection_threshold(1), 8);
+        assert_eq!(tls_http_overflow_connection_threshold(24), 192);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            2
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23969,7 +23968,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            9
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
