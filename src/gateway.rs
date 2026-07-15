@@ -1501,6 +1501,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const STATIC_CACHED_BODY_FAIR_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1515,7 +1516,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
-const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
+const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 128;
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -1529,6 +1530,7 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
+const TLS_STATIC_FAST_LANE_FAIRNESS_BATCH: usize = 128;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
@@ -5459,7 +5461,7 @@ impl Gateway {
                 let _ = downstream.shutdown().await;
                 return Ok(TlsStaticFastLaneAttempt::Served);
             }
-            if served.is_multiple_of(PLAIN_FAST_LANE_FAIRNESS_BATCH) {
+            if served.is_multiple_of(TLS_STATIC_FAST_LANE_FAIRNESS_BATCH) {
                 tokio::task::yield_now().await;
             }
         }
@@ -11582,10 +11584,7 @@ async fn send_connection_static_fast_path(
         .context("failed writing cached static response head");
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
-            stream
-                .write_all(body)
-                .await
-                .context("failed writing cached static response body")
+            send_cached_static_body(stream, body).await
         } else {
             send_static_file_fast(
                 stream,
@@ -11606,6 +11605,29 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
+}
+
+async fn send_cached_static_body(stream: &mut TcpStream, body: &Bytes) -> Result<()> {
+    if body.len() <= STATIC_CACHED_BODY_FAIR_CHUNK_BYTES {
+        return stream
+            .write_all(body)
+            .await
+            .context("failed writing cached static response body");
+    }
+
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = (offset + STATIC_CACHED_BODY_FAIR_CHUNK_BYTES).min(body.len());
+        stream
+            .write_all(&body[offset..end])
+            .await
+            .context("failed writing cached static response body chunk")?;
+        offset = end;
+        if offset < body.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
 }
 
 async fn send_static_file_fast(
@@ -11894,7 +11916,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11903,10 +11925,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // One movable owner per four CPUs avoids a permanently-runnable CFS
-        // sibling on every HTTP shard. The count still scales with the full
-        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // One low-weight owner per CPU removes cross-core realtime queueing;
+        // positive nice preserves CPU for HTTP/TLS/UDP mixed siblings.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11942,11 +11963,8 @@ fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
 }
 
 fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
-    served_since_yield >= PLAIN_FAST_LANE_LOW_DENSITY_BATCH
-        && served_since_yield
-            >= plain_fast_lane_fairness_batch_for(
-                PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
-            )
+    served_since_yield
+        >= plain_fast_lane_fairness_batch_for(PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23657,7 +23675,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23669,7 +23687,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23701,8 +23719,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(1, 2), 1);
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
-        assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
+        assert_eq!(plain_fast_lane_fairness_batch_for(1), 128);
+        assert_eq!(plain_fast_lane_fairness_batch_for(299), 128);
         assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
         assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
         assert_eq!(
