@@ -79,6 +79,7 @@ LOAD_SCALES="${LOAD_SCALES:-1}"
 DURATION_SECS="${DURATION_SECS:-3}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
+CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
 # The persistent controller execs eleven client processes per wave. A 100 ms
 # absolute lead keeps their measurement windows aligned without consuming the
 # one-minute validation budget as idle time.
@@ -169,6 +170,10 @@ for scale in $LOAD_SCALES; do
 done
 [[ "$CAPTURE_DOCKER_STATS" == "0" || "$CAPTURE_DOCKER_STATS" == "1" ]] || {
   echo "CAPTURE_DOCKER_STATS must be 0 or 1" >&2
+  exit 1
+}
+[[ "$CAPTURE_THREAD_STATS" == "0" || "$CAPTURE_THREAD_STATS" == "1" ]] || {
+  echo "CAPTURE_THREAD_STATS must be 0 or 1" >&2
   exit 1
 }
 
@@ -696,6 +701,19 @@ CLIENT_WAVE
     local stat_targets=("$PREFIX-gateway-$kind" "$PREFIX-backend" "$CLIENT_CONTAINER")
     docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
       "${stat_targets[@]}" | tee "$RUN_DIR/$stats_name-stats.txt"
+    if [[ "$CAPTURE_THREAD_STATS" == "1" && "$kind" == "proxysss" ]]; then
+      # Git for Windows may check this controller out with CRLF. Normalize the
+      # diagnostic heredoc before the container shell parses it.
+      docker exec -i "$PREFIX-gateway-$kind" bash -c 'tr -d "\r" | bash -s' \
+        >"$RUN_DIR/$stats_name-thread-ticks.txt" <<'THREAD_TICKS'
+set -euo pipefail
+awk '{ print ($14 + $15) "|" $39 "|" $1 "|" $2 }' /proc/1/task/*/stat
+THREAD_TICKS
+      if [[ ! -s "$RUN_DIR/$stats_name-thread-ticks.txt" ]]; then
+        echo "proxysss thread tick sample was empty for $stats_name" >&2
+        return 1
+      fi
+    fi
   else
     printf 'disabled_for_one_minute_feedback=true\n' >"$RUN_DIR/$stats_name-stats.txt"
   fi
@@ -850,6 +868,7 @@ isolated_repetitions=$ISOLATED_REPETITIONS
 equal_load_fraction=$EQUAL_LOAD_FRACTION
 min_target_achievement=$MIN_TARGET_ACHIEVEMENT
 capture_docker_stats=$CAPTURE_DOCKER_STATS
+capture_thread_stats=$CAPTURE_THREAD_STATS
 run_isolated_saturation=$RUN_ISOLATED_SATURATION
 run_mixed_matrix=$RUN_MIXED_MATRIX
 mixed_scenarios=${MIXED_SCENARIOS:-all}
