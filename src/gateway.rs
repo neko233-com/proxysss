@@ -1533,12 +1533,10 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
-// polling on every few ready tasks spends a material part of saturated
-// small-packet CPU in the driver. Tokio still enters epoll immediately when
-// the runnable queue drains, so its throughput default keeps idle latency
-// while amortizing driver checks across a useful busy batch.
+// polling substantially more frequent than Tokio's throughput-oriented
+// default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 61;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
