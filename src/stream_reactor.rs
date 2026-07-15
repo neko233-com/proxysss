@@ -17,7 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
-use rustc_hash::FxHashMap;
 use tokio::sync::oneshot;
 
 const REGISTRATION_QUEUE_CAPACITY: usize = 131_072;
@@ -62,6 +61,52 @@ struct SocketState {
     pending: Option<Vec<u8>>,
     pending_offset: usize,
     completion: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct SocketTable {
+    slots: Vec<Option<Box<SocketState>>>,
+    active: usize,
+}
+
+impl SocketTable {
+    fn len(&self) -> usize {
+        self.active
+    }
+
+    fn get(&self, fd: &RawFd) -> Option<&SocketState> {
+        usize::try_from(*fd)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+            .and_then(Option::as_deref)
+    }
+
+    fn get_mut(&mut self, fd: &RawFd) -> Option<&mut SocketState> {
+        usize::try_from(*fd)
+            .ok()
+            .and_then(|index| self.slots.get_mut(index))
+            .and_then(Option::as_deref_mut)
+    }
+
+    fn insert(&mut self, fd: RawFd, state: SocketState) {
+        let Ok(index) = usize::try_from(fd) else {
+            return;
+        };
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        if self.slots[index].is_none() {
+            self.active = self.active.saturating_add(1);
+        }
+        self.slots[index] = Some(Box::new(state));
+    }
+
+    fn remove(&mut self, fd: &RawFd) -> Option<Box<SocketState>> {
+        let index = usize::try_from(*fd).ok()?;
+        let state = self.slots.get_mut(index)?.take()?;
+        self.active = self.active.saturating_sub(1);
+        Some(state)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,7 +274,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     };
     assert_eq!(add_wake, 0, "failed registering WebSocket reactor eventfd");
 
-    let mut sockets = FxHashMap::<RawFd, SocketState>::default();
+    let mut sockets = SocketTable::default();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut active_spin_polls = 0_usize;
@@ -346,7 +391,7 @@ fn set_current_thread_nice(nice: i32) {
     }
 }
 
-fn register_pair(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, pair: SocketPair) {
+fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
     let downstream_fd = pair.downstream.as_raw_fd();
     let upstream_fd = pair.upstream.as_raw_fd();
     let completion = pair.completion;
@@ -418,7 +463,7 @@ fn base_events() -> u32 {
 
 fn relay_read(
     epoll_fd: RawFd,
-    sockets: &mut FxHashMap<RawFd, SocketState>,
+    sockets: &mut SocketTable,
     fd: RawFd,
     peer_fd: RawFd,
     buffer: &mut [u8],
@@ -479,7 +524,7 @@ fn relay_read(
     RelayReadOutcome::Open
 }
 
-fn flush_pending(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
+fn flush_pending(epoll_fd: RawFd, sockets: &mut SocketTable, fd: RawFd) -> bool {
     let Some(state) = sockets.get_mut(&fd) else {
         return false;
     };
@@ -519,11 +564,7 @@ fn flush_pending(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, f
     modify_socket(epoll_fd, peer_fd, source)
 }
 
-fn mark_read_closed(
-    epoll_fd: RawFd,
-    sockets: &mut FxHashMap<RawFd, SocketState>,
-    fd: RawFd,
-) -> bool {
+fn mark_read_closed(epoll_fd: RawFd, sockets: &mut SocketTable, fd: RawFd) -> bool {
     let Some(peer_fd) = sockets.get(&fd).map(|state| state.peer_fd) else {
         return false;
     };
@@ -547,7 +588,7 @@ fn mark_read_closed(
     modify_socket(epoll_fd, peer_fd, peer)
 }
 
-fn pair_finished(sockets: &FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
+fn pair_finished(sockets: &SocketTable, fd: RawFd) -> bool {
     let Some(state) = sockets.get(&fd) else {
         return true;
     };
@@ -560,7 +601,7 @@ fn pair_finished(sockets: &FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
         && peer.pending.as_ref().map_or(0, Vec::len) == peer.pending_offset
 }
 
-fn pause_reader(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, fd: RawFd) -> bool {
+fn pause_reader(epoll_fd: RawFd, sockets: &mut SocketTable, fd: RawFd) -> bool {
     let Some(source) = sockets.get_mut(&fd) else {
         return false;
     };
@@ -582,7 +623,7 @@ fn send_nonblocking(fd: RawFd, buffer: &[u8]) -> io::Result<usize> {
     }
 }
 
-fn close_pair(epoll_fd: RawFd, sockets: &mut FxHashMap<RawFd, SocketState>, fd: RawFd) {
+fn close_pair(epoll_fd: RawFd, sockets: &mut SocketTable, fd: RawFd) {
     let Some(mut state) = sockets.remove(&fd) else {
         return;
     };

@@ -405,6 +405,22 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     let client = builder.build().context("failed to build reqwest client")?;
     let url = Arc::new(args.url);
 
+    // HTTPS saturation measures steady HTTP/2/TLS request processing, not a
+    // race between the first QEMU-scheduled client handshake and the shared
+    // measurement timestamp. A HEAD request creates the same pooled TLS/H2
+    // connection for both candidates without transferring a benchmark body.
+    if args.insecure {
+        let response = client
+            .head(url.as_str())
+            .send()
+            .await
+            .context("failed to preconnect HTTPS benchmark client")?;
+        response
+            .bytes()
+            .await
+            .context("failed to drain HTTPS preconnect response")?;
+    }
+
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
         let stats = stats.clone();
