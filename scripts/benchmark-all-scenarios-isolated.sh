@@ -56,6 +56,7 @@ CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 VALIDATION_TIMING_FILE="${VALIDATION_TIMING_FILE:-}"
+MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-0}"
 # CPU isolation is mandatory for fair throughput attribution. Memory is
 # measured in every run, but left uncapped by default so a synthetic cgroup
 # ceiling does not turn a safe memory-for-performance trade into a false fail.
@@ -78,11 +79,11 @@ LOAD_SCALES="${LOAD_SCALES:-1}"
 DURATION_SECS="${DURATION_SECS:-3}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-# The persistent controller still execs eleven amd64 client processes per
-# wave. Give QEMU enough time to start every process before the shared absolute
-# timestamp; otherwise late processes independently enter the 250 ms fallback
-# window and the workload is no longer concurrent.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-750}"
+# The persistent controller execs eleven client processes per wave. A 250 ms
+# absolute lead keeps their measurement windows aligned without consuming the
+# one-minute validation budget as idle time.
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
+UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-1000}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
@@ -146,6 +147,18 @@ for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT
 done
 [[ "$CLIENT_START_LEAD_MS" =~ ^[1-9][0-9]*$ ]] || {
   echo "CLIENT_START_LEAD_MS must be a positive integer" >&2
+  exit 1
+}
+[[ "$UDP_CLIENT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "UDP_CLIENT_TIMEOUT_MS must be a positive integer" >&2
+  exit 1
+}
+[[ "$MAX_VALIDATION_SECS" =~ ^[0-9]+$ ]] || {
+  echo "MAX_VALIDATION_SECS must be a non-negative integer" >&2
+  exit 1
+}
+command -v timeout >/dev/null 2>&1 || {
+  echo "GNU timeout is required for the hard validation deadline" >&2
   exit 1
 }
 for scale in $LOAD_SCALES; do
@@ -645,8 +658,8 @@ CLIENT_WAVE
   scenario_requested "$only_scenario" websocket-long-connection && launch_client "$phase" "$kind" websocket-long-connection websocket "ws://${gateway_ip}:18080/ws/" "$STREAM_CONNECTIONS" websocket --url "ws://${gateway_ip}:18080/ws/" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
   scenario_requested "$only_scenario" game-long-connection && launch_client "$phase" "$kind" game-long-connection tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
   scenario_requested "$only_scenario" tcp-stream && launch_client "$phase" "$kind" tcp-stream tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024
-  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${gateway_ip}:18300" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
-  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${gateway_ip}:18310" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
+  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${gateway_ip}:18300" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms "$UDP_CLIENT_TIMEOUT_MS"
+  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${gateway_ip}:18310" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms "$UDP_CLIENT_TIMEOUT_MS"
   cat >>"$WAVE_SCRIPT" <<'CLIENT_WAVE'
 status=0
 for pid in "${pids[@]}"; do
@@ -657,7 +670,16 @@ CLIENT_WAVE
 
   WAVE_START_AT_UNIX_MS=$(( $("$HELPER" now-unix-ms) + CLIENT_START_LEAD_MS ))
   local client_exec_log="$RUN_DIR/$phase-$kind-client-exec.log"
-  docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
+  local remaining_validation_secs=2147483647
+  if (( MAX_VALIDATION_SECS > 0 )); then
+    remaining_validation_secs=$((MATRIX_VALIDATION_DEADLINE_SECS - $(date +%s)))
+    if (( remaining_validation_secs <= 0 )); then
+      echo "hard validation deadline reached before $WAVE_CLIENT_NAME" >&2
+      return 124
+    fi
+  fi
+  timeout --foreground --signal=TERM --kill-after=0.1s "${remaining_validation_secs}s" \
+    docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
   local name row_scenario protocol target concurrency gateway result_phase
@@ -682,6 +704,11 @@ CLIENT_WAVE
   wait "$client_exec_pid"
   exit_code=$?
   set -e
+  if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
+    docker exec "$CLIENT_CONTAINER" sh -c 'pkill -TERM -x proxysss 2>/dev/null || true' >/dev/null 2>&1 || true
+    echo "client wave $WAVE_CLIENT_NAME stopped at the ${MAX_VALIDATION_SECS}s hard deadline" >&2
+    return 124
+  fi
   docker cp "$CLIENT_CONTAINER:/tmp/proxysss-bench-results/." "$WAVE_RESULTS_DIR"
   if [[ "$exit_code" != "0" ]]; then
     cat "$client_exec_log" >&2 || true
@@ -841,6 +868,8 @@ nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM
 client_start_lead_ms=$CLIENT_START_LEAD_MS
+udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS
+max_validation_secs=$MAX_VALIDATION_SECS
 role_isolation=docker-cgroup-cpuset-network-namespace
 role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
 gateway_memory_samples=cgroup-v2-current-and-peak
@@ -866,7 +895,7 @@ run_scale() {
   if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate saturation "$kind"; done
+      for kind in $repetition_order; do run_candidate saturation "$kind" || return $?; done
     done
     printf '%s\n' "${SATURATION_ROWS[@]}" >"$SATURATION_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$SATURATION_RESULTS_JSONL" --out "$SATURATION_RESULTS_JSON"
@@ -874,7 +903,7 @@ run_scale() {
       --fraction "$EQUAL_LOAD_FRACTION" --duration-secs "$DURATION_SECS"
     for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$LATENCY_RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate equal-load "$kind"; done
+      for kind in $repetition_order; do run_candidate equal-load "$kind" || return $?; done
     done
     printf '%s\n' "${LATENCY_ROWS[@]}" >"$LATENCY_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$LATENCY_RESULTS_JSONL" --out "$LATENCY_RESULTS_JSON"
@@ -886,7 +915,7 @@ run_scale() {
       for repetition in $(seq 1 "$ISOLATED_REPETITIONS"); do
         order_repetition=$((scenario_index + repetition))
         scenario_order="$(order_for_repetition "$RUN_ORDER" "$order_repetition")"
-        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario"; done
+        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario" || return $?; done
       done
       scenario_index=$((scenario_index + 1))
     done
@@ -911,8 +940,14 @@ start_gateway proxysss
 wait_gateway proxysss
 
 matrix_validation_start_secs="$(date +%s)"
+MATRIX_VALIDATION_DEADLINE_SECS=$((matrix_validation_start_secs + MAX_VALIDATION_SECS - 1))
 overall_status=0
 for scale in $LOAD_SCALES; do
+  if (( MAX_VALIDATION_SECS > 0 && $(date +%s) >= MATRIX_VALIDATION_DEADLINE_SECS )); then
+    echo "hard validation deadline reached before scale $scale" >&2
+    overall_status=124
+    break
+  fi
   if ! run_scale "$scale"; then overall_status=1; fi
 done
 matrix_validation_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))

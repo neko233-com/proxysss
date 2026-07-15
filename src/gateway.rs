@@ -11948,7 +11948,7 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
         // One movable owner per four CPUs avoids a permanently-runnable CFS
         // sibling on every HTTP shard. The count still scales with the full
         // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11958,8 +11958,8 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
+fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> bool {
+    false
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -11979,7 +11979,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 7,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -11988,7 +11988,7 @@ fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -12017,7 +12017,7 @@ fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 12,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
@@ -23740,7 +23740,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23751,7 +23751,7 @@ mod tests {
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(shared_udp_runtime_profile(
+        assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
@@ -23780,7 +23780,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            7
+            3
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23792,7 +23792,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            4
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23811,7 +23811,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            12
+            3
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),

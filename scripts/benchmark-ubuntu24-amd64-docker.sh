@@ -97,7 +97,7 @@ ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-750}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
 MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-60}}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -309,6 +309,7 @@ DURATION_SECS="$DURATION_SECS" \
 SAMPLE_AFTER_SECS="$SAMPLE_AFTER_SECS" \
 CAPTURE_DOCKER_STATS="$CAPTURE_DOCKER_STATS" \
 CLIENT_START_LEAD_MS="$CLIENT_START_LEAD_MS" \
+MAX_VALIDATION_SECS="$MAX_VALIDATION_SECS" \
 HTTP_CONCURRENCY="$http_concurrency" \
 HTTPS_CONCURRENCY="$https_concurrency" \
 STATIC_LARGE_CONCURRENCY="$static_large_concurrency" \
@@ -331,7 +332,11 @@ set -e
 for scale in $LOAD_SCALES; do
   source_dir="$OUTPUT_ROOT/current/runs/all-scenarios-isolated/matrix/scale-$scale"
   archive_dir="$OUTPUT_ROOT/scale-$scale"
-  test -d "$source_dir"
+  if [[ ! -d "$source_dir" ]]; then
+    echo "scale $scale did not finish before the hard deadline" >&2
+    benchmark_status=1
+    continue
+  fi
   rm -rf "$archive_dir"
   cp -a "$source_dir" "$archive_dir"
 done
