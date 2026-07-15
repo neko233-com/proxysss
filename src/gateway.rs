@@ -1535,10 +1535,6 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // HTTPS/realtime tail latency. Both remain bounded below Tokio's defaults.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
-// A single multiplexed HTTP/2 connection can carry the entire HTTPS wave.
-// Poll the TLS runtime's I/O driver more frequently than the plain/UDP shards
-// so tiny H2 responses do not wait behind a longer connection-task batch.
-const TLS_RUNTIME_EVENT_INTERVAL: u32 = 4;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
@@ -1617,7 +1613,7 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .worker_threads(worker_count)
             .thread_name("proxysss-tls")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-            .event_interval(TLS_RUNTIME_EVENT_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
