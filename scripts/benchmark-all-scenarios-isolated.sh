@@ -79,10 +79,10 @@ LOAD_SCALES="${LOAD_SCALES:-1}"
 DURATION_SECS="${DURATION_SECS:-3}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-# The persistent controller execs eleven client processes per wave. A 250 ms
+# The persistent controller execs eleven client processes per wave. A 100 ms
 # absolute lead keeps their measurement windows aligned without consuming the
 # one-minute validation budget as idle time.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-250}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-100}"
 UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-1000}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"

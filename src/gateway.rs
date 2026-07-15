@@ -1552,6 +1552,8 @@ static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
 #[cfg(target_os = "linux")]
@@ -1789,6 +1791,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
+        STATIC_SENDFILE_REACTOR_CPU_DIVISOR.store(
+            sendfile_reactor_cpu_divisor(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
         let stream_reactor_divisor =
             realtime_stream_reactor_cpu_divisor(config.runtime.performance.traffic_profile);
         REALTIME_STREAM_REACTOR_CPU_DIVISOR.store(stream_reactor_divisor, Ordering::Relaxed);
@@ -1802,7 +1808,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
-        STATIC_SENDFILE_REACTOR_NICE.store(0, Ordering::Relaxed);
+        STATIC_SENDFILE_REACTOR_NICE.store(
+            sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
     }
     plan
 }
@@ -11706,6 +11715,11 @@ async fn sendfile_all_async(
         configured_chunk_bytes
     };
     let data_plane_cores = adaptive_data_plane_workers(1);
+    let sendfile_reactor_workers = data_plane_cores.div_ceil(
+        STATIC_SENDFILE_REACTOR_CPU_DIVISOR
+            .load(Ordering::Relaxed)
+            .max(1),
+    );
 
     if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
         match crate::sendfile_reactor::dispatch(
@@ -11714,7 +11728,7 @@ async fn sendfile_all_async(
             0,
             len,
             max_chunk_bytes,
-            data_plane_cores,
+            sendfile_reactor_workers,
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
             Ok(completion) => {
@@ -11959,14 +11973,14 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> bool {
-    false
+    matches!(_profile, RuntimePerformanceTrafficProfile::Balanced)
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -11979,7 +11993,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12039,7 +12053,28 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Bulk => 1,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -23751,7 +23786,7 @@ mod tests {
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!shared_udp_runtime_profile(
+        assert!(shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
@@ -23763,7 +23798,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            4
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23780,7 +23815,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            1
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23820,12 +23855,20 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!sendfile_reactor_profile_enabled(
+        assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
+        assert_eq!(
+            sendfile_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
+            4
+        );
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            3
+        );
         let mut sendfile_sequence = 0;
         assert!(balanced_sendfile_mid_yield_for_next_response(
             &mut sendfile_sequence,

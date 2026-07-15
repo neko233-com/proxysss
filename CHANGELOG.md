@@ -5,7 +5,7 @@
 - Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.
 - Locked the default TLS ALPN order so ordinary clients prefer HTTP/2 on port 443 while ACME TLS-ALPN-01 remains available, and added default-config coverage for self-signed TLS bootstrap.
 - Hardened the Ubuntu 24 Docker benchmark entrypoints for Windows Docker Desktop path handling and emitted a same-run fairness manifest proving matching ports, CPU/FD/sysctl limits, protocol surfaces, and nginx/proxysss optimizations. Strict measured validation remains capped at 60 seconds.
-- Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, and isolated balanced UDP/realtime/TLS scheduler weights so datagram or crypto load cannot starve plain HTTP.
+- Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, kept balanced UDP on the proven per-core fast path, and reduced TLS/sendfile/realtime owner contention under mixed load.
 
 ## v1.3.5 - 2026-07-01
 
