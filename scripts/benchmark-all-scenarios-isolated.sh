@@ -427,7 +427,7 @@ wait_gateway() {
   local gateway_ip
   gateway_ip="$(gateway_ip_for "$kind")"
   for _ in $(seq 1 60); do
-    if docker run --rm --platform "$BENCH_PLATFORM" --network "$NETWORK" "$IMAGE" proxysss bench http \
+    if docker exec "$CLIENT_CONTAINER" proxysss bench http \
       --url "http://${gateway_ip}:18080/bench/small.html" --concurrency 1 \
       --duration-secs 1 2>/dev/null | grep -Eq '^success +: [1-9]'; then
       return 0
@@ -837,11 +837,11 @@ run_scale() {
 # Backend, both gateways, and the client controller stay warm across every
 # scale. The inactive gateway is paused on the shared gateway cpuset.
 start_backend
+start_client_controller
 start_gateway nginx
 wait_gateway nginx
 start_gateway proxysss
 wait_gateway proxysss
-start_client_controller
 
 matrix_validation_start_secs="$(date +%s)"
 overall_status=0
