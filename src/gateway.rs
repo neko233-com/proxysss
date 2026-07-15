@@ -1500,7 +1500,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
@@ -1527,7 +1527,6 @@ const TLS_ACCEPT_LOW_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_BATCH: usize = 1;
 const TLS_ACCEPT_HIGH_DENSITY_PER_SHARD: usize = 4_096;
 const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
-const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 16;
 // Data-plane shards mostly run connection-local tasks. Checking Tokio's global
 // injection queue every two polls and the I/O driver every three polls spends
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
@@ -1536,23 +1535,15 @@ const TLS_OVERFLOW_CONNECTIONS_PER_WORKER: usize = 16;
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 #[cfg(target_os = "linux")]
-const H2_MIXED_PER_CORE_OPS: u64 = 3_800;
-
-#[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static TLS_OVERFLOW_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
-static PLAIN_HYPER_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static TCP_STREAMS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_os = "linux")]
-static H2_MIXED_NEXT_SLOT_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
@@ -1632,42 +1623,6 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
-}
-
-fn dedicated_tls_overflow_runtime() -> Option<&'static tokio::runtime::Runtime> {
-    TLS_OVERFLOW_RUNTIME
-        .get_or_init(|| {
-            let cores = adaptive_data_plane_workers(1);
-            let base_workers = tls_http_runtime_workers_for(
-                cores,
-                TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
-            );
-            let overflow_workers = tls_http_overflow_workers_for(cores, base_workers);
-            if overflow_workers == 0 {
-                return None;
-            }
-            let scheduler_nice = TLS_HTTP_RUNTIME_NICE.load(Ordering::Relaxed);
-            tracing::info!(
-                runtime_workers = overflow_workers,
-                activation_connections = tls_http_overflow_connection_threshold(base_workers),
-                scheduler_nice,
-                "starting elastic TLS HTTP overflow runtime"
-            );
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder
-                .worker_threads(overflow_workers)
-                .thread_name("proxysss-tls-overflow")
-                .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-                .on_thread_start(move || set_current_thread_nice(scheduler_nice))
-                .enable_all();
-            Some(
-                builder
-                    .build()
-                    .expect("failed to build proxysss TLS overflow runtime"),
-            )
-        })
-        .as_ref()
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -2039,21 +1994,6 @@ struct ActiveConnectionGuard(Arc<AtomicUsize>);
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct ActivePlainHyperConnectionGuard;
-
-impl ActivePlainHyperConnectionGuard {
-    fn enter() -> Self {
-        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ActivePlainHyperConnectionGuard {
-    fn drop(&mut self) {
-        PLAIN_HYPER_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -4863,7 +4803,6 @@ impl Gateway {
         remote_addr: SocketAddr,
         worker_index: usize,
     ) {
-        let _active_plain_hyper = ActivePlainHyperConnectionGuard::enter();
         let gateway = self.clone();
         let service = service_fn(move |request| {
             let gateway = gateway.clone();
@@ -5568,7 +5507,6 @@ impl Gateway {
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
             let _ = dedicated_tls_connection_runtimes();
-            let _ = dedicated_tls_overflow_runtime();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -5697,25 +5635,12 @@ impl Gateway {
                     .fetch_add(1, Ordering::Relaxed)
                     .saturating_add(1);
                 let connection_guard = ActiveConnectionGuard(active_connections.clone());
-                let connection = async move {
+                std::mem::drop(tokio::spawn(async move {
                     let _connection_guard = connection_guard;
                     gateway
                         .serve_tls_http_connection(stream, acceptor, remote_addr, worker_index)
                         .await;
-                };
-                let base_workers = tls_http_runtime_workers_for(
-                    adaptive_data_plane_workers(1),
-                    TLS_HTTP_RUNTIME_CPU_DIVISOR.load(Ordering::Relaxed),
-                );
-                if active_connection_count > tls_http_overflow_connection_threshold(base_workers) {
-                    if let Some(runtime) = dedicated_tls_overflow_runtime() {
-                        std::mem::drop(runtime.spawn(connection));
-                    } else {
-                        std::mem::drop(tokio::spawn(connection));
-                    }
-                } else {
-                    std::mem::drop(tokio::spawn(connection));
-                }
+                }));
                 accepted_since_yield += 1;
                 let handshake_batch = if active_connection_count > TLS_ACCEPT_HIGH_DENSITY_PER_SHARD
                 {
@@ -5847,9 +5772,6 @@ impl Gateway {
         let service = service_fn(move |request| {
             let gateway = gateway.clone();
             async move {
-                if is_http2 {
-                    apply_h2_mixed_fairness().await;
-                }
                 gateway
                     .handle_hyper_request(request, remote_addr, "https")
                     .await
@@ -6167,7 +6089,6 @@ impl Gateway {
             self.stats
                 .tcp_sessions_active
                 .fetch_add(1, Ordering::Relaxed);
-            TCP_STREAMS_ACTIVE.fetch_add(1, Ordering::Relaxed);
 
             let session = async move {
                 let mut inbound = inbound;
@@ -6492,7 +6413,6 @@ impl Gateway {
                     .stats
                     .tcp_sessions_active
                     .fetch_sub(1, Ordering::Relaxed);
-                TCP_STREAMS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
             };
             std::mem::drop(tokio::spawn(session));
         }
@@ -10957,46 +10877,6 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
 }
 
-#[cfg(target_os = "linux")]
-async fn apply_h2_mixed_fairness() {
-    if PLAIN_HYPER_CONNECTIONS_ACTIVE.load(Ordering::Relaxed) == 0
-        && TCP_STREAMS_ACTIVE.load(Ordering::Relaxed) == 0
-    {
-        H2_MIXED_NEXT_SLOT_NS.store(0, Ordering::Relaxed);
-        return;
-    }
-
-    const BURST_REQUESTS: u64 = 64;
-    let limit = (data_plane_cpu_ids().len() as u64)
-        .saturating_mul(H2_MIXED_PER_CORE_OPS)
-        .max(H2_MIXED_PER_CORE_OPS);
-    let interval_ns = 1_000_000_000_u64 / limit;
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64;
-    let floor = now_ns.saturating_sub(interval_ns.saturating_mul(BURST_REQUESTS));
-
-    let scheduled_ns = loop {
-        let current = H2_MIXED_NEXT_SLOT_NS.load(Ordering::Relaxed);
-        let scheduled = current.max(floor).saturating_add(interval_ns);
-        if H2_MIXED_NEXT_SLOT_NS
-            .compare_exchange_weak(current, scheduled, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            break scheduled;
-        }
-    };
-
-    if scheduled_ns > now_ns {
-        tokio::time::sleep(Duration::from_nanos(scheduled_ns - now_ns)).await;
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn apply_h2_mixed_fairness() {}
-
 fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
     let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
     builder
@@ -12023,10 +11903,9 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
-    // running a permanently-ready reactor alongside every HTTP shard. Small
-    // is realtime-first at one owner per two CPUs; balanced/bulk use one per
-    // four so mixed HTTP/TLS/UDP retains scheduler capacity. Both scale with
-    // the full cpuset rather than imposing a fixed high-core cap.
+    // running a fixed worker cap. The profile-selected divisor scales with the
+    // full cpuset, and balanced mode uses a low-CFS-weight per-core lane to
+    // avoid queueing unrelated long connections behind one shared owner.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
@@ -12034,7 +11913,8 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -12042,9 +11922,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // One balanced owner covers four data-plane CPUs. Keep bounded wake
-        // budget without outranking the nice-0 HTTP shards.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        // Per-core nice +6 lanes preserve bounded CFS ownership while removing
+        // a shared relay queue from p95/p99.
+        RuntimePerformanceTrafficProfile::Balanced => 6,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12062,7 +11942,8 @@ fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
 
@@ -12070,26 +11951,13 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
 
-fn tls_http_overflow_workers_for(cores: usize, base_workers: usize) -> usize {
-    cores
-        .max(1)
-        .saturating_sub(base_workers.max(1))
-        .min(base_workers.max(1))
-}
-
-fn tls_http_overflow_connection_threshold(base_workers: usize) -> usize {
-    base_workers
-        .max(1)
-        .saturating_mul(TLS_OVERFLOW_CONNECTIONS_PER_WORKER)
-}
-
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // H2/rustls keeps a small CFS discount; the density-triggered overflow
-        // runtime removes queueing without making TLS dominate plain HTTP.
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        // Per-core nice +5 crypto workers preserve bounded CFS ownership while
+        // avoiding one shared handshake/H2 queue.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23805,6 +23673,8 @@ mod tests {
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
+        assert_eq!(realtime_stream_reactor_workers_for(4, 1), 4);
+        assert_eq!(realtime_stream_reactor_workers_for(96, 1), 96);
         assert_eq!(realtime_stream_reactor_workers_for(4, 4), 1);
         assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
         assert_eq!(
@@ -23813,7 +23683,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23825,7 +23695,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            6
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23848,7 +23718,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23859,20 +23729,13 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
-        assert_eq!(tls_http_overflow_workers_for(1, 1), 0);
-        assert_eq!(tls_http_overflow_workers_for(2, 1), 1);
-        assert_eq!(tls_http_overflow_workers_for(4, 1), 1);
-        assert_eq!(tls_http_overflow_workers_for(96, 24), 24);
-        assert_eq!(tls_http_overflow_workers_for(96, 96), 0);
-        assert_eq!(tls_http_overflow_connection_threshold(1), 16);
-        assert_eq!(tls_http_overflow_connection_threshold(24), 384);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            5
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
