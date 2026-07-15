@@ -15,6 +15,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use base64::Engine;
 use brotli::CompressorWriter;
 use bytes::{Buf, Bytes, BytesMut};
@@ -115,6 +116,7 @@ pub struct Gateway {
     http_cache: Arc<DashMap<String, CachedHttpEntry>>,
     raw_http_pools: Arc<DashMap<String, Arc<RawHttpUpstreamPool>>>,
     static_route_cache: Arc<DashMap<String, PathBuf>>,
+    h2_static_route_cache: Arc<DashMap<String, Arc<CachedH2StaticRoute>>>,
     static_file_cache: Arc<DashMap<String, CachedStaticFile>>,
     static_file_cache_bytes: Arc<AtomicU64>,
     static_file_load_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
@@ -1867,6 +1869,19 @@ struct CachedStaticFile {
     revalidating: bool,
 }
 
+struct CachedH2StaticPayload {
+    body: Bytes,
+    content_length: HeaderValue,
+    checked_at: Instant,
+}
+
+struct CachedH2StaticRoute {
+    target: PathBuf,
+    content_type: HeaderValue,
+    payload: ArcSwap<CachedH2StaticPayload>,
+    revalidating: AtomicBool,
+}
+
 struct HttpCacheRevalidateRequest<'a> {
     host: &'a str,
     uri: &'a Uri,
@@ -2207,6 +2222,7 @@ impl Gateway {
             http_cache: Arc::new(DashMap::new()),
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
+            h2_static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
@@ -2310,6 +2326,7 @@ impl Gateway {
                 &self.static_file_cache_bytes,
                 &self.static_file_load_locks,
                 &self.static_route_cache,
+                &self.h2_static_route_cache,
             )
             .await
             {
@@ -7495,17 +7512,8 @@ impl Gateway {
             && self.bootstrap_fast_lane.hyper_static_success
             && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
         {
-            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
-                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
-                    target.as_path(),
-                    method,
-                    &self.static_file_cache,
-                ) {
-                    if cached.revalidate {
-                        self.spawn_static_cache_revalidation(target.clone());
-                    }
-                    return Ok(Some(cached.response));
-                }
+            if let Some(response) = self.try_h2_cached_static_response(request.uri().path()) {
+                return Ok(Some(response));
             }
         }
 
@@ -7617,6 +7625,54 @@ impl Gateway {
         } else {
             Ok(None)
         }
+    }
+
+    fn try_h2_cached_static_response(&self, path: &str) -> Option<GatewayResponse> {
+        let route = self
+            .h2_static_route_cache
+            .get(path)
+            .map(|entry| entry.clone())?;
+        let (response, revalidate) = cached_h2_static_response(&route);
+        if revalidate {
+            self.spawn_h2_static_cache_revalidation(route.clone());
+        }
+        Some(response)
+    }
+
+    fn spawn_h2_static_cache_revalidation(&self, route: Arc<CachedH2StaticRoute>) {
+        let static_file_cache = self.static_file_cache.clone();
+        let static_file_cache_bytes = self.static_file_cache_bytes.clone();
+        let static_file_load_locks = self.static_file_load_locks.clone();
+        std::mem::drop(tokio::spawn(async move {
+            let result: Result<()> = async {
+                let metadata = tokio::fs::metadata(&route.target)
+                    .await
+                    .context("failed reading H2 static cache metadata")?;
+                if !metadata.is_file() {
+                    return Err(anyhow!("H2 static cache target is no longer a file"));
+                }
+                let body = cached_static_file_body(
+                    &route.target,
+                    &metadata,
+                    &static_file_cache,
+                    &static_file_cache_bytes,
+                    &static_file_load_locks,
+                )
+                .await?;
+                route.payload.store(Arc::new(CachedH2StaticPayload {
+                    content_length: HeaderValue::from_str(&body.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    body,
+                    checked_at: Instant::now(),
+                }));
+                Ok(())
+            }
+            .await;
+            route.revalidating.store(false, Ordering::Release);
+            if let Err(error) = result {
+                tracing::debug!(?error, path = %route.target.display(), "H2 static cache revalidation failed");
+            }
+        }));
     }
 
     fn spawn_static_cache_revalidation(&self, target: PathBuf) {
@@ -18161,6 +18217,28 @@ struct CachedStaticResponse {
     revalidate: bool,
 }
 
+fn cached_h2_static_response(route: &CachedH2StaticRoute) -> (GatewayResponse, bool) {
+    let payload = route.payload.load_full();
+    let revalidate = payload.checked_at.elapsed()
+        > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+        && route
+            .revalidating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+
+    let mut response = Response::new(full_body(payload.body.clone()));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, route.content_type.clone());
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, payload.content_length.clone());
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    (response, revalidate)
+}
+
 fn fresh_cached_static_file_response(
     target: &Path,
     method: &Method,
@@ -18396,6 +18474,7 @@ async fn preload_static_site_fast_lane_cache(
     static_file_cache_bytes: &AtomicU64,
     static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
     static_route_cache: &DashMap<String, PathBuf>,
+    h2_static_route_cache: &DashMap<String, Arc<CachedH2StaticRoute>>,
 ) -> Result<usize> {
     let mut candidates = HashMap::<String, PathBuf>::new();
     let prefix = normalize_webdav_prefix(&site.path_prefix);
@@ -18423,7 +18502,7 @@ async fn preload_static_site_fast_lane_cache(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("failed reading static preload metadata"),
         };
-        static_route_cache.insert(request_path, target.clone());
+        static_route_cache.insert(request_path.clone(), target.clone());
 
         let should_cache_body = matches!(
             traffic_profile,
@@ -18445,6 +18524,20 @@ async fn preload_static_site_fast_lane_cache(
                 static_file_load_locks,
             )
             .await?;
+            h2_static_route_cache.insert(
+                request_path,
+                Arc::new(CachedH2StaticRoute {
+                    target: target.clone(),
+                    content_type: HeaderValue::from_static(static_content_type(&target)),
+                    payload: ArcSwap::from_pointee(CachedH2StaticPayload {
+                        content_length: HeaderValue::from_str(&body.len().to_string())
+                            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                        body: body.clone(),
+                        checked_at: Instant::now(),
+                    }),
+                    revalidating: AtomicBool::new(false),
+                }),
+            );
             if !body.is_empty() {
                 preloaded = preloaded.saturating_add(1);
             }
@@ -22857,6 +22950,44 @@ mod tests {
     }
 
     #[test]
+    fn lock_free_h2_route_cache_shares_body_and_coalesces_revalidation() {
+        let route = CachedH2StaticRoute {
+            target: PathBuf::from("asset.js"),
+            content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
+            payload: ArcSwap::from_pointee(CachedH2StaticPayload {
+                body: Bytes::from_static(b"test"),
+                content_length: HeaderValue::from_static("4"),
+                checked_at: Instant::now() - Duration::from_secs(2),
+            }),
+            revalidating: AtomicBool::new(false),
+        };
+
+        let (response, revalidate) = cached_h2_static_response(&route);
+        assert!(revalidate);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/javascript; charset=utf-8"
+            ))
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("4"))
+        );
+        assert_eq!(
+            response.headers().get(ACCEPT_RANGES),
+            Some(&HeaderValue::from_static("bytes"))
+        );
+        match response.body() {
+            GatewayBody::Full(Some(body)) => assert_eq!(body.as_ref(), b"test"),
+            _ => panic!("cached H2 route response must use the shared full body"),
+        }
+
+        let (_, duplicate_revalidate) = cached_h2_static_response(&route);
+        assert!(!duplicate_revalidate);
+    }
+
+    #[test]
     fn plain_static_stale_candidate_serves_body_and_coalesces_revalidation() {
         let cache = DashMap::new();
         cache.insert(
@@ -24149,6 +24280,7 @@ mod tests {
             http_cache: Arc::new(DashMap::new()),
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
+            h2_static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),

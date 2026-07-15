@@ -7,6 +7,7 @@ description = "General-purpose Rust gateway built to replace nginx with HTTP, HT
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 base64 = "0.22"
 brotli = "8"
 bytes = "1"
