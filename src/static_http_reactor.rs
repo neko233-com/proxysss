@@ -87,6 +87,7 @@ struct Connection {
     config_epoch: Arc<AtomicU64>,
     expected_epoch: u64,
     pending: bool,
+    write_blocked: bool,
     head_offset: usize,
     body_offset: usize,
     file_offset: libc::off_t,
@@ -291,6 +292,7 @@ fn register(
             config_epoch: request.config_epoch,
             expected_epoch: request.expected_epoch,
             pending: false,
+            write_blocked: false,
             head_offset: 0,
             body_offset: 0,
             file_offset: 0,
@@ -448,7 +450,11 @@ fn flush(
             return false;
         };
         if !connection.pending {
-            return add_or_modify(epoll_fd, fd, connection, false);
+            if connection.write_blocked {
+                connection.write_blocked = false;
+                return add_or_modify(epoll_fd, fd, connection, false);
+            }
+            return true;
         }
         match flush_one(fd, connection) {
             Ok(true) => {
@@ -461,13 +467,28 @@ fn flush(
                     return false;
                 }
             }
-            Ok(false) => return add_or_modify(epoll_fd, fd, connection, false),
+            Ok(false) => {
+                if connection.write_blocked {
+                    return true;
+                }
+                connection.write_blocked = true;
+                return add_or_modify(epoll_fd, fd, connection, false);
+            }
             Err(_) => return false,
         }
     }
-    table
-        .get_mut(fd)
-        .is_some_and(|connection| add_or_modify(epoll_fd, fd, connection, false))
+    let Some(connection) = table.get_mut(fd) else {
+        return false;
+    };
+    if connection.write_blocked {
+        true
+    } else {
+        // Re-enter epoll after the per-event fairness cap. EPOLLOUT is used as
+        // the continuation only here and after a real EAGAIN; the ordinary
+        // small-response path leaves its stable EPOLLIN registration intact.
+        connection.write_blocked = true;
+        add_or_modify(epoll_fd, fd, connection, false)
+    }
 }
 
 fn flush_one(fd: RawFd, connection: &mut Connection) -> io::Result<bool> {
@@ -547,12 +568,7 @@ fn set_tcp_cork(fd: RawFd, enabled: bool) {
 }
 
 fn add_or_modify(epoll_fd: RawFd, fd: RawFd, connection: &Connection, add: bool) -> bool {
-    let mut interests = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
-    if connection.pending {
-        interests |= libc::EPOLLOUT as u32;
-    } else {
-        interests |= libc::EPOLLIN as u32;
-    }
+    let interests = socket_interests(connection.write_blocked);
     let mut event = libc::epoll_event {
         events: interests,
         u64: fd as u64,
@@ -563,6 +579,16 @@ fn add_or_modify(epoll_fd: RawFd, fd: RawFd, connection: &Connection, add: bool)
         libc::EPOLL_CTL_MOD
     };
     unsafe { libc::epoll_ctl(epoll_fd, operation, fd, &mut event) == 0 }
+}
+
+fn socket_interests(write_blocked: bool) -> u32 {
+    let mut interests = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
+    interests |= if write_blocked {
+        libc::EPOLLOUT as u32
+    } else {
+        libc::EPOLLIN as u32
+    };
+    interests
 }
 
 fn close(epoll_fd: RawFd, table: &mut ConnectionTable, fd: RawFd) {
@@ -676,5 +702,12 @@ mod tests {
         drop(fallback.stream);
         drop(client);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ordinary_static_response_keeps_read_interest_until_write_blocks() {
+        let base = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
+        assert_eq!(socket_interests(false), base | libc::EPOLLIN as u32);
+        assert_eq!(socket_interests(true), base | libc::EPOLLOUT as u32);
     }
 }
