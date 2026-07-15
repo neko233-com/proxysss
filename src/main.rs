@@ -668,7 +668,10 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     },
 ];
 
-#[tokio::main]
+// Listener and connection hot paths own CPU-adaptive data runtimes. Keep the
+// supervisory/control-plane executor single-threaded so it cannot add a full
+// extra set of CFS competitors to a small production cpuset.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
