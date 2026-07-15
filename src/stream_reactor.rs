@@ -25,11 +25,11 @@ const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_READ_BATCH: usize = 8;
 const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // Only nearly-idle owners use a short reply spin. Mixed traffic returns
-// directly to epoll after each batch; per-core low-weight owners remove the
-// shared queue without monopolizing HTTP/TLS/UDP siblings.
+// directly to epoll after each batch; per-core owners explicitly yield at
+// batch boundaries instead of relying on coarse CFS weighting.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const DENSE_SPIN_POLLS: usize = 1;
+const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const WAKE_TOKEN: u64 = u64::MAX;
 
@@ -297,6 +297,11 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             {
                 close_pair(epoll_fd, &mut sockets, fd);
             }
+        }
+        if sockets.len() / 2 > ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
+            // Finish every ready fd from this bounded batch, then hand the CPU
+            // to the colocated HTTP/TLS/UDP shard before polling again.
+            thread::yield_now();
         }
     }
 

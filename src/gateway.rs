@@ -11903,10 +11903,10 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Per-core owners remove a shared synchronized-tick queue. The low CFS
-        // weight preserves HTTP/TLS/UDP saturation throughput, while idle CPU
-        // remains fully available for fixed-load realtime latency.
-        RuntimePerformanceTrafficProfile::Balanced => 6,
+        // Per-core owners drain one bounded epoll batch and then yield to the
+        // sibling HTTP shard. Normal CFS weight keeps synchronized ticks from
+        // queueing while explicit batch boundaries preserve mixed fairness.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23669,7 +23669,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            6
+            0
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
