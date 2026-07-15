@@ -1496,7 +1496,7 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -1760,7 +1760,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
-        STATIC_SENDFILE_REACTOR_NICE.store(0, Ordering::Relaxed);
+        STATIC_SENDFILE_REACTOR_NICE.store(
+            sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
     }
     plan
 }
@@ -5173,8 +5176,6 @@ impl Gateway {
                     file_path: candidate.path.clone(),
                     len: candidate.len,
                     sendfile: candidate.sendfile.clone(),
-                    #[cfg(target_os = "linux")]
-                    gateway_socket_tuned: AtomicBool::new(false),
                 };
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
@@ -10898,8 +10899,6 @@ struct ConnectionStaticFastPathCache {
     file_path: PathBuf,
     len: u64,
     sendfile: Option<Arc<std::fs::File>>,
-    #[cfg(target_os = "linux")]
-    gateway_socket_tuned: AtomicBool,
 }
 
 impl ConnectionStaticFastPathCache {
@@ -11577,9 +11576,6 @@ async fn send_connection_static_fast_path(
     let cork_static = cached.len > 0;
     #[cfg(target_os = "linux")]
     if cork_static {
-        if cached.sendfile.is_some() && !cached.gateway_socket_tuned.swap(true, Ordering::Relaxed) {
-            tune_tcp_stream_for_gateway(stream);
-        }
         set_tcp_cork(stream, true);
     }
 
@@ -11982,7 +11978,18 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -23727,12 +23734,20 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!sendfile_reactor_profile_enabled(
+        assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            3
+        );
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
+            0
+        );
         let mut sendfile_sequence = 0;
         assert!(balanced_sendfile_mid_yield_for_next_response(
             &mut sendfile_sequence,
