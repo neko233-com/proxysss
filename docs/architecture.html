@@ -667,7 +667,7 @@
             <article class="step">
               <span class="tag expert">Step 5</span>
               <h3>发往上游或本地能力面</h3>
-              <p class="subtle">最终不是去上游池，就是读静态文件、走 WebDAV、返回内建服务结果；静态文件支持 Range/206 断点续传，大文件区间会流式发送。</p>
+              <p class="subtle">最终不是去上游池，就是读静态文件、走 WebDAV、返回内建服务结果；没有用户路由命中 `/` 时才返回只含 GitHub 与 GitHub Docs 的零外部资源欢迎页。静态文件支持 Range/206 断点续传，大文件区间会流式发送。</p>
             </article>
           </div>
 

@@ -3950,6 +3950,8 @@ mod tests {
         assert_eq!(config.http.plain_bind, "0.0.0.0:80");
         assert_eq!(config.http.tls_bind, "0.0.0.0:443");
         assert_eq!(config.http.h3_bind, "0.0.0.0:443");
+        assert_eq!(config.http.tls.mode, TlsMode::SelfSigned);
+        assert!(config.http.tls.generate_self_signed_if_missing);
         assert_eq!(config.admin.bind, "127.0.0.1:7777");
         assert!(config.tcp.listeners.is_empty());
         assert!(config.udp.listeners.is_empty());

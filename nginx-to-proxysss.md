@@ -32,6 +32,7 @@
 - 你只是做 `HTTP -> HTTP`：优先看 `reverse_proxy.routes`
 - 你想按“整站结构”组织配置：优先看 `domain_routes`
 - 你在做数据库、游戏、MQTT、UDP：直接看 `tcp.listeners` / `udp.listeners`
+- 没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；迁移业务首页时应显式声明 route/static site
 
 ## 2. 新手先迁最常见的 6 类 nginx 配置
 

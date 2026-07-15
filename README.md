@@ -77,11 +77,13 @@ services:
 What each part means:
 
 - `plain_bind` exposes public HTTP on port `80`.
-- `tls_bind` exposes HTTPS and HTTP/2 on port `443`.
+- `tls_bind` exposes HTTPS and default-preferred HTTP/2 on port `443`; a fresh default config bootstraps a self-signed certificate until production TLS is configured.
 - `h3_bind` exposes HTTP/3 on port `443/udp`.
 - `domain_routes` is the recommended HTTP routing model when you care about hostnames.
 - `domains` is the host list this route should answer for.
 - `upstream` is the backend app that will receive the request.
+
+When no user route owns `/`, the Rust gateway returns a zero-asset `Welcome to proxysss` page with only GitHub and GitHub Docs links.
 
 Check the file before you run it:
 

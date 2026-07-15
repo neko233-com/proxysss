@@ -8,10 +8,32 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-[[ "$(uname -s)" == "Linux" || "$(uname -s)" == "Darwin" ]] || {
-  echo "benchmark-all-scenarios-isolated.sh requires Linux or macOS with local Docker" >&2
-  exit 1
-}
+# Preserve Linux paths passed to containers under Git Bash/MSYS. Host paths
+# rooted in the checkout are converted explicitly for Docker Desktop.
+DOCKER_CLI_BIN="$(type -P docker || true)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    docker() {
+      local arg
+      local -a docker_args=()
+      for arg in "$@"; do
+        if [[ "$arg" == "$ROOT"* ]]; then
+          arg="$(cygpath -m "$ROOT")${arg#"$ROOT"}"
+        fi
+        docker_args+=("$arg")
+      done
+      MSYS2_ARG_CONV_EXCL='*' "$DOCKER_CLI_BIN" "${docker_args[@]}"
+    }
+    ;;
+esac
+
+case "$(uname -s)" in
+  Linux | Darwin | MINGW* | MSYS* | CYGWIN*) ;;
+  *)
+    echo "benchmark-all-scenarios-isolated.sh requires Linux, macOS, or Windows Git Bash with local Docker" >&2
+    exit 1
+    ;;
+esac
 for command in docker go openssl; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "missing required command: $command" >&2
@@ -43,6 +65,8 @@ BACKEND_MEMORY="${BACKEND_MEMORY:-}"
 CLIENT_MEMORY="${CLIENT_MEMORY:-}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-300000}"
 NGINX_WORKERS="${NGINX_WORKERS:-4}"
+GATEWAY_SOMAXCONN="${GATEWAY_SOMAXCONN:-65535}"
+GATEWAY_SYSCTL_ARGS=(--sysctl "net.core.somaxconn=${GATEWAY_SOMAXCONN}")
 TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-balanced}"
 BENCH_PLATFORM="${BENCH_PLATFORM:-linux/amd64}"
 HTTP_CONCURRENCY="${HTTP_CONCURRENCY:-64}"
@@ -354,6 +378,34 @@ NGINX
 write_proxy_config
 write_nginx_config
 
+write_fairness_manifest() {
+  grep -Fq 'plain_bind: 0.0.0.0:18080' "$RUN_DIR/proxysss.yaml"
+  grep -Fq 'tls_bind: 0.0.0.0:18443' "$RUN_DIR/proxysss.yaml"
+  grep -Fq 'listen 0.0.0.0:18080 backlog=65536 reuseport;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'listen 0.0.0.0:18443 ssl backlog=65536 reuseport;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'http2 on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'events { use epoll; worker_connections 65535; multi_accept on; }' "$RUN_DIR/nginx.conf"
+  grep -Fq 'sendfile on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'tcp_nodelay on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'socket_extreme: true' "$RUN_DIR/proxysss.yaml"
+  {
+    echo 'comparison=equivalent-protocol-and-routing-surface'
+    echo "gateway_cpuset=$GATEWAY_CPUSET"
+    echo "gateway_nofile=$NOFILE_LIMIT"
+    echo "gateway_somaxconn=$GATEWAY_SOMAXCONN"
+    echo "nginx_workers=$NGINX_WORKERS"
+    echo 'shared_kernel=true'
+    echo 'shared_container_sysctls=true'
+    echo 'shared_ports=http:18080,https-h2:18443,tcp:18200,udp:18300,qcp-transparent:18310'
+    echo 'nginx_optimizations=epoll,multi_accept,reuseport,sendfile,tcp_nopush,tcp_nodelay,upstream_keepalive,tls_session_cache'
+    echo 'proxysss_optimizations=adaptive_system,socket_extreme,reuseport,preload,pools,h2'
+    echo "proxysss_config_sha256=$(sha256sum "$RUN_DIR/proxysss.yaml" | awk '{print $1}')"
+    echo "nginx_config_sha256=$(sha256sum "$RUN_DIR/nginx.conf" | awk '{print $1}')"
+  } >"$RUN_DIR/fairness-config.txt"
+}
+
+write_fairness_manifest
+
 memory_limit_enabled() {
   [[ -n "$1" && "$1" != "0" && "$1" != "infinity" && "$1" != "unlimited" ]]
 }
@@ -398,7 +450,7 @@ start_gateway() {
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" ${memory_arg:+"$memory_arg"} \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-      --sysctl net.core.somaxconn=65535 \
+      "${GATEWAY_SYSCTL_ARGS[@]}" \
       "$IMAGE" bash -ec '
         mkdir -p /run/proxysss
         openssl ecparam -name prime256v1 -genkey -noout -out /run/proxysss/bench.key
@@ -412,7 +464,7 @@ start_gateway() {
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" ${memory_arg:+"$memory_arg"} \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-      --sysctl net.core.somaxconn=65535 \
+      "${GATEWAY_SYSCTL_ARGS[@]}" \
       "$IMAGE" bash -ec '
         mkdir -p /run/nginx
         openssl ecparam -name prime256v1 -genkey -noout -out /run/nginx/bench.key

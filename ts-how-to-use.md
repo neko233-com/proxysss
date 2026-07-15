@@ -10,6 +10,7 @@ proxysss 的 TypeScript 运行时是内嵌 QuickJS，不依赖 node、deno 或 t
 
 - 固定的 HTTP / HTTPS / TCP / UDP / FTP / WebDAV / TLS / 缓存 / 限流，优先走 YAML
 - 只有当你真的需要业务感知、租户感知、player_id 感知、特殊上游选择时，再进入 TS
+- 默认 `/` 的 `Welcome to proxysss` 页面是 Rust 内建 fallback，不属于脚本 API；用户路由优先，不要为了改默认页把 TS 放进热路径
 
 ## 1. 两种读法
 

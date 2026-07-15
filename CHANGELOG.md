@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.
+- Locked the default TLS ALPN order so ordinary clients prefer HTTP/2 on port 443 while ACME TLS-ALPN-01 remains available, and added default-config coverage for self-signed TLS bootstrap.
+- Hardened the Ubuntu 24 Docker benchmark entrypoints for Windows Docker Desktop path handling and emitted a same-run fairness manifest proving matching ports, CPU/FD/sysctl limits, protocol surfaces, and nginx/proxysss optimizations. Strict measured validation remains capped at 60 seconds.
+
 ## v1.3.5 - 2026-07-01
 
 - Added independent QCP UDP listener coverage for neko233-com/QCP alongside existing KCP-style UDP examples, templates, capability output, nginx-parity output, and Chinese-first docs. KCP and QCP remain separate listener modes; proxysss forwards datagrams transparently and leaves protocol framing/reliability semantics to upstream services.

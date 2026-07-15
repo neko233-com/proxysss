@@ -34,6 +34,7 @@
 一句话理解：
 
 - `Caddy` 迁移更像从“简洁站点代理”迁到“更完整的通用网关”
+- 没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；迁移 `file_server` 或站点首页时应显式声明 static site/route
 
 ### 1.2 Caddyfile 常见能力，对应到哪里
 

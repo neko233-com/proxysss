@@ -1,413 +1,124 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
   <title>Welcome to proxysss</title>
   <style>
     :root {
-      color-scheme: dark;
-      --ink: #05070b;
-      --graphite: #101217;
-      --line: rgba(232, 236, 242, 0.12);
-      --text: #f7f5ee;
-      --muted: #a7adb7;
-      --teal: #48e0d0;
-      --amber: #ffd166;
-      --violet: #a78bfa;
-      --coral: #ff7a90;
-      --green: #7af59b;
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #ffffff;
+      color: #090d1a;
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
     }
+
     * { box-sizing: border-box; }
-    html { min-height: 100%; background: var(--ink); }
+    html, body { min-height: 100%; }
+
     body {
       margin: 0;
+      background: #ffffff;
+    }
+
+    main {
       min-height: 100vh;
-      font-family: Inter, "Avenir Next", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-      color: var(--text);
-      background:
-        linear-gradient(115deg, rgba(72, 224, 208, 0.12), transparent 34%),
-        linear-gradient(245deg, rgba(255, 209, 102, 0.10), transparent 31%),
-        linear-gradient(180deg, #07090d 0%, #101217 48%, #07080b 100%);
-      overflow-x: hidden;
-    }
-    a { color: inherit; }
-    .shell { position: relative; min-height: 100vh; isolation: isolate; overflow: hidden; }
-    .grid {
-      position: absolute;
-      inset: 0;
-      z-index: -3;
-      background-image:
-        linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px);
-      background-size: 42px 42px;
-      mask-image: linear-gradient(90deg, transparent, black 13%, black 87%, transparent);
-    }
-    .scan {
-      position: absolute;
-      inset: -30% -10%;
-      z-index: -2;
-      background:
-        linear-gradient(105deg, transparent 24%, rgba(72,224,208,0.16) 31%, transparent 39%),
-        linear-gradient(105deg, transparent 57%, rgba(167,139,250,0.14) 63%, transparent 70%);
-      animation: scan 11s linear infinite;
-    }
-    .mesh {
-      position: absolute;
-      inset: 0;
-      z-index: -1;
-      background:
-        radial-gradient(ellipse at 76% 18%, rgba(72,224,208,0.18), transparent 34%),
-        radial-gradient(ellipse at 18% 82%, rgba(255,122,144,0.12), transparent 30%);
-      opacity: 0.82;
-    }
-    .wrap {
-      width: min(1180px, calc(100vw - 40px));
-      min-height: 100vh;
-      margin: 0 auto;
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      gap: 28px;
-      padding: 28px 0;
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      animation: enter 700ms ease forwards;
-    }
-    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
-    .mark {
-      width: 44px;
-      height: 44px;
-      border-radius: 15px;
-      position: relative;
-      background: conic-gradient(from 210deg, var(--teal), var(--green), var(--amber), var(--teal));
-      box-shadow: 0 0 34px rgba(72, 224, 208, 0.24);
-      animation: breathe 3.6s ease-in-out infinite;
-      flex: 0 0 auto;
-    }
-    .mark::after {
-      content: "";
-      position: absolute;
-      inset: 11px;
-      border: 5px solid #05070b;
-      border-right-width: 7px;
-      border-radius: 9px 9px 9px 2px;
-      transform: skewY(-8deg);
-    }
-    .brand strong { display: block; font-size: 17px; line-height: 1.05; }
-    .brand span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
-    nav { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
-    .nav-link,
-    .cta {
-      min-height: 42px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 0 15px;
-      text-decoration: none;
-      font-size: 13px;
-      font-weight: 750;
-      background: rgba(255, 255, 255, 0.045);
-      backdrop-filter: blur(16px);
-      transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
-    }
-    .cta { color: #07100f; border-color: transparent; background: linear-gradient(135deg, var(--teal), var(--amber)); }
-    .nav-link:hover,
-    .cta:hover { transform: translateY(-2px); border-color: rgba(255,255,255,0.26); }
-    .hero {
-      display: grid;
-      grid-template-columns: minmax(0, 0.94fr) minmax(360px, 0.78fr);
-      align-items: center;
-      gap: clamp(30px, 6vw, 88px);
-    }
-    .copy {
-      max-width: 680px;
-      animation: enter 800ms 120ms ease forwards;
-    }
-    .kicker {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--teal);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-    }
-    .kicker::before {
-      content: "";
-      width: 42px;
-      height: 2px;
-      border-radius: 999px;
-      background: linear-gradient(90deg, var(--teal), transparent);
-    }
-    h1 {
-      margin: 22px 0 18px;
-      max-width: 760px;
-      font-size: clamp(54px, 9vw, 132px);
-      line-height: 0.84;
-      letter-spacing: 0;
-    }
-    .lead {
-      max-width: 620px;
-      margin: 0;
-      color: #c4cad4;
-      font-size: clamp(17px, 2vw, 22px);
-      line-height: 1.55;
-    }
-    .quick { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 30px; }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      min-height: 38px;
-      padding: 0 13px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.045);
-      color: #d7dbe2;
-      font-size: 13px;
-      white-space: nowrap;
-    }
-    .chip::before {
-      content: "";
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--green);
-      box-shadow: 0 0 18px rgba(122,245,155,.72);
-    }
-    .visual {
-      position: relative;
-      min-height: 520px;
-      animation: enter 850ms 240ms ease forwards;
-    }
-    .gateway {
-      position: absolute;
-      inset: 8% 3% 6% 3%;
-      border: 1px solid rgba(255,255,255,0.13);
-      border-radius: 34px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.09), transparent 38%), rgba(11, 13, 18, 0.78);
-      box-shadow: 0 34px 100px rgba(0,0,0,0.42);
-      overflow: hidden;
-      backdrop-filter: blur(22px);
-    }
-    .gateway::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(115deg, transparent 18%, rgba(72,224,208,0.14), transparent 44%);
-      transform: translateX(-55%);
-      animation: sheen 4.8s ease-in-out infinite;
-    }
-    .gateway-head {
-      position: relative;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 22px;
-      border-bottom: 1px solid rgba(255,255,255,0.10);
-    }
-    .state { color: var(--green); font-size: 12px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; }
-    .state::before {
-      content: "";
-      display: inline-block;
-      width: 9px;
-      height: 9px;
-      margin-right: 9px;
-      border-radius: 999px;
-      background: var(--green);
-      box-shadow: 0 0 20px rgba(122,245,155,.78);
-      animation: blink 1.8s ease-in-out infinite;
-    }
-    .port { color: var(--muted); font-size: 13px; }
-    .routes { position: relative; display: grid; gap: 12px; padding: 22px; }
-    .route {
-      display: grid;
-      grid-template-columns: 58px minmax(0, 1fr) auto;
-      gap: 14px;
-      align-items: center;
-      min-height: 68px;
-      padding: 12px;
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 18px;
-      background: rgba(255,255,255,0.045);
-      animation: route-in 650ms ease forwards;
-    }
-    .route:nth-child(2) { animation-delay: 120ms; }
-    .route:nth-child(3) { animation-delay: 240ms; }
-    .route:nth-child(4) { animation-delay: 360ms; }
-    .badge {
+      min-height: 100svh;
       display: grid;
       place-items: center;
-      width: 48px;
-      height: 44px;
-      border-radius: 14px;
-      color: #080b0f;
-      font-weight: 900;
-      font-size: 12px;
-      background: var(--teal);
+      padding: 48px 24px;
     }
-    .route:nth-child(2) .badge { background: var(--amber); }
-    .route:nth-child(3) .badge { background: var(--violet); color: white; }
-    .route:nth-child(4) .badge { background: var(--coral); color: white; }
-    .route div strong,
-    .route div span { display: block; min-width: 0; }
-    .route div strong { overflow-wrap: anywhere; font-size: 15px; line-height: 1.25; }
-    .route div span { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.35; }
-    .latency { color: var(--green); font-size: 12px; font-weight: 800; white-space: nowrap; }
-    .flow {
-      position: absolute;
-      left: 44px;
-      right: 44px;
-      bottom: 34px;
-      height: 88px;
+
+    .welcome {
       display: grid;
-      align-items: end;
-      opacity: 0.82;
+      justify-items: center;
+      gap: 48px;
+      width: min(100%, 900px);
+      text-align: center;
     }
-    .wire {
-      position: relative;
-      height: 2px;
-      background: linear-gradient(90deg, transparent, rgba(72,224,208,.75), transparent);
-      overflow: hidden;
+
+    h1 {
+      margin: 0;
+      color: #090d1a;
+      font-size: clamp(3.25rem, 7vw, 6rem);
+      font-weight: 760;
+      line-height: 0.98;
+      letter-spacing: -0.055em;
     }
-    .wire + .wire { margin-top: 18px; background: linear-gradient(90deg, transparent, rgba(255,209,102,.72), transparent); }
-    .wire::after {
-      content: "";
-      position: absolute;
-      top: -2px;
-      left: -18%;
-      width: 18%;
-      height: 6px;
-      border-radius: 999px;
-      background: white;
-      box-shadow: 0 0 18px currentColor;
-      animation: packet 2.4s linear infinite;
-    }
-    .wire:nth-child(2)::after { animation-delay: 650ms; }
-    .wire:nth-child(3)::after { animation-delay: 1.2s; }
-    footer {
+
+    nav {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 14px;
-      animation: enter 800ms 360ms ease forwards;
+      grid-template-columns: repeat(2, minmax(0, 254px));
+      gap: 24px;
+      width: min(100%, 532px);
     }
-    .fact {
-      min-height: 104px;
-      padding: 16px;
-      border-top: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent);
-      transition: transform 180ms ease, border-color 180ms ease;
+
+    a {
+      min-height: 84px;
+      display: inline-grid;
+      place-items: center;
+      padding: 20px 32px;
+      border: 2px solid #1557ff;
+      border-radius: 10px;
+      color: #1557ff;
+      background: #ffffff;
+      font-size: 1.25rem;
+      font-weight: 700;
+      line-height: 1;
+      text-decoration: none;
+      transition: transform 160ms ease, background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
     }
-    .fact:hover { transform: translateY(-4px); border-color: rgba(72,224,208,0.45); }
-    .fact strong { display: block; margin-bottom: 8px; font-size: 14px; }
-    .fact span { display: block; color: var(--muted); font-size: 13px; line-height: 1.42; }
-    @keyframes enter {
-      from { transform: translateY(10px); }
-      to { transform: translate(0, 0); }
+
+    a:first-child {
+      color: #ffffff;
+      background: #1557ff;
+      box-shadow: 0 10px 30px rgba(21, 87, 255, 0.18);
     }
-    @keyframes scan { from { transform: translateX(-18%); } to { transform: translateX(18%); } }
-    @keyframes breathe { 0%, 100% { transform: scale(1); filter: saturate(1); } 50% { transform: scale(1.04); filter: saturate(1.24); } }
-    @keyframes sheen { 0%, 20% { transform: translateX(-70%); } 65%, 100% { transform: translateX(70%); } }
-    @keyframes blink { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .42; transform: scale(.72); } }
-    @keyframes route-in { from { transform: translateX(8px); } to { transform: translateX(0); } }
-    @keyframes packet { to { left: 118%; } }
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 1ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 1ms !important;
+
+    a:hover { transform: translateY(-2px); }
+    a:first-child:hover { background: #0d49e8; }
+    a:last-child:hover { background: #f5f8ff; }
+
+    a:focus-visible {
+      outline: 4px solid rgba(21, 87, 255, 0.24);
+      outline-offset: 4px;
+    }
+
+    @media (max-width: 600px) {
+      main { padding: 32px 20px; }
+      .welcome { gap: 36px; }
+
+      h1 {
+        max-width: 9ch;
+        font-size: clamp(3rem, 16vw, 4.75rem);
       }
+
+      nav {
+        grid-template-columns: 1fr;
+        gap: 14px;
+        width: min(100%, 320px);
+      }
+
+      a { min-height: 68px; }
     }
-    @media (max-width: 920px) {
-      .wrap { width: min(100vw - 28px, 720px); padding: 22px 0; }
-      .hero { grid-template-columns: 1fr; align-items: start; gap: 22px; }
-      .visual { min-height: 430px; }
-      footer { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 560px) {
-      .wrap { width: calc(100vw - 20px); gap: 20px; padding: 18px 0; }
-      header { align-items: flex-start; flex-direction: column; }
-      nav { justify-content: flex-start; width: 100%; }
-      .nav-link, .cta { flex: 1 1 auto; min-width: 128px; }
-      h1 { font-size: clamp(48px, 18vw, 78px); }
-      .lead { font-size: 16px; }
-      .quick { margin-top: 22px; }
-      .chip { white-space: normal; }
-      .visual { min-height: 390px; }
-      .gateway { inset: 0; border-radius: 26px; }
-      .gateway-head, .routes { padding: 16px; }
-      .route { grid-template-columns: 46px minmax(0, 1fr); min-height: 72px; }
-      .badge { width: 40px; height: 38px; }
-      .latency { grid-column: 2; }
-      .flow { display: none; }
-      footer { grid-template-columns: 1fr; gap: 6px; }
-      .fact { min-height: 0; }
+
+    @media (prefers-reduced-motion: reduce) {
+      a { transition: none; }
+      a:hover { transform: none; }
     }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <div class="grid" aria-hidden="true"></div>
-    <div class="scan" aria-hidden="true"></div>
-    <div class="mesh" aria-hidden="true"></div>
-    <div class="wrap">
-      <header>
-        <div class="brand">
-          <div class="mark" aria-hidden="true"></div>
-          <div>
-            <strong>proxysss</strong>
-            <span>v__VERSION__ general gateway</span>
-          </div>
-        </div>
-        <nav aria-label="primary">
-          <a class="nav-link" href="/healthz">Health</a>
-          <a class="nav-link" href="/metrics">Metrics</a>
-          <a class="cta" href="/docs.html">Docs</a>
-        </nav>
-      </header>
-      <section class="hero" aria-label="Welcome to proxysss">
-        <div class="copy">
-          <div class="kicker">Welcome to proxysss</div>
-          <h1>Gateway ready.</h1>
-          <p class="lead">A single Rust binary for HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, FTP, WebDAV, static sites, and reverse proxy routing.</p>
-          <div class="quick" aria-label="runtime highlights">
-            <span class="chip">80 / 443 public edge</span>
-            <span class="chip">7777 loopback admin</span>
-            <span class="chip">YAML as source of truth</span>
-            <span class="chip">embedded TypeScript hooks</span>
-          </div>
-        </div>
-        <div class="visual" aria-hidden="true">
-          <div class="gateway">
-            <div class="gateway-head">
-              <span class="state">online</span>
-              <span class="port">edge :80 :443</span>
-            </div>
-            <div class="routes">
-              <div class="route"><span class="badge">TLS</span><div><strong>domain_routes</strong><span>SNI certificate selection plus host/path routing</span></div><span class="latency">live</span></div>
-              <div class="route"><span class="badge">H3</span><div><strong>http3 listener</strong><span>QUIC edge traffic with the same config surface</span></div><span class="latency">ready</span></div>
-              <div class="route"><span class="badge">TS</span><div><strong>script hooks</strong><span>Optional routing policy without a sidecar runtime</span></div><span class="latency">hot</span></div>
-              <div class="route"><span class="badge">IO</span><div><strong>static / dav / stream</strong><span>Gateway duties stay in the Rust data path</span></div><span class="latency">fast</span></div>
-            </div>
-            <div class="flow"><div class="wire"></div><div class="wire"></div><div class="wire"></div></div>
-          </div>
-        </div>
-      </section>
-      <footer aria-label="capabilities">
-        <div class="fact"><strong>Reverse proxy</strong><span>Host and path routing, upstream pools, forwarding headers, WebSocket upgrades.</span></div>
-        <div class="fact"><strong>TLS control</strong><span>Manual certificates, managed ACME, HTTP/2, HTTP/3, and SNI selection.</span></div>
-        <div class="fact"><strong>Hot reload</strong><span>Main YAML, extension script, plugins, routes, static sites, and WebDAV settings.</span></div>
-        <div class="fact"><strong>Agent friendly</strong><span>Readable config, inspectable CLI output, and loopback admin automation.</span></div>
-      </footer>
-    </div>
+  <main>
+    <section class="welcome" aria-labelledby="welcome-title">
+      <h1 id="welcome-title">Welcome to proxysss</h1>
+      <nav aria-label="Project links">
+        <a href="https://github.com/neko233-com/proxysss">GitHub</a>
+        <a href="https://neko233-com.github.io/proxysss/">GitHub Docs</a>
+      </nav>
+    </section>
   </main>
 </body>
 </html>

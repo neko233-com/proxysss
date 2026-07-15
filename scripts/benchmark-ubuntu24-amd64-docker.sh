@@ -15,6 +15,26 @@ FEEDBACK_START_SECS="$(date +%s)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Git Bash/MSYS rewrites Linux container paths such as /work into paths under
+# its own installation directory. Disable that implicit conversion at Docker
+# boundaries, while explicitly translating checkout-owned host paths.
+DOCKER_CLI_BIN="$(type -P docker || true)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    docker() {
+      local arg
+      local -a docker_args=()
+      for arg in "$@"; do
+        if [[ "$arg" == "$ROOT"* ]]; then
+          arg="$(cygpath -m "$ROOT")${arg#"$ROOT"}"
+        fi
+        docker_args+=("$arg")
+      done
+      MSYS2_ARG_CONV_EXCL='*' "$DOCKER_CLI_BIN" "${docker_args[@]}"
+    }
+    ;;
+esac
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "missing required command: $1" >&2

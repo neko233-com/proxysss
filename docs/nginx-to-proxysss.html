@@ -241,7 +241,7 @@
             <div class="kicker">Migration mindset</div>
             <h2>先记住该把配置写在哪里</h2>
           </div>
-          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 `reverse_proxy`、`domain_routes`、`static_sites` 还是 `tcp/udp listeners`。</p>
+          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 `reverse_proxy`、`domain_routes`、`static_sites` 还是 `tcp/udp listeners`。没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 route/static site。</p>
         </div>
 
         <table>

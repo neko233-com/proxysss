@@ -12,27 +12,26 @@ cd "$repo_root"
 docker build -f docker/ubuntu24-bench.Dockerfile -t "$image" .
 
 docker run --rm \
+  -e CARGO_TARGET_DIR=/target \
+  -v proxysss-scenario-target:/target \
   -v "$repo_root:/work" \
   -w /work \
   "$image" \
   bash -lc "
     set -euo pipefail
-    # Focused Rust checks protect the newly declared scenario surfaces without
-    # turning default GitHub CI back into a full test/smoke pipeline.
-    cargo test --locked static_site_serves_byte_ranges -- --nocapture
-    cargo test --locked static_site_rejects_unsatisfiable_byte_range -- --nocapture
-    cargo test --locked service_discovery_accepts_registry_mappings -- --nocapture
-    cargo test --locked validate_rejects_unknown_service_discovery_registry -- --nocapture
-    cargo test --locked integration_deep_static_site_supports_range_downloads -- --nocapture
+    # One full pass covers the scenario surfaces and avoids repeated Linux
+    # recompilation when the checkout is bind-mounted from Windows.
+    cargo test --locked
 
     # Build the CLI once, then validate that the broad scenario sample is both
     # syntactically valid and visible through agent-friendly inspection commands.
     cargo build --locked
-    ./target/debug/proxysss -config $config check-config
-    ./target/debug/proxysss -config $config config explain | tee /tmp/proxysss-explain.txt
-    ./target/debug/proxysss -config $config config routes | tee /tmp/proxysss-routes.txt
-    ./target/debug/proxysss config capabilities | tee /tmp/proxysss-capabilities.txt
-    ./target/debug/proxysss config nginx-parity --format yaml | tee /tmp/proxysss-nginx-parity.yaml
+    proxysss_bin=/target/debug/proxysss
+    \$proxysss_bin -config $config check-config
+    \$proxysss_bin -config $config config explain | tee /tmp/proxysss-explain.txt
+    \$proxysss_bin -config $config config routes | tee /tmp/proxysss-routes.txt
+    \$proxysss_bin config capabilities | tee /tmp/proxysss-capabilities.txt
+    \$proxysss_bin config nginx-parity --format yaml | tee /tmp/proxysss-nginx-parity.yaml
 
     # Grep the exact operator-facing surfaces that must not regress silently:
     # static Range, discovery mappings, WAF/plugin boundary, CDN/IPv6, and the

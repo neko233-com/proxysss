@@ -5515,7 +5515,7 @@ impl Gateway {
             self.acme_tls_alpn_certs.clone(),
             self.on_demand_certs.clone(),
             self.on_demand_trigger.clone(),
-            vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
+            default_tls_alpn_protocols(),
         )?));
         let base_worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
         let max_worker_count =
@@ -13114,6 +13114,13 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
     Ok(())
 }
 
+fn default_tls_alpn_protocols() -> Vec<Vec<u8>> {
+    // ACME TLS-ALPN must remain available for certificate automation. Normal
+    // clients do not offer it, so h2 is their first mutually supported
+    // protocol and HTTP/1.1 remains the compatibility fallback.
+    vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()]
+}
+
 fn build_rustls_server_config(
     config: &GatewayConfig,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
@@ -19438,7 +19445,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
     <header class="hero">
       <div class="eyebrow">proxysss docs / human first</div>
       <h1>先复制成功，再看完整能力面。</h1>
-      <p class="lead">这页内建文档同时服务两类人：新手要能在几分钟内跑起一个站点；高手要能立刻找到路由面、TLS、AI SSE、TCP/UDP、reload 和运维边界，不需要先看一屏宣传。</p>
+      <p class="lead">这页内建文档同时服务两类人：新手要能在几分钟内跑起一个站点；高手要能立刻找到路由面、TLS、AI SSE、TCP/UDP、reload 和运维边界，不需要先看一屏宣传。默认 `/` 是只含 GitHub 与 GitHub Docs 的零外部资源 fallback，用户路由优先；默认 443 普通客户端优先协商 HTTP/2。</p>
       <div class="meta">
         <div class="meta-item">
           <div class="meta-label">Default HTTP</div>
@@ -24634,14 +24641,24 @@ mod tests {
         let config = GatewayConfig::default();
         let html = render_welcome_html(&config);
         assert!(html.contains("Welcome to proxysss"));
-        assert!(html.contains("<h1>Gateway ready.</h1>"));
-        assert!(html.contains("animation:"));
-        assert!(html.contains("@keyframes"));
+        assert!(html.contains("https://github.com/neko233-com/proxysss"));
+        assert!(html.contains("https://neko233-com.github.io/proxysss/"));
+        assert!(html.contains(">GitHub</a>"));
+        assert!(html.contains(">GitHub Docs</a>"));
         assert!(!html.contains("<script"));
-        assert!(html.contains("/docs.html"));
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));
-        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!html.contains("Gateway ready."));
+        assert!(!html.contains("general gateway"));
+        assert!(!html.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn default_tls_alpn_prefers_http2_for_normal_clients() {
+        let protocols = default_tls_alpn_protocols();
+        assert_eq!(protocols[0], b"acme-tls/1");
+        assert_eq!(protocols[1], b"h2");
+        assert_eq!(protocols[2], b"http/1.1");
     }
 
     #[test]

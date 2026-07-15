@@ -233,7 +233,7 @@
             <div class="kicker">Migration mindset</div>
             <h2>先理解 Caddy 和 proxysss 的思路差别</h2>
           </div>
-          <p class="subtle">`Caddy` 的强项是上手快和自动 HTTPS；`proxysss` 的目标是把 nginx 级网关能力放进一套更容易维护的单文件 YAML。</p>
+          <p class="subtle">`Caddy` 的强项是上手快和自动 HTTPS；`proxysss` 的目标是把 nginx 级网关能力放进一套更容易维护的单文件 YAML。没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 static site/route。</p>
         </div>
 
         <table>
