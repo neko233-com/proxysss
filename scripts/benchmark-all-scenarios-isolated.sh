@@ -526,6 +526,7 @@ start_gateway() {
   if [[ "$kind" == "proxysss" ]]; then
     docker create --name "$name" --network "$NETWORK" --ip "$gateway_ip" \
       --platform "$BENCH_PLATFORM" \
+      --cap-add PERFMON --security-opt seccomp=unconfined \
       --cpuset-cpus "$GATEWAY_CPUSET" ${memory_arg:+"$memory_arg"} \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       "${GATEWAY_SYSCTL_ARGS[@]}" \
