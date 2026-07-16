@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
+use memchr::memmem;
 use tokio::sync::oneshot;
 
 const REGISTRATION_QUEUE_CAPACITY: usize = 131_072;
@@ -327,21 +328,16 @@ fn prepare_next(
     if connection.pending {
         return true;
     }
-    let head_end = connection.exact_request_head.len();
-    if connection.input.len() < head_end {
+    let Some(head_end) = memmem::find(&connection.input, b"\r\n\r\n").map(|index| index + 4) else {
         return connection.input.len() < MAX_HEAD_BYTES;
-    }
+    };
     if connection.config_epoch.load(Ordering::Acquire) != connection.expected_epoch
         || connection.input[..head_end] != *connection.exact_request_head
         || !file_is_current(connection, file_observations)
     {
         return fallback(connection);
     }
-    if connection.input.len() == head_end {
-        connection.input.clear();
-    } else {
-        connection.input.drain(..head_end);
-    }
+    connection.input.drain(..head_end);
     connection.pending = true;
     connection.head_offset = 0;
     connection.body_offset = 0;
