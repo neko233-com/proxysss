@@ -13,7 +13,6 @@
 - Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
 - Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
 - Bounded the default-small TLS crypto runtime to one owner per four detected CPUs and its UDP/QCP runtime to one owner per two CPUs, preserving full-CPU `SO_REUSEPORT` listener fanout and adaptive scaling while reducing mixed-traffic scheduler contention.
-- Removed unused Tokio process/signal/stdio runtime features; proxysss uses synchronous OS process control, so plain HTTP reactors no longer scan Tokio's orphan-process queue while parking between socket events.
 
 ## v1.3.5 - 2026-07-01
 
