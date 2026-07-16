@@ -21,6 +21,8 @@ import (
 	"time"
 )
 
+const realtimeCompletionGuardMicros int64 = 1_000
+
 type BenchRow struct {
 	Scenario        string   `json:"scenario,omitempty"`
 	Gateway         string   `json:"gateway,omitempty"`
@@ -913,9 +915,15 @@ func runWriteEqualLoadPlan(args []string) error {
 			scheduledTotal = (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
 		} else {
 			// Realtime workers intentionally tick together. Their first operation
-			// is one full interval after measurement_start, so only whole
-			// per-connection ticks strictly before the deadline are executable.
-			scheduledTotal = ((durationMicros - 1) / intervalMicros) * int64(concurrency)
+			// is one full interval after measurement_start. Reserve one
+			// millisecond for the final bounded round trip: a slot 200-900 us
+			// before the hard deadline is schedulable but cannot reliably finish
+			// inside a one-second sample on either gateway.
+			executableMicros := durationMicros - realtimeCompletionGuardMicros
+			if executableMicros < 1 {
+				executableMicros = 1
+			}
+			scheduledTotal = ((executableMicros - 1) / intervalMicros) * int64(concurrency)
 		}
 		if scheduledTotal < 1 {
 			scheduledTotal = 1

@@ -229,6 +229,31 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	}
 }
 
+func TestEqualLoadPlanReservesRealtimeCompletionGuard(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "qcp-transparent", Gateway: "nginx", Protocol: "udp", Concurrency: 64, OpsPerSec: 8964},
+		{Scenario: "qcp-transparent", Gateway: "proxysss", Protocol: "udp", Concurrency: 64, OpsPerSec: 12000},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|2176.000000\n") {
+		t.Fatalf("realtime target must leave one millisecond for final completion: %s", raw)
+	}
+}
+
 func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "saturation.json")

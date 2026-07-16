@@ -1560,6 +1560,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const SHARDED_PLAIN_HTTP_EVENT_INTERVAL: u32 = 8;
 // HTTP/2 stream futures are deliberately driven inside their owning
 // connection to avoid one Tokio task allocation per small response. Yield
 // after every completed stream even on the bounded balanced runtime: larger
@@ -1618,7 +1619,7 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
                         .worker_threads(1)
                         .thread_name(format!("proxysss-http-{worker_index}"))
                         .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                        .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                        .event_interval(SHARDED_PLAIN_HTTP_EVENT_INTERVAL)
                         .on_thread_start(move || pin_current_data_plane_thread(worker_index))
                         .enable_all();
                     builder
@@ -12511,14 +12512,17 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 1,
     }
 }
@@ -24462,7 +24466,7 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!sendfile_reactor_profile_enabled(
+        assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
@@ -24470,8 +24474,9 @@ mod tests {
         ));
         assert_eq!(
             sendfile_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
+        assert_eq!(SHARDED_PLAIN_HTTP_EVENT_INTERVAL, 8);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
             3
