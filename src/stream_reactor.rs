@@ -29,7 +29,11 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // batch boundaries instead of relying on coarse CFS weighting.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const QUIET_REPLY_SPIN_POLLS: usize = 4;
+const QUIET_REPLY_SPIN_LOW_POLLS: usize = 1;
+const QUIET_REPLY_SPIN_MID_POLLS: usize = 2;
+const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 4;
+const QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER: usize = 16;
+const QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER: usize = 32;
 const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 48;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
@@ -121,6 +125,16 @@ enum RelayReadOutcome {
 
 fn quiet_reply_spin_enabled(blocked_wait: bool, downstream: bool, pair_count: usize) -> bool {
     blocked_wait && downstream && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER
+}
+
+fn quiet_reply_spin_polls(pair_count: usize) -> usize {
+    if pair_count <= QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER {
+        QUIET_REPLY_SPIN_LOW_POLLS
+    } else if pair_count <= QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER {
+        QUIET_REPLY_SPIN_MID_POLLS
+    } else {
+        QUIET_REPLY_SPIN_HIGH_POLLS
+    }
 }
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
@@ -335,10 +349,11 @@ fn run_reactor(
                 ACTIVE_SPIN_POLLS
             } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
                 // Fixed-rate game/WebSocket ticks commonly block before the
-                // client request arrives. Four bounded nonblocking epoll passes
-                // catch replies that land just after the request write. A reply
-                // event never schedules another spin, bounding syscall/CFS cost.
-                QUIET_REPLY_SPIN_POLLS
+                // client request arrives. Scale one/two/four nonblocking epoll
+                // passes with owner density so sparse traffic pays one syscall,
+                // while denser owners can catch replies landing just after the
+                // request write. Reply events never schedule another spin.
+                quiet_reply_spin_polls(pair_count)
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 DENSE_SPIN_POLLS
             } else {
@@ -723,7 +738,11 @@ mod tests {
     #[test]
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
-        assert_eq!(QUIET_REPLY_SPIN_POLLS, 4);
+        assert_eq!(quiet_reply_spin_polls(16), 1);
+        assert_eq!(quiet_reply_spin_polls(17), 2);
+        assert_eq!(quiet_reply_spin_polls(32), 2);
+        assert_eq!(quiet_reply_spin_polls(33), 4);
+        assert_eq!(quiet_reply_spin_polls(48), 4);
         assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 48);
         assert!(quiet_reply_spin_enabled(true, true, 48));
         assert!(!quiet_reply_spin_enabled(true, false, 48));

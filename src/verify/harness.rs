@@ -112,12 +112,15 @@ load_balance:
     )
 }
 
-pub async fn spawn_json_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> {
+pub async fn spawn_json_echo_upstream(port: u16) -> Result<tokio::task::JoinHandle<()>> {
     let bind = format!("127.0.0.1:{port}");
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(&bind)
-            .await
-            .expect("bind json echo upstream");
+    // Bind before returning so callers can start the gateway immediately.
+    // Spawning first left a scheduler race where a parallel Docker test could
+    // occupy the reserved port or proxy traffic before the mock was listening.
+    let listener = TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("failed binding json echo upstream {bind}"))?;
+    Ok(tokio::spawn(async move {
         loop {
             let Ok((stream, remote_addr)) = listener.accept().await else {
                 break;
@@ -212,7 +215,7 @@ pub async fn spawn_json_echo_upstream(port: u16) -> tokio::task::JoinHandle<()> 
                     .await;
             });
         }
-    })
+    }))
 }
 
 pub async fn spawn_sse_hold_upstream(port: u16) -> tokio::task::JoinHandle<()> {

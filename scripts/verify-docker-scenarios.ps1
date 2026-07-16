@@ -21,9 +21,22 @@ Push-Location $repoRoot
 try {
     # Build the same Ubuntu 24 toolchain image used by the Linux benchmark
     # helpers, so scenario validation runs in a production-like Linux family.
-    docker build -f docker/ubuntu24-bench.Dockerfile -t $Image .
-    if ($LASTEXITCODE -ne 0) {
-        throw "Docker scenario image build failed with exit code $LASTEXITCODE"
+    if ($env:REUSE_VERIFY_IMAGE -eq "1") {
+        docker image inspect $Image *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "REUSE_VERIFY_IMAGE=1 but local image does not exist: $Image"
+        }
+        $probe = docker run --rm $Image bash -lc 'source /etc/os-release; printf "%s %s %s" "$ID" "$VERSION_ID" "$(uname -m)"'
+        if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne "ubuntu 24.04 x86_64") {
+            throw "cached scenario image must be Ubuntu 24.04 x86_64; detected: $probe"
+        }
+        Write-Host "reusing verified local Ubuntu 24 scenario image: $Image"
+    }
+    else {
+        docker build -f docker/ubuntu24-bench.Dockerfile -t $Image .
+        if ($LASTEXITCODE -ne 0) {
+            throw "Docker scenario image build failed with exit code $LASTEXITCODE"
+        }
     }
 
     # Keep the command body in one bash script inside the container. That avoids

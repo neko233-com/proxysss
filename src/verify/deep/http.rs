@@ -129,7 +129,7 @@ async fn integration_deep_reverse_proxy_strip_prefix_and_host() -> Result<()> {
     let root = temp_root("proxysss-deep-proxy");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let yaml = format!(
@@ -162,7 +162,7 @@ async fn integration_deep_domain_route_matches_host() -> Result<()> {
     let root = temp_root("proxysss-deep-domain");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let yaml = format!(
@@ -203,7 +203,7 @@ async fn integration_deep_cache_sets_x_cache_header() -> Result<()> {
     let root = temp_root("proxysss-deep-cache");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let yaml = format!(

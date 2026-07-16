@@ -13,7 +13,7 @@ async fn integration_e2e_http_reverse_proxy_roundtrip() -> Result<()> {
     let root = temp_root("proxysss-e2e-http");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config_path = write_config(
@@ -73,7 +73,7 @@ async fn integration_e2e_http_reverse_proxy_plain_fast_lane_keeps_forwarding_hea
     let root = temp_root("proxysss-e2e-http-forwarding");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config_path = write_config(
@@ -225,7 +225,7 @@ async fn integration_e2e_ai_proxy_raw_sse_fast_lane_keeps_forwarding_and_metadat
     let root = temp_root("proxysss-e2e-ai-sse-headers");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config_path = write_config(
@@ -296,7 +296,7 @@ async fn integration_e2e_https_http2_reverse_proxy_roundtrip() -> Result<()> {
     let root = temp_root("proxysss-e2e-https-h2");
     let upstream_port = reserve_port().await?;
     let gateway_port = reserve_port().await?;
-    let _upstream = spawn_json_echo_upstream(upstream_port).await;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let cert_path = root.join("proxysss-test.crt");
     let key_path = root.join("proxysss-test.key");
