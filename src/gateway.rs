@@ -11968,7 +11968,7 @@ fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> boo
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Small => 4,
         RuntimePerformanceTrafficProfile::Balanced => 8,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
@@ -23786,7 +23786,7 @@ mod tests {
         ));
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            1
+            4
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
