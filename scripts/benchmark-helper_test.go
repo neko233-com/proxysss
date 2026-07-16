@@ -254,6 +254,31 @@ func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	}
 }
 
+func TestEqualLoadPlanAllowsTargetBelowConnectionCount(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "static-large", Gateway: "nginx", Concurrency: 32, OpsPerSec: 64},
+		{Scenario: "static-large", Gateway: "proxysss", Concurrency: 32, OpsPerSec: 96},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|16.000000\n") {
+		t.Fatalf("low-rate target must not force all 32 connections to run: %s", raw)
+	}
+}
+
 func TestAllScenariosEqualLoadGateRequiresTargetCompletion(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "equal-load.json")

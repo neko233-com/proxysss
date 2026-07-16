@@ -567,10 +567,11 @@ where
 /// cannot monopolize the runtime that also services game/WebSocket sessions.
 const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
 // Socket readiness and Tokio's cooperative budget already bound a hot relay.
-// Reuse the normal relay budget so a short queue of WebSocket frames drains
-// before parking instead of self-waking every few frames and creating a p99
-// scheduler step under mixed fixed-rate traffic.
-const WEBSOCKET_RELAY_POLL_STEPS: usize = MAX_POOLED_RELAY_POLL_STEPS;
+// A normal WebSocket echo frame needs one read and one write. Three polls let
+// that frame drain and then naturally park on readiness, while preventing a
+// continuously readable tunnel from consuming the normal 64-step bulk relay
+// budget on the shared small-profile data runtime.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = 3;
 
 struct PooledRelayCopyBuffer<
     const MAX_POLL_STEPS: usize,
@@ -1517,7 +1518,12 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
-const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 256;
+// A shard with roughly one runnable connection per scheduler lane is still
+// low-density. Once dozens of keep-alive connections compete per worker, a
+// 256-response run lets hot static sockets queue unrelated HTTP, TLS and
+// realtime I/O for multiple milliseconds. Switch to the bounded batch before
+// that mixed-load knee while preserving the lower-overhead 1x path.
+const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = false;
@@ -10996,7 +11002,7 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
         .http2()
         .timer(timer)
-        .adaptive_window(true)
+        .adaptive_window(false)
         .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
         .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
         .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
@@ -11011,7 +11017,7 @@ fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
     let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
     builder
         .timer(TokioTimer::new())
-        .adaptive_window(true)
+        .adaptive_window(false)
         .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
         .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
         .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
@@ -24034,8 +24040,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(2_047, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(2_048, 8), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(511, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 32);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),

@@ -909,10 +909,21 @@ func runWriteEqualLoadPlan(args []string) error {
 		// asymptotic fractional target that is mathematically unreachable in a
 		// one-second feedback window.
 		scheduledPerConnection := int64(*durationSecs) * 1_000_000 / intervalMicros
+		var actualTarget float64
 		if scheduledPerConnection < 1 {
-			scheduledPerConnection = 1
+			// When the desired rate is below one operation per connection in a
+			// short sample, workers are phase-offset across the interval. Do
+			// not claim that every connection must complete once: that makes
+			// the target exceed the requested fixed rate and is impossible for
+			// large transfers near the sample boundary.
+			scheduledTotal := int64(math.Floor(desiredOps * float64(*durationSecs)))
+			if scheduledTotal < 1 {
+				scheduledTotal = 1
+			}
+			actualTarget = float64(scheduledTotal) / float64(*durationSecs)
+		} else {
+			actualTarget = float64(scheduledPerConnection*int64(concurrency)) / float64(*durationSecs)
 		}
-		actualTarget := float64(scheduledPerConnection*int64(concurrency)) / float64(*durationSecs)
 		lines = append(lines, fmt.Sprintf("%s|%d|%.6f", scenario, intervalMicros, actualTarget))
 	}
 	if len(lines) == 0 {
