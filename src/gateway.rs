@@ -2002,11 +2002,62 @@ struct CachedStaticFile {
     len: u64,
     modified: Option<SystemTime>,
     body: Bytes,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
     content_type: HeaderValue,
     content_length: HeaderValue,
     http1_keep_alive_response: Option<Bytes>,
     freshness: Arc<StaticCacheFreshness>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct StaticSendfilePool {
+    idle: ArrayQueue<std::fs::File>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl StaticSendfilePool {
+    fn new(file: std::fs::File) -> Self {
+        let capacity = adaptive_data_plane_workers(1)
+            .saturating_mul(8)
+            .clamp(1, 256);
+        Self::with_capacity(file, capacity)
+    }
+
+    fn with_capacity(file: std::fs::File, capacity: usize) -> Self {
+        let idle = ArrayQueue::new(capacity);
+        idle.push(file)
+            .expect("new static sendfile descriptor pool has capacity");
+        Self { idle }
+    }
+
+    fn checkout(&self, path: &Path) -> Result<std::fs::File> {
+        self.idle.pop().map_or_else(
+            || {
+                std::fs::File::open(path).with_context(|| {
+                    format!("failed opening static file for sendfile {}", path.display())
+                })
+            },
+            Ok,
+        )
+    }
+
+    fn checkin(&self, file: std::fs::File) {
+        let _ = self.idle.push(file);
+    }
+
+    fn prewarm(&self, path: &Path) -> usize {
+        let mut opened = 0;
+        while self.idle.len() < self.idle.capacity() {
+            let Ok(file) = std::fs::File::open(path) else {
+                break;
+            };
+            if self.idle.push(file).is_err() {
+                break;
+            }
+            opened += 1;
+        }
+        opened
+    }
 }
 
 #[derive(Clone)]
@@ -5214,7 +5265,7 @@ impl Gateway {
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
-                let force_yield = yield_after_sendfile_response && cached.sendfile;
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5411,7 +5462,7 @@ impl Gateway {
                 .as_ref()
                 .filter(|cached| cached.matches(&request))
             {
-                let force_yield = yield_after_sendfile_response && cached.sendfile;
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5471,7 +5522,7 @@ impl Gateway {
                 // Keep the already-serialized response instead of making all
                 // keep-alive connections rebuild it on the same TTL boundary.
                 cached.checked_at = Instant::now();
-                let force_yield = yield_after_sendfile_response && cached.sendfile;
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5531,9 +5582,9 @@ impl Gateway {
                     body: candidate.cached_body.clone(),
                     file_path: candidate.path.clone(),
                     len: candidate.len,
-                    sendfile: candidate.sendfile.is_some(),
+                    sendfile: candidate.sendfile.clone(),
                 };
-                let force_yield = yield_after_sendfile_response && cached.sendfile;
+                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -11341,7 +11392,7 @@ struct StaticFastPathCandidate {
     content_type: &'static str,
     cached_body: Option<Bytes>,
     combined_response: Option<Bytes>,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
 }
 
 struct ConnectionStaticFastPathCache {
@@ -11355,7 +11406,7 @@ struct ConnectionStaticFastPathCache {
     body: Option<Bytes>,
     file_path: PathBuf,
     len: u64,
-    sendfile: bool,
+    sendfile: Option<Arc<StaticSendfilePool>>,
 }
 
 impl ConnectionStaticFastPathCache {
@@ -11389,7 +11440,11 @@ impl ConnectionStaticFastPathCache {
                 (Some(current), Some(candidate)) => {
                     current.len() == candidate.len() && current.as_ptr() == candidate.as_ptr()
                 }
-                (None, None) => self.sendfile == candidate.sendfile.is_some(),
+                (None, None) => match (&self.sendfile, &candidate.sendfile) {
+                    (Some(current), Some(candidate)) => Arc::ptr_eq(current, candidate),
+                    (None, None) => true,
+                    _ => false,
+                },
                 _ => false,
             }
     }
@@ -12057,7 +12112,7 @@ async fn send_connection_static_fast_path(
                 stream,
                 &cached.file_path,
                 cached.len,
-                None,
+                cached.sendfile.clone(),
                 cooperative_mid_yield,
             )
             .await
@@ -12078,21 +12133,25 @@ async fn send_static_file_fast(
     stream: &mut TcpStream,
     path: &Path,
     _len: u64,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let file = match sendfile {
-            Some(file) => file,
-            None => Arc::new(
+        let (file, pool) = match sendfile {
+            Some(pool) => (pool.checkout(path)?, Some(pool)),
+            None => (
                 std::fs::File::open(path).context("failed opening static file for sendfile")?,
+                None,
             ),
         };
-        sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
+        let result = sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
             .await
-            .context("sendfile static response failed")?;
-        Ok(())
+            .context("sendfile static response failed");
+        if let Some(pool) = pool {
+            pool.checkin(file);
+        }
+        result.map(|_| ())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -18891,33 +18950,34 @@ fn cached_static_sendfile(
     target: &Path,
     metadata: &std::fs::Metadata,
     static_file_cache: &DashMap<String, CachedStaticFile>,
-) -> Result<Arc<std::fs::File>> {
+) -> Result<Arc<StaticSendfilePool>> {
     let key = target.to_string_lossy().to_string();
     let modified = metadata.modified().ok();
     if let Some(entry) = static_file_cache.get(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
             entry.freshness.mark_checked();
-            if let Some(file) = &entry.sendfile {
-                return Ok(file.clone());
+            if let Some(pool) = &entry.sendfile {
+                return Ok(pool.clone());
             }
         }
     }
 
-    let file = Arc::new(std::fs::File::open(target).with_context(|| {
+    let file = std::fs::File::open(target).with_context(|| {
         format!(
             "failed opening static file for sendfile {}",
             target.display()
         )
-    })?);
+    })?;
+    let pool = Arc::new(StaticSendfilePool::new(file));
     if let Some(mut entry) = static_file_cache.get_mut(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
             entry.freshness.mark_checked();
-            entry.sendfile = Some(file.clone());
-            return Ok(file);
+            entry.sendfile = Some(pool.clone());
+            return Ok(pool);
         }
     }
     if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
-        return Ok(file);
+        return Ok(pool);
     }
     static_file_cache.insert(
         key,
@@ -18925,7 +18985,7 @@ fn cached_static_sendfile(
             len: metadata.len(),
             modified,
             body: Bytes::new(),
-            sendfile: Some(file.clone()),
+            sendfile: Some(pool.clone()),
             content_type: HeaderValue::from_static(static_content_type(target)),
             content_length: HeaderValue::from_str(&metadata.len().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
@@ -18933,7 +18993,7 @@ fn cached_static_sendfile(
             freshness: Arc::new(StaticCacheFreshness::new()),
         },
     );
-    Ok(file)
+    Ok(pool)
 }
 
 async fn preload_static_site_fast_lane_cache(
@@ -18997,7 +19057,8 @@ async fn preload_static_site_fast_lane_cache(
                 preloaded = preloaded.saturating_add(1);
             }
         } else if should_cache_sendfile {
-            cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            let pool = cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            pool.prewarm(&target);
             preloaded = preloaded.saturating_add(1);
         }
     }
@@ -23493,7 +23554,9 @@ mod tests {
         ));
         std::fs::write(&path, b"sendfile-data").expect("write sendfile fixture");
         let metadata = std::fs::metadata(&path).expect("sendfile metadata");
-        let file = Arc::new(std::fs::File::open(&path).expect("open sendfile fixture"));
+        let pool = Arc::new(StaticSendfilePool::new(
+            std::fs::File::open(&path).expect("open sendfile fixture"),
+        ));
         let key = path.to_string_lossy().to_string();
         let cache = DashMap::new();
         let freshness = Arc::new(StaticCacheFreshness::new());
@@ -23508,7 +23571,7 @@ mod tests {
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
                 body: Bytes::new(),
-                sendfile: Some(file.clone()),
+                sendfile: Some(pool.clone()),
                 content_type: HeaderValue::from_static("application/octet-stream"),
                 content_length: HeaderValue::from_str(&metadata.len().to_string())
                     .expect("content length"),
@@ -23519,12 +23582,39 @@ mod tests {
 
         let refreshed =
             cached_static_sendfile(&path, &metadata, &cache).expect("revalidate sendfile entry");
-        assert!(Arc::ptr_eq(&file, &refreshed));
+        assert!(Arc::ptr_eq(&pool, &refreshed));
         let entry = cache.get(&key).expect("cached sendfile entry");
         assert!(entry.body.is_empty());
         assert!(!entry.freshness.revalidating.load(Ordering::Relaxed));
         drop(entry);
         std::fs::remove_file(path).expect("remove sendfile fixture");
+    }
+
+    #[test]
+    fn static_sendfile_pool_prewarms_reuses_and_bounds_descriptors() {
+        let path =
+            std::env::temp_dir().join(format!("proxysss-sendfile-pool-{}.bin", std::process::id()));
+        std::fs::write(&path, b"sendfile-pool-data").expect("write sendfile pool fixture");
+        let pool = StaticSendfilePool::with_capacity(
+            std::fs::File::open(&path).expect("open initial sendfile pool fixture"),
+            3,
+        );
+
+        assert_eq!(pool.prewarm(&path), 2);
+        assert_eq!(pool.idle.len(), 3);
+        let first = pool.checkout(&path).expect("checkout first descriptor");
+        let second = pool.checkout(&path).expect("checkout second descriptor");
+        let third = pool.checkout(&path).expect("checkout third descriptor");
+        assert_eq!(pool.idle.len(), 0);
+        let overflow = pool.checkout(&path).expect("open overflow descriptor");
+
+        pool.checkin(first);
+        pool.checkin(second);
+        pool.checkin(third);
+        pool.checkin(overflow);
+        assert_eq!(pool.idle.len(), 3);
+        drop(pool);
+        std::fs::remove_file(path).expect("remove sendfile pool fixture");
     }
 
     #[test]
