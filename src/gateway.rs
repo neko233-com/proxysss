@@ -12019,7 +12019,7 @@ fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
 #[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Small => 2,
         RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
@@ -23836,7 +23836,7 @@ mod tests {
         assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
-            0
+            2
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
