@@ -1515,7 +1515,7 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 const STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -12312,7 +12312,13 @@ async fn sendfile_all_async(
             in_fd,
             0,
             len,
-            sendfile_reactor_job_chunk_bytes(reactor_adaptive, len, max_chunk_bytes),
+            sendfile_reactor_job_chunk_bytes(
+                reactor_adaptive,
+                len,
+                max_chunk_bytes,
+                active_transfers,
+                data_plane_cores,
+            ),
             sendfile_reactor_workers,
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
@@ -12430,8 +12436,16 @@ fn sendfile_reactor_should_dispatch(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn sendfile_reactor_job_chunk_bytes(adaptive: bool, len: u64, max_chunk_bytes: u64) -> u64 {
-    if adaptive {
+fn sendfile_reactor_job_chunk_bytes(
+    adaptive: bool,
+    len: u64,
+    max_chunk_bytes: u64,
+    active_transfers: usize,
+    data_plane_cores: usize,
+) -> u64 {
+    if adaptive && active_transfers <= data_plane_cores.max(1).saturating_mul(2) {
+        len.min(max_chunk_bytes.clamp(1, STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES))
+    } else if adaptive {
         len.max(1)
     } else {
         max_chunk_bytes.max(1)
@@ -24707,11 +24721,15 @@ mod tests {
         assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
         assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
         assert_eq!(
-            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024, 16, 8,),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024, 17, 8,),
             32 * 1024 * 1024
         );
         assert_eq!(
-            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024, 16, 8,),
             16 * 1024 * 1024
         );
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);

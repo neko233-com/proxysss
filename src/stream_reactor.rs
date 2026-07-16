@@ -31,7 +31,7 @@ const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 const QUIET_REPLY_SPIN_LOW_POLLS: usize = 1;
 const QUIET_REPLY_SPIN_MID_POLLS: usize = 2;
-const QUIET_REPLY_WAIT_HIGH_NANOS: i64 = 50_000;
+const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 8;
 const QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER: usize = 16;
 const QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER: usize = 32;
 const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
@@ -133,17 +133,7 @@ fn quiet_reply_spin_polls(pair_count: usize) -> usize {
     } else if pair_count <= QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER {
         QUIET_REPLY_SPIN_MID_POLLS
     } else {
-        0
-    }
-}
-
-fn quiet_reply_wait_nanos(pair_count: usize) -> i64 {
-    if pair_count > QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER
-        && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER
-    {
-        QUIET_REPLY_WAIT_HIGH_NANOS
-    } else {
-        0
+        QUIET_REPLY_SPIN_HIGH_POLLS
     }
 }
 
@@ -312,17 +302,13 @@ fn run_reactor(
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut active_spin_polls = 0_usize;
-    let mut reply_wait_nanos = 0_i64;
     let mut continuous_batches = 0_usize;
 
     loop {
-        let timed_reply_wait = std::mem::take(&mut reply_wait_nanos);
         let timeout = if active_spin_polls > 0 { 0 } else { -1 };
         let wait_started = Instant::now();
-        let ready = if timed_reply_wait > 0 {
-            epoll_wait_nanos(epoll_fd, &mut events, timed_reply_wait)
-        } else {
-            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, timeout) }
+        let ready = unsafe {
+            libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, timeout)
         };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -332,9 +318,7 @@ fn run_reactor(
         }
         if ready == 0 {
             active_spin_polls = active_spin_polls.saturating_sub(1);
-            if timed_reply_wait == 0 {
-                std::hint::spin_loop();
-            }
+            std::hint::spin_loop();
             continue;
         }
         active_spin_polls = 0;
@@ -367,11 +351,10 @@ fn run_reactor(
             } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
                 // Fixed-rate game/WebSocket ticks commonly block before the
                 // client request arrives. Sparse owners use one/two immediate
-                // probes. Dense owners enter one short, interruptible epoll
-                // wait: any socket wakes it, so the backend scheduling gap is
-                // covered without burning a gateway CPU on dozens of syscalls.
+                // probes. Dense owners use eight: enough to cover the short
+                // backend scheduling gap without restoring the rejected
+                // 32-poll loop that starved sibling HTTP work.
                 active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
-                reply_wait_nanos = reply_wait_nanos.max(quiet_reply_wait_nanos(pair_count));
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
             }
@@ -427,31 +410,6 @@ fn run_reactor(
 
     unsafe {
         libc::close(epoll_fd);
-    }
-}
-
-fn epoll_wait_nanos(epoll_fd: RawFd, events: &mut [libc::epoll_event], timeout_nanos: i64) -> i32 {
-    let timeout = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: timeout_nanos.max(0),
-    };
-    let ready = unsafe {
-        libc::syscall(
-            libc::SYS_epoll_pwait2,
-            epoll_fd,
-            events.as_mut_ptr(),
-            events.len() as i32,
-            &timeout,
-            std::ptr::null::<libc::sigset_t>(),
-            8_usize,
-        ) as i32
-    };
-    if ready < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-        // Linux before 5.11 has no epoll_pwait2. Preserve correctness and
-        // compatibility without introducing a millisecond-scale timer.
-        unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, 0) }
-    } else {
-        ready
     }
 }
 
@@ -782,29 +740,15 @@ mod tests {
         assert_eq!(quiet_reply_spin_polls(16), 1);
         assert_eq!(quiet_reply_spin_polls(17), 2);
         assert_eq!(quiet_reply_spin_polls(32), 2);
-        assert_eq!(quiet_reply_spin_polls(33), 0);
-        assert_eq!(quiet_reply_spin_polls(48), 0);
-        assert_eq!(quiet_reply_wait_nanos(32), 0);
-        assert_eq!(quiet_reply_wait_nanos(33), 50_000);
-        assert_eq!(quiet_reply_wait_nanos(128), 50_000);
-        assert_eq!(quiet_reply_wait_nanos(129), 0);
+        assert_eq!(quiet_reply_spin_polls(33), 8);
+        assert_eq!(quiet_reply_spin_polls(48), 8);
+        assert_eq!(quiet_reply_spin_polls(128), 8);
         assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 128);
         assert!(quiet_reply_spin_enabled(true, true, 128));
         assert!(!quiet_reply_spin_enabled(true, false, 128));
         assert!(!quiet_reply_spin_enabled(false, true, 128));
         assert!(!quiet_reply_spin_enabled(true, true, 129));
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
-    }
-
-    #[test]
-    fn nanosecond_epoll_wait_is_available_or_falls_back() {
-        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(epoll_fd >= 0);
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
-        assert_eq!(epoll_wait_nanos(epoll_fd, &mut events, 1), 0);
-        unsafe {
-            libc::close(epoll_fd);
-        }
     }
 
     #[test]
