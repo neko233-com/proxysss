@@ -904,12 +904,19 @@ func runWriteEqualLoadPlan(args []string) error {
 		if intervalMicros < 1 {
 			intervalMicros = 1
 		}
-		// HTTP/SSE workers use centered uniform phase offsets. Across all workers
-		// that produces one aggregate slot every interval/concurrency without a
-		// request exactly at the measurement boundary. Gate against that rounded
-		// integer schedule, including rates below one operation per connection.
 		durationMicros := int64(*durationSecs) * 1_000_000
-		scheduledTotal := (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
+		var scheduledTotal int64
+		if proxy.Protocol == "http" || proxy.Protocol == "sse" {
+			// HTTP/SSE workers use centered uniform phase offsets. Across all
+			// workers that produces one aggregate slot every interval/concurrency
+			// without a request exactly at the measurement boundary.
+			scheduledTotal = (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
+		} else {
+			// Realtime workers intentionally tick together. Their first operation
+			// is one full interval after measurement_start, so only whole
+			// per-connection ticks strictly before the deadline are executable.
+			scheduledTotal = ((durationMicros - 1) / intervalMicros) * int64(concurrency)
+		}
 		if scheduledTotal < 1 {
 			scheduledTotal = 1
 		}

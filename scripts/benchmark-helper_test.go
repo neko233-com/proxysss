@@ -209,8 +209,8 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	results := filepath.Join(dir, "saturation.json")
 	plan := filepath.Join(dir, "plan.txt")
 	writeBenchRows(t, results, []BenchRow{
-		{Scenario: "websocket", Gateway: "nginx", Concurrency: 8, OpsPerSec: 800},
-		{Scenario: "websocket", Gateway: "proxysss", Concurrency: 8, OpsPerSec: 1200},
+		{Scenario: "websocket", Gateway: "nginx", Protocol: "websocket", Concurrency: 8, OpsPerSec: 800},
+		{Scenario: "websocket", Gateway: "proxysss", Protocol: "websocket", Concurrency: 8, OpsPerSec: 1200},
 	})
 	if err := runWriteEqualLoadPlan([]string{
 		"--results", results,
@@ -224,7 +224,7 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(raw), "websocket|14286|560.000000") {
+	if !strings.HasPrefix(string(raw), "websocket|14286|552.000000") {
 		t.Fatalf("unexpected equal-load plan: %s", raw)
 	}
 }
@@ -234,8 +234,8 @@ func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	results := filepath.Join(dir, "saturation.json")
 	plan := filepath.Join(dir, "plan.txt")
 	writeBenchRows(t, results, []BenchRow{
-		{Scenario: "static-large", Gateway: "nginx", Concurrency: 4, OpsPerSec: 83.5},
-		{Scenario: "static-large", Gateway: "proxysss", Concurrency: 4, OpsPerSec: 90},
+		{Scenario: "static-large", Gateway: "nginx", Protocol: "http", Concurrency: 4, OpsPerSec: 83.5},
+		{Scenario: "static-large", Gateway: "proxysss", Protocol: "http", Concurrency: 4, OpsPerSec: 90},
 	})
 	if err := runWriteEqualLoadPlan([]string{
 		"--results", results,
@@ -259,8 +259,8 @@ func TestEqualLoadPlanAllowsTargetBelowConnectionCount(t *testing.T) {
 	results := filepath.Join(dir, "saturation.json")
 	plan := filepath.Join(dir, "plan.txt")
 	writeBenchRows(t, results, []BenchRow{
-		{Scenario: "static-large", Gateway: "nginx", Concurrency: 32, OpsPerSec: 64},
-		{Scenario: "static-large", Gateway: "proxysss", Concurrency: 32, OpsPerSec: 96},
+		{Scenario: "static-large", Gateway: "nginx", Protocol: "http", Concurrency: 32, OpsPerSec: 64},
+		{Scenario: "static-large", Gateway: "proxysss", Protocol: "http", Concurrency: 32, OpsPerSec: 96},
 	})
 	if err := runWriteEqualLoadPlan([]string{
 		"--results", results,

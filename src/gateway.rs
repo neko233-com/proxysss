@@ -120,6 +120,8 @@ pub struct Gateway {
     raw_http_pools: Arc<DashMap<String, Arc<RawHttpUpstreamPool>>>,
     static_route_cache: Arc<DashMap<String, PathBuf>>,
     static_file_cache: Arc<DashMap<String, CachedStaticFile>>,
+    h2_static_response_cache: Arc<ArcSwap<FxHashMap<String, PrebuiltH2StaticResponse>>>,
+    h2_static_response_refresh_lock: Arc<TokioMutex<()>>,
     static_file_cache_bytes: Arc<AtomicU64>,
     static_file_load_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
@@ -1507,6 +1509,7 @@ const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
+const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 256;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
@@ -1514,7 +1517,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 128;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
 // A shard with roughly one runnable connection per scheduler lane is still
 // low-density. Once dozens of keep-alive connections compete per worker, a
@@ -1540,7 +1543,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1885,6 +1888,30 @@ struct CachedStaticFile {
     content_length: HeaderValue,
     checked_at: Instant,
     revalidating: bool,
+}
+
+#[derive(Clone)]
+struct PrebuiltH2StaticResponse {
+    body: Bytes,
+    content_type: HeaderValue,
+    content_length: HeaderValue,
+    checked_at: Instant,
+}
+
+impl PrebuiltH2StaticResponse {
+    fn response(&self) -> GatewayResponse {
+        let mut response = Response::new(full_body(self.body.clone()));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, self.content_type.clone());
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, self.content_length.clone());
+        response
+            .headers_mut()
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        response
+    }
 }
 
 struct HttpCacheRevalidateRequest<'a> {
@@ -2266,6 +2293,8 @@ impl Gateway {
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(ArcSwap::from_pointee(FxHashMap::default())),
+            h2_static_response_refresh_lock: Arc::new(TokioMutex::new(())),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges,
@@ -2292,6 +2321,7 @@ impl Gateway {
     async fn warm_up(&self, config: &GatewayConfig) {
         let started = Instant::now();
         self.preload_static_fast_lane_cache(config).await;
+        self.refresh_h2_static_response_cache().await;
         let predialed = self.prewarm_upstream_pools(config).await;
         self.stats.warm.store(true, Ordering::Release);
         tracing::info!(
@@ -2387,6 +2417,15 @@ impl Gateway {
                 "static fast lane cache preloaded"
             );
         }
+    }
+
+    async fn refresh_h2_static_response_cache(&self) {
+        let _refresh_guard = self.h2_static_response_refresh_lock.lock().await;
+        self.h2_static_response_cache
+            .store(Arc::new(build_prebuilt_h2_static_responses(
+                &self.static_route_cache,
+                &self.static_file_cache,
+            )));
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -5278,7 +5317,7 @@ impl Gateway {
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
                     checked_at: Instant::now(),
-                    hits_until_revalidation_check: PLAIN_FAST_LANE_FAIRNESS_BATCH as u8,
+                    hits_until_revalidation_check: STATIC_FILE_CONNECTION_REVALIDATE_HITS,
                     header: Bytes::copy_from_slice(static_header.as_bytes()),
                     combined_response,
                     body: candidate.cached_body.clone(),
@@ -7725,6 +7764,13 @@ impl Gateway {
             return None;
         }
 
+        let snapshots = self.h2_static_response_cache.load();
+        if let Some(cached) = snapshots.get(request.uri().path()).filter(|cached| {
+            cached.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+        }) {
+            return Some(cached.response());
+        }
+
         let target = self.static_route_cache.get(request.uri().path())?;
         let cached = cached_static_file_response_stale_while_revalidate(
             target.as_path(),
@@ -7741,6 +7787,9 @@ impl Gateway {
         let static_file_cache = self.static_file_cache.clone();
         let static_file_cache_bytes = self.static_file_cache_bytes.clone();
         let static_file_load_locks = self.static_file_load_locks.clone();
+        let static_route_cache = self.static_route_cache.clone();
+        let h2_static_response_cache = self.h2_static_response_cache.clone();
+        let h2_static_response_refresh_lock = self.h2_static_response_refresh_lock.clone();
         std::mem::drop(tokio::spawn(async move {
             let key = target.to_string_lossy().to_string();
             match tokio::fs::metadata(&target).await {
@@ -7783,6 +7832,12 @@ impl Gateway {
                     finish_failed_static_revalidation(&key, &static_file_cache);
                 }
             }
+
+            let _refresh_guard = h2_static_response_refresh_lock.lock().await;
+            h2_static_response_cache.store(Arc::new(build_prebuilt_h2_static_responses(
+                &static_route_cache,
+                &static_file_cache,
+            )));
         }));
     }
 
@@ -11047,7 +11102,7 @@ struct ConnectionStaticFastPathCache {
     target: String,
     host: Option<String>,
     checked_at: Instant,
-    hits_until_revalidation_check: u8,
+    hits_until_revalidation_check: u16,
     header: Bytes,
     combined_response: Option<Bytes>,
     body: Option<Bytes>,
@@ -11065,7 +11120,7 @@ impl ConnectionStaticFastPathCache {
             self.hits_until_revalidation_check -= 1;
             return true;
         }
-        self.hits_until_revalidation_check = PLAIN_FAST_LANE_FAIRNESS_BATCH as u8;
+        self.hits_until_revalidation_check = STATIC_FILE_CONNECTION_REVALIDATE_HITS;
         self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
     }
 
@@ -18466,6 +18521,33 @@ fn finish_failed_static_revalidation(
     }
 }
 
+fn build_prebuilt_h2_static_responses(
+    static_route_cache: &DashMap<String, PathBuf>,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> FxHashMap<String, PrebuiltH2StaticResponse> {
+    let mut responses = FxHashMap::default();
+    responses.reserve(static_route_cache.len().min(STATIC_FILE_CACHE_MAX_ENTRIES));
+    for route in static_route_cache.iter() {
+        let cache_key = route.value().to_string_lossy();
+        let Some(cached) = static_file_cache.get(cache_key.as_ref()) else {
+            continue;
+        };
+        if cached.body.is_empty() {
+            continue;
+        }
+        responses.insert(
+            route.key().clone(),
+            PrebuiltH2StaticResponse {
+                body: cached.body.clone(),
+                content_type: cached.content_type.clone(),
+                content_length: cached.content_length.clone(),
+                checked_at: cached.checked_at,
+            },
+        );
+    }
+    responses
+}
+
 fn stale_cached_static_file_candidate(
     target: &Path,
     method: &str,
@@ -23002,8 +23084,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_h2_static_response_keeps_range_and_length_headers() {
+    fn prebuilt_h2_static_response_keeps_range_and_length_headers() {
         let cache = DashMap::new();
+        let routes = DashMap::new();
+        routes.insert("/bench/asset.js".to_string(), PathBuf::from("asset.js"));
         cache.insert(
             "asset.js".to_string(),
             CachedStaticFile {
@@ -23018,26 +23102,28 @@ mod tests {
             },
         );
 
-        let response = cached_static_file_response_stale_while_revalidate(
-            Path::new("asset.js"),
-            &Method::GET,
-            &cache,
-        )
-        .expect("fresh cached response");
+        let snapshots = build_prebuilt_h2_static_responses(&routes, &cache);
+        let response = snapshots
+            .get("/bench/asset.js")
+            .expect("prebuilt H2 response")
+            .response();
 
-        assert!(!response.revalidate);
-        assert_eq!(response.response.status(), StatusCode::OK);
-        match response.response.body() {
+        assert_eq!(response.status(), StatusCode::OK);
+        match response.body() {
             GatewayBody::Full(Some(body)) => assert_eq!(body, &Bytes::from_static(b"test")),
             _ => panic!("cached H2 response must use a full body"),
         }
         assert_eq!(
-            response.response.headers().get(CONTENT_LENGTH),
+            response.headers().get(CONTENT_LENGTH),
             Some(&HeaderValue::from_static("4"))
         );
         assert_eq!(
-            response.response.headers().get(ACCEPT_RANGES),
+            response.headers().get(ACCEPT_RANGES),
             Some(&HeaderValue::from_static("bytes"))
+        );
+        assert_ne!(
+            STATIC_FILE_CONNECTION_REVALIDATE_HITS as usize,
+            PLAIN_FAST_LANE_FAIRNESS_BATCH
         );
     }
 
@@ -24039,8 +24125,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(511, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 128);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 128);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
@@ -24367,6 +24453,8 @@ mod tests {
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(ArcSwap::from_pointee(FxHashMap::default())),
+            h2_static_response_refresh_lock: Arc::new(TokioMutex::new(())),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
