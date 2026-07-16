@@ -1515,7 +1515,7 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -12307,19 +12307,20 @@ async fn sendfile_all_async(
         active_transfers,
         data_plane_cores,
     ) {
+        let active_reactor_workers = sendfile_reactor_active_workers(
+            reactor_adaptive,
+            active_transfers,
+            data_plane_cores,
+            sendfile_reactor_workers,
+        );
         match crate::sendfile_reactor::dispatch(
             out_fd,
             in_fd,
             0,
             len,
-            sendfile_reactor_job_chunk_bytes(
-                reactor_adaptive,
-                len,
-                max_chunk_bytes,
-                active_transfers,
-                data_plane_cores,
-            ),
+            sendfile_reactor_job_chunk_bytes(reactor_adaptive, len, max_chunk_bytes),
             sendfile_reactor_workers,
+            active_reactor_workers,
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
             Ok(completion) => {
@@ -12436,19 +12437,25 @@ fn sendfile_reactor_should_dispatch(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn sendfile_reactor_job_chunk_bytes(
-    adaptive: bool,
-    len: u64,
-    max_chunk_bytes: u64,
-    active_transfers: usize,
-    data_plane_cores: usize,
-) -> u64 {
-    if adaptive && active_transfers <= data_plane_cores.max(1).saturating_mul(2) {
-        len.min(max_chunk_bytes.clamp(1, STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES))
-    } else if adaptive {
+fn sendfile_reactor_job_chunk_bytes(adaptive: bool, len: u64, max_chunk_bytes: u64) -> u64 {
+    if adaptive {
         len.max(1)
     } else {
         max_chunk_bytes.max(1)
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_active_workers(
+    adaptive: bool,
+    active_transfers: usize,
+    data_plane_cores: usize,
+    reactor_workers: usize,
+) -> usize {
+    if adaptive && active_transfers <= data_plane_cores.max(1).saturating_mul(2) {
+        reactor_workers.max(1).div_ceil(2)
+    } else {
+        reactor_workers.max(1)
     }
 }
 
@@ -12674,7 +12681,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -12683,10 +12690,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Four owners on an eight-core gateway keep game/TCP/WebSocket pairs
-        // below the high-density knee. nice 3 leaves HTTP the primary CFS
-        // consumer during saturation while fixed-rate realtime work stays
-        // prompt on otherwise-idle cores.
+        // One soft-affinity owner per allowed CPU keeps pair queues shallow.
+        // nice 3 leaves HTTP the primary CFS consumer during saturation while
+        // fixed-rate realtime work stays prompt on otherwise-idle cores.
         RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
@@ -24721,17 +24727,16 @@ mod tests {
         assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
         assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
         assert_eq!(
-            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024, 16, 8,),
-            8 * 1024 * 1024
-        );
-        assert_eq!(
-            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024, 17, 8,),
+            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024),
             32 * 1024 * 1024
         );
         assert_eq!(
-            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024, 16, 8,),
+            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024),
             16 * 1024 * 1024
         );
+        assert_eq!(sendfile_reactor_active_workers(true, 16, 8, 8), 4);
+        assert_eq!(sendfile_reactor_active_workers(true, 17, 8, 8), 8);
+        assert_eq!(sendfile_reactor_active_workers(false, 1, 8, 8), 8);
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
@@ -24746,7 +24751,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),

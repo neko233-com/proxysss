@@ -119,6 +119,7 @@ pub(crate) fn dispatch(
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
+    active_workers: usize,
     scheduler_nice: i32,
 ) -> io::Result<oneshot::Receiver<io::Result<SendfileCompletion>>> {
     if len == 0 {
@@ -141,9 +142,14 @@ pub(crate) fn dispatch(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
-    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
     let current_cpu = current_cpu();
-    let index = preferred_worker_index(&reactors.worker_cpus, current_cpu, fallback);
+    let index = preferred_worker_index_limited(
+        &reactors.worker_cpus,
+        current_cpu,
+        fallback,
+        active_workers,
+    );
     let worker = &reactors.workers[index];
     worker
         .registrations
@@ -200,6 +206,28 @@ fn preferred_worker_index(
                 .position(|worker_cpu| *worker_cpu == Some(cpu))
         })
         .unwrap_or(fallback % worker_cpus.len().max(1))
+}
+
+fn preferred_worker_index_limited(
+    worker_cpus: &[Option<usize>],
+    current_cpu: Option<usize>,
+    fallback: usize,
+    active_workers: usize,
+) -> usize {
+    let active_workers = active_workers.clamp(1, worker_cpus.len().max(1));
+    if active_workers >= worker_cpus.len() {
+        return preferred_worker_index(worker_cpus, current_cpu, fallback);
+    }
+    let candidate = |slot: usize| slot.saturating_mul(worker_cpus.len()) / active_workers;
+    if let Some(cpu) = current_cpu {
+        for slot in 0..active_workers {
+            let index = candidate(slot);
+            if worker_cpus.get(index).copied().flatten() == Some(cpu) {
+                return index;
+            }
+        }
+    }
+    candidate(fallback % active_workers)
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -475,6 +503,7 @@ mod tests {
             (expected.len() - start) as u64,
             16 * 1024,
             1,
+            1,
             0,
         )
         .unwrap();
@@ -499,6 +528,15 @@ mod tests {
         assert_eq!(preferred_worker_index(&worker_cpus, Some(6), 0), 2);
         assert_eq!(preferred_worker_index(&worker_cpus, Some(7), 3), 3);
         assert_eq!(preferred_worker_index(&worker_cpus, None, 5), 1);
+        assert_eq!(
+            preferred_worker_index_limited(&worker_cpus, Some(6), 0, 2),
+            2
+        );
+        assert_eq!(
+            preferred_worker_index_limited(&worker_cpus, Some(4), 1, 2),
+            2
+        );
+        assert_eq!(preferred_worker_index_limited(&worker_cpus, None, 1, 2), 2);
     }
 
     #[test]

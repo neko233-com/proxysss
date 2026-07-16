@@ -31,7 +31,7 @@ const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 const QUIET_REPLY_SPIN_LOW_POLLS: usize = 1;
 const QUIET_REPLY_SPIN_MID_POLLS: usize = 2;
-const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 8;
+const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 0;
 const QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER: usize = 16;
 const QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER: usize = 32;
 const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
@@ -246,12 +246,11 @@ impl Reactors {
 }
 
 fn reactor_worker_cpu(index: usize, worker_count: usize, allowed_cpus: &[usize]) -> Option<usize> {
-    if allowed_cpus.is_empty() || worker_count < allowed_cpus.len() {
-        // A sparse realtime pool must be able to follow whichever data-plane
-        // CPU has spare capacity. Hard-pinning its sole owner to the last CPU
-        // creates a hotspot beside that CPU's HTTP/UDP shard while another CPU
-        // remains idle. Linux will normally keep the thread cache-local and
-        // migrate it only when the runnable imbalance warrants doing so.
+    if allowed_cpus.is_empty() || worker_count <= allowed_cpus.len() {
+        // A realtime pool no larger than the cpuset must follow whichever
+        // data-plane CPU has spare capacity. Hard-pinning creates hotspots
+        // beside HTTP/UDP shards while another CPU remains idle. Linux keeps
+        // threads cache-local and migrates them only for runnable imbalance.
         return None;
     }
     allowed_cpus
@@ -730,8 +729,8 @@ mod tests {
 
     #[test]
     fn per_cpu_reactor_workers_pin_in_reverse_order() {
-        assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), Some(4));
-        assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), Some(2));
+        assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), None);
+        assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), None);
     }
 
     #[test]
@@ -740,9 +739,9 @@ mod tests {
         assert_eq!(quiet_reply_spin_polls(16), 1);
         assert_eq!(quiet_reply_spin_polls(17), 2);
         assert_eq!(quiet_reply_spin_polls(32), 2);
-        assert_eq!(quiet_reply_spin_polls(33), 8);
-        assert_eq!(quiet_reply_spin_polls(48), 8);
-        assert_eq!(quiet_reply_spin_polls(128), 8);
+        assert_eq!(quiet_reply_spin_polls(33), 0);
+        assert_eq!(quiet_reply_spin_polls(48), 0);
+        assert_eq!(quiet_reply_spin_polls(128), 0);
         assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 128);
         assert!(quiet_reply_spin_enabled(true, true, 128));
         assert!(!quiet_reply_spin_enabled(true, false, 128));
