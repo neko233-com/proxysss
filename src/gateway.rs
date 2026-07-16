@@ -1512,6 +1512,7 @@ impl HyperBody for GatewayBody {
 }
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -1577,6 +1578,7 @@ static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLoc
 #[cfg(target_os = "linux")]
 static STATIC_REVALIDATION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
+static SHARDED_PLAIN_HTTP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -1605,13 +1607,30 @@ static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
-        // One CPU-sized runtime still provides one I/O worker per allowed core,
-        // but lets ready connection tasks move between them. Separate one-thread
-        // runtimes permanently inherit SO_REUSEPORT hash skew: an H2 connection,
-        // large-file flows, and UDP/TCP listeners can land on one busy shard
-        // while sibling cores sit idle. Work stealing keeps the default-small
-        // protocol set unified without adding a competing runtime pool.
         let worker_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        if SHARDED_PLAIN_HTTP_DATA_RUNTIMES.load(Ordering::Relaxed) {
+            let runtime_shards = plain_http_runtime_shard_count_for(worker_count, true);
+            tracing::info!(runtime_shards, "starting per-core plain HTTP data runtimes");
+            return (0..runtime_shards)
+                .map(|worker_index| {
+                    let mut builder = tokio::runtime::Builder::new_multi_thread();
+                    builder
+                        .worker_threads(1)
+                        .thread_name(format!("proxysss-http-{worker_index}"))
+                        .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                        .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+                        .on_thread_start(move || pin_current_data_plane_thread(worker_index))
+                        .enable_all();
+                    builder
+                        .build()
+                        .expect("failed to build proxysss per-core HTTP data runtime")
+                })
+                .collect();
+        }
+
+        // Small keeps every protocol on one CPU-sized runtime. Work stealing
+        // absorbs sparse SO_REUSEPORT placement when H2, UDP, and streams share
+        // the same scheduler; balanced isolates those protocol owners first.
         tracing::info!(
             runtime_workers = worker_count,
             "starting unified work-stealing data runtime"
@@ -1822,6 +1841,11 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
+        SHARDED_PLAIN_HTTP_DATA_RUNTIMES.store(
+            config.runtime.performance.enabled
+                && sharded_plain_http_runtime_profile(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
         SHARED_TLS_DATA_RUNTIMES.store(
             config.runtime.performance.enabled
                 && shared_tls_runtime_profile(config.runtime.performance.traffic_profile),
@@ -11525,9 +11549,8 @@ fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
 fn static_sendfile_fast_path_threshold_bytes(config: &GatewayConfig) -> u64 {
     match config.runtime.performance.traffic_profile {
         RuntimePerformanceTrafficProfile::Bulk => 0,
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => {
-            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
-        }
+        RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES,
+        RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES,
     }
 }
 
@@ -12184,7 +12207,6 @@ async fn sendfile_all_async(
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 // Keep small-file and realtime tasks runnable without paying
-                // Keep small-file and realtime tasks runnable without paying
                 // Linux timer-wheel granularity after every 2 MiB sendfile
                 // chunk. A cooperative yield preserves backpressure/fairness
                 // while immediately resuming when no sibling task is ready.
@@ -12373,6 +12395,19 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
 
 fn http_data_plane_workers_for(cores: usize) -> usize {
     cores.max(1)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sharded_plain_http_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
+}
+
+fn plain_http_runtime_shard_count_for(cores: usize, sharded: bool) -> usize {
+    if sharded {
+        http_data_plane_workers_for(cores)
+    } else {
+        1
+    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -24367,6 +24402,17 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
         assert_eq!(tls_http_runtime_workers_for(8, 8), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 8), 12);
+        assert!(!sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
+        assert_eq!(plain_http_runtime_shard_count_for(8, false), 1);
+        assert_eq!(plain_http_runtime_shard_count_for(8, true), 8);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
@@ -24430,6 +24476,19 @@ mod tests {
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
             3
         );
+        let mut config = GatewayConfig::default();
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
+        assert_eq!(
+            static_sendfile_fast_path_threshold_bytes(&config),
+            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
+        );
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Balanced;
+        assert_eq!(
+            static_sendfile_fast_path_threshold_bytes(&config),
+            STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES
+        );
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Bulk;
+        assert_eq!(static_sendfile_fast_path_threshold_bytes(&config), 0);
         let mut sendfile_sequence = 0;
         assert!(balanced_sendfile_mid_yield_for_next_response(
             &mut sendfile_sequence,
