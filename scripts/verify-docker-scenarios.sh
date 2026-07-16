@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${PROXYSSS_VERIFY_IMAGE:-proxysss-ubuntu24-scenarios}"
+reuse_image="${REUSE_VERIFY_IMAGE:-0}"
 config="examples/all-scenarios.example.yaml"
 
 cd "$repo_root"
@@ -27,9 +28,27 @@ case "$(uname -s)" in
     ;;
 esac
 
-# Reuse the Ubuntu 24 benchmark image so scenario validation runs in the same
-# Linux family used by the production performance gate.
-docker build -f docker/ubuntu24-bench.Dockerfile -t "$image" .
+if [[ "$reuse_image" != "0" && "$reuse_image" != "1" ]]; then
+  echo "REUSE_VERIFY_IMAGE must be 0 or 1" >&2
+  exit 1
+fi
+
+# Use the Ubuntu 24 benchmark image so scenario validation runs in the same
+# Linux family used by the production performance gate. A local cache may be
+# selected explicitly when registry metadata is temporarily unavailable.
+if [[ "$reuse_image" == "1" ]]; then
+  docker image inspect "$image" >/dev/null
+else
+  docker build -f docker/ubuntu24-bench.Dockerfile -t "$image" .
+fi
+
+docker run --rm "$image" bash -lc '
+  set -euo pipefail
+  test "$(uname -m)" = x86_64
+  . /etc/os-release
+  test "$ID" = ubuntu
+  test "$VERSION_ID" = 24.04
+'
 
 docker run --rm \
   -e CARGO_TARGET_DIR=/target \
