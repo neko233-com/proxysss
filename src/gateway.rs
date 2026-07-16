@@ -1174,10 +1174,28 @@ fn tune_tcp_stream_for_latency(stream: &TcpStream) {
     tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
+fn tune_tcp_stream_for_static_transfer(stream: &TcpStream) {
+    tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::StaticTransfer);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
     Realtime,
+    StaticTransfer,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn tcp_profile_uses_deep_send_queue(profile: TcpSocketTuneProfile) -> bool {
+    matches!(
+        profile,
+        TcpSocketTuneProfile::Gateway | TcpSocketTuneProfile::StaticTransfer
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn tcp_profile_uses_deep_receive_queue(profile: TcpSocketTuneProfile) -> bool {
+    matches!(profile, TcpSocketTuneProfile::Gateway)
 }
 
 #[cfg(target_os = "linux")]
@@ -1217,10 +1235,10 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
     }
 
     // Large request/response gateway sockets benefit from deep queues. Keep
-    // realtime game/MQTT/tool streams on Linux autotuning: forcing 1 MiB per
+    // realtime game/MQTT/tool streams on Linux autotuning: forcing deep queues per
     // direction wastes kernel memory at 100k connections and can add queueing
     // without helping one-frame-at-a-time traffic.
-    if matches!(profile, TcpSocketTuneProfile::Gateway) {
+    if tcp_profile_uses_deep_send_queue(profile) {
         let buf_size: libc::c_int = match level {
             linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
@@ -1234,13 +1252,15 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
                 &buf_size as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&buf_size) as libc::socklen_t,
             );
-            let _ = libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&buf_size) as libc::socklen_t,
-            );
+            if tcp_profile_uses_deep_receive_queue(profile) {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+            }
         }
     }
 
@@ -1249,7 +1269,7 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
         linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme
     ) {
-        if matches!(profile, TcpSocketTuneProfile::Gateway) {
+        if tcp_profile_uses_deep_send_queue(profile) {
             let lowat: libc::c_int = match level {
                 linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
                 _ => 4 * 1024 * 1024,
@@ -5171,6 +5191,7 @@ impl Gateway {
                 config.runtime.performance.traffic_profile,
                 RuntimePerformanceTrafficProfile::Balanced
             );
+        let tune_static_transfer_socket = yield_after_sendfile_response;
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
         let mut fairness_batch = plain_fast_lane_fairness_batch_for(
@@ -5187,6 +5208,7 @@ impl Gateway {
         let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
+        let mut static_transfer_socket_tuned = false;
         let outcome = 'fast_lane: loop {
             let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -5218,6 +5240,11 @@ impl Gateway {
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
+                );
+                tune_static_transfer_socket_once(
+                    &stream,
+                    tune_static_transfer_socket && cached.sendfile.is_some(),
+                    &mut static_transfer_socket_tuned,
                 );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
@@ -5416,6 +5443,11 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
+                tune_static_transfer_socket_once(
+                    &stream,
+                    tune_static_transfer_socket && cached.sendfile.is_some(),
+                    &mut static_transfer_socket_tuned,
+                );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -5475,6 +5507,11 @@ impl Gateway {
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
+                );
+                tune_static_transfer_socket_once(
+                    &stream,
+                    tune_static_transfer_socket && cached.sendfile.is_some(),
+                    &mut static_transfer_socket_tuned,
                 );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
@@ -5538,6 +5575,11 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
+                tune_static_transfer_socket_once(
+                    &stream,
+                    tune_static_transfer_socket && cached.sendfile.is_some(),
+                    &mut static_transfer_socket_tuned,
+                );
                 send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
@@ -5561,6 +5603,13 @@ impl Gateway {
                 && candidate.cached_body.is_some()
                 && static_header.len() + candidate.len as usize <= POOL_BUFFER_BYTES;
 
+            tune_static_transfer_socket_once(
+                &stream,
+                tune_static_transfer_socket
+                    && request.method == "GET"
+                    && candidate.sendfile.is_some(),
+                &mut static_transfer_socket_tuned,
+            );
             let send_result = if small_single_write {
                 let body = candidate
                     .cached_body
@@ -12510,12 +12559,20 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
     usize::from(remote_addr.port()) % 3
 }
 
+fn tune_static_transfer_socket_once(stream: &TcpStream, sendfile: bool, tuned: &mut bool) {
+    if static_transfer_socket_tune_needed(sendfile, *tuned) {
+        tune_tcp_stream_for_static_transfer(stream);
+        *tuned = true;
+    }
+}
+
+fn static_transfer_socket_tune_needed(sendfile: bool, tuned: bool) -> bool {
+    sendfile && !tuned
+}
+
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(
-        profile,
-        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
-    )
+    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -24466,7 +24523,7 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(sendfile_reactor_profile_enabled(
+        assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
@@ -24481,6 +24538,24 @@ mod tests {
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
             3
         );
+        assert!(tcp_profile_uses_deep_send_queue(
+            TcpSocketTuneProfile::Gateway
+        ));
+        assert!(tcp_profile_uses_deep_send_queue(
+            TcpSocketTuneProfile::StaticTransfer
+        ));
+        assert!(!tcp_profile_uses_deep_send_queue(
+            TcpSocketTuneProfile::Realtime
+        ));
+        assert!(tcp_profile_uses_deep_receive_queue(
+            TcpSocketTuneProfile::Gateway
+        ));
+        assert!(!tcp_profile_uses_deep_receive_queue(
+            TcpSocketTuneProfile::StaticTransfer
+        ));
+        assert!(static_transfer_socket_tune_needed(true, false));
+        assert!(!static_transfer_socket_tune_needed(true, true));
+        assert!(!static_transfer_socket_tune_needed(false, false));
         let mut config = GatewayConfig::default();
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
         assert_eq!(
