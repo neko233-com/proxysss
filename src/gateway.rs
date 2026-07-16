@@ -12285,11 +12285,20 @@ async fn sendfile_all_async(
             .load(Ordering::Relaxed)
             .max(1),
     );
+    let reactor_enabled = STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed);
+    let reactor_adaptive = STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed);
+    if reactor_enabled && reactor_adaptive && transfer_guard.active <= data_plane_cores {
+        // Let sibling large responses on the same pinned HTTP owners register
+        // before classifying pressure. Equal-load remains sparse after this
+        // one cooperative turn; saturation exposes its real transfer band.
+        tokio::task::yield_now().await;
+    }
+    let active_transfers = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed);
 
     if sendfile_reactor_should_dispatch(
-        STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed),
-        STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed),
-        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+        reactor_enabled,
+        reactor_adaptive,
+        active_transfers,
         data_plane_cores,
     ) {
         match crate::sendfile_reactor::dispatch(
@@ -12388,11 +12397,12 @@ fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cor
 fn sendfile_reactor_should_dispatch(
     enabled: bool,
     adaptive: bool,
-    active_plain_connections: usize,
+    active_transfers: usize,
     data_plane_cores: usize,
 ) -> bool {
+    let cores = data_plane_cores.max(1);
     enabled
-        && (!adaptive || active_plain_connections <= data_plane_cores.max(1).saturating_mul(128))
+        && (!adaptive || (active_transfers > cores && active_transfers <= cores.saturating_mul(4)))
 }
 
 #[cfg(target_os = "linux")]
@@ -12772,7 +12782,7 @@ fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> us
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -24652,8 +24662,10 @@ mod tests {
         assert!(sendfile_pressure_should_raise_buffer(5, 8));
         assert!(!sendfile_pressure_should_raise_buffer(1, 1));
         assert!(sendfile_pressure_should_raise_buffer(2, 1));
-        assert!(sendfile_reactor_should_dispatch(true, true, 1024, 8));
-        assert!(!sendfile_reactor_should_dispatch(true, true, 1025, 8));
+        assert!(!sendfile_reactor_should_dispatch(true, true, 8, 8));
+        assert!(sendfile_reactor_should_dispatch(true, true, 9, 8));
+        assert!(sendfile_reactor_should_dispatch(true, true, 32, 8));
+        assert!(!sendfile_reactor_should_dispatch(true, true, 33, 8));
         assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
         assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
@@ -24809,7 +24821,7 @@ mod tests {
         assert_eq!(SHARDED_PLAIN_HTTP_EVENT_INTERVAL, 8);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            3
         );
         let mut config = GatewayConfig::default();
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
