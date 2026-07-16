@@ -5,6 +5,7 @@
 - Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.
 - Locked the default TLS ALPN order so ordinary clients prefer HTTP/2 on port 443 while ACME TLS-ALPN-01 remains available, and added default-config coverage for self-signed TLS bootstrap.
 - Hardened the Ubuntu 24 Docker benchmark entrypoints for Windows Docker Desktop path handling and emitted a same-run fairness manifest proving matching ports, CPU/FD/sysctl limits, protocol surfaces, and nginx/proxysss optimizations. Strict measured validation remains capped at 60 seconds.
+- Added explicit `REUSE_BENCH_IMAGE=1` support for offline/transient-registry validation; the wrapper still probes the cached image for amd64 and Ubuntu 24.04 before building or measuring the checkout.
 - Made the Ubuntu 24 wrapper record and forward explicit `TRAFFIC_PROFILE`, saturation/latency run orders, and benchmark subnet/role addresses so default-small and balanced experiments remain reproducible without editing scripts.
 - Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, kept balanced UDP on the proven per-core fast path, and reduced TLS/sendfile/realtime owner contention under mixed load.
 - Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.

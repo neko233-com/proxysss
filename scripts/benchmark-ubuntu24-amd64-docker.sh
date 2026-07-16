@@ -98,6 +98,7 @@ RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
+REUSE_BENCH_IMAGE="${REUSE_BENCH_IMAGE:-0}"
 CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-100}"
 MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-60}}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
@@ -144,6 +145,10 @@ if [[ "$CAPTURE_THREAD_STATS" != "0" && "$CAPTURE_THREAD_STATS" != "1" ]]; then
   echo "CAPTURE_THREAD_STATS must be 0 or 1" >&2
   exit 1
 fi
+if [[ "$REUSE_BENCH_IMAGE" != "0" && "$REUSE_BENCH_IMAGE" != "1" ]]; then
+  echo "REUSE_BENCH_IMAGE must be 0 or 1" >&2
+  exit 1
+fi
 if [[ "$RUN_SERIAL_ISOLATED" != "0" && "$RUN_SERIAL_ISOLATED" != "1" ]]; then
   echo "RUN_SERIAL_ISOLATED must be 0 or 1" >&2
   exit 1
@@ -180,8 +185,13 @@ restore_ownership() {
 }
 trap restore_ownership EXIT
 
-echo "==> building Ubuntu 24 benchmark image: $IMAGE"
-docker build --platform linux/amd64 -f docker/ubuntu24-bench.Dockerfile -t "$IMAGE" .
+if [[ "$REUSE_BENCH_IMAGE" == "1" ]]; then
+  echo "==> reusing locally cached Ubuntu 24 benchmark image: $IMAGE"
+  docker image inspect "$IMAGE" >/dev/null
+else
+  echo "==> building Ubuntu 24 benchmark image: $IMAGE"
+  docker build --platform linux/amd64 -f docker/ubuntu24-bench.Dockerfile -t "$IMAGE" .
+fi
 image_ready=1
 
 image_arch="$(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
