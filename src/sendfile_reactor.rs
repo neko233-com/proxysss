@@ -16,7 +16,6 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
-use rustc_hash::FxHashMap;
 use tokio::sync::oneshot;
 
 // Per-worker handoff bursts are bounded independently of active jobs. A full
@@ -36,13 +35,54 @@ struct SendfileJob {
 }
 
 struct SendfileState {
-    _socket: TcpStream,
+    socket: TcpStream,
     file: File,
     offset: libc::off_t,
     sent: u64,
     len: u64,
     max_chunk_bytes: u64,
     completion: Option<oneshot::Sender<io::Result<u64>>>,
+}
+
+#[derive(Default)]
+struct SendfileTable {
+    slots: Vec<Option<SendfileState>>,
+}
+
+impl SendfileTable {
+    fn contains(&self, fd: RawFd) -> bool {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+            .is_some_and(Option::is_some)
+    }
+
+    fn get_mut(&mut self, fd: RawFd) -> Option<&mut SendfileState> {
+        let index = usize::try_from(fd).ok()?;
+        self.slots.get_mut(index)?.as_mut()
+    }
+
+    fn insert(&mut self, fd: RawFd, state: SendfileState) {
+        let index = usize::try_from(fd).expect("sendfile fd must be non-negative");
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        debug_assert!(self.slots[index].is_none());
+        self.slots[index] = Some(state);
+    }
+
+    fn remove(&mut self, fd: RawFd) -> Option<SendfileState> {
+        let index = usize::try_from(fd).ok()?;
+        self.slots.get_mut(index)?.take()
+    }
+
+    fn active_fds(&self) -> Vec<RawFd> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, state)| state.as_ref().map(|_| fd as RawFd))
+            .collect()
+    }
 }
 
 struct ReactorWorker {
@@ -201,7 +241,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     };
     assert_eq!(add_wake, 0, "failed registering sendfile reactor eventfd");
 
-    let mut jobs = FxHashMap::<RawFd, SendfileState>::default();
+    let mut jobs = SendfileTable::default();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     loop {
         let ready =
@@ -230,7 +270,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             }
 
             let fd = token as RawFd;
-            if !jobs.contains_key(&fd) {
+            if !jobs.contains(fd) {
                 continue;
             }
             let flags = event.events as i32;
@@ -255,12 +295,12 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     }
 }
 
-fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
+fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
     jobs.insert(
         fd,
         SendfileState {
-            _socket: job.socket,
+            socket: job.socket,
             file: job.file,
             offset: job.offset as libc::off_t,
             sent: 0,
@@ -284,20 +324,17 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
     }
 }
 
-fn finish_unregistered_job(
-    jobs: &mut FxHashMap<RawFd, SendfileState>,
-    fd: RawFd,
-    result: io::Result<u64>,
-) {
-    if let Some(mut state) = jobs.remove(&fd) {
+fn finish_unregistered_job(jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
+    if let Some(mut state) = jobs.remove(fd) {
+        uncork_sendfile_socket(&state.socket);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
     }
 }
 
-fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
-    let Some(state) = jobs.get_mut(&fd) else {
+fn drive_job(jobs: &mut SendfileTable, fd: RawFd) -> DriveResult {
+    let Some(state) = jobs.get_mut(fd) else {
         return DriveResult::Complete(Err(io::Error::new(
             io::ErrorKind::NotFound,
             "sendfile reactor job disappeared",
@@ -337,24 +374,20 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
     DriveResult::Pending
 }
 
-fn complete_job(
-    epoll_fd: RawFd,
-    jobs: &mut FxHashMap<RawFd, SendfileState>,
-    fd: RawFd,
-    result: io::Result<u64>,
-) {
+fn complete_job(epoll_fd: RawFd, jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
     unsafe {
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
     }
-    if let Some(mut state) = jobs.remove(&fd) {
+    if let Some(mut state) = jobs.remove(fd) {
+        uncork_sendfile_socket(&state.socket);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
     }
 }
 
-fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, message: &str) {
-    let fds = jobs.keys().copied().collect::<Vec<_>>();
+fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, message: &str) {
+    let fds = jobs.active_fds();
     for fd in fds {
         complete_job(
             epoll_fd,
@@ -459,5 +492,47 @@ mod tests {
         assert_eq!(preferred_worker_index(&worker_cpus, Some(6), 0), 2);
         assert_eq!(preferred_worker_index(&worker_cpus, Some(7), 3), 3);
         assert_eq!(preferred_worker_index(&worker_cpus, None, 5), 1);
+    }
+
+    #[test]
+    fn sendfile_table_indexes_jobs_by_fd_without_hashing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let file = File::open("/dev/null").unwrap();
+        let fd = server.as_raw_fd();
+        let (completion, _receiver) = oneshot::channel();
+        let mut jobs = SendfileTable::default();
+        jobs.insert(
+            fd,
+            SendfileState {
+                socket: server,
+                file,
+                offset: 0,
+                sent: 0,
+                len: 1,
+                max_chunk_bytes: 1,
+                completion: Some(completion),
+            },
+        );
+        assert!(jobs.contains(fd));
+        assert_eq!(jobs.active_fds(), vec![fd]);
+        assert!(jobs.get_mut(fd).is_some());
+        assert!(jobs.remove(fd).is_some());
+        assert!(!jobs.contains(fd));
+        drop(client);
+    }
+}
+
+fn uncork_sendfile_socket(socket: &TcpStream) {
+    let disabled: libc::c_int = 0;
+    unsafe {
+        let _ = libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            (&disabled as *const libc::c_int).cast(),
+            mem::size_of_val(&disabled) as libc::socklen_t,
+        );
     }
 }
