@@ -4869,9 +4869,16 @@ impl Gateway {
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
-            let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
-                .await
-                .context("failed reading plain http fast-lane request")?;
+            let expected_static_head = static_response_cache
+                .as_ref()
+                .map(|cached| cached.request_head.as_ref());
+            let (head_end, exact_static_head) = read_fast_lane_http_prefix_with_expected(
+                &mut stream,
+                &mut prefix,
+                expected_static_head,
+            )
+            .await
+            .context("failed reading plain http fast-lane request")?;
             if prefix.is_empty() {
                 break if served_any {
                     PlainHttpFastLaneDecision::Served
@@ -4885,10 +4892,11 @@ impl Gateway {
             };
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
-            if let Some(cached) = static_response_cache
-                .as_ref()
-                .filter(|cached| cached.raw_request_matches(request_head))
-            {
+            if let Some(cached) = static_response_cache.as_ref().filter(|cached| {
+                exact_static_head
+                    && cached.checked_at.elapsed()
+                        <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            }) {
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
@@ -10939,11 +10947,6 @@ struct ConnectionStaticFastPathCache {
 }
 
 impl ConnectionStaticFastPathCache {
-    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
-        self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && self.request_head.as_ref() == request_head
-    }
-
     fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
         request.method == "GET"
             && request.keep_alive
@@ -11443,18 +11446,40 @@ async fn read_fast_lane_http_prefix<Stream>(
 where
     Stream: AsyncRead + Unpin + ?Sized,
 {
+    read_fast_lane_http_prefix_with_expected(stream, prefix, None)
+        .await
+        .map(|(head_end, _)| head_end)
+}
+
+async fn read_fast_lane_http_prefix_with_expected<Stream>(
+    stream: &mut Stream,
+    prefix: &mut BytesMut,
+    expected_head: Option<&[u8]>,
+) -> std::io::Result<(Option<usize>, bool)>
+where
+    Stream: AsyncRead + Unpin + ?Sized,
+{
     loop {
-        if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
-            return Ok(Some(index + 4));
+        if let Some(expected) = expected_head {
+            let compared = prefix.len().min(expected.len());
+            if prefix[..compared] == expected[..compared] {
+                if prefix.len() >= expected.len() {
+                    return Ok((Some(expected.len()), true));
+                }
+            } else if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
+                return Ok((Some(index + 4), false));
+            }
+        } else if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
+            return Ok((Some(index + 4), false));
         }
         if prefix.len() >= TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES {
-            return Ok(None);
+            return Ok((None, false));
         }
         let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
         prefix.reserve(remaining.min(4096));
         let read = stream.read_buf(prefix).await?;
         if read == 0 {
-            return Ok(None);
+            return Ok((None, false));
         }
     }
 }
@@ -22710,6 +22735,31 @@ mod tests {
         assert_eq!(second_end, second.len());
         assert_eq!(&prefix[..second_end], second);
         assert_eq!(prefix.as_ptr(), allocation);
+    }
+
+    #[tokio::test]
+    async fn fast_lane_reader_reuses_exact_head_and_detects_mismatch() {
+        let expected = b"GET /bench/a HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let changed = b"GET /bench/b HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let mut prefix = BytesMut::with_capacity(256);
+        prefix.extend_from_slice(expected);
+        prefix.extend_from_slice(changed);
+
+        let (head_end, exact) =
+            read_fast_lane_http_prefix_with_expected(&mut reader, &mut prefix, Some(expected))
+                .await
+                .expect("read exact cached request head");
+        assert_eq!(head_end, Some(expected.len()));
+        assert!(exact);
+
+        discard_fast_lane_http_head(&mut prefix, expected.len());
+        let (head_end, exact) =
+            read_fast_lane_http_prefix_with_expected(&mut reader, &mut prefix, Some(expected))
+                .await
+                .expect("read changed request head");
+        assert_eq!(head_end, Some(changed.len()));
+        assert!(!exact);
     }
 
     #[tokio::test]
