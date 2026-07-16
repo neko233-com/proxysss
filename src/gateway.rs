@@ -197,7 +197,7 @@ impl RawHttpUpstreamPool {
                 )
             })?;
         let _ = stream.set_nodelay(true);
-        tune_tcp_stream_for_gateway(&stream);
+        tune_tcp_stream_for_latency(&stream);
         Ok(stream)
     }
 
@@ -1502,8 +1502,6 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1536,13 +1534,14 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
@@ -1624,8 +1623,19 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    if SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        return dedicated_http_connection_runtime(worker_index);
+    }
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn initialize_tls_connection_runtimes() {
+    if SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        let _ = dedicated_http_connection_runtimes();
+    } else {
+        let _ = dedicated_tls_connection_runtimes();
+    }
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1655,7 +1665,7 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
         return dedicated_http_connection_runtime(worker_index);
     }
     let runtimes = dedicated_udp_connection_runtimes();
@@ -1663,7 +1673,7 @@ fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runt
 }
 
 fn initialize_udp_connection_runtimes() {
-    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
         let _ = dedicated_http_connection_runtimes();
     } else {
         let _ = dedicated_udp_connection_runtimes();
@@ -1734,7 +1744,12 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
-        SHARED_BALANCED_UDP_RUNTIMES.store(
+        SHARED_TLS_DATA_RUNTIMES.store(
+            config.runtime.performance.enabled
+                && shared_tls_runtime_profile(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        SHARED_UDP_DATA_RUNTIMES.store(
             config.runtime.performance.enabled
                 && shared_udp_runtime_profile(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -5508,7 +5523,7 @@ impl Gateway {
                 1
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
-            let _ = dedicated_tls_connection_runtimes();
+            initialize_tls_connection_runtimes();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -6802,7 +6817,7 @@ impl Gateway {
                     existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
                     associations.remove(&client_addr);
-                } else if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+                } else if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
                     shared_udp_packets_since_yield =
                         shared_udp_packets_since_yield.saturating_add(1);
                     if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
@@ -8593,7 +8608,7 @@ impl Gateway {
             )
         })?;
         let _ = upstream_io.set_nodelay(true);
-        tune_tcp_stream_for_gateway(&upstream_io);
+        tune_tcp_stream_for_latency(&upstream_io);
         let request_bytes = if route.emit_metadata_headers {
             let prefix = config
                 .services
@@ -11774,7 +11789,11 @@ async fn sendfile_all_async(
             bytes_since_cooperative_yield.saturating_add(written as u64);
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
-                tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
+                // Keep small-file and realtime tasks runnable without paying
+                // Linux timer-wheel granularity after every 2 MiB sendfile
+                // chunk. A cooperative yield preserves backpressure/fairness
+                // while immediately resuming when no sibling task is ready.
+                tokio::task::yield_now().await;
             } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
                 bytes_since_cooperative_yield = 0;
                 tokio::task::yield_now().await;
@@ -11961,8 +11980,16 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn shared_udp_runtime_profile(_profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(_profile, RuntimePerformanceTrafficProfile::Balanced)
+fn shared_tls_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Small)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23775,7 +23802,16 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
-        assert!(!shared_udp_runtime_profile(
+        assert!(shared_tls_runtime_profile(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(!shared_tls_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!shared_tls_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
+        assert!(shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
         assert!(shared_udp_runtime_profile(

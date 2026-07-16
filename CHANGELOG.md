@@ -13,6 +13,8 @@
 - Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
 - Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
 - Bounded the default-small TLS crypto runtime to one owner per four detected CPUs and its UDP/QCP runtime to one owner per two CPUs, preserving full-CPU `SO_REUSEPORT` listener fanout and adaptive scaling while reducing mixed-traffic scheduler contention.
+- Consolidated default-small HTTP/1.1, HTTP/2/TLS, WebSocket, TCP, UDP, and transparent QCP work onto the same CPU-adaptive per-core data shards, halving I/O-driver polling intervals for latency, using cooperative sendfile yields instead of timer sleeps, and keeping tiny reverse/SSE upstream sockets on Linux autotuning rather than forced bulk buffers.
+- Fixed the mmap static-cache threshold being Linux-only at compile time even though the portable cache path uses it, restoring Windows/macOS build parity for large cached assets.
 
 ## v1.3.5 - 2026-07-01
 
