@@ -317,7 +317,7 @@ impl BenchmarkSchedule {
             // and WebSocket schedules stay synchronized to model game ticks.
             let first_offset = if self.stagger_operations {
                 interval.mul_f64(
-                    (worker_index.min(self.participants - 1) + 1) as f64 / self.participants as f64,
+                    worker_index.min(self.participants - 1) as f64 / self.participants as f64,
                 )
             } else {
                 interval
@@ -357,7 +357,10 @@ async fn wait_for_operation_slot(
     deadline: tokio::time::Instant,
 ) -> bool {
     if let Some(ticker) = ticker.as_mut() {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => return false,
+        }
     }
     tokio::time::Instant::now() < deadline
 }
@@ -1076,4 +1079,28 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
     let last = values.len().saturating_sub(1);
     let index = ((last as f64) * quantile).round() as usize;
     values[index.min(last)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixed_rate_wait_stops_at_measurement_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut ticker = Some(tokio::time::interval_at(
+            now + Duration::from_secs(4),
+            Duration::from_secs(4),
+        ));
+        let deadline = now + Duration::from_millis(10);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_operation_slot(&mut ticker, deadline),
+        )
+        .await
+        .expect("deadline must wake before the distant ticker");
+
+        assert!(!result);
+    }
 }

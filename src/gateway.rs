@@ -120,6 +120,7 @@ pub struct Gateway {
     raw_http_pools: Arc<DashMap<String, Arc<RawHttpUpstreamPool>>>,
     static_route_cache: Arc<DashMap<String, PathBuf>>,
     static_file_cache: Arc<DashMap<String, CachedStaticFile>>,
+    h2_static_response_cache: Arc<DashMap<String, CachedH2StaticResponse>>,
     static_file_cache_bytes: Arc<AtomicU64>,
     static_file_load_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
@@ -567,11 +568,10 @@ where
 /// cannot monopolize the runtime that also services game/WebSocket sessions.
 const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
 // Socket readiness and Tokio's cooperative budget already bound a hot relay.
-// A normal WebSocket echo frame needs one read and one write. Three polls let
-// that frame drain and then naturally park on readiness, while preventing a
-// continuously readable tunnel from consuming the normal 64-step bulk relay
-// budget on the shared small-profile data runtime.
-const WEBSOCKET_RELAY_POLL_STEPS: usize = 3;
+// Eight polls drain a short WebSocket frame queue without the self-wake churn
+// of a three-step turn, while preventing a continuously readable tunnel from
+// consuming the normal 64-step bulk relay budget on the shared small profile.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = 8;
 
 struct PooledRelayCopyBuffer<
     const MAX_POLL_STEPS: usize,
@@ -1516,7 +1516,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 128;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
 // A shard with roughly one runnable connection per scheduler lane is still
 // low-density. Once dozens of keep-alive connections compete per worker, a
@@ -1887,6 +1887,30 @@ struct CachedStaticFile {
     content_length: HeaderValue,
     checked_at: Instant,
     revalidating: bool,
+}
+
+#[derive(Clone)]
+struct CachedH2StaticResponse {
+    body: Bytes,
+    content_type: HeaderValue,
+    content_length: HeaderValue,
+    checked_at: Instant,
+}
+
+impl CachedH2StaticResponse {
+    fn response(&self) -> GatewayResponse {
+        let mut response = Response::new(full_body(self.body.clone()));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, self.content_type.clone());
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, self.content_length.clone());
+        response
+            .headers_mut()
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        response
+    }
 }
 
 struct HttpCacheRevalidateRequest<'a> {
@@ -2268,6 +2292,7 @@ impl Gateway {
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(DashMap::new()),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges,
@@ -2293,6 +2318,7 @@ impl Gateway {
     /// plane and a benchmark naturally starts only after warm-up.
     async fn warm_up(&self, config: &GatewayConfig) {
         let started = Instant::now();
+        self.h2_static_response_cache.clear();
         self.preload_static_fast_lane_cache(config).await;
         let predialed = self.prewarm_upstream_pools(config).await;
         self.stats.warm.store(true, Ordering::Release);
@@ -7727,7 +7753,19 @@ impl Gateway {
             return None;
         }
 
-        let target = self.static_route_cache.get(request.uri().path())?;
+        let request_path = request.uri().path();
+        if let Some(cached) = self
+            .h2_static_response_cache
+            .get(request_path)
+            .filter(|cached| {
+                cached.checked_at.elapsed()
+                    <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+            })
+        {
+            return Some(cached.response());
+        }
+
+        let target = self.static_route_cache.get(request_path)?;
         let cached = cached_static_file_response_stale_while_revalidate(
             target.as_path(),
             method,
@@ -7736,6 +7774,21 @@ impl Gateway {
         if cached.revalidate {
             self.spawn_static_cache_revalidation(target.clone());
         }
+        let body = match cached.response.body() {
+            GatewayBody::Full(Some(body)) => body.clone(),
+            _ => return Some(cached.response),
+        };
+        let content_type = cached.response.headers().get(CONTENT_TYPE)?.clone();
+        let content_length = cached.response.headers().get(CONTENT_LENGTH)?.clone();
+        self.h2_static_response_cache.insert(
+            request_path.to_string(),
+            CachedH2StaticResponse {
+                body,
+                content_type,
+                content_length,
+                checked_at: Instant::now(),
+            },
+        );
         Some(cached.response)
     }
 
@@ -24041,8 +24094,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(511, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 128);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 128);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
@@ -24369,6 +24422,7 @@ mod tests {
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(DashMap::new()),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),

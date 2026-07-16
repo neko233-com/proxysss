@@ -224,7 +224,7 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(raw), "websocket|14286|552.000000") {
+	if !strings.HasPrefix(string(raw), "websocket|14286|560.000000") {
 		t.Fatalf("unexpected equal-load plan: %s", raw)
 	}
 }
@@ -249,8 +249,8 @@ func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(string(raw), "|20.000000\n") {
-		t.Fatalf("one-second target must match the 20 executable operations: %s", raw)
+	if !strings.HasSuffix(string(raw), "|21.000000\n") {
+		t.Fatalf("one-second target must match the 21 phase-spread operations: %s", raw)
 	}
 }
 
