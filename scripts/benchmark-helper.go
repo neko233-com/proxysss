@@ -23,6 +23,7 @@ import (
 
 const (
 	realtimeCompletionGuardMicros  int64 = 1_000
+	tcpCompletionGuardMicros       int64 = 2_000
 	websocketCompletionGuardMicros int64 = 5_000
 )
 
@@ -923,7 +924,13 @@ func runWriteEqualLoadPlan(args []string) error {
 			// before the hard deadline is schedulable but cannot reliably finish
 			// inside a one-second sample on either gateway.
 			completionGuardMicros := realtimeCompletionGuardMicros
-			if proxy.Protocol == "websocket" || nginx.Protocol == "websocket" {
+			if proxy.Protocol == "tcp" || nginx.Protocol == "tcp" {
+				// A raw TCP echo still crosses two userspace relays. At the
+				// high-density 64-connection slot, one millisecond was below
+				// the measured 1.1-1.3 ms p99 and made the final whole tick
+				// mathematically impossible.
+				completionGuardMicros = tcpCompletionGuardMicros
+			} else if proxy.Protocol == "websocket" || nginx.Protocol == "websocket" {
 				// A WebSocket echo includes framing plus two user-space protocol
 				// transitions. One millisecond is enough for raw TCP/UDP but
 				// makes the final synchronized WebSocket tick client-limited at

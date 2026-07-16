@@ -279,6 +279,31 @@ func TestEqualLoadPlanReservesWebSocketCompletionGuard(t *testing.T) {
 	}
 }
 
+func TestEqualLoadPlanReservesTCPCompletionGuard(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "tcp-stream", Gateway: "nginx", Protocol: "tcp", Concurrency: 64, OpsPerSec: 9226},
+		{Scenario: "tcp-stream", Gateway: "proxysss", Protocol: "tcp", Concurrency: 64, OpsPerSec: 14468},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|2240.000000\n") {
+		t.Fatalf("tcp target must leave two milliseconds for final relay completion: %s", raw)
+	}
+}
+
 func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "saturation.json")

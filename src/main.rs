@@ -2522,7 +2522,7 @@ mod tests {
         assert!(wrapper.contains("LATENCY_REPETITIONS=\"${LATENCY_REPETITIONS:-2}\""));
         assert!(wrapper.contains("MAX_FEEDBACK_SECS:-20"));
         assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-500}\""));
-        assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-250}\""));
+        assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-1000}\""));
         assert!(wrapper.contains("CLIENT_START_LEAD_MS=\"${CLIENT_START_LEAD_MS:-2000}\""));
         assert!(wrapper.contains(
             "EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}\""

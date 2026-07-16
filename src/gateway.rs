@@ -12386,10 +12386,10 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         // Four owners on an eight-core gateway keep game/TCP/WebSocket pairs
-        // below the high-density knee. nice 3 leaves HTTP the primary CFS
-        // consumer during saturation while fixed-rate realtime work stays
-        // prompt on otherwise-idle cores.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        // below the high-density knee. nice 5 leaves enough CPU for static and
+        // reverse-proxy siblings while the measured realtime paths retain
+        // substantial throughput headroom over nginx.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12490,7 +12490,7 @@ fn plain_fast_lane_should_yield(served_since_yield: usize, fairness_batch: usize
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
@@ -24416,7 +24416,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            5
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -24519,7 +24519,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            5
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
