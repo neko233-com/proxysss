@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
-use std::future::Future;
+use std::future::{ready, Future};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Cursor, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
@@ -24,6 +24,7 @@ use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::future::Either;
 use futures::TryStreamExt;
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
@@ -1496,7 +1497,7 @@ impl HyperBody for GatewayBody {
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -4918,6 +4919,9 @@ impl Gateway {
             );
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
+        let mut fairness_batch = plain_fast_lane_fairness_batch_for(
+            PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+        );
         let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
         prefix.extend_from_slice(&initial_prefix);
         let mut static_header = String::with_capacity(160);
@@ -4946,10 +4950,13 @@ impl Gateway {
             };
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
-            if let Some(cached) = static_response_cache
-                .as_ref()
-                .filter(|cached| cached.raw_request_matches(request_head))
-            {
+            let static_cache_hit = static_response_cache
+                .as_mut()
+                .is_some_and(|cached| cached.raw_request_matches(request_head));
+            if static_cache_hit {
+                let cached = static_response_cache
+                    .as_ref()
+                    .expect("static cache hit checked");
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
@@ -4962,8 +4969,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5156,8 +5166,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5213,8 +5226,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5253,6 +5269,7 @@ impl Gateway {
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
                     checked_at: Instant::now(),
+                    hits_until_revalidation_check: PLAIN_FAST_LANE_FAIRNESS_BATCH as u8,
                     header: Bytes::copy_from_slice(static_header.as_bytes()),
                     combined_response,
                     body: candidate.cached_body.clone(),
@@ -5270,8 +5287,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5360,8 +5380,11 @@ impl Gateway {
             }
             discard_fast_lane_http_head(&mut prefix, head_end);
             served_since_yield = served_since_yield.saturating_add(1);
-            if plain_fast_lane_should_yield(served_since_yield) {
+            if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                 served_since_yield = 0;
+                fairness_batch = plain_fast_lane_fairness_batch_for(
+                    PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                );
                 tokio::task::yield_now().await;
             }
         };
@@ -5831,23 +5854,37 @@ impl Gateway {
             prefix
         };
 
-        let gateway = self.clone();
-        let service = service_fn(move |request| {
-            let gateway = gateway.clone();
-            async move {
-                gateway
-                    .handle_hyper_request(request, remote_addr, "https")
-                    .await
-            }
-        });
-
         let io = TokioIo::new(PrefixedIo::new(tls_stream, prefix));
         let result = if is_http2 {
+            let gateway = self.clone();
+            let service = service_fn(move |request| {
+                if let Some(response) = gateway.try_immutable_h2_static_success_fast_path(&request)
+                {
+                    gateway.stats.record_http_request();
+                    Either::Left(ready(Ok(response)))
+                } else {
+                    let gateway = gateway.clone();
+                    Either::Right(async move {
+                        gateway
+                            .handle_hyper_request(request, remote_addr, "https")
+                            .await
+                    })
+                }
+            });
             optimized_http2_server_builder()
                 .serve_connection(io, service)
                 .await
                 .map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
         } else {
+            let gateway = self.clone();
+            let service = service_fn(move |request| {
+                let gateway = gateway.clone();
+                async move {
+                    gateway
+                        .handle_hyper_request(request, remote_addr, "https")
+                        .await
+                }
+            });
             optimized_http_server_builder()
                 .serve_connection_with_upgrades(io, service)
                 .await
@@ -7548,27 +7585,8 @@ impl Gateway {
         // HTTP/2 cannot carry HTTP/1 Upgrade/Transfer-Encoding ambiguity. For
         // an already-ended GET stream, take the immutable precompiled static
         // lane before any HTTP/1-oriented header scans.
-        if request.version() == Version::HTTP_2
-            && method == Method::GET
-            && request.body().is_end_stream()
-            && !request.headers().contains_key(RANGE)
-            && !self.bootstrap_config.runtime.hot_reload.enabled
-            && !self.bootstrap_config.admin.enabled
-            && self.bootstrap_fast_lane.hyper_static_success
-            && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
-        {
-            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
-                if let Some(cached) = cached_static_file_response_stale_while_revalidate(
-                    target.as_path(),
-                    method,
-                    &self.static_file_cache,
-                ) {
-                    if cached.revalidate {
-                        self.spawn_static_cache_revalidation(target.clone());
-                    }
-                    return Ok(Some(cached.response));
-                }
-            }
+        if let Some(response) = self.try_immutable_h2_static_success_fast_path(request) {
+            return Ok(Some(response));
         }
 
         if !request_body_declared_empty(method, request.headers()) {
@@ -7679,6 +7697,35 @@ impl Gateway {
         } else {
             Ok(None)
         }
+    }
+
+    fn try_immutable_h2_static_success_fast_path(
+        &self,
+        request: &Request<Incoming>,
+    ) -> Option<GatewayResponse> {
+        let method = request.method();
+        if request.version() != Version::HTTP_2
+            || method != Method::GET
+            || !request.body().is_end_stream()
+            || request.headers().contains_key(RANGE)
+            || self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+            || !self.bootstrap_fast_lane.hyper_static_success
+            || monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
+        {
+            return None;
+        }
+
+        let target = self.static_route_cache.get(request.uri().path())?;
+        let cached = cached_static_file_response_stale_while_revalidate(
+            target.as_path(),
+            method,
+            &self.static_file_cache,
+        )?;
+        if cached.revalidate {
+            self.spawn_static_cache_revalidation(target.clone());
+        }
+        Some(cached.response)
     }
 
     fn spawn_static_cache_revalidation(&self, target: PathBuf) {
@@ -10991,6 +11038,7 @@ struct ConnectionStaticFastPathCache {
     target: String,
     host: Option<String>,
     checked_at: Instant,
+    hits_until_revalidation_check: u8,
     header: Bytes,
     combined_response: Option<Bytes>,
     body: Option<Bytes>,
@@ -11000,9 +11048,16 @@ struct ConnectionStaticFastPathCache {
 }
 
 impl ConnectionStaticFastPathCache {
-    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
+    fn raw_request_matches(&mut self, request_head: &[u8]) -> bool {
+        if self.request_head.as_ref() != request_head {
+            return false;
+        }
+        if self.hits_until_revalidation_check > 0 {
+            self.hits_until_revalidation_check -= 1;
+            return true;
+        }
+        self.hits_until_revalidation_check = PLAIN_FAST_LANE_FAIRNESS_BATCH as u8;
         self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && self.request_head.as_ref() == request_head
     }
 
     fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
@@ -11836,10 +11891,10 @@ async fn sendfile_all_async(
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 // Keep small-file and realtime tasks runnable without paying
-                // The small profile uses a 16 MiB ceiling, so sendfile normally
-                // reaches socket WouldBlock before this branch. Yield only
-                // after a full immediately-writable chunk; ordinary kernel
-                // backpressure already returns control through async_io.
+                // Keep small-file and realtime tasks runnable without paying
+                // Linux timer-wheel granularity after every 2 MiB sendfile
+                // chunk. A cooperative yield preserves backpressure/fairness
+                // while immediately resuming when no sibling task is ready.
                 tokio::task::yield_now().await;
             } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
                 bytes_since_cooperative_yield = 0;
@@ -12082,12 +12137,8 @@ fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
     }
 }
 
-fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
-    served_since_yield >= PLAIN_FAST_LANE_LOW_DENSITY_BATCH
-        && served_since_yield
-            >= plain_fast_lane_fairness_batch_for(
-                PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
-            )
+fn plain_fast_lane_should_yield(served_since_yield: usize, fairness_batch: usize) -> bool {
+    served_since_yield >= fairness_batch
 }
 
 #[cfg(any(test, target_os = "linux"))]
