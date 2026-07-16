@@ -11990,7 +11990,7 @@ fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
 #[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Small => 2,
         RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
@@ -23817,7 +23817,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            1
+            2
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
