@@ -1558,11 +1558,13 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 // HTTP/2 stream futures are deliberately driven inside their owning
-// connection to avoid one Tokio task allocation per small response. Yield
-// after every completed stream, though: a continuously-ready H2 connection
-// otherwise stays in the worker LIFO slot and can delay unrelated HTTP/1,
-// TCP, UDP and WebSocket I/O on the shared balanced/small data shards.
-const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
+// connection to avoid one Tokio task allocation per small response. Shared
+// small-profile shards yield after every completed stream so H2 cannot occupy
+// the worker LIFO slot. Balanced owns a low-CFS-weight TLS runtime, where a
+// bounded 32-stream batch removes per-response scheduler overhead without
+// placing HTTP/1, TCP, UDP or WebSocket work in the same starvation domain.
+const H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
+const H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH: usize = 32;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1949,6 +1951,7 @@ async fn drive_h2_connection_tasks(
 ) {
     let mut tasks = FuturesUnordered::new();
     let mut consecutive_ready = 0_usize;
+    let fairness_batch = h2_connection_task_fairness_batch();
     loop {
         if tasks.is_empty() {
             consecutive_ready = 0;
@@ -1971,7 +1974,7 @@ async fn drive_h2_connection_tasks(
             }
             _ = tasks.next() => {
                 consecutive_ready = consecutive_ready.saturating_add(1);
-                if consecutive_ready >= H2_CONNECTION_TASK_FAIRNESS_BATCH {
+                if consecutive_ready >= fairness_batch {
                     consecutive_ready = 0;
                     tokio::task::yield_now().await;
                 }
@@ -12278,10 +12281,7 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn shared_tls_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(
-        profile,
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
-    )
+    matches!(profile, RuntimePerformanceTrafficProfile::Small)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12309,9 +12309,29 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
+}
+
+fn h2_connection_task_fairness_batch_for(shared_tls_runtime: bool) -> usize {
+    if shared_tls_runtime {
+        H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH
+    } else {
+        H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH
+    }
+}
+
+fn h2_connection_task_fairness_batch() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        return h2_connection_task_fairness_batch_for(
+            SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed),
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    h2_connection_task_fairness_batch_for(true)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -15457,7 +15477,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 2;
 const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
 
 fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
@@ -23297,7 +23317,6 @@ mod tests {
 
     #[tokio::test]
     async fn h2_connection_executor_drives_streams_without_tokio_spawn_per_request() {
-        assert_eq!(H2_CONNECTION_TASK_FAIRNESS_BATCH, 1);
         let (executor, receiver) = h2_connection_executor();
         let completed = Arc::new(AtomicUsize::new(0));
         let task_completed = completed.clone();
@@ -24254,7 +24273,7 @@ mod tests {
         assert!(shared_tls_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(shared_tls_runtime_profile(
+        assert!(!shared_tls_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_tls_runtime_profile(
@@ -24294,11 +24313,19 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            5
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             5
+        );
+        assert_eq!(
+            h2_connection_task_fairness_batch_for(true),
+            H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH
+        );
+        assert_eq!(
+            h2_connection_task_fairness_batch_for(false),
+            H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
