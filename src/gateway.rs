@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use base64::Engine;
 use brotli::CompressorWriter;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
@@ -5257,10 +5257,9 @@ impl Gateway {
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
-            let (head_end, socket_wait) = read_plain_fast_lane_http_prefix(&stream, &mut prefix)
+            let head_end = read_plain_fast_lane_http_prefix(&stream, &mut prefix)
                 .await
                 .context("failed reading plain http fast-lane request")?;
-            let busy_plain_connection = plain_connection_is_busy(served_any, socket_wait);
             if prefix.is_empty() {
                 break if served_any {
                     PlainHttpFastLaneDecision::Served
@@ -5289,13 +5288,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                    busy_plain_connection,
-                )
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5492,13 +5485,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                    busy_plain_connection,
-                )
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5558,13 +5545,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                    busy_plain_connection,
-                )
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5626,13 +5607,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(
-                    &mut stream,
-                    &cached,
-                    mid_yield,
-                    busy_plain_connection,
-                )
-                .await?;
+                send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -5694,7 +5669,6 @@ impl Gateway {
                                 candidate.len,
                                 candidate.sendfile.clone(),
                                 false,
-                                busy_plain_connection,
                             )
                             .await
                             .map(|_| ())
@@ -11968,32 +11942,35 @@ where
 async fn read_plain_fast_lane_http_prefix(
     stream: &TcpStream,
     prefix: &mut BytesMut,
-) -> std::io::Result<(Option<usize>, Duration)> {
-    let mut socket_wait = Duration::ZERO;
+) -> std::io::Result<Option<usize>> {
     loop {
         if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
-            return Ok((Some(index + 4), socket_wait));
+            return Ok(Some(index + 4));
         }
         if prefix.len() >= TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES {
-            return Ok((None, socket_wait));
+            return Ok(None);
         }
         let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
         prefix.reserve(remaining.min(4096));
-        match stream.try_read_buf(prefix) {
-            Ok(0) => return Ok((None, socket_wait)),
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let started = Instant::now();
-                stream.readable().await?;
-                socket_wait = socket_wait.saturating_add(started.elapsed());
-            }
-            Err(error) => return Err(error),
+        if read_plain_fast_buf(stream, prefix).await? == 0 {
+            return Ok(None);
         }
     }
 }
 
-fn plain_connection_is_busy(served_any: bool, socket_wait: Duration) -> bool {
-    served_any && socket_wait < Duration::from_micros(500)
+async fn read_plain_fast_buf<B>(stream: &TcpStream, buffer: &mut B) -> std::io::Result<usize>
+where
+    B: BufMut,
+{
+    loop {
+        match stream.try_read_buf(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.readable().await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn write_all_plain_fast(stream: &TcpStream, mut bytes: &[u8]) -> std::io::Result<()> {
@@ -12169,7 +12146,6 @@ async fn send_connection_static_fast_path(
     stream: &mut TcpStream,
     cached: &ConnectionStaticFastPathCache,
     cooperative_mid_yield: bool,
-    busy_plain_connection: bool,
 ) -> Result<()> {
     if let Some(response) = cached.combined_response.as_ref() {
         return write_all_plain_fast(stream, response)
@@ -12199,7 +12175,6 @@ async fn send_connection_static_fast_path(
                 cached.len,
                 cached.sendfile.clone(),
                 cooperative_mid_yield,
-                busy_plain_connection,
             )
             .await
             .map(|_| ())
@@ -12221,7 +12196,6 @@ async fn send_static_file_fast(
     _len: u64,
     sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
-    busy_plain_connection: bool,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -12232,15 +12206,9 @@ async fn send_static_file_fast(
                 None,
             ),
         };
-        let result = sendfile_all_async(
-            stream,
-            file.as_raw_fd(),
-            _len,
-            cooperative_mid_yield,
-            busy_plain_connection,
-        )
-        .await
-        .context("sendfile static response failed");
+        let result = sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
+            .await
+            .context("sendfile static response failed");
         if let Some(pool) = pool {
             pool.checkin(file);
         }
@@ -12250,7 +12218,6 @@ async fn send_static_file_fast(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = sendfile;
-        let _ = busy_plain_connection;
         let _ = cooperative_mid_yield;
         let mut file = tokio::fs::File::open(path)
             .await
@@ -12268,25 +12235,25 @@ async fn sendfile_all_async(
     in_fd: std::os::fd::RawFd,
     len: u64,
     cooperative_mid_yield: bool,
-    busy_plain_connection: bool,
 ) -> std::io::Result<u64> {
     if len == 0 {
         return Ok(0);
     }
     let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
-    let _send_buffer_guard = busy_plain_connection
-        .then(|| {
-            ScopedSendBuffer::apply(
-                out_fd,
-                STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
-            )
-        })
-        .flatten();
+    let data_plane_cores = adaptive_data_plane_workers(1);
+    let _send_buffer_guard =
+        sendfile_pressure_should_raise_buffer(transfer_guard.active, data_plane_cores)
+            .then(|| {
+                ScopedSendBuffer::apply(
+                    out_fd,
+                    STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
+                )
+            })
+            .flatten();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
-    let data_plane_cores = adaptive_data_plane_workers(1);
     let max_chunk_bytes = if cooperative_mid_yield {
         configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
     } else if transfer_guard.active <= data_plane_cores {
@@ -12327,31 +12294,21 @@ async fn sendfile_all_async(
     while sent < len {
         let chunk_start = sent;
         let chunk_end = sent.saturating_add(max_chunk_bytes).min(len);
-        stream
-            .async_io(tokio::io::Interest::WRITABLE, || {
-                while sent < chunk_end {
-                    let count = (chunk_end - sent) as usize;
-                    let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
-                    if written > 0 {
-                        sent = sent.saturating_add(written as u64);
-                        continue;
-                    }
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "sendfile source ended before configured length",
-                        ));
-                    }
-
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                Ok(())
-            })
-            .await?;
+        match sendfile_until_blocked(out_fd, in_fd, &mut offset, &mut sent, chunk_end) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        while sent < chunk_end {
+            stream.writable().await?;
+            match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                sendfile_until_blocked(out_fd, in_fd, &mut offset, &mut sent, chunk_end)
+            }) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 // Keep small-file and realtime tasks runnable without paying
@@ -12366,6 +12323,41 @@ async fn sendfile_all_async(
     }
 
     Ok(sent)
+}
+
+#[cfg(target_os = "linux")]
+fn sendfile_until_blocked(
+    out_fd: std::os::fd::RawFd,
+    in_fd: std::os::fd::RawFd,
+    offset: &mut libc::off_t,
+    sent: &mut u64,
+    chunk_end: u64,
+) -> std::io::Result<()> {
+    while *sent < chunk_end {
+        let count = (chunk_end - *sent) as usize;
+        let written = unsafe { libc::sendfile(out_fd, in_fd, offset, count) };
+        if written > 0 {
+            *sent = sent.saturating_add(written as u64);
+            continue;
+        }
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sendfile source ended before configured length",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cores: usize) -> bool {
+    active_transfers > data_plane_cores.max(1).div_ceil(2)
 }
 
 #[cfg(target_os = "linux")]
@@ -22616,7 +22608,7 @@ async fn read_raw_reverse_http_response_into(
         }
 
         buffer.reserve(4096);
-        let read = upstream.read_buf(buffer).await?;
+        let read = read_plain_fast_buf(upstream, buffer).await?;
         if read == 0 {
             return Err(anyhow!("upstream closed during handshake"));
         }
@@ -22644,12 +22636,11 @@ async fn read_raw_fast_http_response_head(
             return Err(anyhow!("upstream response headers exceeded 64KiB"));
         }
 
-        let mut chunk = [0_u8; 4096];
-        let read = upstream.read(&mut chunk).await?;
+        buffer.reserve(4096);
+        let read = read_plain_fast_buf(upstream, &mut buffer).await?;
         if read == 0 {
             return Err(anyhow!("upstream closed during handshake"));
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -23372,15 +23363,9 @@ mod tests {
         });
 
         assert_eq!(
-            sendfile_all_async(
-                &server,
-                file.as_raw_fd(),
-                expected.len() as u64,
-                false,
-                false,
-            )
-            .await
-            .expect("send direct file"),
+            sendfile_all_async(&server, file.as_raw_fd(), expected.len() as u64, false)
+                .await
+                .expect("send direct file"),
             expected.len() as u64
         );
         server.shutdown().await.expect("finish sendfile fixture");
@@ -24625,9 +24610,10 @@ mod tests {
             2 * 1024 * 1024,
             1024 * 1024
         ));
-        assert!(!plain_connection_is_busy(false, Duration::ZERO));
-        assert!(plain_connection_is_busy(true, Duration::from_micros(499)));
-        assert!(!plain_connection_is_busy(true, Duration::from_micros(500)));
+        assert!(!sendfile_pressure_should_raise_buffer(4, 8));
+        assert!(sendfile_pressure_should_raise_buffer(5, 8));
+        assert!(!sendfile_pressure_should_raise_buffer(1, 1));
+        assert!(sendfile_pressure_should_raise_buffer(2, 1));
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
