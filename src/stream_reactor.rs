@@ -56,6 +56,7 @@ struct Reactors {
 struct SocketState {
     _stream: TcpStream,
     peer_fd: RawFd,
+    downstream: bool,
     read_enabled: bool,
     read_closed: bool,
     write_shutdown: bool,
@@ -116,6 +117,10 @@ enum RelayReadOutcome {
     Open,
     ReadClosed,
     Failed,
+}
+
+fn quiet_reply_spin_enabled(blocked_wait: bool, downstream: bool, pair_count: usize) -> bool {
+    blocked_wait && downstream && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER
 }
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
@@ -319,20 +324,20 @@ fn run_reactor(
             }
 
             let fd = token as RawFd;
-            let Some((peer_fd, read_enabled)) = sockets
+            let Some((peer_fd, downstream, read_enabled)) = sockets
                 .get(&fd)
-                .map(|state| (state.peer_fd, state.read_enabled))
+                .map(|state| (state.peer_fd, state.downstream, state.read_enabled))
             else {
                 continue;
             };
             let pair_count = sockets.len() / 2;
             active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
                 ACTIVE_SPIN_POLLS
-            } else if blocked_wait && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER {
+            } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
                 // Fixed-rate game/WebSocket ticks commonly block before the
-                // request arrives. One immediate nonblocking epoll pass catches
-                // the corresponding upstream reply without enabling dense
-                // saturation spin or taking a CFS slice from HTTP siblings.
+                // client request arrives. One immediate nonblocking epoll pass
+                // catches its upstream reply. A reply event never schedules a
+                // second empty poll, bounding syscall/CFS cost for HTTP siblings.
                 QUIET_REPLY_SPIN_POLLS
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 DENSE_SPIN_POLLS
@@ -412,6 +417,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
         SocketState {
             _stream: pair.downstream,
             peer_fd: upstream_fd,
+            downstream: true,
             read_enabled: true,
             read_closed: false,
             write_shutdown: false,
@@ -426,6 +432,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
         SocketState {
             _stream: pair.upstream,
             peer_fd: downstream_fd,
+            downstream: false,
             read_enabled: true,
             read_closed: false,
             write_shutdown: false,
@@ -718,6 +725,10 @@ mod tests {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
         assert_eq!(QUIET_REPLY_SPIN_POLLS, 1);
         assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 32);
+        assert!(quiet_reply_spin_enabled(true, true, 32));
+        assert!(!quiet_reply_spin_enabled(true, false, 32));
+        assert!(!quiet_reply_spin_enabled(false, true, 32));
+        assert!(!quiet_reply_spin_enabled(true, true, 33));
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 

@@ -1174,29 +1174,6 @@ fn tune_tcp_stream_for_latency(stream: &TcpStream) {
     tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
-fn reuseport_incoming_cpu_for_worker(cpus: &[usize], worker_index: usize) -> Option<usize> {
-    (!cpus.is_empty()).then(|| cpus[worker_index % cpus.len()])
-}
-
-#[cfg(target_os = "linux")]
-fn tune_reuseport_listener_incoming_cpu(fd: std::os::fd::RawFd, worker_index: usize) {
-    let cpus = data_plane_cpu_ids();
-    let Some(cpu) = reuseport_incoming_cpu_for_worker(cpus, worker_index) else {
-        return;
-    };
-    let cpu = cpu as libc::c_int;
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_INCOMING_CPU,
-            &cpu as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&cpu) as libc::socklen_t,
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
@@ -1546,6 +1523,8 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 1024 * 1024;
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1623,6 +1602,8 @@ static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_SCOPED_SNDBUF_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
@@ -1931,6 +1912,19 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
+        STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.store(
+            if config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Balanced
+                )
+            {
+                STATIC_SENDFILE_BALANCED_SNDBUF_BYTES
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
         STATIC_SENDFILE_REACTOR_NICE.store(
             sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -5056,10 +5050,6 @@ impl Gateway {
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
             let listener = bind_tcp_listener(bind_addr, "plain http listener").await?;
-            #[cfg(target_os = "linux")]
-            if self.bootstrap_config.runtime.performance.enabled {
-                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
-            }
             tracing::info!(
                 bind = %bind_addr,
                 worker = worker_index,
@@ -5932,10 +5922,6 @@ impl Gateway {
         let mut workers = JoinSet::new();
         for worker_index in 0..base_worker_count {
             let listener = bind_tcp_listener(bind_addr, "tls http listener").await?;
-            #[cfg(target_os = "linux")]
-            if self.bootstrap_config.runtime.performance.enabled {
-                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
-            }
             tracing::info!(
                 bind = %bind_addr,
                 worker = worker_index,
@@ -5996,8 +5982,6 @@ impl Gateway {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 let listener = bind_tcp_listener(bind_addr, "elastic tls http listener").await?;
-                #[cfg(target_os = "linux")]
-                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
                 tracing::info!(
                     bind = %bind_addr,
                     worker = worker_index,
@@ -6445,10 +6429,6 @@ impl Gateway {
                 }
                 Err(error) => return Err(error),
             };
-            #[cfg(target_os = "linux")]
-            if sharded_runtime_enabled {
-                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
-            }
             tracing::info!(
                 listener = %listener_config.name,
                 bind = %bind_addr,
@@ -7077,10 +7057,6 @@ impl Gateway {
                 }
                 Err(error) => return Err(error),
             };
-            #[cfg(target_os = "linux")]
-            if weighted_runtime {
-                tune_reuseport_listener_incoming_cpu(listener_socket.as_raw_fd(), worker_index);
-            }
             tracing::info!(
                 listener = %listener_config.name,
                 bind = %bind_addr,
@@ -12221,6 +12197,10 @@ async fn sendfile_all_async(
     }
     let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
+    let _send_buffer_guard = ScopedSendBuffer::apply(
+        out_fd,
+        STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
+    );
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
@@ -12304,6 +12284,74 @@ async fn sendfile_all_async(
     }
 
     Ok(sent)
+}
+
+#[cfg(target_os = "linux")]
+struct ScopedSendBuffer {
+    fd: std::os::fd::RawFd,
+    restore_request_bytes: libc::c_int,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn scoped_send_buffer_should_raise(current_kernel_bytes: i32, request_bytes: i32) -> bool {
+    request_bytes > 0 && current_kernel_bytes < request_bytes.saturating_mul(2)
+}
+
+#[cfg(target_os = "linux")]
+impl ScopedSendBuffer {
+    fn apply(fd: std::os::fd::RawFd, request_bytes: usize) -> Option<Self> {
+        if request_bytes == 0 {
+            return None;
+        }
+        let mut current: libc::c_int = 0;
+        let mut current_len = std::mem::size_of_val(&current) as libc::socklen_t;
+        let read = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &mut current as *mut _ as *mut libc::c_void,
+                &mut current_len,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        let request = libc::c_int::try_from(request_bytes).ok()?;
+        if !scoped_send_buffer_should_raise(current, request) {
+            return None;
+        }
+        let changed = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &request as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&request) as libc::socklen_t,
+            )
+        };
+        (changed == 0).then_some(Self {
+            fd,
+            // Linux reports the doubled kernel value from SO_SNDBUF. Passing
+            // half restores the original requested queue target.
+            restore_request_bytes: (current / 2).max(1),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedSendBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &self.restore_request_bytes as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&self.restore_request_bytes) as libc::socklen_t,
+            );
+        }
+    }
 }
 
 async fn bind_tcp_listener(bind_addr: SocketAddr, label: &str) -> Result<TcpListener> {
@@ -24484,9 +24532,11 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert_eq!(reuseport_incoming_cpu_for_worker(&[], 0), None);
-        assert_eq!(reuseport_incoming_cpu_for_worker(&[2, 4], 0), Some(2));
-        assert_eq!(reuseport_incoming_cpu_for_worker(&[2, 4], 3), Some(4));
+        assert!(scoped_send_buffer_should_raise(128 * 1024, 1024 * 1024));
+        assert!(!scoped_send_buffer_should_raise(
+            2 * 1024 * 1024,
+            1024 * 1024
+        ));
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
