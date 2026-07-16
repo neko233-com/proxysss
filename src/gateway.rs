@@ -1535,8 +1535,8 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
-const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 15;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
+const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1589,11 +1589,6 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-data")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
             .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-            // Echo-style TCP/UDP/WebSocket wake chains otherwise stay in
-            // Tokio's non-stealable LIFO slot and can delay unrelated H2/static
-            // readiness by tens of milliseconds. Put every wake into the
-            // stealable local queue so mixed p99 tracks real CPU availability.
-            .disable_lifo_slot()
             .on_thread_start(register_current_data_plane_thread)
             .enable_all();
         vec![builder

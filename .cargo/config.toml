@@ -1,3 +1,0 @@
-[build]
-# Required for Tokio Builder::disable_lifo_slot on the unified mixed data runtime.
-rustflags = ["--cfg", "tokio_unstable"]
