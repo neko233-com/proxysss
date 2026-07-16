@@ -25,13 +25,18 @@ const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const WAKE_TOKEN: u64 = u64::MAX;
 
+pub(crate) struct SendfileCompletion {
+    pub(crate) bytes: u64,
+    pub(crate) uncorked: bool,
+}
+
 struct SendfileJob {
     socket: TcpStream,
     file: File,
     offset: u64,
     len: u64,
     max_chunk_bytes: u64,
-    completion: oneshot::Sender<io::Result<u64>>,
+    completion: oneshot::Sender<io::Result<SendfileCompletion>>,
 }
 
 struct SendfileState {
@@ -41,7 +46,7 @@ struct SendfileState {
     sent: u64,
     len: u64,
     max_chunk_bytes: u64,
-    completion: Option<oneshot::Sender<io::Result<u64>>>,
+    completion: Option<oneshot::Sender<io::Result<SendfileCompletion>>>,
 }
 
 #[derive(Default)]
@@ -115,10 +120,13 @@ pub(crate) fn dispatch(
     max_chunk_bytes: u64,
     requested_workers: usize,
     scheduler_nice: i32,
-) -> io::Result<oneshot::Receiver<io::Result<u64>>> {
+) -> io::Result<oneshot::Receiver<io::Result<SendfileCompletion>>> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
-        let _ = sender.send(Ok(0));
+        let _ = sender.send(Ok(SendfileCompletion {
+            bytes: 0,
+            uncorked: false,
+        }));
         return Ok(receiver);
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
@@ -326,7 +334,7 @@ fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
 
 fn finish_unregistered_job(jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
     if let Some(mut state) = jobs.remove(fd) {
-        uncork_sendfile_socket(&state.socket);
+        let result = finish_sendfile_result(&state.socket, result);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
@@ -379,7 +387,7 @@ fn complete_job(epoll_fd: RawFd, jobs: &mut SendfileTable, fd: RawFd, result: io
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
     }
     if let Some(mut state) = jobs.remove(fd) {
-        uncork_sendfile_socket(&state.socket);
+        let result = finish_sendfile_result(&state.socket, result);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
@@ -478,10 +486,9 @@ mod tests {
             client.read_exact(&mut received).unwrap();
             (received, expected[start..].to_vec())
         });
-        assert_eq!(
-            completion.blocking_recv().unwrap().unwrap(),
-            (64 * 1024 - start) as u64
-        );
+        let completion = completion.blocking_recv().unwrap().unwrap();
+        assert_eq!(completion.bytes, (64 * 1024 - start) as u64);
+        assert!(completion.uncorked);
         let (received, expected) = reader.join().unwrap();
         assert_eq!(received, expected);
     }
@@ -524,15 +531,25 @@ mod tests {
     }
 }
 
-fn uncork_sendfile_socket(socket: &TcpStream) {
+fn finish_sendfile_result(
+    socket: &TcpStream,
+    result: io::Result<u64>,
+) -> io::Result<SendfileCompletion> {
+    result.map(|bytes| SendfileCompletion {
+        bytes,
+        uncorked: uncork_sendfile_socket(socket),
+    })
+}
+
+fn uncork_sendfile_socket(socket: &TcpStream) -> bool {
     let disabled: libc::c_int = 0;
     unsafe {
-        let _ = libc::setsockopt(
+        libc::setsockopt(
             socket.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_CORK,
             (&disabled as *const libc::c_int).cast(),
             mem::size_of_val(&disabled) as libc::socklen_t,
-        );
+        ) == 0
     }
 }

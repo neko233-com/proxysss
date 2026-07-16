@@ -5675,6 +5675,7 @@ impl Gateway {
                     .await
                     .context("failed writing plain http fast path response head");
 
+                let mut body_uncorked = false;
                 let body_result =
                     if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
                         if let Some(body) = candidate.cached_body.as_ref() {
@@ -5690,13 +5691,15 @@ impl Gateway {
                                 false,
                             )
                             .await
-                            .map(|_| ())
+                            .map(|uncorked| {
+                                body_uncorked = uncorked;
+                            })
                         }
                     } else {
                         Ok(())
                     };
                 #[cfg(target_os = "linux")]
-                if cork_static {
+                if cork_static && !body_uncorked {
                     set_tcp_cork(&stream, false);
                 }
                 header_result.and(body_result)
@@ -12182,6 +12185,7 @@ async fn send_connection_static_fast_path(
     let header_result = write_all_plain_fast(stream, &cached.header)
         .await
         .context("failed writing cached static response head");
+    let mut body_uncorked = false;
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
             write_all_plain_fast(stream, body)
@@ -12196,14 +12200,16 @@ async fn send_connection_static_fast_path(
                 cooperative_mid_yield,
             )
             .await
-            .map(|_| ())
+            .map(|uncorked| {
+                body_uncorked = uncorked;
+            })
         }
     } else {
         Ok(())
     };
 
     #[cfg(target_os = "linux")]
-    if cork_static {
+    if cork_static && !body_uncorked {
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
@@ -12215,7 +12221,7 @@ async fn send_static_file_fast(
     _len: u64,
     sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
-) -> Result<()> {
+) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let (file, pool) = match sendfile {
@@ -12231,7 +12237,7 @@ async fn send_static_file_fast(
         if let Some(pool) = pool {
             pool.checkin(file);
         }
-        result.map(|_| ())
+        result.map(|(_, uncorked)| uncorked)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -12244,7 +12250,7 @@ async fn send_static_file_fast(
         tokio::io::copy(&mut file, stream)
             .await
             .context("failed copying static fast path file")?;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -12254,9 +12260,9 @@ async fn sendfile_all_async(
     in_fd: std::os::fd::RawFd,
     len: u64,
     cooperative_mid_yield: bool,
-) -> std::io::Result<u64> {
+) -> std::io::Result<(u64, bool)> {
     if len == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
     let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
@@ -12311,9 +12317,10 @@ async fn sendfile_all_async(
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
             Ok(completion) => {
-                return completion.await.map_err(|_| {
+                let completion = completion.await.map_err(|_| {
                     std::io::Error::other("sendfile reactor stopped before job completion")
-                })?;
+                })??;
+                return Ok((completion.bytes, completion.uncorked));
             }
             Err(error) => {
                 tracing::debug!(
@@ -12360,7 +12367,7 @@ async fn sendfile_all_async(
         }
     }
 
-    Ok(sent)
+    Ok((sent, false))
 }
 
 #[cfg(target_os = "linux")]
@@ -23440,7 +23447,7 @@ mod tests {
             sendfile_all_async(&server, file.as_raw_fd(), expected.len() as u64, false)
                 .await
                 .expect("send direct file"),
-            expected.len() as u64
+            (expected.len() as u64, false)
         );
         server.shutdown().await.expect("finish sendfile fixture");
         assert_eq!(reader.await.expect("join sendfile reader"), expected);
