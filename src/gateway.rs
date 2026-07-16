@@ -12306,7 +12306,7 @@ async fn sendfile_all_async(
             in_fd,
             0,
             len,
-            max_chunk_bytes,
+            sendfile_reactor_job_chunk_bytes(reactor_adaptive, len, max_chunk_bytes),
             sendfile_reactor_workers,
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
@@ -12420,6 +12420,15 @@ fn sendfile_reactor_should_dispatch(
     let cores = data_plane_cores.max(1);
     enabled
         && (!adaptive || (active_transfers > cores && active_transfers <= cores.saturating_mul(4)))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_job_chunk_bytes(adaptive: bool, len: u64, max_chunk_bytes: u64) -> u64 {
+    if adaptive {
+        len.max(1)
+    } else {
+        max_chunk_bytes.max(1)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -24690,6 +24699,14 @@ mod tests {
         assert!(!sendfile_reactor_should_dispatch(true, true, 33, 8));
         assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
         assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
+        assert_eq!(
+            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            16 * 1024 * 1024
+        );
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);

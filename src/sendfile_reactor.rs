@@ -52,6 +52,7 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
+    worker_cpus: Vec<Option<usize>>,
     next: AtomicUsize,
 }
 
@@ -92,7 +93,9 @@ pub(crate) fn dispatch(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
-    let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let current_cpu = current_cpu();
+    let index = preferred_worker_index(&reactors.worker_cpus, current_cpu, fallback);
     let worker = &reactors.workers[index];
     worker
         .registrations
@@ -107,6 +110,7 @@ impl Reactors {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
+        let mut worker_cpus = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
@@ -121,12 +125,33 @@ impl Reactors {
                 .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
+            worker_cpus.push(cpu);
         }
         Self {
             workers,
+            worker_cpus,
             next: AtomicUsize::new(0),
         }
     }
+}
+
+fn current_cpu() -> Option<usize> {
+    let cpu = unsafe { libc::sched_getcpu() };
+    (cpu >= 0).then_some(cpu as usize)
+}
+
+fn preferred_worker_index(
+    worker_cpus: &[Option<usize>],
+    current_cpu: Option<usize>,
+    fallback: usize,
+) -> usize {
+    current_cpu
+        .and_then(|cpu| {
+            worker_cpus
+                .iter()
+                .position(|worker_cpu| *worker_cpu == Some(cpu))
+        })
+        .unwrap_or(fallback % worker_cpus.len().max(1))
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -232,14 +257,6 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
 
 fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
-    let mut event = libc::epoll_event {
-        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
-        u64: fd as u64,
-    };
-    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-        let _ = job.completion.send(Err(io::Error::last_os_error()));
-        return;
-    }
     jobs.insert(
         fd,
         SendfileState {
@@ -252,6 +269,31 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
             completion: Some(job.completion),
         },
     );
+    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
+        finish_unregistered_job(jobs, fd, result);
+        return;
+    }
+
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+        u64: fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+        finish_unregistered_job(jobs, fd, Err(io::Error::last_os_error()));
+        return;
+    }
+}
+
+fn finish_unregistered_job(
+    jobs: &mut FxHashMap<RawFd, SendfileState>,
+    fd: RawFd,
+    result: io::Result<u64>,
+) {
+    if let Some(mut state) = jobs.remove(&fd) {
+        if let Some(completion) = state.completion.take() {
+            let _ = completion.send(result);
+        }
+    }
 }
 
 fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
@@ -409,5 +451,13 @@ mod tests {
         );
         let (received, expected) = reader.join().unwrap();
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn sendfile_handoff_prefers_current_cpu_owner() {
+        let worker_cpus = vec![Some(2), Some(4), Some(6), Some(8)];
+        assert_eq!(preferred_worker_index(&worker_cpus, Some(6), 0), 2);
+        assert_eq!(preferred_worker_index(&worker_cpus, Some(7), 3), 3);
+        assert_eq!(preferred_worker_index(&worker_cpus, None, 5), 1);
     }
 }

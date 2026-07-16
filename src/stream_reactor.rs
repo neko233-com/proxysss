@@ -34,7 +34,7 @@ const QUIET_REPLY_SPIN_MID_POLLS: usize = 2;
 const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 4;
 const QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER: usize = 16;
 const QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER: usize = 32;
-const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 48;
+const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
@@ -743,11 +743,11 @@ mod tests {
         assert_eq!(quiet_reply_spin_polls(32), 2);
         assert_eq!(quiet_reply_spin_polls(33), 4);
         assert_eq!(quiet_reply_spin_polls(48), 4);
-        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 48);
-        assert!(quiet_reply_spin_enabled(true, true, 48));
-        assert!(!quiet_reply_spin_enabled(true, false, 48));
-        assert!(!quiet_reply_spin_enabled(false, true, 48));
-        assert!(!quiet_reply_spin_enabled(true, true, 49));
+        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 128);
+        assert!(quiet_reply_spin_enabled(true, true, 128));
+        assert!(!quiet_reply_spin_enabled(true, false, 128));
+        assert!(!quiet_reply_spin_enabled(false, true, 128));
+        assert!(!quiet_reply_spin_enabled(true, true, 129));
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 
