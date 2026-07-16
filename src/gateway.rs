@@ -1539,6 +1539,7 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 128;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
+const PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES: usize = 256 * 1024;
 // A shard with roughly one runnable connection per scheduler lane is still
 // low-density. Once dozens of keep-alive connections compete per worker, a
 // 256-response run lets hot static sockets queue unrelated HTTP, TLS and
@@ -5256,9 +5257,10 @@ impl Gateway {
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
-            let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
+            let (head_end, socket_wait) = read_plain_fast_lane_http_prefix(&stream, &mut prefix)
                 .await
                 .context("failed reading plain http fast-lane request")?;
+            let busy_plain_connection = plain_connection_is_busy(served_any, socket_wait);
             if prefix.is_empty() {
                 break if served_any {
                     PlainHttpFastLaneDecision::Served
@@ -5287,7 +5289,13 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
+                send_connection_static_fast_path(
+                    &mut stream,
+                    cached,
+                    mid_yield,
+                    busy_plain_connection,
+                )
+                .await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5484,7 +5492,13 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
+                send_connection_static_fast_path(
+                    &mut stream,
+                    cached,
+                    mid_yield,
+                    busy_plain_connection,
+                )
+                .await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5544,7 +5558,13 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
+                send_connection_static_fast_path(
+                    &mut stream,
+                    cached,
+                    mid_yield,
+                    busy_plain_connection,
+                )
+                .await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5606,7 +5626,13 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
+                send_connection_static_fast_path(
+                    &mut stream,
+                    &cached,
+                    mid_yield,
+                    busy_plain_connection,
+                )
+                .await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -5638,8 +5664,7 @@ impl Gateway {
                 small_static_response.reserve(static_header.len() + body.len());
                 small_static_response.extend_from_slice(static_header.as_bytes());
                 small_static_response.extend_from_slice(body);
-                stream
-                    .write_all(&small_static_response)
+                write_all_plain_fast(&stream, &small_static_response)
                     .await
                     .context("failed writing combined static fast path response")
             } else {
@@ -5652,16 +5677,14 @@ impl Gateway {
                     set_tcp_cork(&stream, true);
                 }
 
-                let header_result = stream
-                    .write_all(static_header.as_bytes())
+                let header_result = write_all_plain_fast(&stream, static_header.as_bytes())
                     .await
                     .context("failed writing plain http fast path response head");
 
                 let body_result =
                     if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
                         if let Some(body) = candidate.cached_body.as_ref() {
-                            stream
-                                .write_all(body)
+                            write_all_plain_fast(&stream, body)
                                 .await
                                 .context("failed writing cached static fast path body")
                         } else {
@@ -5671,6 +5694,7 @@ impl Gateway {
                                 candidate.len,
                                 candidate.sendfile.clone(),
                                 false,
+                                busy_plain_connection,
                             )
                             .await
                             .map(|_| ())
@@ -9121,8 +9145,7 @@ impl Gateway {
                 },
             )
         };
-        upstream_io
-            .write_all(&request_bytes)
+        write_all_plain_fast(&upstream_io, &request_bytes)
             .await
             .with_context(|| {
                 format!("failed sending plain raw SSE request to {}", route.upstream)
@@ -9146,8 +9169,7 @@ impl Gateway {
             transfer_chunked,
         );
         if request.method == Method::HEAD || status_has_no_body(response_head.status) {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             if upstream_keep_alive {
@@ -9161,21 +9183,18 @@ impl Gateway {
                         Vec::with_capacity(response_head_bytes.len() + len as usize);
                     response_bytes.extend_from_slice(&response_head_bytes);
                     response_bytes.extend_from_slice(&leftover[..len as usize]);
-                    downstream
-                        .write_all(&response_bytes)
+                    write_all_plain_fast(downstream, &response_bytes)
                         .await
                         .context("failed writing raw SSE response head/body")?;
                     leftover_len == len
                 } else {
-                    downstream
-                        .write_all(&response_head_bytes)
+                    write_all_plain_fast(downstream, &response_head_bytes)
                         .await
                         .context("failed writing raw SSE response head")?;
                     relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
                 }
             } else {
-                downstream
-                    .write_all(&response_head_bytes)
+                write_all_plain_fast(downstream, &response_head_bytes)
                     .await
                     .context("failed writing raw SSE response head")?;
                 relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
@@ -9184,8 +9203,7 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else if transfer_chunked {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             let reusable = relay_passthrough_chunked_http_body(
@@ -9199,8 +9217,7 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
@@ -9300,8 +9317,7 @@ impl Gateway {
                 .as_ref()
                 .expect("raw reverse request serialized")
         };
-        upstream_io
-            .write_all(request_bytes)
+        write_all_plain_fast(&upstream_io, request_bytes)
             .await
             .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
@@ -9315,8 +9331,7 @@ impl Gateway {
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
         if request.method == Method::HEAD || status_has_no_body(response.status) {
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             if upstream_keep_alive && buffered_body_len == 0 {
@@ -9329,13 +9344,12 @@ impl Gateway {
         } else if let Some(len) = response.content_length {
             let buffered_body_len_u64 = buffered_body_len as u64;
             let buffered_to_write = buffered_body_len_u64.min(len) as usize;
-            downstream
-                .write_all(
-                    &upstream_response_buffer
-                        [..response.head_end.saturating_add(buffered_to_write)],
-                )
-                .await
-                .context("failed writing raw HTTP response head/body")?;
+            write_all_plain_fast(
+                downstream,
+                &upstream_response_buffer[..response.head_end.saturating_add(buffered_to_write)],
+            )
+            .await
+            .context("failed writing raw HTTP response head/body")?;
             let reusable = if buffered_body_len_u64 > len {
                 false
             } else {
@@ -9357,8 +9371,7 @@ impl Gateway {
         } else if response.transfer_chunked {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             let reusable =
@@ -9373,8 +9386,7 @@ impl Gateway {
         } else {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, leftover).await?;
@@ -11953,6 +11965,64 @@ where
     }
 }
 
+async fn read_plain_fast_lane_http_prefix(
+    stream: &TcpStream,
+    prefix: &mut BytesMut,
+) -> std::io::Result<(Option<usize>, Duration)> {
+    let mut socket_wait = Duration::ZERO;
+    loop {
+        if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
+            return Ok((Some(index + 4), socket_wait));
+        }
+        if prefix.len() >= TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES {
+            return Ok((None, socket_wait));
+        }
+        let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
+        prefix.reserve(remaining.min(4096));
+        match stream.try_read_buf(prefix) {
+            Ok(0) => return Ok((None, socket_wait)),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let started = Instant::now();
+                stream.readable().await?;
+                socket_wait = socket_wait.saturating_add(started.elapsed());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn plain_connection_is_busy(served_any: bool, socket_wait: Duration) -> bool {
+    served_any && socket_wait < Duration::from_micros(500)
+}
+
+async fn write_all_plain_fast(stream: &TcpStream, mut bytes: &[u8]) -> std::io::Result<()> {
+    let mut written_since_yield = 0_usize;
+    while !bytes.is_empty() {
+        match stream.try_write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "plain fast-lane socket wrote zero bytes",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+                written_since_yield = written_since_yield.saturating_add(written);
+                if !bytes.is_empty() && written_since_yield >= PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES {
+                    written_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.writable().await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn discard_fast_lane_http_head(prefix: &mut BytesMut, head_end: usize) {
     debug_assert!(head_end <= prefix.len());
     let remaining = prefix.len().saturating_sub(head_end);
@@ -12099,10 +12169,10 @@ async fn send_connection_static_fast_path(
     stream: &mut TcpStream,
     cached: &ConnectionStaticFastPathCache,
     cooperative_mid_yield: bool,
+    busy_plain_connection: bool,
 ) -> Result<()> {
     if let Some(response) = cached.combined_response.as_ref() {
-        return stream
-            .write_all(response)
+        return write_all_plain_fast(stream, response)
             .await
             .context("failed writing cached combined static response");
     }
@@ -12114,14 +12184,12 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, true);
     }
 
-    let header_result = stream
-        .write_all(&cached.header)
+    let header_result = write_all_plain_fast(stream, &cached.header)
         .await
         .context("failed writing cached static response head");
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
-            stream
-                .write_all(body)
+            write_all_plain_fast(stream, body)
                 .await
                 .context("failed writing cached static response body")
         } else {
@@ -12131,6 +12199,7 @@ async fn send_connection_static_fast_path(
                 cached.len,
                 cached.sendfile.clone(),
                 cooperative_mid_yield,
+                busy_plain_connection,
             )
             .await
             .map(|_| ())
@@ -12152,6 +12221,7 @@ async fn send_static_file_fast(
     _len: u64,
     sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
+    busy_plain_connection: bool,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -12162,9 +12232,15 @@ async fn send_static_file_fast(
                 None,
             ),
         };
-        let result = sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
-            .await
-            .context("sendfile static response failed");
+        let result = sendfile_all_async(
+            stream,
+            file.as_raw_fd(),
+            _len,
+            cooperative_mid_yield,
+            busy_plain_connection,
+        )
+        .await
+        .context("sendfile static response failed");
         if let Some(pool) = pool {
             pool.checkin(file);
         }
@@ -12174,6 +12250,7 @@ async fn send_static_file_fast(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = sendfile;
+        let _ = busy_plain_connection;
         let _ = cooperative_mid_yield;
         let mut file = tokio::fs::File::open(path)
             .await
@@ -12191,16 +12268,21 @@ async fn sendfile_all_async(
     in_fd: std::os::fd::RawFd,
     len: u64,
     cooperative_mid_yield: bool,
+    busy_plain_connection: bool,
 ) -> std::io::Result<u64> {
     if len == 0 {
         return Ok(0);
     }
     let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
-    let _send_buffer_guard = ScopedSendBuffer::apply(
-        out_fd,
-        STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
-    );
+    let _send_buffer_guard = busy_plain_connection
+        .then(|| {
+            ScopedSendBuffer::apply(
+                out_fd,
+                STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
+            )
+        })
+        .flatten();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
@@ -23290,9 +23372,15 @@ mod tests {
         });
 
         assert_eq!(
-            sendfile_all_async(&server, file.as_raw_fd(), expected.len() as u64, false)
-                .await
-                .expect("send direct file"),
+            sendfile_all_async(
+                &server,
+                file.as_raw_fd(),
+                expected.len() as u64,
+                false,
+                false,
+            )
+            .await
+            .expect("send direct file"),
             expected.len() as u64
         );
         server.shutdown().await.expect("finish sendfile fixture");
@@ -24537,6 +24625,10 @@ mod tests {
             2 * 1024 * 1024,
             1024 * 1024
         ));
+        assert!(!plain_connection_is_busy(false, Duration::ZERO));
+        assert!(plain_connection_is_busy(true, Duration::from_micros(499)));
+        assert!(!plain_connection_is_busy(true, Duration::from_micros(500)));
+        assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
