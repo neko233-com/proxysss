@@ -29,6 +29,8 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // batch boundaries instead of relying on coarse CFS weighting.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
+const QUIET_REPLY_SPIN_POLLS: usize = 1;
+const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 32;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
@@ -300,7 +302,8 @@ fn run_reactor(
             std::hint::spin_loop();
             continue;
         }
-        if wait_started.elapsed() >= BLOCKED_WAIT_RESET {
+        let blocked_wait = wait_started.elapsed() >= BLOCKED_WAIT_RESET;
+        if blocked_wait {
             continuous_batches = 0;
         } else {
             continuous_batches = continuous_batches.saturating_add(1);
@@ -325,6 +328,12 @@ fn run_reactor(
             let pair_count = sockets.len() / 2;
             active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
                 ACTIVE_SPIN_POLLS
+            } else if blocked_wait && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER {
+                // Fixed-rate game/WebSocket ticks commonly block before the
+                // request arrives. One immediate nonblocking epoll pass catches
+                // the corresponding upstream reply without enabling dense
+                // saturation spin or taking a CFS slice from HTTP siblings.
+                QUIET_REPLY_SPIN_POLLS
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 DENSE_SPIN_POLLS
             } else {
@@ -707,6 +716,8 @@ mod tests {
     #[test]
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
+        assert_eq!(QUIET_REPLY_SPIN_POLLS, 1);
+        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 32);
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 

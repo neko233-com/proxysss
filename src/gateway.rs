@@ -1174,6 +1174,29 @@ fn tune_tcp_stream_for_latency(stream: &TcpStream) {
     tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn reuseport_incoming_cpu_for_worker(cpus: &[usize], worker_index: usize) -> Option<usize> {
+    (!cpus.is_empty()).then(|| cpus[worker_index % cpus.len()])
+}
+
+#[cfg(target_os = "linux")]
+fn tune_reuseport_listener_incoming_cpu(fd: std::os::fd::RawFd, worker_index: usize) {
+    let cpus = data_plane_cpu_ids();
+    let Some(cpu) = reuseport_incoming_cpu_for_worker(cpus, worker_index) else {
+        return;
+    };
+    let cpu = cpu as libc::c_int;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_INCOMING_CPU,
+            &cpu as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&cpu) as libc::socklen_t,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
@@ -5033,6 +5056,10 @@ impl Gateway {
         let mut workers = JoinSet::new();
         for worker_index in 0..worker_count {
             let listener = bind_tcp_listener(bind_addr, "plain http listener").await?;
+            #[cfg(target_os = "linux")]
+            if self.bootstrap_config.runtime.performance.enabled {
+                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
+            }
             tracing::info!(
                 bind = %bind_addr,
                 worker = worker_index,
@@ -5905,6 +5932,10 @@ impl Gateway {
         let mut workers = JoinSet::new();
         for worker_index in 0..base_worker_count {
             let listener = bind_tcp_listener(bind_addr, "tls http listener").await?;
+            #[cfg(target_os = "linux")]
+            if self.bootstrap_config.runtime.performance.enabled {
+                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
+            }
             tracing::info!(
                 bind = %bind_addr,
                 worker = worker_index,
@@ -5965,6 +5996,8 @@ impl Gateway {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 let listener = bind_tcp_listener(bind_addr, "elastic tls http listener").await?;
+                #[cfg(target_os = "linux")]
+                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
                 tracing::info!(
                     bind = %bind_addr,
                     worker = worker_index,
@@ -6412,6 +6445,10 @@ impl Gateway {
                 }
                 Err(error) => return Err(error),
             };
+            #[cfg(target_os = "linux")]
+            if sharded_runtime_enabled {
+                tune_reuseport_listener_incoming_cpu(listener.as_raw_fd(), worker_index);
+            }
             tracing::info!(
                 listener = %listener_config.name,
                 bind = %bind_addr,
@@ -7040,6 +7077,10 @@ impl Gateway {
                 }
                 Err(error) => return Err(error),
             };
+            #[cfg(target_os = "linux")]
+            if weighted_runtime {
+                tune_reuseport_listener_incoming_cpu(listener_socket.as_raw_fd(), worker_index);
+            }
             tracing::info!(
                 listener = %listener_config.name,
                 bind = %bind_addr,
@@ -24443,6 +24484,9 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
+        assert_eq!(reuseport_incoming_cpu_for_worker(&[], 0), None);
+        assert_eq!(reuseport_incoming_cpu_for_worker(&[2, 4], 0), Some(2));
+        assert_eq!(reuseport_incoming_cpu_for_worker(&[2, 4], 3), Some(4));
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
