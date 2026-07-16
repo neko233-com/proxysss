@@ -120,7 +120,7 @@ services:
 
 How to think about it:
 
-- `auto_https.domains` 非空就自动启用内建 managed ACME。生产默认使用 TLS-ALPN-01，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。原有显式 `challenge: http01` 仍完整兼容（需开放 80）。
+- `auto_https.domains` 非空就自动启用免费的内建 managed ACME。生产默认使用 TLS-ALPN-01 与 ECDSA P-256 证书密钥，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。极老旧客户端可显式设置 `http.tls.acme.key_algorithm: rsa2048`；原有 `challenge: http01` 仍完整兼容（需开放 80）。
 - The domain's public A/AAAA record must reach this host and ports 80 and 443 must be reachable. `email` is optional; adding it enables certificate-expiry/security notices.
 - The route still lives in `domain_routes`; TLS automation does not change how you declare backends.
 
@@ -346,6 +346,7 @@ http:
     acme:
       email: admin@example.com
       challenge: dns01
+      key_algorithm: ecdsa_p256 # 推荐默认；老旧客户端可改 rsa2048
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12

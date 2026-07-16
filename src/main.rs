@@ -348,7 +348,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "auto https",
-        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard DNS-01 uses built-in http.tls.mode=acme_managed + http.tls.acme.challenge=dns01 provider strategies",
+        "proxysss YAML style http.tls.auto_https expands to free managed ACME HTTP-01/TLS-ALPN-01 with ECDSA P-256 by default and optional RSA-2048 compatibility; wildcard DNS-01 uses built-in http.tls.mode=acme_managed + http.tls.acme.challenge=dns01 provider strategies",
     ),
     (
         "multi-cert sni",
@@ -1284,7 +1284,7 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.logging.error_log_path.display()
     );
     println!(
-        "auto https        : enabled={}, mode={:?}, domains={}, production={}",
+        "auto https        : enabled={}, mode={:?}, domains={}, production={}, key_algorithm={:?}",
         config.http.tls.auto_https.enabled,
         config.http.tls.mode,
         if config.http.tls.auto_https.domains.is_empty() {
@@ -1292,7 +1292,8 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         } else {
             config.http.tls.auto_https.domains.join(",")
         },
-        config.http.tls.auto_https.production
+        config.http.tls.auto_https.production,
+        config.http.tls.acme.key_algorithm
     );
     println!(
         "reverse proxy     : routes={}",
@@ -2446,7 +2447,10 @@ mod tests {
     fn capability_matrix_mentions_auto_https() {
         assert!(CAPABILITY_MATRIX
             .iter()
-            .any(|(name, status)| *name == "auto https" && status.contains("auto_https")));
+            .any(|(name, status)| *name == "auto https"
+                && status.contains("auto_https")
+                && status.contains("ECDSA P-256")
+                && status.contains("RSA-2048")));
     }
 
     #[test]

@@ -486,7 +486,7 @@ services:
             <article class="card">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就把 WebSocket 升为 WSS</h3>
-              <p class="subtle">只填写域名即可启用内建 ACME：默认正式 Let's Encrypt + TLS-ALPN-01，只要求 A/AAAA 指向网关且公网 443 可达，不需要 certbot、acme.sh、DNS API 或账号邮箱。显式 `challenge: http01` 仍兼容，需要公网 80。</p>
+              <p class="subtle">只填写域名即可启用免费的内建 ACME：默认正式 Let's Encrypt + TLS-ALPN-01 + ECDSA P-256，只要求 A/AAAA 指向网关且公网 443 可达，不需要 certbot、acme.sh、DNS API 或账号邮箱。极老旧客户端可设置 `http.tls.acme.key_algorithm: rsa2048`；显式 `challenge: http01` 仍兼容，需要公网 80。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
@@ -633,6 +633,7 @@ services:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:

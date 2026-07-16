@@ -467,7 +467,7 @@ services:
             <article class="path">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就给 WebSocket 加 WSS</h3>
-              <p class="subtle">A/AAAA 指向网关且公网 443 可达时，只填写域名即可通过默认 TLS-ALPN-01 自动签正式证书；不需要证书脚本、DNS API 或邮箱。HTTP-01 仍可显式启用。</p>
+              <p class="subtle">A/AAAA 指向网关且公网 443 可达时，只填写域名即可通过默认 TLS-ALPN-01 + ECDSA P-256 免费签正式证书；不需要证书脚本、DNS API 或邮箱。极老旧客户端可选 RSA-2048；HTTP-01 仍可显式启用。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
@@ -619,6 +619,7 @@ tcp:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:

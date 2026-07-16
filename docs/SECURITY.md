@@ -91,6 +91,7 @@ Agent API (requires `admin.enable_write_ops`):
 ### TLS
 
 - Use `http.tls.mode: acme_managed` for public sites (HTTP-01 / TLS-ALPN-01).
+- Managed ACME defaults to ECDSA P-256; use `http.tls.acme.key_algorithm: rsa2048` only when legacy-client compatibility requires it.
 - Use `http.tls.on_demand` for first-hit managed ACME with `allow` glob patterns and optional `ask_url` gate.
 - Use built-in `http.tls.mode: acme_managed` + `challenge: dns01` for wildcard certificates (`manual` needs no API key). Legacy `acme_dns_external` + `acme.sh` is optional only for unsupported DNS vendors.
 - Avoid `self_signed` on the public internet.

@@ -158,7 +158,7 @@ http:
       domains: [wss.example.com]
 ```
 
-这会使用内建 managed ACME 的正式 TLS-ALPN-01，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且公网 443 可达。邮箱仍可通过 `http.tls.auto_https.email` 选填，以接收到期和安全通知。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。
+这会使用免费的内建 managed ACME、正式 TLS-ALPN-01 与默认 ECDSA P-256，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且公网 443 可达。邮箱仍可通过 `http.tls.auto_https.email` 选填；极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。
 
 如果是泛域名：
 
@@ -170,6 +170,7 @@ http:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:

@@ -47,11 +47,12 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
-    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, Order, OrderStatus,
+    RetryPolicy,
 };
 use memchr::memmem;
 use quinn::crypto::rustls::QuicServerConfig;
-use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
+use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair, PKCS_RSA_SHA256};
 use rustc_hash::FxHashMap;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
@@ -82,14 +83,14 @@ use std::sync::OnceLock;
 
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
-    on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
-    AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
-    FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig,
-    HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig,
-    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile, StaticSiteConfig,
-    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    on_demand_domain_allowed, AcmeChallengeType, AcmeKeyAlgorithm, ActiveHealthConfig,
+    ActiveHealthOverrideConfig, AdminConfig, CacheBehavior, CompressionAlgorithm,
+    DomainRouteConfig, DomainTlsMode, FileCloudConfig, FtpUserPolicy, GatewayConfig,
+    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
+    MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
+    ResponseCompressionConfig, ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile,
+    StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig,
+    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::linux_tune::{self, TcpTuneProfile};
@@ -1589,6 +1590,11 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-data")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
             .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            // Echo-style TCP/UDP/WebSocket wake chains otherwise stay in
+            // Tokio's non-stealable LIFO slot and can delay unrelated H2/static
+            // readiness by tens of milliseconds. Put every wake into the
+            // stealable local queue so mixed p99 tracks real CPU availability.
+            .disable_lifo_slot()
             .on_thread_start(register_current_data_plane_thread)
             .enable_all();
         vec![builder
@@ -13561,10 +13567,9 @@ async fn issue_managed_acme_certificate(
             return Err(anyhow!("acme order ended in unexpected state {status:?}"));
         }
 
-        let private_key_pem = order
-            .finalize()
-            .await
-            .context("failed to finalize managed acme order")?;
+        let private_key_pem =
+            finalize_managed_acme_order(&mut order, &tls.acme.domains, tls.acme.key_algorithm)
+                .await?;
         let certificate_pem = order
             .poll_certificate(&retry)
             .await
@@ -13602,6 +13607,35 @@ async fn issue_managed_acme_certificate(
     }
 
     result
+}
+
+async fn finalize_managed_acme_order(
+    order: &mut Order,
+    domains: &[String],
+    key_algorithm: AcmeKeyAlgorithm,
+) -> Result<String> {
+    let mut params = CertificateParams::new(domains.to_vec())
+        .context("failed building managed acme certificate parameters")?;
+    params.distinguished_name = DistinguishedName::new();
+    let private_key = generate_managed_acme_key_pair(key_algorithm)?;
+    let csr = params
+        .serialize_request(&private_key)
+        .context("failed serializing managed acme CSR")?;
+    order
+        .finalize_csr(csr.der())
+        .await
+        .context("failed to finalize managed acme order")?;
+    Ok(private_key.serialize_pem())
+}
+
+fn generate_managed_acme_key_pair(key_algorithm: AcmeKeyAlgorithm) -> Result<KeyPair> {
+    match key_algorithm {
+        AcmeKeyAlgorithm::EcdsaP256 => {
+            KeyPair::generate().context("failed generating ECDSA P-256 certificate key")
+        }
+        AcmeKeyAlgorithm::Rsa2048 => KeyPair::generate_for(&PKCS_RSA_SHA256)
+            .context("failed generating RSA-2048 certificate key"),
+    }
 }
 
 async fn issue_on_demand_managed_certificate(
@@ -15664,9 +15698,12 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
     let tls = &config.http.tls;
     let mode = serde_json::to_value(tls.mode).unwrap_or(serde_json::Value::Null);
     let challenge = serde_json::to_value(tls.acme.challenge).unwrap_or(serde_json::Value::Null);
+    let key_algorithm =
+        serde_json::to_value(tls.acme.key_algorithm).unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "mode": mode,
         "challenge": challenge,
+        "key_algorithm": key_algorithm,
         "server_name": tls.server_name,
         "cert_path": tls.cert_path.display().to_string(),
         "key_path": tls.key_path.display().to_string(),
@@ -15682,6 +15719,7 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
             "email": tls.acme.email,
             "domains": tls.acme.domains,
             "directory_production": tls.acme.directory_production,
+            "key_algorithm": key_algorithm,
             "dns_provider": tls.acme.dns.provider,
             "dns_credentials_configured": !tls.acme.dns.credentials.is_empty(),
         },
@@ -19666,7 +19704,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
           <article class="path">
             <span class="tag beginner">正式上线</span>
             <h3>只填域名就给 WebSocket 加 WSS</h3>
-            <p class="subtle">单域名只填域名即可走正式 TLS-ALPN-01；无需证书脚本、DNS API 或邮箱，只需公网 443。显式 HTTP-01（需 80）继续兼容；泛域名使用 DNS-01。</p>
+            <p class="subtle">单域名只填域名即可免费走正式 TLS-ALPN-01 与默认 ECDSA P-256；无需证书脚本、DNS API 或邮箱，只需公网 443。极老旧客户端可选 RSA-2048；显式 HTTP-01（需 80）继续兼容，泛域名使用 DNS-01。</p>
             <pre><code>{{ACME_DNS}}</code></pre>
           </article>
         </div>
@@ -19884,7 +19922,7 @@ fn docs_template_ftp() -> &'static str {
 }
 
 fn docs_template_acme_dns() -> &'static str {
-    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用内建 ACME：正式 Let's Encrypt + TLS-ALPN-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用免费内建 ACME：正式 Let's Encrypt + TLS-ALPN-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\n    acme:\n      key_algorithm: ecdsa_p256 # 推荐默认；极老旧客户端可改 rsa2048\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
 }
 
 fn docs_template_health() -> &'static str {
@@ -20479,7 +20517,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <div>
                     <div class="eyebrow">Built-in ACME</div>
                     <h2>TLS / Certificates</h2>
-                    <p class="hint">Fully embedded — no acme.sh, certbot, or cloud CLI. HTTP-01/TLS-ALPN-01 for normal domains; DNS-01 for wildcard via built-in cloud providers or manual TXT.</p>
+                    <p class="hint">Fully embedded and free — no acme.sh, certbot, or cloud CLI. ECDSA P-256 is the stable default; RSA-2048 is available for legacy clients. HTTP-01/TLS-ALPN-01 handles normal domains; DNS-01 handles wildcard domains.</p>
                 </div>
                 <div id="tls-state" class="status-dot">Loading TLS summary</div>
             </div>
@@ -24865,11 +24903,32 @@ mod tests {
     }
 
     #[test]
+    fn builtin_docs_explain_free_acme_key_compatibility() {
+        let html = render_docs_html(&GatewayConfig::default());
+        assert!(html.contains("ECDSA P-256"));
+        assert!(html.contains("RSA-2048"));
+        assert!(html.contains("免费"));
+    }
+
+    #[test]
     fn default_tls_alpn_prefers_http2_for_normal_clients() {
         let protocols = default_tls_alpn_protocols();
         assert_eq!(protocols[0], b"acme-tls/1");
         assert_eq!(protocols[1], b"h2");
         assert_eq!(protocols[2], b"http/1.1");
+    }
+
+    #[test]
+    fn managed_acme_supports_ecdsa_p256_and_rsa2048_keys() {
+        let ecdsa = generate_managed_acme_key_pair(AcmeKeyAlgorithm::EcdsaP256)
+            .expect("generate ECDSA P-256 key");
+        assert_eq!(ecdsa.algorithm(), &rcgen::PKCS_ECDSA_P256_SHA256);
+        assert!(ecdsa.serialize_pem().contains("PRIVATE KEY"));
+
+        let rsa = generate_managed_acme_key_pair(AcmeKeyAlgorithm::Rsa2048)
+            .expect("generate RSA-2048 key");
+        assert_eq!(rsa.algorithm(), &PKCS_RSA_SHA256);
+        assert!(rsa.serialize_pem().contains("PRIVATE KEY"));
     }
 
     #[test]

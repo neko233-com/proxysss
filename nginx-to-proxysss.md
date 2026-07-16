@@ -248,7 +248,7 @@ http:
       domains: [wss.example.com]
 ```
 
-只给域名就会启用内建 managed ACME，默认正式环境 TLS-ALPN-01；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。`email` 是可选通知地址；保留的显式 `http.tls.mode: acme_managed`、`challenge: http01`（需 80）、`tls_alpn01` 和 DNS-01 配置仍完全支持。
+只给域名就会启用免费的内建 managed ACME，默认正式环境 TLS-ALPN-01 与 ECDSA P-256；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。`email` 是可选通知地址；极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`，显式 `challenge: http01`（需 80）、`tls_alpn01` 和 DNS-01 配置仍完全支持。
 
 如果你做的是泛域名：
 
@@ -260,6 +260,7 @@ http:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:

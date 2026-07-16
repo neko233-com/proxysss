@@ -230,6 +230,8 @@ pub struct AcmeExternalConfig {
     #[serde(default)]
     pub challenge: AcmeChallengeType,
     #[serde(default)]
+    pub key_algorithm: AcmeKeyAlgorithm,
+    #[serde(default)]
     pub directory_production: bool,
     #[serde(default = "default_acme_renew_hours")]
     pub renew_interval_hours: u64,
@@ -262,6 +264,14 @@ pub enum AcmeChallengeType {
     Http01,
     TlsAlpn01,
     Dns01,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeKeyAlgorithm {
+    #[default]
+    EcdsaP256,
+    Rsa2048,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2444,6 +2454,7 @@ impl Default for AcmeExternalConfig {
             domains: Vec::new(),
             cache_dir: default_acme_cache_dir(),
             challenge: AcmeChallengeType::default(),
+            key_algorithm: AcmeKeyAlgorithm::default(),
             directory_production: false,
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
@@ -3926,6 +3937,7 @@ mod tests {
         assert!(yaml.contains("traffic_profile: small"));
         assert!(yaml.contains("adaptive_system: true"));
         assert!(yaml.contains("socket_extreme: true"));
+        assert!(yaml.contains("key_algorithm: ecdsa_p256"));
     }
 
     #[test]
@@ -4611,6 +4623,30 @@ udp:
         assert_eq!(config.http.tls_bind, "0.0.0.0:443");
         assert_eq!(config.http.h3_bind, "0.0.0.0:443");
         assert_eq!(config.admin.bind, "127.0.0.1:7777");
+        assert_eq!(
+            config.http.tls.acme.key_algorithm,
+            AcmeKeyAlgorithm::EcdsaP256
+        );
+    }
+
+    #[test]
+    fn managed_acme_accepts_rsa2048_certificate_keys() {
+        let base_dir =
+            std::env::temp_dir().join(format!("proxysss-rsa2048-acme-test-{}", std::process::id()));
+        fs::create_dir_all(&base_dir).expect("create temp config dir");
+        let config_path = base_dir.join("proxysss.yaml");
+        fs::write(
+            &config_path,
+            "http:\n  tls:\n    mode: acme_managed\n    generate_self_signed_if_missing: false\n    acme:\n      domains: [example.com]\n      key_algorithm: rsa2048\nplugins:\n  enabled: false\n",
+        )
+        .expect("write config");
+
+        let config = GatewayConfig::load(&config_path).expect("load rsa2048 acme config");
+        assert_eq!(
+            config.http.tls.acme.key_algorithm,
+            AcmeKeyAlgorithm::Rsa2048
+        );
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

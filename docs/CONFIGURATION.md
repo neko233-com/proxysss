@@ -72,7 +72,7 @@ services:
 
 这段配置做了什么：
 
-- 只要 `auto_https.domains` 非空，proxysss 就自动切到内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 TLS-ALPN-01：A/AAAA 指向网关且公网 443 可达即可，不需要额外证书工具、DNS API 或邮箱。显式 `challenge: http01` 仍完整兼容（需要公网 80），`tls_alpn01` 与 DNS-01 入口也保持不变。
+- 只要 `auto_https.domains` 非空，proxysss 就自动切到免费的内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 TLS-ALPN-01 与 ECDSA P-256 证书密钥：A/AAAA 指向网关且公网 443 可达即可，不需要额外证书工具、DNS API 或邮箱。ECDSA P-256 握手开销更小，是推荐稳定默认；只有兼容极老旧客户端时才设置 `http.tls.acme.key_algorithm: rsa2048`。显式 `challenge: http01` 仍完整兼容（需要公网 80），`tls_alpn01` 与 DNS-01 入口也保持不变。
 - 不用额外跑 `certbot`、`acme.sh` 或云厂商 CLI，也不必填写邮箱。邮箱是可选项：填写 `http.tls.auto_https.email` 才会收到到期和安全通知。
 - WebSocket upgrade 路由照常声明；签证完成后同一条 `/ws` 自动同时支持 `ws://` 与 `wss://`。
 
@@ -452,6 +452,7 @@ http:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256 # 推荐默认；兼容极老旧客户端时改 rsa2048
       dns:
         provider: cloudflare
         credentials:
