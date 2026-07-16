@@ -11938,7 +11938,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 #[cfg(any(test, target_os = "linux"))]
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 4,
+        RuntimePerformanceTrafficProfile::Small => 2,
         RuntimePerformanceTrafficProfile::Balanced => 4,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
@@ -23751,7 +23751,7 @@ mod tests {
         assert_eq!(realtime_stream_reactor_workers_for(96, 4), 24);
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            4
+            2
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
