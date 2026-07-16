@@ -409,6 +409,15 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     let client = builder.build().context("failed to build reqwest client")?;
     let url = Arc::new(args.url);
 
+    // Plain HTTP/1 measurements use many pooled connections, unlike HTTPS/H2
+    // which multiplexes on one preconnected session below. Open the same
+    // connection count for both gateways before the absolute measurement
+    // timestamp so one-second p99 represents steady gateway work instead of
+    // whichever candidate completed the initial TCP ramp first.
+    if url.starts_with("http://") {
+        preconnect_http1_pool(&client, url.clone(), concurrency).await?;
+    }
+
     // HTTPS saturation measures steady HTTP/2/TLS request processing, not a
     // race between the first QEMU-scheduled client handshake and the shared
     // measurement timestamp. A HEAD request creates the same pooled TLS/H2
@@ -464,6 +473,38 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
 
     print_operation_target(concurrency, schedule.operation_interval);
     print_summary("http", args.duration_secs, &stats, latencies);
+    Ok(())
+}
+
+async fn preconnect_http1_pool(
+    client: &reqwest::Client,
+    url: Arc<String>,
+    connections: usize,
+) -> Result<()> {
+    let barrier = Arc::new(Barrier::new(connections.saturating_add(1)));
+    let mut tasks = JoinSet::new();
+    for _ in 0..connections {
+        let client = client.clone();
+        let url = url.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let response = client
+                .head(url.as_str())
+                .send()
+                .await
+                .context("failed to preconnect HTTP/1 benchmark client")?;
+            response
+                .bytes()
+                .await
+                .context("failed to drain HTTP/1 preconnect response")?;
+            Result::<()>::Ok(())
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = tasks.join_next().await {
+        result.context("HTTP/1 preconnect task failed")??;
+    }
     Ok(())
 }
 

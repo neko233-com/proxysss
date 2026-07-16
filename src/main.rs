@@ -2462,6 +2462,8 @@ mod tests {
         assert!(wrapper.contains("MAX_FEEDBACK_SECS:-20"));
         assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-500}\""));
         assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-250}\""));
+        assert!(wrapper.contains("CLIENT_START_LEAD_MS=\"${CLIENT_START_LEAD_MS:-1000}\""));
+        assert!(include_str!("bench.rs").contains("preconnect_http1_pool"));
         assert!(wrapper.contains("validation_wall_elapsed_secs"));
         assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
         assert!(runner.contains("required_active_measurement_secs"));

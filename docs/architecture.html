@@ -738,7 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
-          <p class="subtle">Linux 性能模式从 cgroup effective cpuset 发现完整 CPU 集，再建立全核 `SO_REUSEPORT` listener fanout。默认 small 把 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 放进一个 CPU-sized Tokio runtime，每个允许核心一个 nice 0 worker，并允许 ready connection work-steal。Tokio LIFO slot 保留。global injection queue 每 31 次 poll、I/O driver 每 16 次 poll 检查；8-poll 实验降低了 4x HTTP 吞吐且没有修复尾延迟。低密度 HTTP/TLS 显式 yield 摊到每 256 响应；高密度 plain HTTP 使用每 128 响应的公平边界。静态文件重验证独立使用 256-hit budget。WebSocket 使用 readiness-bounded 64-poll normal relay turn。持续 UDP burst 每 8 包 cooperative yield。balanced UDP 复用该 runtime，TLS 保持 bounded runtime 并以 nice 5 运行，避免 H2 worker 在共享 cpuset 上抢占 nice-0 HTTP/realtime shard；bulk 才启用专用 transfer owner。</p>
+          <p class="subtle">Linux 性能模式从 cgroup effective cpuset 发现完整 CPU 集，再建立全核 `SO_REUSEPORT` listener fanout。默认 small 与 balanced 把 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 放进一个 CPU-sized Tokio runtime，每个允许核心一个 nice 0 worker，并允许 ready connection work-steal。Tokio LIFO slot 保留。global injection queue 每 31 次 poll、I/O driver 每 16 次 poll 检查；8-poll 实验降低了 4x HTTP 吞吐且没有修复尾延迟。低密度 HTTP/TLS 显式 yield 摊到每 256 响应；高密度 plain HTTP 使用每 128 响应的公平边界。静态文件重验证独立使用 256-hit budget。WebSocket 使用 readiness-bounded 64-poll normal relay turn。持续 UDP burst 每 4 包 cooperative yield；bulk 才启用专用 transfer owner。</p>
           <p class="subtle">每次 level-triggered readiness 最多连续 drain 8 个 16 KiB read batch，合并已排队 WebSocket/game/TCP 小帧的 epoll/hash dispatch；达到上限就归还 event loop，partial write 立即进入显式 pending/backpressure。普通数据事件只在本端已经观察到 EOF 后才做完整 pair-finished 查询，去掉每帧两端状态查找。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用全核 CPU 自适应 `SO_REUSEPORT` socket fanout并复用有界 UDP buffer pool；默认 small 与 balanced 的 recv loop、association reader 都留在对应 per-core HTTP data shard。无 policy worker 本地缓存 upstream/config 快照；pending 去重使用分片集合，association prune 按时间、创建数量和容量压力节流。</p>
         </section>
@@ -863,7 +863,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Warm-up</span>
               <h3>配置加载后先自我预热</h3>
-              <p class="subtle">静态热文件、sendfile 描述符、小对象完整 HTTP/1 keep-alive 响应 bytes、反向代理 keepalive 池都会先准备好。上游预拨按 CPU 并行、按 pool 去重并受每池/全局上限约束，避免首个真实请求承担序列化、拷贝或冷连接成本。</p>
+              <p class="subtle">静态热文件、sendfile 描述符、小对象完整 HTTP/1 keep-alive 响应 bytes、反向代理 keepalive 池都会先准备好。每个去重 upstream pool 只预拨一对 socket，避免从启动 runtime 大批创建后跨 reactor 长期使用；数字 IP 在 pool 创建时预解析为 SocketAddr。</p>
             </article>
             <article class="card">
               <span class="tag expert">Validation</span>
@@ -899,7 +899,7 @@ scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
           <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 在 Ubuntu 24.04 x86_64 容器内构建当前 checkout，并把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 同时放大；逐档判定 saturation 吞吐和 equal-load p50/p95/p99。equal-load 取较慢 saturation 的 25%，双方须完成至少 98% 可执行 target。HTTP/SSE 使用 centered uniform phase 并对 aggregate slot 四舍五入；WebSocket/TCP/UDP 使用严格早于 deadline 的 whole per-connection synchronized ticks。nginx 1.31.2 mainline 使用 `-O3 -fno-plt`、相同 gateway cpuset、sysctl 与等价协议配置。完整矩阵 active measurement 最多 20 秒；Docker role isolation 不能冒充三台物理机。</p>
-          <p class="subtle">20 秒上限按 active measurement window 累加。默认每尺度运行 1 次 saturation 和 2 次反向 candidate order 的 equal-load，共 18 秒 active measurement；latency report 使用两次样本 median。inactive gateway unpause 后双方都有相同的 250 ms excluded settle，再安排 50 ms future start。UDP/QCP response timeout 为 500 ms。</p>
+          <p class="subtle">20 秒上限按 active measurement window 累加。默认每尺度运行 1 次 saturation 和 2 次反向 candidate order 的 equal-load，共 18 秒 active measurement；latency report 使用两次样本 median。inactive gateway unpause 后双方都有相同的 250 ms excluded settle，再安排 1000 ms future start；plain HTTP/1 在 active window 前并发建立与测量 concurrency 相同的连接池，HTTPS/H2 预连单个 multiplexed session。预连不计入 active measurement，UDP/QCP response timeout 为 500 ms。</p>
           <p class="subtle">严格矩阵中的 `protocol: qcp` 是透明 UDP edge forwarding：proxysss 与 nginx 等价 UDP listener 接受相同负载和门禁。该结果不代表 proxysss 在热路径解析或终止 QCP frame；KCP 专用封装仍不进入默认 nginx head-to-head 矩阵。</p>
         </section>
 

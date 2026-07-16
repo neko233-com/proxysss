@@ -80,11 +80,11 @@ DURATION_SECS="${DURATION_SECS:-1}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
-# The persistent controller execs eleven client processes per wave. A 50 ms
-# absolute lead keeps their one-second measurement windows aligned. Only the
-# active windows consume the 20-second measurement budget; orchestration is
-# reported separately as wall time.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-50}"
+# The persistent controller execs eleven client processes per wave. A one-second
+# absolute lead lets plain HTTP clients preconnect their declared concurrency
+# while keeping all one-second measurement windows aligned. Only active windows
+# consume the 20-second measurement budget; orchestration is wall time.
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-1000}"
 GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-250}"
 UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
 CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-4}"

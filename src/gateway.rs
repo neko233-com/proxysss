@@ -175,14 +175,20 @@ impl FastLaneState {
 struct RawHttpUpstreamPool {
     host: String,
     port: u16,
+    socket_addr: Option<SocketAddr>,
     idle: ArrayQueue<TcpStream>,
 }
 
 impl RawHttpUpstreamPool {
     fn new(host: String, port: u16) -> Self {
+        let socket_addr = host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, port));
         Self {
             host,
             port,
+            socket_addr,
             idle: ArrayQueue::new(raw_http_pool_idle_capacity()),
         }
     }
@@ -194,14 +200,16 @@ impl RawHttpUpstreamPool {
             }
         }
 
-        let stream = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed connecting raw HTTP upstream {}:{}",
-                    self.host, self.port
-                )
-            })?;
+        let stream = match self.socket_addr {
+            Some(addr) => TcpStream::connect(addr).await,
+            None => TcpStream::connect((self.host.as_str(), self.port)).await,
+        }
+        .with_context(|| {
+            format!(
+                "failed connecting raw HTTP upstream {}:{}",
+                self.host, self.port
+            )
+        })?;
         let _ = stream.set_nodelay(true);
         tune_tcp_stream_for_latency(&stream);
         Ok(stream)
@@ -224,21 +232,7 @@ fn raw_http_pool_idle_capacity() -> usize {
     adaptive_data_plane_workers(1).saturating_mul(64).max(64)
 }
 
-const RAW_HTTP_PREWARM_CONNECTIONS_PER_CORE: usize = 16;
-const RAW_HTTP_PREWARM_TOTAL_CONNECTIONS_PER_CORE: usize = 64;
-
-fn raw_http_prewarm_limits_for(cores: usize, pool_capacity: usize) -> (usize, usize) {
-    let cores = cores.max(1);
-    let pool_capacity = pool_capacity.max(1);
-    let per_upstream = cores
-        .saturating_mul(RAW_HTTP_PREWARM_CONNECTIONS_PER_CORE)
-        .min(pool_capacity)
-        .max(1);
-    let total = cores
-        .saturating_mul(RAW_HTTP_PREWARM_TOTAL_CONNECTIONS_PER_CORE)
-        .max(per_upstream);
-    (per_upstream, total)
-}
+const RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL: usize = 2;
 
 /// Bounded, lock-free pool of reusable heap buffers for hot-path relay and
 /// streaming loops. Caps steady-state allocation churn under very high
@@ -2469,38 +2463,26 @@ impl Gateway {
             );
         }
 
-        let data_plane_cores = adaptive_data_plane_workers(1);
-        let (per_upstream, mut remaining_budget) =
-            raw_http_prewarm_limits_for(data_plane_cores, raw_http_pool_idle_capacity());
         let mut seen_pools = HashSet::new();
         let mut predialed = 0_usize;
         for upstream in upstreams {
             let Ok(Some((key, host, port))) = raw_http_pool_parts_from_upstream(&upstream) else {
                 continue;
             };
-            if !seen_pools.insert(key.clone()) || remaining_budget == 0 {
+            if !seen_pools.insert(key.clone()) {
                 continue;
             }
             let pool = self.raw_http_pool_for_parts(key, host, port);
-            let target = per_upstream.min(remaining_budget);
-            let mut attempts = FuturesUnordered::new();
-            for _ in 0..target {
-                let pool = pool.clone();
-                attempts.push(async move {
-                    tokio::time::timeout(Duration::from_millis(250), pool.checkout())
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                });
-            }
-            let mut warmed = Vec::with_capacity(target);
-            while let Some(stream) = attempts.next().await {
-                if let Some(stream) = stream {
-                    warmed.push(stream);
+            let mut warmed = Vec::with_capacity(RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL);
+            for _ in 0..RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL {
+                match tokio::time::timeout(Duration::from_millis(250), pool.checkout()).await {
+                    Ok(Ok(stream)) => {
+                        predialed = predialed.saturating_add(1);
+                        warmed.push(stream);
+                    }
+                    _ => break,
                 }
             }
-            remaining_budget = remaining_budget.saturating_sub(warmed.len());
-            predialed = predialed.saturating_add(warmed.len());
             for stream in warmed {
                 pool.checkin(stream);
             }
@@ -12296,7 +12278,10 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn shared_tls_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Small)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12324,13 +12309,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // Balanced keeps a bounded TLS/H2 runtime beside the CPU-sized
-        // HTTP/realtime shards. A continuously runnable H2 worker at nice 0
-        // otherwise competes with one data shard on the same cgroup CPU and
-        // periodically pushes roughly one core's HTTP/TCP/UDP work into p95.
-        // H2 retains dedicated ownership and ample throughput while CFS lets
-        // latency-sensitive shared-shard I/O run first.
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -15478,7 +15457,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
 const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
 
 fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
@@ -23060,6 +23039,7 @@ mod tests {
             let _ = release_replacement_rx.await;
         });
         let pool = RawHttpUpstreamPool::new(address.ip().to_string(), address.port());
+        assert_eq!(pool.socket_addr, Some(address));
         let first = pool.checkout().await.expect("connect first raw socket");
         first.readable().await.expect("observe closed raw socket");
         pool.checkin(first);
@@ -24238,9 +24218,6 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert_eq!(raw_http_prewarm_limits_for(1, 64), (16, 64));
-        assert_eq!(raw_http_prewarm_limits_for(8, 512), (128, 512));
-        assert_eq!(raw_http_prewarm_limits_for(8, 32), (32, 512));
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
@@ -24277,7 +24254,7 @@ mod tests {
         assert!(shared_tls_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!shared_tls_runtime_profile(
+        assert!(shared_tls_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_tls_runtime_profile(
@@ -24317,7 +24294,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
