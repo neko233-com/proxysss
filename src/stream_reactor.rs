@@ -29,7 +29,7 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // batch boundaries instead of relying on coarse CFS weighting.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
-const QUIET_REPLY_SPIN_POLLS: usize = 1;
+const QUIET_REPLY_SPIN_POLLS: usize = 4;
 const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 48;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
@@ -335,9 +335,9 @@ fn run_reactor(
                 ACTIVE_SPIN_POLLS
             } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
                 // Fixed-rate game/WebSocket ticks commonly block before the
-                // client request arrives. One immediate nonblocking epoll pass
-                // catches its upstream reply. A reply event never schedules a
-                // second empty poll, bounding syscall/CFS cost for HTTP siblings.
+                // client request arrives. Four bounded nonblocking epoll passes
+                // catch replies that land just after the request write. A reply
+                // event never schedules another spin, bounding syscall/CFS cost.
                 QUIET_REPLY_SPIN_POLLS
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 DENSE_SPIN_POLLS
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
-        assert_eq!(QUIET_REPLY_SPIN_POLLS, 1);
+        assert_eq!(QUIET_REPLY_SPIN_POLLS, 4);
         assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 48);
         assert!(quiet_reply_spin_enabled(true, true, 48));
         assert!(!quiet_reply_spin_enabled(true, false, 48));

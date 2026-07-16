@@ -1524,7 +1524,7 @@ const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 2 * 1024 * 1024;
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
@@ -12293,7 +12293,18 @@ async fn sendfile_all_async(
         // one cooperative turn; saturation exposes its real transfer band.
         tokio::task::yield_now().await;
     }
-    let active_transfers = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed);
+    let mut active_transfers = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed);
+    if reactor_enabled
+        && reactor_adaptive
+        && active_transfers > data_plane_cores
+        && active_transfers <= data_plane_cores.saturating_mul(4)
+    {
+        // A rising saturation wave can cross the reactor band while other
+        // pinned owners are still registering. Confirm once more so dense 4x
+        // traffic is not split between reactor and direct ownership.
+        tokio::task::yield_now().await;
+        active_transfers = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed);
+    }
 
     if sendfile_reactor_should_dispatch(
         reactor_enabled,
@@ -12390,7 +12401,7 @@ fn sendfile_until_blocked(
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cores: usize) -> bool {
-    active_transfers > data_plane_cores.max(1).div_ceil(2)
+    active_transfers > data_plane_cores.max(1)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12782,7 +12793,7 @@ fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> us
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -24658,8 +24669,8 @@ mod tests {
             2 * 1024 * 1024,
             1024 * 1024
         ));
-        assert!(!sendfile_pressure_should_raise_buffer(4, 8));
-        assert!(sendfile_pressure_should_raise_buffer(5, 8));
+        assert!(!sendfile_pressure_should_raise_buffer(8, 8));
+        assert!(sendfile_pressure_should_raise_buffer(9, 8));
         assert!(!sendfile_pressure_should_raise_buffer(1, 1));
         assert!(sendfile_pressure_should_raise_buffer(2, 1));
         assert!(!sendfile_reactor_should_dispatch(true, true, 8, 8));
@@ -24821,7 +24832,7 @@ mod tests {
         assert_eq!(SHARDED_PLAIN_HTTP_EVENT_INTERVAL, 8);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            2
         );
         let mut config = GatewayConfig::default();
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
