@@ -1548,6 +1548,7 @@ static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
+static UDP_SUSTAINED_FAIRNESS_PACKETS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
@@ -1753,6 +1754,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         );
         UDP_RUNTIME_NICE.store(
             udp_runtime_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        UDP_SUSTAINED_FAIRNESS_PACKETS.store(
+            udp_sustained_fairness_packets_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         STATIC_SENDFILE_QOS_ENABLED.store(
@@ -6693,8 +6698,9 @@ impl Gateway {
         let mut local_associations = FxHashMap::<SocketAddr, LocalUdpAssociation>::default();
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
-        let mut shared_udp_packets_since_yield = 0_usize;
-        let mut shared_udp_batch_started = Instant::now();
+        let fairness_packets = UDP_SUSTAINED_FAIRNESS_PACKETS.load(Ordering::Relaxed);
+        let mut udp_packets_since_yield = 0_usize;
+        let mut udp_batch_started = Instant::now();
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
@@ -6802,14 +6808,12 @@ impl Gateway {
                     existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
                     associations.remove(&client_addr);
-                } else if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
-                    shared_udp_packets_since_yield =
-                        shared_udp_packets_since_yield.saturating_add(1);
-                    if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
-                        let sustained =
-                            balanced_udp_batch_is_sustained(shared_udp_batch_started.elapsed());
-                        shared_udp_packets_since_yield = 0;
-                        shared_udp_batch_started = Instant::now();
+                } else if fairness_packets > 0 {
+                    udp_packets_since_yield = udp_packets_since_yield.saturating_add(1);
+                    if udp_packets_since_yield >= fairness_packets {
+                        let sustained = udp_batch_is_sustained(udp_batch_started.elapsed());
+                        udp_packets_since_yield = 0;
+                        udp_batch_started = Instant::now();
                         if sustained {
                             tokio::task::yield_now().await;
                         }
@@ -15074,11 +15078,19 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 8;
-const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
+const UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
 
-fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
-    elapsed <= BALANCED_UDP_FAIRNESS_WINDOW
+#[cfg(any(test, target_os = "linux"))]
+fn udp_sustained_fairness_packets_for(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 16,
+        RuntimePerformanceTrafficProfile::Balanced => 8,
+        RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
+}
+
+fn udp_batch_is_sustained(elapsed: Duration) -> bool {
+    elapsed <= UDP_FAIRNESS_WINDOW
 }
 
 fn spawn_udp_association_reader(
@@ -23846,8 +23858,20 @@ mod tests {
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             12
         );
-        assert!(balanced_udp_batch_is_sustained(Duration::from_millis(8)));
-        assert!(!balanced_udp_batch_is_sustained(Duration::from_millis(9)));
+        assert_eq!(
+            udp_sustained_fairness_packets_for(RuntimePerformanceTrafficProfile::Small),
+            16
+        );
+        assert_eq!(
+            udp_sustained_fairness_packets_for(RuntimePerformanceTrafficProfile::Balanced),
+            8
+        );
+        assert_eq!(
+            udp_sustained_fairness_packets_for(RuntimePerformanceTrafficProfile::Bulk),
+            0
+        );
+        assert!(udp_batch_is_sustained(Duration::from_millis(8)));
+        assert!(!udp_batch_is_sustained(Duration::from_millis(9)));
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
