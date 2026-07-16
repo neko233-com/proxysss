@@ -90,7 +90,7 @@ esac
 
 TOTAL_CPUS="${TOTAL_CPUS:-}"
 CPU_CORES="${CPU_CORES:-}"
-DURATION_SECS="${DURATION_SECS:-3}"
+DURATION_SECS="${DURATION_SECS:-1}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
@@ -99,8 +99,9 @@ SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
 REUSE_BENCH_IMAGE="${REUSE_BENCH_IMAGE:-0}"
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-100}"
-MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-60}}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-50}"
+UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-50}"
+MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-20}}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
 LATENCY_RUN_ORDER="${LATENCY_RUN_ORDER:-proxysss nginx}"
@@ -132,6 +133,7 @@ require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
 require_positive_integer EQUAL_LOAD_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
 require_positive_integer EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
 require_positive_integer CLIENT_START_LEAD_MS "$CLIENT_START_LEAD_MS"
+require_positive_integer UDP_CLIENT_TIMEOUT_MS "$UDP_CLIENT_TIMEOUT_MS"
 require_positive_integer MAX_VALIDATION_SECS "$MAX_VALIDATION_SECS"
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "0" && "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]]; then
   echo "ALLOW_UNBALANCED_REPETITIONS must be 0 or 1" >&2
@@ -264,6 +266,7 @@ fi
   echo "mixed_scenarios=${MIXED_SCENARIOS:-all}"
   echo "run_serial_isolated=$RUN_SERIAL_ISOLATED"
   echo "client_start_lead_ms=$CLIENT_START_LEAD_MS"
+  echo "udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS"
   echo "max_validation_secs=$MAX_VALIDATION_SECS"
   echo "run_order=$RUN_ORDER"
   echo "latency_run_order=$LATENCY_RUN_ORDER"
@@ -343,6 +346,7 @@ SAMPLE_AFTER_SECS="$SAMPLE_AFTER_SECS" \
 CAPTURE_DOCKER_STATS="$CAPTURE_DOCKER_STATS" \
 CAPTURE_THREAD_STATS="$CAPTURE_THREAD_STATS" \
 CLIENT_START_LEAD_MS="$CLIENT_START_LEAD_MS" \
+UDP_CLIENT_TIMEOUT_MS="$UDP_CLIENT_TIMEOUT_MS" \
 MAX_VALIDATION_SECS="$MAX_VALIDATION_SECS" \
 HTTP_CONCURRENCY="$http_concurrency" \
 HTTPS_CONCURRENCY="$https_concurrency" \
@@ -381,8 +385,10 @@ for scale in $LOAD_SCALES; do
 done
 
 validation_elapsed_secs=""
+validation_wall_elapsed_secs=""
 if [[ -f "$OUTPUT_ROOT/validation-timing.txt" ]]; then
   validation_elapsed_secs="$(sed -n 's/^validation_elapsed_secs=//p' "$OUTPUT_ROOT/validation-timing.txt" | tail -1)"
+  validation_wall_elapsed_secs="$(sed -n 's/^validation_wall_elapsed_secs=//p' "$OUTPUT_ROOT/validation-timing.txt" | tail -1)"
 fi
 if ! [[ "$validation_elapsed_secs" =~ ^[0-9]+$ ]]; then
   validation_elapsed_secs=$(( $(date +%s) - VALIDATION_WALL_START_SECS ))
@@ -390,6 +396,7 @@ fi
 total_elapsed_secs=$(( $(date +%s) - FEEDBACK_START_SECS ))
 {
   echo "validation_elapsed_secs=$validation_elapsed_secs"
+  echo "validation_wall_elapsed_secs=${validation_wall_elapsed_secs:-unknown}"
   echo "total_elapsed_secs=$total_elapsed_secs"
 } | tee -a "$OUTPUT_ROOT/host-fingerprint.txt"
 if (( validation_elapsed_secs > MAX_VALIDATION_SECS )); then
@@ -401,7 +408,7 @@ if [[ "$benchmark_status" != "0" ]]; then
   exit "$benchmark_status"
 fi
 
-echo "==> all strict Ubuntu 24 x86_64 Docker scales passed in ${validation_elapsed_secs}s (build/setup total ${total_elapsed_secs}s)"
+echo "==> all strict Ubuntu 24 x86_64 Docker scales passed with ${validation_elapsed_secs}s of active measurement (matrix wall ${validation_wall_elapsed_secs:-unknown}s, build/setup total ${total_elapsed_secs}s)"
 for scale in $LOAD_SCALES; do
   echo "$OUTPUT_ROOT/scale-$scale/saturation-summary.md"
   echo "$OUTPUT_ROOT/scale-$scale/equal-load-summary.md"

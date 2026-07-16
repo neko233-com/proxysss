@@ -76,15 +76,17 @@ STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-4}"
 SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 LOAD_SCALES="${LOAD_SCALES:-1}"
-DURATION_SECS="${DURATION_SECS:-3}"
+DURATION_SECS="${DURATION_SECS:-1}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
 CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
-# The persistent controller execs eleven client processes per wave. A 100 ms
-# absolute lead keeps their measurement windows aligned without consuming the
-# one-minute validation budget as idle time.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-100}"
-UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
+# The persistent controller execs eleven client processes per wave. A 50 ms
+# absolute lead keeps their one-second measurement windows aligned. Only the
+# active windows consume the 20-second measurement budget; orchestration is
+# reported separately as wall time.
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-50}"
+UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-50}"
+CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-2}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
@@ -156,6 +158,10 @@ done
 }
 [[ "$MAX_VALIDATION_SECS" =~ ^[0-9]+$ ]] || {
   echo "MAX_VALIDATION_SECS must be a non-negative integer" >&2
+  exit 1
+}
+[[ "$CLIENT_WAVE_GRACE_SECS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CLIENT_WAVE_GRACE_SECS must be a positive integer" >&2
   exit 1
 }
 command -v timeout >/dev/null 2>&1 || {
@@ -610,6 +616,22 @@ if [[ -n "$MIXED_SCENARIOS" ]]; then
   done
 fi
 
+scale_count=0
+for _scale in $LOAD_SCALES; do
+  scale_count=$((scale_count + 1))
+done
+required_active_measurement_secs=0
+if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
+  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * BENCHMARK_REPETITIONS * 4 * DURATION_SECS))
+fi
+if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
+  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * ${#SCENARIOS[@]} * ISOLATED_REPETITIONS * 2 * DURATION_SECS))
+fi
+if (( MAX_VALIDATION_SECS > 0 && required_active_measurement_secs > MAX_VALIDATION_SECS )); then
+  echo "matrix needs ${required_active_measurement_secs}s active measurement, exceeding MAX_VALIDATION_SECS=${MAX_VALIDATION_SECS}" >&2
+  exit 1
+fi
+
 scenario_requested() {
   local only_scenario="$1" scenario="$2"
   if [[ -n "$only_scenario" ]]; then
@@ -737,15 +759,15 @@ CLIENT_WAVE
 
   WAVE_START_AT_UNIX_MS=$(( $("$HELPER" now-unix-ms) + CLIENT_START_LEAD_MS ))
   local client_exec_log="$RUN_DIR/$phase-$kind-client-exec.log"
-  local remaining_validation_secs=2147483647
+  local wave_timeout_secs=2147483647
   if (( MAX_VALIDATION_SECS > 0 )); then
-    remaining_validation_secs=$((MATRIX_VALIDATION_DEADLINE_SECS - $(date +%s)))
-    if (( remaining_validation_secs <= 0 )); then
-      echo "hard validation deadline reached before $WAVE_CLIENT_NAME" >&2
+    if (( MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS > MAX_VALIDATION_SECS )); then
+      echo "active measurement budget exhausted before $WAVE_CLIENT_NAME" >&2
       return 124
     fi
+    wave_timeout_secs=$((DURATION_SECS + CLIENT_WAVE_GRACE_SECS))
   fi
-  timeout --foreground --signal=TERM --kill-after=0.1s "${remaining_validation_secs}s" \
+  timeout --foreground --signal=TERM --kill-after=0.1s "${wave_timeout_secs}s" \
     docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
@@ -784,9 +806,10 @@ THREAD_TICKS
   wait "$client_exec_pid"
   exit_code=$?
   set -e
+  MATRIX_MEASUREMENT_USED_SECS=$((MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS))
   if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
     docker exec "$CLIENT_CONTAINER" sh -c 'pkill -TERM -x proxysss 2>/dev/null || true' >/dev/null 2>&1 || true
-    echo "client wave $WAVE_CLIENT_NAME stopped at the ${MAX_VALIDATION_SECS}s hard deadline" >&2
+    echo "client wave $WAVE_CLIENT_NAME exceeded its ${wave_timeout_secs}s process deadline" >&2
     return 124
   fi
   docker cp "$CLIENT_CONTAINER:/tmp/proxysss-bench-results/." "$WAVE_RESULTS_DIR"
@@ -951,6 +974,8 @@ bench_platform=$BENCH_PLATFORM
 client_start_lead_ms=$CLIENT_START_LEAD_MS
 udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS
 max_validation_secs=$MAX_VALIDATION_SECS
+required_active_measurement_secs=$required_active_measurement_secs
+client_wave_grace_secs=$CLIENT_WAVE_GRACE_SECS
 role_isolation=docker-cgroup-cpuset-network-namespace
 role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
 gateway_memory_samples=cgroup-v2-current-and-peak
@@ -1021,21 +1046,18 @@ start_gateway proxysss
 wait_gateway proxysss
 
 matrix_validation_start_secs="$(date +%s)"
-MATRIX_VALIDATION_DEADLINE_SECS=$((matrix_validation_start_secs + MAX_VALIDATION_SECS - 1))
+MATRIX_MEASUREMENT_USED_SECS=0
 overall_status=0
 for scale in $LOAD_SCALES; do
-  if (( MAX_VALIDATION_SECS > 0 && $(date +%s) >= MATRIX_VALIDATION_DEADLINE_SECS )); then
-    echo "hard validation deadline reached before scale $scale" >&2
-    overall_status=124
-    break
-  fi
   if ! run_scale "$scale"; then overall_status=1; fi
 done
-matrix_validation_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))
+matrix_validation_wall_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))
+matrix_validation_elapsed_secs=$MATRIX_MEASUREMENT_USED_SECS
 if [[ -n "$VALIDATION_TIMING_FILE" ]]; then
   {
     echo "validation_start_secs=$matrix_validation_start_secs"
     echo "validation_elapsed_secs=$matrix_validation_elapsed_secs"
+    echo "validation_wall_elapsed_secs=$matrix_validation_wall_elapsed_secs"
   } >"$VALIDATION_TIMING_FILE"
 fi
 

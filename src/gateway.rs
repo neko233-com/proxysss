@@ -566,12 +566,11 @@ where
 /// Keep each polling turn bounded so a continuously writable bulk connection
 /// cannot monopolize the runtime that also services game/WebSocket sessions.
 const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
-// A normal WebSocket echo frame needs one read and one write. A budget of two
-// forced a self-wake immediately after every frame, before the relay could poll
-// the next read and naturally park on Pending. Three removes that redundant
-// runnable task while still bounding a continuously readable peer to at most
-// two frame batches per runtime turn.
-const WEBSOCKET_RELAY_POLL_STEPS: usize = 3;
+// Socket readiness and Tokio's cooperative budget already bound a hot relay.
+// Reuse the normal relay budget so a short queue of WebSocket frames drains
+// before parking instead of self-waking every few frames and creating a p99
+// scheduler step under mixed fixed-rate traffic.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = MAX_POOLED_RELAY_POLL_STEPS;
 
 struct PooledRelayCopyBuffer<
     const MAX_POLL_STEPS: usize,
@@ -1517,8 +1516,8 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
 const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
-const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
-const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
+const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
+const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 256;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LINUX_STREAM_REACTOR_ENABLED: bool = false;
@@ -1536,8 +1535,8 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // a material part of small-packet CPU on scheduler bookkeeping. Keep I/O
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
-const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 15;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -5579,7 +5578,7 @@ impl Gateway {
                 let _ = downstream.shutdown().await;
                 return Ok(TlsStaticFastLaneAttempt::Served);
             }
-            if served.is_multiple_of(PLAIN_FAST_LANE_FAIRNESS_BATCH) {
+            if served.is_multiple_of(PLAIN_FAST_LANE_LOW_DENSITY_BATCH) {
                 tokio::task::yield_now().await;
             }
         }
@@ -12141,7 +12140,17 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 }
 
 fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
-    if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
+    plain_fast_lane_fairness_batch_for_workers(active_connections, adaptive_data_plane_workers(1))
+}
+
+fn plain_fast_lane_fairness_batch_for_workers(
+    active_connections: usize,
+    data_plane_workers: usize,
+) -> usize {
+    let high_density_connections = data_plane_workers
+        .max(1)
+        .saturating_mul(PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD);
+    if active_connections < high_density_connections {
         PLAIN_FAST_LANE_LOW_DENSITY_BATCH
     } else {
         PLAIN_FAST_LANE_FAIRNESS_BATCH
@@ -24029,10 +24038,10 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(1, 2), 1);
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
-        assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(2_047, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(2_048, 8), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 32);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0

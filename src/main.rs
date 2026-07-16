@@ -2454,6 +2454,20 @@ mod tests {
     }
 
     #[test]
+    fn ubuntu_benchmark_uses_twenty_second_active_measurement_budget() {
+        let wrapper = include_str!("../scripts/benchmark-ubuntu24-amd64-docker.sh");
+        let runner = include_str!("../scripts/benchmark-all-scenarios-isolated.sh");
+        assert!(wrapper.contains("DURATION_SECS=\"${DURATION_SECS:-1}\""));
+        assert!(wrapper.contains("MAX_FEEDBACK_SECS:-20"));
+        assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-50}\""));
+        assert!(wrapper.contains("validation_wall_elapsed_secs"));
+        assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
+        assert!(runner.contains("required_active_measurement_secs"));
+        assert!(runner.contains("CLIENT_WAVE_GRACE_SECS"));
+        assert!(!runner.contains("MATRIX_VALIDATION_DEADLINE_SECS"));
+    }
+
+    #[test]
     fn capability_matrix_mentions_mqtt_iot() {
         assert!(CAPABILITY_MATRIX
             .iter()
