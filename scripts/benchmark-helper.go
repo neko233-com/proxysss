@@ -904,12 +904,12 @@ func runWriteEqualLoadPlan(args []string) error {
 		if intervalMicros < 1 {
 			intervalMicros = 1
 		}
-		// HTTP/SSE workers are uniformly phase-spread from offset zero. Across
-		// all workers that produces one aggregate slot every interval/concurrency
-		// and stops exactly at the deadline. Gate against that integer schedule,
-		// including rates below one operation per connection.
+		// HTTP/SSE workers use centered uniform phase offsets. Across all workers
+		// that produces one aggregate slot every interval/concurrency without a
+		// request exactly at the measurement boundary. Gate against that rounded
+		// integer schedule, including rates below one operation per connection.
 		durationMicros := int64(*durationSecs) * 1_000_000
-		scheduledTotal := (durationMicros*int64(concurrency) + intervalMicros - 1) / intervalMicros
+		scheduledTotal := (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
 		if scheduledTotal < 1 {
 			scheduledTotal = 1
 		}

@@ -317,7 +317,8 @@ impl BenchmarkSchedule {
             // and WebSocket schedules stay synchronized to model game ticks.
             let first_offset = if self.stagger_operations {
                 interval.mul_f64(
-                    worker_index.min(self.participants - 1) as f64 / self.participants as f64,
+                    (worker_index.min(self.participants - 1) as f64 + 0.5)
+                        / self.participants as f64,
                 )
             } else {
                 interval
