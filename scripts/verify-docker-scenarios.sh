@@ -7,6 +7,26 @@ config="examples/all-scenarios.example.yaml"
 
 cd "$repo_root"
 
+# Git Bash/MSYS rewrites container paths such as /work into paths under the
+# Git installation. Disable implicit conversion at Docker boundaries and only
+# translate checkout-owned host paths explicitly.
+docker_cli_bin="$(type -P docker)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    docker() {
+      local arg
+      local -a docker_args=()
+      for arg in "$@"; do
+        if [[ "$arg" == "$repo_root"* ]]; then
+          arg="$(cygpath -m "$repo_root")${arg#"$repo_root"}"
+        fi
+        docker_args+=("$arg")
+      done
+      MSYS2_ARG_CONV_EXCL='*' "$docker_cli_bin" "${docker_args[@]}"
+    }
+    ;;
+esac
+
 # Reuse the Ubuntu 24 benchmark image so scenario validation runs in the same
 # Linux family used by the production performance gate.
 docker build -f docker/ubuntu24-bench.Dockerfile -t "$image" .
