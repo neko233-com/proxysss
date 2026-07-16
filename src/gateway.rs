@@ -1546,6 +1546,7 @@ static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> =
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
 static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -1570,30 +1571,29 @@ static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
-        // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
-        // one reactor thread. This avoids work-stealing and global-queue costs
-        // under sustained static/reverse-proxy load. TLS connections remain on
-        // the accepting shard so rustls sockets are never migrated mid-flight.
-        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        // One CPU-sized runtime still provides one I/O worker per allowed core,
+        // but lets ready connection tasks move between them. Separate one-thread
+        // runtimes permanently inherit SO_REUSEPORT hash skew: an H2 connection,
+        // large-file flows, and UDP/TCP listeners can land on one busy shard
+        // while sibling cores sit idle. Work stealing keeps the default-small
+        // protocol set unified without adding a competing runtime pool.
+        let worker_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
         tracing::info!(
-            runtime_shards = shard_count,
-            "starting sharded plain HTTP data runtimes"
+            runtime_workers = worker_count,
+            "starting unified work-stealing data runtime"
         );
-        (0..shard_count)
-            .map(|shard_index| {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder
-                    .worker_threads(1)
-                    .thread_name(format!("proxysss-http-{shard_index}"))
-                    .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                    .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
-                    .enable_all();
-                builder
-                    .build()
-                    .expect("failed to build proxysss HTTP runtime shard")
-            })
-            .collect()
+        DATA_RUNTIME_THREAD_INDEX.store(0, Ordering::Relaxed);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(worker_count)
+            .thread_name("proxysss-data")
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .on_thread_start(register_current_data_plane_thread)
+            .enable_all();
+        vec![builder
+            .build()
+            .expect("failed to build proxysss unified data runtime")]
     })
 }
 
@@ -1710,6 +1710,11 @@ fn pin_current_data_plane_thread(worker_index: usize) {
 #[cfg(not(target_os = "linux"))]
 fn pin_current_data_plane_thread(worker_index: usize) {
     DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
+}
+
+fn register_current_data_plane_thread() {
+    let worker_index = DATA_RUNTIME_THREAD_INDEX.fetch_add(1, Ordering::Relaxed);
+    pin_current_data_plane_thread(worker_index);
 }
 
 #[cfg(target_os = "linux")]
