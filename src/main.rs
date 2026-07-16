@@ -2460,10 +2460,12 @@ mod tests {
         assert!(wrapper.contains("DURATION_SECS=\"${DURATION_SECS:-1}\""));
         assert!(wrapper.contains("MAX_FEEDBACK_SECS:-20"));
         assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-500}\""));
+        assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-250}\""));
         assert!(wrapper.contains("validation_wall_elapsed_secs"));
         assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
         assert!(runner.contains("required_active_measurement_secs"));
         assert!(runner.contains("CLIENT_WAVE_GRACE_SECS"));
+        assert!(runner.contains("settle_resumed_gateway"));
         assert!(!runner.contains("MATRIX_VALIDATION_DEADLINE_SECS"));
     }
 

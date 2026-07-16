@@ -85,6 +85,7 @@ CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
 # active windows consume the 20-second measurement budget; orchestration is
 # reported separately as wall time.
 CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-50}"
+GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-250}"
 UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
 CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-4}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
@@ -150,6 +151,10 @@ for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT
 done
 [[ "$CLIENT_START_LEAD_MS" =~ ^[1-9][0-9]*$ ]] || {
   echo "CLIENT_START_LEAD_MS must be a positive integer" >&2
+  exit 1
+}
+[[ "$GATEWAY_RESUME_SETTLE_MS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "GATEWAY_RESUME_SETTLE_MS must be a positive integer" >&2
   exit 1
 }
 [[ "$UDP_CLIENT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || {
@@ -592,6 +597,14 @@ activate_gateway() {
   docker pause "$PREFIX-gateway-$other" >/dev/null 2>&1 || true
 }
 
+settle_resumed_gateway() {
+  local seconds
+  printf -v seconds '%d.%03d' \
+    "$((GATEWAY_RESUME_SETTLE_MS / 1000))" \
+    "$((GATEWAY_RESUME_SETTLE_MS % 1000))"
+  sleep "$seconds"
+}
+
 declare -a SATURATION_ROWS=()
 declare -a ISOLATED_ROWS=()
 declare -a LATENCY_ROWS=()
@@ -718,6 +731,11 @@ run_candidate() {
   local phase="$1" kind="$2" only_scenario="${3:-}"
   : >"$RUN_DIR/clients.meta"
   activate_gateway "$kind"
+  # A paused async gateway resumes with cold CPU caches and overdue timer/I/O
+  # bookkeeping. Starting a one-second sample immediately after unpause creates
+  # candidate-wide p99 spikes unrelated to the steady data path. Apply the same
+  # excluded settle window to both gateways before scheduling the future start.
+  settle_resumed_gateway
 
   local gateway_ip
   gateway_ip="$(gateway_ip_for "$kind")"
@@ -972,6 +990,7 @@ nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM
 client_start_lead_ms=$CLIENT_START_LEAD_MS
+gateway_resume_settle_ms=$GATEWAY_RESUME_SETTLE_MS
 udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS
 max_validation_secs=$MAX_VALIDATION_SECS
 required_active_measurement_secs=$required_active_measurement_secs

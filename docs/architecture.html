@@ -883,7 +883,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder；默认 small 的 TLS handshake、H2 与 plain HTTP 共用相同 per-core data shard。warm-up 从 bounded static cache 构建 immutable `Bytes` 响应表，并通过 ArcSwap 发布只读 FxHashMap；同路径 H2 请求不获取 DashMap shard，过期后 stale-while-revalidate 并原子替换整张有界小表。small 大文件保持 2 MiB `sendfile` cooperative slice；bulk 才启用 reactor。release 使用 fat LTO。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder。warm-up 从 bounded static cache 构建 immutable `Bytes` 响应表，并通过 ArcSwap 发布只读 FxHashMap；同路径 H2 请求不获取 DashMap shard。每条 H2 connection 使用本地 `FuturesUnordered` executor 驱动 stream future，避免每请求一次 Tokio spawn/global-queue hop，同时保留完整 Hyper/H2 future 语义。过期文件继续 stale-while-revalidate 并原子替换快照。</p>
             </article>
           </div>
 
@@ -899,7 +899,7 @@ scripts/benchmark-all-scenarios-isolated.sh
 scripts/benchmark-websocket-production-gate.sh</code></pre>
 
           <p class="subtle">`benchmark-ubuntu24-amd64-docker.sh` 在 Ubuntu 24.04 x86_64 容器内构建当前 checkout，并把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 同时放大；逐档判定 saturation 吞吐和 equal-load p50/p95/p99。equal-load 取较慢 saturation 的 25%，双方须完成至少 98% 可执行 target。HTTP/SSE 使用 centered uniform phase 并对 aggregate slot 四舍五入；WebSocket/TCP/UDP 使用严格早于 deadline 的 whole per-connection synchronized ticks。nginx 1.31.2 mainline 使用 `-O3 -fno-plt`、相同 gateway cpuset、sysctl 与等价协议配置。完整矩阵 active measurement 最多 20 秒；Docker role isolation 不能冒充三台物理机。</p>
-          <p class="subtle">20 秒上限按 active measurement window 累加；每个 wave 启动前预留完整 1 秒采样，并由 GNU `timeout` 另设 4 秒 process grace，卡死会终止容器内发生器。默认启动 lead 为 50 ms，UDP/QCP response timeout 为 500 ms；尾部等待不计入 active measurement。</p>
+          <p class="subtle">20 秒上限按 active measurement window 累加；每个 wave 启动前预留完整 1 秒采样，并由 GNU `timeout` 另设 4 秒 process grace。inactive gateway 使用 Docker pause；每次 unpause 后 nginx 与 proxysss 都先经过默认 250 ms、排除在 active measurement 外的 settle window，再安排 50 ms future start，避免冷 CPU cache 与 overdue timer/I/O bookkeeping 形成候选端整机伪 p99。UDP/QCP response timeout 为 500 ms。</p>
           <p class="subtle">严格矩阵中的 `protocol: qcp` 是透明 UDP edge forwarding：proxysss 与 nginx 等价 UDP listener 接受相同负载和门禁。该结果不代表 proxysss 在热路径解析或终止 QCP frame；KCP 专用封装仍不进入默认 nginx head-to-head 矩阵。</p>
         </section>
 

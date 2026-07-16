@@ -25,7 +25,8 @@ use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::future::Either;
-use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
@@ -1896,6 +1897,58 @@ struct PrebuiltH2StaticResponse {
     content_type: HeaderValue,
     content_length: HeaderValue,
     checked_at: Instant,
+}
+
+type H2ConnectionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct H2ConnectionExecutor {
+    sender: tokio::sync::mpsc::UnboundedSender<H2ConnectionTask>,
+}
+
+impl<F> hyper::rt::Executor<F> for H2ConnectionExecutor
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let _ = self.sender.send(Box::pin(future));
+    }
+}
+
+fn h2_connection_executor() -> (
+    H2ConnectionExecutor,
+    tokio::sync::mpsc::UnboundedReceiver<H2ConnectionTask>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (H2ConnectionExecutor { sender }, receiver)
+}
+
+async fn drive_h2_connection_tasks(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<H2ConnectionTask>,
+) {
+    let mut tasks = FuturesUnordered::new();
+    loop {
+        if tasks.is_empty() {
+            match receiver.recv().await {
+                Some(task) => tasks.push(task),
+                None => break,
+            }
+            continue;
+        }
+
+        tokio::select! {
+            task = receiver.recv() => {
+                match task {
+                    Some(task) => tasks.push(task),
+                    None => {
+                        while tasks.next().await.is_some() {}
+                        break;
+                    }
+                }
+            }
+            _ = tasks.next() => {}
+        }
+    }
 }
 
 impl PrebuiltH2StaticResponse {
@@ -5919,10 +5972,20 @@ impl Gateway {
                     })
                 }
             });
-            optimized_http2_server_builder()
-                .serve_connection(io, service)
-                .await
-                .map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
+            let (executor, receiver) = h2_connection_executor();
+            let builder = optimized_http2_server_builder(executor);
+            let connection = builder.serve_connection(io, service);
+            let task_driver = drive_h2_connection_tasks(receiver);
+            tokio::pin!(connection);
+            tokio::pin!(task_driver);
+            tokio::select! {
+                result = &mut connection => {
+                    result.map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
+                }
+                _ = &mut task_driver => {
+                    Err(anyhow!("HTTP/2 connection task driver stopped early"))
+                }
+            }
         } else {
             let gateway = self.clone();
             let service = service_fn(move |request| {
@@ -11066,8 +11129,10 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
 }
 
-fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
-    let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
+fn optimized_http2_server_builder(
+    executor: H2ConnectionExecutor,
+) -> Http2ServerBuilder<H2ConnectionExecutor> {
+    let mut builder = Http2ServerBuilder::new(executor);
     builder
         .timer(TokioTimer::new())
         .adaptive_window(false)
@@ -23125,6 +23190,20 @@ mod tests {
             STATIC_FILE_CONNECTION_REVALIDATE_HITS as usize,
             PLAIN_FAST_LANE_FAIRNESS_BATCH
         );
+    }
+
+    #[tokio::test]
+    async fn h2_connection_executor_drives_streams_without_tokio_spawn_per_request() {
+        let (executor, receiver) = h2_connection_executor();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let task_completed = completed.clone();
+        hyper::rt::Executor::execute(&executor, async move {
+            task_completed.fetch_add(1, Ordering::Relaxed);
+        });
+        drop(executor);
+
+        drive_h2_connection_tasks(receiver).await;
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
     }
 
     #[test]
