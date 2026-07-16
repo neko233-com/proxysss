@@ -12,7 +12,7 @@
 - Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
 - Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
 - Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
-- Bounded the default-small TLS crypto runtime to one owner per four detected CPUs and gave its dedicated UDP/QCP runtime a light nice +2 weight, preserving adaptive scaling and low-load latency while returning saturated mixed-traffic CPU to HTTP siblings.
+- Bounded the default-small TLS crypto runtime to one owner per four detected CPUs, preserving adaptive scaling while reducing scheduler contention with plain HTTP, WebSocket, TCP, and UDP mixed traffic.
 
 ## v1.3.5 - 2026-07-01
 
