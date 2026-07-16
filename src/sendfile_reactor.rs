@@ -62,6 +62,10 @@ enum DriveResult {
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
+pub(crate) fn warm(requested_workers: usize, scheduler_nice: i32) {
+    let _ = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+}
+
 pub(crate) fn dispatch(
     socket_fd: RawFd,
     file_fd: RawFd,

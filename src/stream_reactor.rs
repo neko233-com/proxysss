@@ -30,7 +30,7 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
 const QUIET_REPLY_SPIN_POLLS: usize = 1;
-const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 32;
+const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 48;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
@@ -724,11 +724,11 @@ mod tests {
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
         assert_eq!(QUIET_REPLY_SPIN_POLLS, 1);
-        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 32);
-        assert!(quiet_reply_spin_enabled(true, true, 32));
-        assert!(!quiet_reply_spin_enabled(true, false, 32));
-        assert!(!quiet_reply_spin_enabled(false, true, 32));
-        assert!(!quiet_reply_spin_enabled(true, true, 33));
+        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 48);
+        assert!(quiet_reply_spin_enabled(true, true, 48));
+        assert!(!quiet_reply_spin_enabled(true, false, 48));
+        assert!(!quiet_reply_spin_enabled(false, true, 48));
+        assert!(!quiet_reply_spin_enabled(true, true, 49));
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 

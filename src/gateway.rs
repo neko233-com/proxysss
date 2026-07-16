@@ -1599,6 +1599,8 @@ static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_ADAPTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
@@ -1896,6 +1898,13 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
+        STATIC_SENDFILE_REACTOR_ADAPTIVE.store(
+            matches!(
+                config.runtime.performance.traffic_profile,
+                RuntimePerformanceTrafficProfile::Balanced
+            ),
+            Ordering::Relaxed,
+        );
         STATIC_SENDFILE_REACTOR_CPU_DIVISOR.store(
             sendfile_reactor_cpu_divisor(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -1930,6 +1939,16 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
+        if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+            crate::sendfile_reactor::warm(
+                adaptive_data_plane_workers(1).div_ceil(
+                    STATIC_SENDFILE_REACTOR_CPU_DIVISOR
+                        .load(Ordering::Relaxed)
+                        .max(1),
+                ),
+                STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
+            );
+        }
     }
     plan
 }
@@ -12267,7 +12286,12 @@ async fn sendfile_all_async(
             .max(1),
     );
 
-    if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+    if sendfile_reactor_should_dispatch(
+        STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed),
+        STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed),
+        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+        data_plane_cores,
+    ) {
         match crate::sendfile_reactor::dispatch(
             out_fd,
             in_fd,
@@ -12358,6 +12382,17 @@ fn sendfile_until_blocked(
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cores: usize) -> bool {
     active_transfers > data_plane_cores.max(1).div_ceil(2)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_should_dispatch(
+    enabled: bool,
+    adaptive: bool,
+    active_plain_connections: usize,
+    data_plane_cores: usize,
+) -> bool {
+    enabled
+        && (!adaptive || active_plain_connections <= data_plane_cores.max(1).saturating_mul(128))
 }
 
 #[cfg(target_os = "linux")]
@@ -12718,7 +12753,10 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -12734,7 +12772,7 @@ fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> us
 fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 0,
     }
 }
@@ -24614,6 +24652,10 @@ mod tests {
         assert!(sendfile_pressure_should_raise_buffer(5, 8));
         assert!(!sendfile_pressure_should_raise_buffer(1, 1));
         assert!(sendfile_pressure_should_raise_buffer(2, 1));
+        assert!(sendfile_reactor_should_dispatch(true, true, 1024, 8));
+        assert!(!sendfile_reactor_should_dispatch(true, true, 1025, 8));
+        assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
+        assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
         assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
@@ -24754,7 +24796,7 @@ mod tests {
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!sendfile_reactor_profile_enabled(
+        assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
@@ -24767,7 +24809,7 @@ mod tests {
         assert_eq!(SHARDED_PLAIN_HTTP_EVENT_INTERVAL, 8);
         assert_eq!(
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            5
         );
         let mut config = GatewayConfig::default();
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
