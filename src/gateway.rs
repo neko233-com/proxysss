@@ -12310,7 +12310,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -12319,9 +12319,11 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // The sparse balanced relay pool removes per-connection Tokio tasks.
-        // Keep it at nice 0 so fixed game ticks retain low p95/p99.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // Four owners on an eight-core gateway keep game/TCP/WebSocket pairs
+        // below the high-density knee. nice 3 leaves HTTP the primary CFS
+        // consumer during saturation while fixed-rate realtime work stays
+        // prompt on otherwise-idle cores.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12374,7 +12376,7 @@ fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -24286,7 +24288,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            2
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -24298,7 +24300,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -24371,7 +24373,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            2
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
