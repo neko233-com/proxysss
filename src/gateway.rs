@@ -1998,13 +1998,11 @@ impl StaticCacheFreshness {
     }
 }
 
-type StaticSendfilePool = Arc<[Arc<std::fs::File>]>;
-
 struct CachedStaticFile {
     len: u64,
     modified: Option<SystemTime>,
     body: Bytes,
-    sendfile: Option<StaticSendfilePool>,
+    sendfile: Option<Arc<std::fs::File>>,
     content_type: HeaderValue,
     content_length: HeaderValue,
     http1_keep_alive_response: Option<Bytes>,
@@ -5098,12 +5096,7 @@ impl Gateway {
         let _active_plain_http = ActivePlainHttpConnectionGuard::enter();
         let (stream, prefix) = if self.plain_http_data_fast_lane_enabled().await {
             match self
-                .try_plain_http_large_static_fast_path(
-                    stream,
-                    remote_addr,
-                    worker_index,
-                    initial_prefix,
-                )
+                .try_plain_http_large_static_fast_path(stream, remote_addr, initial_prefix)
                 .await
             {
                 Ok(PlainHttpFastLaneAttempt::Served) => return,
@@ -5151,7 +5144,6 @@ impl Gateway {
         &self,
         mut stream: TcpStream,
         remote_addr: SocketAddr,
-        worker_index: usize,
         initial_prefix: Bytes,
     ) -> Result<PlainHttpFastLaneAttempt> {
         let dynamic_state;
@@ -5222,7 +5214,7 @@ impl Gateway {
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
-                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
+                let force_yield = yield_after_sendfile_response && cached.sendfile;
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5419,7 +5411,7 @@ impl Gateway {
                 .as_ref()
                 .filter(|cached| cached.matches(&request))
             {
-                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
+                let force_yield = yield_after_sendfile_response && cached.sendfile;
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5479,7 +5471,7 @@ impl Gateway {
                 // Keep the already-serialized response instead of making all
                 // keep-alive connections rebuild it on the same TTL boundary.
                 cached.checked_at = Instant::now();
-                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
+                let force_yield = yield_after_sendfile_response && cached.sendfile;
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5539,9 +5531,9 @@ impl Gateway {
                     body: candidate.cached_body.clone(),
                     file_path: candidate.path.clone(),
                     len: candidate.len,
-                    sendfile: static_sendfile_for_worker(candidate.sendfile.as_ref(), worker_index),
+                    sendfile: candidate.sendfile.is_some(),
                 };
-                let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
+                let force_yield = yield_after_sendfile_response && cached.sendfile;
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
@@ -5597,29 +5589,27 @@ impl Gateway {
                     .await
                     .context("failed writing plain http fast path response head");
 
-                let body_result = if header_result.is_ok()
-                    && request.method == "GET"
-                    && candidate.len > 0
-                {
-                    if let Some(body) = candidate.cached_body.as_ref() {
-                        stream
-                            .write_all(body)
+                let body_result =
+                    if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
+                        if let Some(body) = candidate.cached_body.as_ref() {
+                            stream
+                                .write_all(body)
+                                .await
+                                .context("failed writing cached static fast path body")
+                        } else {
+                            send_static_file_fast(
+                                &mut stream,
+                                &candidate.path,
+                                candidate.len,
+                                candidate.sendfile.clone(),
+                                false,
+                            )
                             .await
-                            .context("failed writing cached static fast path body")
+                            .map(|_| ())
+                        }
                     } else {
-                        send_static_file_fast(
-                            &mut stream,
-                            &candidate.path,
-                            candidate.len,
-                            static_sendfile_for_worker(candidate.sendfile.as_ref(), worker_index),
-                            false,
-                        )
-                        .await
-                        .map(|_| ())
-                    }
-                } else {
-                    Ok(())
-                };
+                        Ok(())
+                    };
                 #[cfg(target_os = "linux")]
                 if cork_static {
                     set_tcp_cork(&stream, false);
@@ -11351,7 +11341,7 @@ struct StaticFastPathCandidate {
     content_type: &'static str,
     cached_body: Option<Bytes>,
     combined_response: Option<Bytes>,
-    sendfile: Option<StaticSendfilePool>,
+    sendfile: Option<Arc<std::fs::File>>,
 }
 
 struct ConnectionStaticFastPathCache {
@@ -11365,7 +11355,7 @@ struct ConnectionStaticFastPathCache {
     body: Option<Bytes>,
     file_path: PathBuf,
     len: u64,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: bool,
 }
 
 impl ConnectionStaticFastPathCache {
@@ -11399,13 +11389,7 @@ impl ConnectionStaticFastPathCache {
                 (Some(current), Some(candidate)) => {
                     current.len() == candidate.len() && current.as_ptr() == candidate.as_ptr()
                 }
-                (None, None) => match (&self.sendfile, &candidate.sendfile) {
-                    (Some(current), Some(candidate)) => candidate
-                        .iter()
-                        .any(|descriptor| Arc::ptr_eq(current, descriptor)),
-                    (None, None) => true,
-                    _ => false,
-                },
+                (None, None) => self.sendfile == candidate.sendfile.is_some(),
                 _ => false,
             }
     }
@@ -12073,7 +12057,7 @@ async fn send_connection_static_fast_path(
                 stream,
                 &cached.file_path,
                 cached.len,
-                cached.sendfile.clone(),
+                None,
                 cooperative_mid_yield,
             )
             .await
@@ -12386,10 +12370,10 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         // Four owners on an eight-core gateway keep game/TCP/WebSocket pairs
-        // below the high-density knee. nice 5 leaves enough CPU for static and
-        // reverse-proxy siblings while the measured realtime paths retain
-        // substantial throughput headroom over nginx.
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        // below the high-density knee. nice 3 leaves HTTP the primary CFS
+        // consumer during saturation while fixed-rate realtime work stays
+        // prompt on otherwise-idle cores.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12490,7 +12474,7 @@ fn plain_fast_lane_should_yield(served_since_yield: usize, fairness_batch: usize
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
@@ -18907,28 +18891,33 @@ fn cached_static_sendfile(
     target: &Path,
     metadata: &std::fs::Metadata,
     static_file_cache: &DashMap<String, CachedStaticFile>,
-) -> Result<StaticSendfilePool> {
+) -> Result<Arc<std::fs::File>> {
     let key = target.to_string_lossy().to_string();
     let modified = metadata.modified().ok();
     if let Some(entry) = static_file_cache.get(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
             entry.freshness.mark_checked();
-            if let Some(files) = &entry.sendfile {
-                return Ok(files.clone());
+            if let Some(file) = &entry.sendfile {
+                return Ok(file.clone());
             }
         }
     }
 
-    let files = open_static_sendfile_pool(target)?;
+    let file = Arc::new(std::fs::File::open(target).with_context(|| {
+        format!(
+            "failed opening static file for sendfile {}",
+            target.display()
+        )
+    })?);
     if let Some(mut entry) = static_file_cache.get_mut(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
             entry.freshness.mark_checked();
-            entry.sendfile = Some(files.clone());
-            return Ok(files);
+            entry.sendfile = Some(file.clone());
+            return Ok(file);
         }
     }
     if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
-        return Ok(files);
+        return Ok(file);
     }
     static_file_cache.insert(
         key,
@@ -18936,7 +18925,7 @@ fn cached_static_sendfile(
             len: metadata.len(),
             modified,
             body: Bytes::new(),
-            sendfile: Some(files.clone()),
+            sendfile: Some(file.clone()),
             content_type: HeaderValue::from_static(static_content_type(target)),
             content_length: HeaderValue::from_str(&metadata.len().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
@@ -18944,31 +18933,7 @@ fn cached_static_sendfile(
             freshness: Arc::new(StaticCacheFreshness::new()),
         },
     );
-    Ok(files)
-}
-
-fn open_static_sendfile_pool(target: &Path) -> Result<StaticSendfilePool> {
-    let shard_count = adaptive_data_plane_workers(1);
-    let mut files = Vec::with_capacity(shard_count);
-    for _ in 0..shard_count {
-        files.push(Arc::new(std::fs::File::open(target).with_context(
-            || {
-                format!(
-                    "failed opening static file for sendfile {}",
-                    target.display()
-                )
-            },
-        )?));
-    }
-    Ok(Arc::from(files.into_boxed_slice()))
-}
-
-fn static_sendfile_for_worker(
-    pool: Option<&StaticSendfilePool>,
-    worker_index: usize,
-) -> Option<Arc<std::fs::File>> {
-    let pool = pool?;
-    Some(pool[worker_index % pool.len()].clone())
+    Ok(file)
 }
 
 async fn preload_static_site_fast_lane_cache(
@@ -23529,7 +23494,6 @@ mod tests {
         std::fs::write(&path, b"sendfile-data").expect("write sendfile fixture");
         let metadata = std::fs::metadata(&path).expect("sendfile metadata");
         let file = Arc::new(std::fs::File::open(&path).expect("open sendfile fixture"));
-        let files = Arc::from(vec![file.clone()].into_boxed_slice());
         let key = path.to_string_lossy().to_string();
         let cache = DashMap::new();
         let freshness = Arc::new(StaticCacheFreshness::new());
@@ -23544,7 +23508,7 @@ mod tests {
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
                 body: Bytes::new(),
-                sendfile: Some(files),
+                sendfile: Some(file.clone()),
                 content_type: HeaderValue::from_static("application/octet-stream"),
                 content_length: HeaderValue::from_str(&metadata.len().to_string())
                     .expect("content length"),
@@ -23555,9 +23519,7 @@ mod tests {
 
         let refreshed =
             cached_static_sendfile(&path, &metadata, &cache).expect("revalidate sendfile entry");
-        assert!(refreshed
-            .iter()
-            .any(|descriptor| Arc::ptr_eq(&file, descriptor)));
+        assert!(Arc::ptr_eq(&file, &refreshed));
         let entry = cache.get(&key).expect("cached sendfile entry");
         assert!(entry.body.is_empty());
         assert!(!entry.freshness.revalidating.load(Ordering::Relaxed));
@@ -24416,7 +24378,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -24519,7 +24481,7 @@ mod tests {
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            3
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
