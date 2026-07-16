@@ -2463,6 +2463,14 @@ mod tests {
         assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-500}\""));
         assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-250}\""));
         assert!(wrapper.contains("CLIENT_START_LEAD_MS=\"${CLIENT_START_LEAD_MS:-2000}\""));
+        assert!(wrapper.contains(
+            "EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}\""
+        ));
+        assert!(runner
+            .contains("EQUAL_LOAD_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}\""));
+        assert!(runner.contains(
+            "EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}\""
+        ));
         assert!(include_str!("bench.rs").contains("preconnect_http1_pool"));
         assert!(include_str!("bench.rs").contains("prewarm_http_resource"));
         assert!(include_str!("bench.rs").contains("prewarm_sse_resource"));

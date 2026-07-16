@@ -49,11 +49,14 @@ BACKEND_CPUSET="${BACKEND_CPUSET:-4-7}"
 CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 # Each scenario already has its own client process. During fixed-rate equal
 # load, letting every process inherit the whole cpuset as Tokio's worker count
-# creates 11 * N runnable threads and makes generator timers skip ticks. One
-# I/O owner is enough there; static-large keeps two for response-body copying.
+# creates 11 * N runnable threads and makes generator timers skip ticks.
+# Realtime protocols keep one I/O owner. HTTP/SSE use two so fast responses do
+# not create a single-worker cooperative scheduling cliff; static-large also
+# keeps two for response-body copying.
 # Saturation continues using the whole client cpuset so it cannot cap a faster
 # gateway before the gateway's own CPU is full.
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
+EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 VALIDATION_TIMING_FILE="${VALIDATION_TIMING_FILE:-}"
 MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-0}"
@@ -143,7 +146,7 @@ for value_name in BENCHMARK_REPETITIONS LATENCY_REPETITIONS ISOLATED_REPETITIONS
     exit 1
   }
 done
-for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
+for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$value_name must be a positive integer" >&2
@@ -698,11 +701,21 @@ launch_client() {
   local runtime_workers="$client_cpu_cores"
   if [[ "$phase" == "equal-load" ]]; then
     runtime_workers="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
+    if [[ "$protocol" == "http" || "$protocol" == "sse" ]]; then
+      runtime_workers="$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS"
+    fi
     if [[ "$scenario" == "static-large" ]]; then
       runtime_workers="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
     fi
   fi
-  if (( runtime_workers > client_cpu_cores )); then
+  # HTTP/SSE may use two workers on a one-CPU partition. Both candidates get
+  # identical bounded generator resources, while timers and I/O can progress
+  # independently. Realtime stays capped to its assigned CPU partition.
+  if [[ "$phase" == "equal-load" && ( "$protocol" == "http" || "$protocol" == "sse" ) ]]; then
+    if (( runtime_workers > CLIENT_CPU_CORES )); then
+      runtime_workers="$CLIENT_CPU_CORES"
+    fi
+  elif (( runtime_workers > client_cpu_cores )); then
     runtime_workers="$client_cpu_cores"
   fi
   if [[ "$phase" == "equal-load" ]]; then
@@ -988,6 +1001,7 @@ backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
 saturation_client_tokio_workers=$CLIENT_CPU_CORES
 equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS
+equal_load_http_client_tokio_workers=$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS
 equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS
 nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE

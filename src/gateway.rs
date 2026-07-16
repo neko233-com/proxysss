@@ -1526,18 +1526,16 @@ const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
-const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 512;
+const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 256;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // Socket reads/writes already yield when the peer is not ready. Amortize the
-// Disable Tokio's implicit cooperative counter only around bounded socket
-// exchanges, then retain an explicit connection-level boundary so tiny cached
-// objects and raw proxy responses avoid a 128-I/O tail cliff without starving
-// sibling connections.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 256;
+// explicit cooperative yield over a larger batch so tiny cached objects do not
+// pay scheduler overhead on every response. Raw reverse requests cross their
+// own upstream/downstream readiness points and need no extra periodic yield.
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 128;
 const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
-const PLAIN_RAW_IO_FAIRNESS_BATCH: usize = 256;
 // A shard with roughly one runnable connection per scheduler lane is still
 // low-density. Once dozens of keep-alive connections compete per worker, a
 // 256-response run lets hot static sockets queue unrelated HTTP, TLS and
@@ -1581,7 +1579,6 @@ static STATIC_REVALIDATION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock
 static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
 static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
-static DEDICATED_UDP_RESPONSE_FAIRNESS_ENABLED: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static ACTIVE_SENDFILE_TRANSFERS: AtomicUsize = AtomicUsize::new(0);
@@ -1835,14 +1832,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 && shared_udp_runtime_profile(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
-        DEDICATED_UDP_RESPONSE_FAIRNESS_ENABLED.store(
-            config.runtime.performance.enabled
-                && matches!(
-                    config.runtime.performance.traffic_profile,
-                    RuntimePerformanceTrafficProfile::Balanced
-                ),
-            Ordering::Relaxed,
-        );
         TLS_HTTP_RUNTIME_CPU_DIVISOR.store(
             tls_http_runtime_cpu_divisor(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -1951,7 +1940,39 @@ struct CachedHttpEntry {
     upstream: String,
 }
 
-#[derive(Clone)]
+struct StaticCacheFreshness {
+    checked_at_unix_ms: AtomicU64,
+    revalidating: AtomicBool,
+}
+
+impl StaticCacheFreshness {
+    fn new() -> Self {
+        Self {
+            checked_at_unix_ms: AtomicU64::new(current_unix_millis()),
+            revalidating: AtomicBool::new(false),
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        current_unix_millis().saturating_sub(self.checked_at_unix_ms.load(Ordering::Acquire))
+            > STATIC_FILE_CACHE_REVALIDATE_SECS.saturating_mul(1000)
+    }
+
+    fn mark_checked(&self) {
+        self.checked_at_unix_ms
+            .store(current_unix_millis(), Ordering::Release);
+        self.revalidating.store(false, Ordering::Release);
+    }
+
+    fn claim_revalidation(&self) -> bool {
+        self.is_stale()
+            && self
+                .revalidating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+}
+
 struct CachedStaticFile {
     len: u64,
     modified: Option<SystemTime>,
@@ -1960,8 +1981,7 @@ struct CachedStaticFile {
     content_type: HeaderValue,
     content_length: HeaderValue,
     http1_keep_alive_response: Option<Bytes>,
-    checked_at: Instant,
-    revalidating: bool,
+    freshness: Arc<StaticCacheFreshness>,
 }
 
 #[derive(Clone)]
@@ -1969,7 +1989,7 @@ struct PrebuiltH2StaticResponse {
     body: Bytes,
     content_type: HeaderValue,
     content_length: HeaderValue,
-    checked_at: Instant,
+    freshness: Arc<StaticCacheFreshness>,
 }
 
 type H2ConnectionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -5143,10 +5163,9 @@ impl Gateway {
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
-            let head_end =
-                tokio::task::unconstrained(read_fast_lane_http_prefix(&mut stream, &mut prefix))
-                    .await
-                    .context("failed reading plain http fast-lane request")?;
+            let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
+                .await
+                .context("failed reading plain http fast-lane request")?;
             if prefix.is_empty() {
                 break if served_any {
                     PlainHttpFastLaneDecision::Served
@@ -5175,12 +5194,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tokio::task::unconstrained(send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                ))
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5352,15 +5366,11 @@ impl Gateway {
                             });
                         }
                         discard_fast_lane_http_head(&mut prefix, head_end);
-                        // Disable Tokio's implicit 128-operation coop cliff
-                        // inside one bounded raw proxy exchange, then retain
-                        // an explicit nginx-style multi_accept boundary across
-                        // a continuously-ready keep-alive connection.
-                        served_since_yield = served_since_yield.saturating_add(1);
-                        if served_since_yield >= PLAIN_RAW_IO_FAIRNESS_BATCH {
-                            served_since_yield = 0;
-                            tokio::task::yield_now().await;
-                        }
+                        // A raw reverse request already crosses upstream and
+                        // downstream readiness points. Reset the amortized
+                        // static-lane counter instead of adding a redundant
+                        // cooperative yield on every 32nd response.
+                        served_since_yield = 0;
                         continue;
                     }
                     break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
@@ -5381,12 +5391,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tokio::task::unconstrained(send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                ))
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5446,12 +5451,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tokio::task::unconstrained(send_connection_static_fast_path(
-                    &mut stream,
-                    cached,
-                    mid_yield,
-                ))
-                .await?;
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5513,12 +5513,7 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tokio::task::unconstrained(send_connection_static_fast_path(
-                    &mut stream,
-                    &cached,
-                    mid_yield,
-                ))
-                .await?;
+                send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -7048,8 +7043,8 @@ impl Gateway {
         let mut local_associations = FxHashMap::<SocketAddr, LocalUdpAssociation>::default();
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
-        let mut udp_packets_since_yield = 0_usize;
-        let mut udp_batch_started = Instant::now();
+        let mut shared_udp_packets_since_yield = 0_usize;
+        let mut shared_udp_batch_started = Instant::now();
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
@@ -7157,19 +7152,14 @@ impl Gateway {
                     existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
                     associations.remove(&client_addr);
-                } else {
-                    let fairness_packets = udp_response_fairness_packets(
-                        SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed),
-                        DEDICATED_UDP_RESPONSE_FAIRNESS_ENABLED.load(Ordering::Relaxed),
-                    );
-                    if fairness_packets > 0 {
-                        udp_packets_since_yield = udp_packets_since_yield.saturating_add(1);
-                    }
-                    if fairness_packets > 0 && udp_packets_since_yield >= fairness_packets {
+                } else if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
+                    shared_udp_packets_since_yield =
+                        shared_udp_packets_since_yield.saturating_add(1);
+                    if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
                         let sustained =
-                            balanced_udp_batch_is_sustained(udp_batch_started.elapsed());
-                        udp_packets_since_yield = 0;
-                        udp_batch_started = Instant::now();
+                            balanced_udp_batch_is_sustained(shared_udp_batch_started.elapsed());
+                        shared_udp_packets_since_yield = 0;
+                        shared_udp_batch_started = Instant::now();
                         if sustained {
                             tokio::task::yield_now().await;
                         }
@@ -7979,9 +7969,10 @@ impl Gateway {
         }
 
         let snapshots = self.h2_static_response_cache.load();
-        if let Some(cached) = snapshots.get(request.uri().path()).filter(|cached| {
-            cached.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-        }) {
+        if let Some(cached) = snapshots
+            .get(request.uri().path())
+            .filter(|cached| !cached.freshness.is_stale())
+        {
             return Some(cached.response());
         }
 
@@ -8006,8 +7997,14 @@ impl Gateway {
         let h2_static_response_refresh_lock = self.h2_static_response_refresh_lock.clone();
         spawn_static_revalidation_task(async move {
             let key = target.to_string_lossy().to_string();
+            let previous_identity = static_file_cache
+                .get(&key)
+                .map(|entry| (entry.len, entry.modified));
+            let mut refresh_h2_snapshot = false;
             match tokio::fs::metadata(&target).await {
                 Ok(metadata) if metadata.is_file() => {
+                    let current_identity = (metadata.len(), metadata.modified().ok());
+                    refresh_h2_snapshot = previous_identity != Some(current_identity);
                     let sendfile_entry = static_file_cache
                         .get(&key)
                         .is_some_and(|entry| entry.sendfile.is_some() && entry.body.is_empty());
@@ -8025,6 +8022,7 @@ impl Gateway {
                         .map(|_| ())
                     };
                     if let Err(error) = result {
+                        refresh_h2_snapshot = false;
                         tracing::debug!(?error, path = %target.display(), "background static cache revalidation failed");
                         finish_failed_static_revalidation(&key, &static_file_cache);
                     }
@@ -8033,12 +8031,14 @@ impl Gateway {
                     if let Some((_, stale)) = static_file_cache.remove(&key) {
                         static_file_cache_bytes
                             .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                        refresh_h2_snapshot = true;
                     }
                 }
                 Ok(_) => {
                     if let Some((_, stale)) = static_file_cache.remove(&key) {
                         static_file_cache_bytes
                             .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                        refresh_h2_snapshot = true;
                     }
                 }
                 Err(error) => {
@@ -8047,11 +8047,13 @@ impl Gateway {
                 }
             }
 
-            let _refresh_guard = h2_static_response_refresh_lock.lock().await;
-            h2_static_response_cache.store(Arc::new(build_prebuilt_h2_static_responses(
-                &static_route_cache,
-                &static_file_cache,
-            )));
+            if refresh_h2_snapshot {
+                let _refresh_guard = h2_static_response_refresh_lock.lock().await;
+                h2_static_response_cache.store(Arc::new(build_prebuilt_h2_static_responses(
+                    &static_route_cache,
+                    &static_file_cache,
+                )));
+            }
         });
     }
 
@@ -9026,21 +9028,21 @@ impl Gateway {
                 },
             )
         };
-        tokio::task::unconstrained(upstream_io.write_all(&request_bytes))
+        upstream_io
+            .write_all(&request_bytes)
             .await
             .with_context(|| {
                 format!("failed sending plain raw SSE request to {}", route.upstream)
             })?;
 
-        let response_head =
-            tokio::task::unconstrained(read_raw_fast_http_response_head(&mut upstream_io, true))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed reading plain raw SSE response from {}",
-                        route.upstream
-                    )
-                })?;
+        let response_head = read_raw_fast_http_response_head(&mut upstream_io, true)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading plain raw SSE response from {}",
+                    route.upstream
+                )
+            })?;
         let upstream_keep_alive = !response_head.connection_close;
         let content_length = response_head.content_length;
         let transfer_chunked = response_head.transfer_chunked;
@@ -9051,7 +9053,8 @@ impl Gateway {
             transfer_chunked,
         );
         if request.method == Method::HEAD || status_has_no_body(response_head.status) {
-            tokio::task::unconstrained(downstream.write_all(&response_head_bytes))
+            downstream
+                .write_all(&response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             if upstream_keep_alive {
@@ -9065,18 +9068,21 @@ impl Gateway {
                         Vec::with_capacity(response_head_bytes.len() + len as usize);
                     response_bytes.extend_from_slice(&response_head_bytes);
                     response_bytes.extend_from_slice(&leftover[..len as usize]);
-                    tokio::task::unconstrained(downstream.write_all(&response_bytes))
+                    downstream
+                        .write_all(&response_bytes)
                         .await
                         .context("failed writing raw SSE response head/body")?;
                     leftover_len == len
                 } else {
-                    tokio::task::unconstrained(downstream.write_all(&response_head_bytes))
+                    downstream
+                        .write_all(&response_head_bytes)
                         .await
                         .context("failed writing raw SSE response head")?;
                     relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
                 }
             } else {
-                tokio::task::unconstrained(downstream.write_all(&response_head_bytes))
+                downstream
+                    .write_all(&response_head_bytes)
                     .await
                     .context("failed writing raw SSE response head")?;
                 relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
@@ -9085,7 +9091,8 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else if transfer_chunked {
-            tokio::task::unconstrained(downstream.write_all(&response_head_bytes))
+            downstream
+                .write_all(&response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             let reusable = relay_passthrough_chunked_http_body(
@@ -9099,7 +9106,8 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else {
-            tokio::task::unconstrained(downstream.write_all(&response_head_bytes))
+            downstream
+                .write_all(&response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
@@ -9199,25 +9207,25 @@ impl Gateway {
                 .as_ref()
                 .expect("raw reverse request serialized")
         };
-        tokio::task::unconstrained(upstream_io.write_all(request_bytes))
+        upstream_io
+            .write_all(request_bytes)
             .await
             .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
-        let response = tokio::task::unconstrained(read_raw_reverse_http_response_into(
+        let response = read_raw_reverse_http_response_into(
             &mut upstream_io,
             upstream_response_buffer,
             response_cache,
-        ))
+        )
         .await
         .with_context(|| format!("failed reading plain raw reverse response from {upstream}"))?;
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
         if request.method == Method::HEAD || status_has_no_body(response.status) {
-            tokio::task::unconstrained(
-                downstream.write_all(&upstream_response_buffer[..response.head_end]),
-            )
-            .await
-            .context("failed writing raw HTTP response head")?;
+            downstream
+                .write_all(&upstream_response_buffer[..response.head_end])
+                .await
+                .context("failed writing raw HTTP response head")?;
             if upstream_keep_alive && buffered_body_len == 0 {
                 *lane_upstream = Some(RawReverseLaneUpstream {
                     key: pool_key.clone(),
@@ -9228,11 +9236,13 @@ impl Gateway {
         } else if let Some(len) = response.content_length {
             let buffered_body_len_u64 = buffered_body_len as u64;
             let buffered_to_write = buffered_body_len_u64.min(len) as usize;
-            tokio::task::unconstrained(downstream.write_all(
-                &upstream_response_buffer[..response.head_end.saturating_add(buffered_to_write)],
-            ))
-            .await
-            .context("failed writing raw HTTP response head/body")?;
+            downstream
+                .write_all(
+                    &upstream_response_buffer
+                        [..response.head_end.saturating_add(buffered_to_write)],
+                )
+                .await
+                .context("failed writing raw HTTP response head/body")?;
             let reusable = if buffered_body_len_u64 > len {
                 false
             } else {
@@ -9254,11 +9264,10 @@ impl Gateway {
         } else if response.transfer_chunked {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            tokio::task::unconstrained(
-                downstream.write_all(&upstream_response_buffer[..response.head_end]),
-            )
-            .await
-            .context("failed writing raw HTTP response head")?;
+            downstream
+                .write_all(&upstream_response_buffer[..response.head_end])
+                .await
+                .context("failed writing raw HTTP response head")?;
             let reusable =
                 relay_passthrough_chunked_http_body(&mut upstream_io, downstream, leftover).await?;
             if reusable && upstream_keep_alive {
@@ -9271,11 +9280,10 @@ impl Gateway {
         } else {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            tokio::task::unconstrained(
-                downstream.write_all(&upstream_response_buffer[..response.head_end]),
-            )
-            .await
-            .context("failed writing raw HTTP response head")?;
+            downstream
+                .write_all(&upstream_response_buffer[..response.head_end])
+                .await
+                .context("failed writing raw HTTP response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, leftover).await?;
         }
         Ok(true)
@@ -15551,18 +15559,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
 const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
-const DEDICATED_UDP_RESPONSE_FAIRNESS_PACKETS: usize = 32;
 const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
-
-fn udp_response_fairness_packets(shared_runtime: bool, dedicated_response_fairness: bool) -> usize {
-    if shared_runtime {
-        BALANCED_UDP_FAIRNESS_PACKETS
-    } else if dedicated_response_fairness {
-        DEDICATED_UDP_RESPONSE_FAIRNESS_PACKETS
-    } else {
-        0
-    }
-}
 
 fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
     elapsed <= BALANCED_UDP_FAIRNESS_WINDOW
@@ -18635,8 +18632,7 @@ async fn cached_static_file_body(
                     content_type,
                     content_length,
                     http1_keep_alive_response,
-                    checked_at: Instant::now(),
-                    revalidating: false,
+                    freshness: Arc::new(StaticCacheFreshness::new()),
                 },
             );
             static_file_cache_bytes.fetch_add(body_len, Ordering::Relaxed);
@@ -18666,13 +18662,12 @@ fn fresh_static_cache_body(
     modified: Option<SystemTime>,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) -> Option<Bytes> {
-    let mut entry = static_file_cache.get_mut(key)?;
+    let entry = static_file_cache.get(key)?;
     if entry.len == metadata.len()
         && entry.modified == modified
         && entry.body.len() as u64 == entry.len
     {
-        entry.checked_at = Instant::now();
-        entry.revalidating = false;
+        entry.freshness.mark_checked();
         return Some(entry.body.clone());
     }
     None
@@ -18710,9 +18705,7 @@ fn fresh_cached_static_file_response(
     }
     let key = target.to_string_lossy();
     let entry = static_file_cache.get(key.as_ref())?;
-    if entry.body.len() as u64 != entry.len
-        || entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-    {
+    if entry.body.len() as u64 != entry.len || entry.freshness.is_stale() {
         return None;
     }
     let mut response = GatewayHttpResponse::bytes(
@@ -18745,7 +18738,7 @@ fn cached_static_file_response_stale_while_revalidate(
     if entry.body.len() as u64 != entry.len {
         return None;
     }
-    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+    let revalidate = entry.freshness.claim_revalidation();
 
     let mut response = Response::new(full_body(entry.body.clone()));
     response
@@ -18757,21 +18750,6 @@ fn cached_static_file_response_stale_while_revalidate(
     response
         .headers_mut()
         .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    drop(entry);
-
-    let revalidate = if stale {
-        let mut entry = static_file_cache.get_mut(key.as_ref())?;
-        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && !entry.revalidating
-        {
-            entry.revalidating = true;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
     Some(CachedStaticResponse {
         response,
         revalidate,
@@ -18782,9 +18760,8 @@ fn finish_failed_static_revalidation(
     key: &str,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) {
-    if let Some(mut entry) = static_file_cache.get_mut(key) {
-        entry.checked_at = Instant::now();
-        entry.revalidating = false;
+    if let Some(entry) = static_file_cache.get(key) {
+        entry.freshness.mark_checked();
     }
 }
 
@@ -18808,7 +18785,7 @@ fn build_prebuilt_h2_static_responses(
                 body: cached.body.clone(),
                 content_type: cached.content_type.clone(),
                 content_length: cached.content_length.clone(),
-                checked_at: cached.checked_at,
+                freshness: cached.freshness.clone(),
             },
         );
     }
@@ -18826,7 +18803,7 @@ fn stale_cached_static_file_candidate(
     }
     let key = target.to_string_lossy().to_string();
     let entry = static_file_cache.get(&key)?;
-    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+    let revalidate = entry.freshness.claim_revalidation();
     let sendfile = if cfg!(target_os = "linux") && entry.len >= sendfile_threshold {
         Some(entry.sendfile.as_ref()?.clone())
     } else {
@@ -18848,21 +18825,6 @@ fn stale_cached_static_file_candidate(
         combined_response: entry.http1_keep_alive_response.clone(),
         sendfile,
     };
-    drop(entry);
-
-    let revalidate = if stale {
-        let mut entry = static_file_cache.get_mut(&key)?;
-        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && !entry.revalidating
-        {
-            entry.revalidating = true;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
     Some((candidate, revalidate))
 }
 
@@ -18877,7 +18839,7 @@ fn fresh_cached_static_file_candidate(
     }
     let key = target.to_string_lossy().to_string();
     let entry = static_file_cache.get(&key)?;
-    if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS) {
+    if entry.freshness.is_stale() {
         return None;
     }
 
@@ -18912,21 +18874,12 @@ fn cached_static_sendfile(
 ) -> Result<Arc<std::fs::File>> {
     let key = target.to_string_lossy().to_string();
     let modified = metadata.modified().ok();
-    if let Some(mut entry) = static_file_cache.get_mut(&key) {
+    if let Some(entry) = static_file_cache.get(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
-            entry.checked_at = Instant::now();
-            entry.revalidating = false;
+            entry.freshness.mark_checked();
             if let Some(file) = &entry.sendfile {
                 return Ok(file.clone());
             }
-            let file = Arc::new(std::fs::File::open(target).with_context(|| {
-                format!(
-                    "failed opening static file for sendfile {}",
-                    target.display()
-                )
-            })?);
-            entry.sendfile = Some(file.clone());
-            return Ok(file);
         }
     }
 
@@ -18936,6 +18889,13 @@ fn cached_static_sendfile(
             target.display()
         )
     })?);
+    if let Some(mut entry) = static_file_cache.get_mut(&key) {
+        if entry.len == metadata.len() && entry.modified == modified {
+            entry.freshness.mark_checked();
+            entry.sendfile = Some(file.clone());
+            return Ok(file);
+        }
+    }
     if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
         return Ok(file);
     }
@@ -18950,8 +18910,7 @@ fn cached_static_sendfile(
             content_length: HeaderValue::from_str(&metadata.len().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
             http1_keep_alive_response: None,
-            checked_at: Instant::now(),
-            revalidating: false,
+            freshness: Arc::new(StaticCacheFreshness::new()),
         },
     );
     Ok(file)
@@ -23369,8 +23328,7 @@ mod tests {
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
                 http1_keep_alive_response: None,
-                checked_at: Instant::now(),
-                revalidating: false,
+                freshness: Arc::new(StaticCacheFreshness::new()),
             },
         );
 
@@ -23422,6 +23380,11 @@ mod tests {
             &Bytes::from_static(b"test"),
         )
         .expect("prebuilt HTTP/1 response");
+        let freshness = Arc::new(StaticCacheFreshness::new());
+        freshness.checked_at_unix_ms.store(
+            current_unix_millis().saturating_sub(3_000),
+            Ordering::Relaxed,
+        );
         cache.insert(
             "asset.js".to_string(),
             CachedStaticFile {
@@ -23432,8 +23395,7 @@ mod tests {
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
                 http1_keep_alive_response: Some(prebuilt.clone()),
-                checked_at: Instant::now() - Duration::from_secs(3),
-                revalidating: false,
+                freshness,
             },
         );
 
@@ -23469,6 +23431,12 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&path).expect("open sendfile fixture"));
         let key = path.to_string_lossy().to_string();
         let cache = DashMap::new();
+        let freshness = Arc::new(StaticCacheFreshness::new());
+        freshness.checked_at_unix_ms.store(
+            current_unix_millis().saturating_sub(2_000),
+            Ordering::Relaxed,
+        );
+        freshness.revalidating.store(true, Ordering::Relaxed);
         cache.insert(
             key.clone(),
             CachedStaticFile {
@@ -23480,8 +23448,7 @@ mod tests {
                 content_length: HeaderValue::from_str(&metadata.len().to_string())
                     .expect("content length"),
                 http1_keep_alive_response: None,
-                checked_at: Instant::now() - Duration::from_secs(2),
-                revalidating: true,
+                freshness,
             },
         );
 
@@ -23490,7 +23457,7 @@ mod tests {
         assert!(Arc::ptr_eq(&file, &refreshed));
         let entry = cache.get(&key).expect("cached sendfile entry");
         assert!(entry.body.is_empty());
-        assert!(!entry.revalidating);
+        assert!(!entry.freshness.revalidating.load(Ordering::Relaxed));
         drop(entry);
         std::fs::remove_file(path).expect("remove sendfile fixture");
     }
@@ -24430,8 +24397,8 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
         assert_eq!(plain_fast_lane_fairness_batch_for_workers(511, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 256);
-        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 128);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 128);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
@@ -24444,9 +24411,6 @@ mod tests {
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             12
         );
-        assert_eq!(udp_response_fairness_packets(true, false), 4);
-        assert_eq!(udp_response_fairness_packets(false, true), 32);
-        assert_eq!(udp_response_fairness_packets(false, false), 0);
         assert!(balanced_udp_batch_is_sustained(Duration::from_millis(8)));
         assert!(!balanced_udp_batch_is_sustained(Duration::from_millis(9)));
         assert!(!sendfile_reactor_profile_enabled(
