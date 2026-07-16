@@ -434,6 +434,17 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
             .context("failed to drain HTTPS preconnect response")?;
     }
 
+    // HEAD establishes transport capacity but intentionally skips the static
+    // GET cache and reverse-proxy response path. Exercise one real GET, allow
+    // stale-while-revalidate work to finish outside the active window, then
+    // confirm the refreshed path. This keeps one-second p99 from measuring a
+    // synchronized cache-expiry wave while applying the same warm-up to nginx.
+    if method == Method::GET {
+        prewarm_http_resource(&client, url.as_str()).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        prewarm_http_resource(&client, url.as_str()).await?;
+    }
+
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
         let stats = stats.clone();
@@ -473,6 +484,19 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
 
     print_operation_target(concurrency, schedule.operation_interval);
     print_summary("http", args.duration_secs, &stats, latencies);
+    Ok(())
+}
+
+async fn prewarm_http_resource(client: &reqwest::Client, url: &str) -> Result<()> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("failed to warm HTTP benchmark resource")?;
+    response
+        .bytes()
+        .await
+        .context("failed to drain HTTP benchmark resource warm-up")?;
     Ok(())
 }
 

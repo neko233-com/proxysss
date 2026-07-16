@@ -1521,7 +1521,7 @@ const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
-const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
+const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
 const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 256;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_MAX_BYTES: u64 = 1024 * 1024;
@@ -1558,13 +1558,11 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
 // HTTP/2 stream futures are deliberately driven inside their owning
-// connection to avoid one Tokio task allocation per small response. Shared
-// small-profile shards yield after every completed stream so H2 cannot occupy
-// the worker LIFO slot. Balanced owns a low-CFS-weight TLS runtime, where a
-// bounded 32-stream batch removes per-response scheduler overhead without
-// placing HTTP/1, TCP, UDP or WebSocket work in the same starvation domain.
-const H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
-const H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH: usize = 32;
+// connection to avoid one Tokio task allocation per small response. Yield
+// after every completed stream even on the bounded balanced runtime: larger
+// ready batches make that continuously-runnable owner consume enough CFS time
+// to suppress HTTP/1/static/reverse throughput on the shared gateway cpuset.
+const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1574,6 +1572,8 @@ static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> =
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static STATIC_REVALIDATION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
 static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
@@ -1584,6 +1584,8 @@ static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+static STATIC_REVALIDATION_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
@@ -1708,6 +1710,36 @@ fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runt
     &runtimes[worker_index % runtimes.len()]
 }
 
+#[cfg(target_os = "linux")]
+fn dedicated_static_revalidation_runtime() -> &'static tokio::runtime::Runtime {
+    STATIC_REVALIDATION_RUNTIME.get_or_init(|| {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(1)
+            .thread_name("proxysss-static-refresh")
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .on_thread_start(|| set_current_thread_nice(10))
+            .enable_all();
+        builder
+            .build()
+            .expect("failed to build proxysss static revalidation runtime")
+    })
+}
+
+fn spawn_static_revalidation_task<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    #[cfg(target_os = "linux")]
+    if STATIC_REVALIDATION_RUNTIME_ENABLED.load(Ordering::Relaxed) {
+        std::mem::drop(dedicated_static_revalidation_runtime().spawn(future));
+        return;
+    }
+
+    std::mem::drop(tokio::spawn(future));
+}
+
 fn initialize_udp_connection_runtimes() {
     if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
         let _ = dedicated_http_connection_runtimes();
@@ -1814,6 +1846,11 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             udp_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
+        STATIC_REVALIDATION_RUNTIME_ENABLED
+            .store(config.runtime.performance.enabled, Ordering::Relaxed);
+        if config.runtime.performance.enabled {
+            let _ = dedicated_static_revalidation_runtime();
+        }
         STATIC_SENDFILE_QOS_ENABLED.store(
             config.runtime.performance.enabled
                 && matches!(
@@ -1951,7 +1988,6 @@ async fn drive_h2_connection_tasks(
 ) {
     let mut tasks = FuturesUnordered::new();
     let mut consecutive_ready = 0_usize;
-    let fairness_batch = h2_connection_task_fairness_batch();
     loop {
         if tasks.is_empty() {
             consecutive_ready = 0;
@@ -1974,7 +2010,7 @@ async fn drive_h2_connection_tasks(
             }
             _ = tasks.next() => {
                 consecutive_ready = consecutive_ready.saturating_add(1);
-                if consecutive_ready >= fairness_batch {
+                if consecutive_ready >= H2_CONNECTION_TASK_FAIRNESS_BATCH {
                     consecutive_ready = 0;
                     tokio::task::yield_now().await;
                 }
@@ -7914,7 +7950,7 @@ impl Gateway {
         let static_route_cache = self.static_route_cache.clone();
         let h2_static_response_cache = self.h2_static_response_cache.clone();
         let h2_static_response_refresh_lock = self.h2_static_response_refresh_lock.clone();
-        std::mem::drop(tokio::spawn(async move {
+        spawn_static_revalidation_task(async move {
             let key = target.to_string_lossy().to_string();
             match tokio::fs::metadata(&target).await {
                 Ok(metadata) if metadata.is_file() => {
@@ -7962,7 +7998,7 @@ impl Gateway {
                 &static_route_cache,
                 &static_file_cache,
             )));
-        }));
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12314,26 +12350,6 @@ fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     }
 }
 
-fn h2_connection_task_fairness_batch_for(shared_tls_runtime: bool) -> usize {
-    if shared_tls_runtime {
-        H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH
-    } else {
-        H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH
-    }
-}
-
-fn h2_connection_task_fairness_batch() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        return h2_connection_task_fairness_batch_for(
-            SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed),
-        );
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    h2_connection_task_fairness_batch_for(true)
-}
-
 #[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
@@ -15477,7 +15493,7 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
-const BALANCED_UDP_FAIRNESS_PACKETS: usize = 2;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
 const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
 
 fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
@@ -23348,7 +23364,7 @@ mod tests {
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
                 http1_keep_alive_response: Some(prebuilt.clone()),
-                checked_at: Instant::now() - Duration::from_secs(2),
+                checked_at: Instant::now() - Duration::from_secs(3),
                 revalidating: false,
             },
         );
@@ -24319,14 +24335,7 @@ mod tests {
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             5
         );
-        assert_eq!(
-            h2_connection_task_fairness_batch_for(true),
-            H2_SHARED_CONNECTION_TASK_FAIRNESS_BATCH
-        );
-        assert_eq!(
-            h2_connection_task_fairness_batch_for(false),
-            H2_DEDICATED_CONNECTION_TASK_FAIRNESS_BATCH
-        );
+        assert_eq!(H2_CONNECTION_TASK_FAIRNESS_BATCH, 1);
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
             2
