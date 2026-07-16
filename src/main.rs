@@ -2465,6 +2465,8 @@ mod tests {
         assert!(wrapper.contains("CLIENT_START_LEAD_MS=\"${CLIENT_START_LEAD_MS:-1000}\""));
         assert!(include_str!("bench.rs").contains("preconnect_http1_pool"));
         assert!(include_str!("bench.rs").contains("prewarm_http_resource"));
+        assert!(include_str!("bench.rs").contains("prewarm_sse_resource"));
+        assert!(include_str!("bench.rs").contains("udp warm-up timeout"));
         assert!(wrapper.contains("validation_wall_elapsed_secs"));
         assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
         assert!(runner.contains("required_active_measurement_secs"));

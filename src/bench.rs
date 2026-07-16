@@ -562,6 +562,10 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let url = Arc::new(args.url);
     let max_chunks = args.max_chunks.max(1);
 
+    prewarm_sse_resource(&client, url.as_str()).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    prewarm_sse_resource(&client, url.as_str()).await?;
+
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
         let stats = stats.clone();
@@ -637,6 +641,27 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     Ok(())
 }
 
+async fn prewarm_sse_resource(client: &reqwest::Client, url: &str) -> Result<()> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .context("failed to warm SSE benchmark resource")?;
+    if !response.status().is_success() {
+        anyhow::bail!("SSE benchmark warm-up returned {}", response.status());
+    }
+    let mut stream = response.bytes_stream();
+    match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        Ok(Some(Ok(_))) => Ok(()),
+        Ok(Some(Err(error))) => {
+            Err(anyhow::Error::new(error).context("failed reading SSE benchmark warm-up"))
+        }
+        Ok(None) => anyhow::bail!("SSE benchmark warm-up ended before the first chunk"),
+        Err(_) => anyhow::bail!("SSE benchmark warm-up timed out"),
+    }
+}
+
 async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     if args.hold_connections {
         return run_websocket_connection_capacity(args).await;
@@ -706,6 +731,38 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 stats.add_task(&local);
                 return local.latencies_us;
             };
+            let warmup = async {
+                websocket
+                    .send(Message::Binary(payload.as_ref().clone().into()))
+                    .await?;
+                loop {
+                    match websocket.next().await {
+                        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Text(_))) => {
+                            return Ok::<(), tokio_tungstenite::tungstenite::Error>(());
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            websocket.send(Message::Pong(payload)).await?;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            return Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(error),
+                    }
+                }
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_millis(500), warmup).await,
+                Ok(Ok(()))
+            ) {
+                match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
+                    Ok((stream, _)) => websocket = stream,
+                    Err(_) => {
+                        stats.add_task(&local);
+                        return local.latencies_us;
+                    }
+                }
+            }
             let measurement_start = *scheduled_start
                 .get()
                 .expect("websocket benchmark start time initialized");
@@ -935,15 +992,35 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
             let stream =
                 tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr.as_str()))
                     .await;
+            let mut stream = match stream {
+                Ok(Ok(stream)) => Some(stream),
+                Ok(Err(_)) | Err(_) => None,
+            };
+            if let Some(warm_stream) = stream.as_mut() {
+                let _ = warm_stream.set_nodelay(true);
+                let mut warm_buffer = vec![0_u8; payload.len()];
+                let warmup = async {
+                    warm_stream.write_all(&payload).await?;
+                    warm_stream.read_exact(&mut warm_buffer).await?;
+                    Ok::<(), std::io::Error>(())
+                };
+                if !matches!(
+                    tokio::time::timeout(Duration::from_millis(500), warmup).await,
+                    Ok(Ok(()))
+                ) {
+                    stream = TcpStream::connect(addr.as_str()).await.ok();
+                }
+            }
             let (deadline, mut ticker) = schedule.begin(worker_index).await;
             let mut stream = match stream {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(_)) | Err(_) => {
+                Some(stream) => stream,
+                None => {
                     local.record_error();
                     stats.add_task(&local);
                     return local.latencies_us;
                 }
             };
+            let _ = stream.set_nodelay(true);
 
             let mut buffer = vec![0_u8; payload.len()];
             while wait_for_operation_slot(&mut ticker, deadline).await {
@@ -1013,10 +1090,11 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
                 Ok(socket) if socket.connect(addr.as_str()).await.is_ok() => Some(socket),
                 Ok(_) | Err(_) => None,
             };
-            let (deadline, mut ticker) = schedule.begin(worker_index).await;
             let socket = match socket {
                 Some(socket) => socket,
                 None => {
+                    let (deadline, _) = schedule.begin(worker_index).await;
+                    let _ = deadline;
                     local.record_error();
                     stats.add_task(&local);
                     return local.latencies_us;
@@ -1024,6 +1102,31 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
             };
 
             let mut buffer = vec![0_u8; payload.len().max(65_536)];
+            let warmup = async {
+                socket.send(&payload).await?;
+                match tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    socket.recv(&mut buffer),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "udp warm-up timeout",
+                    )),
+                }
+            };
+            let warmup_ok = warmup.await.is_ok();
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            if !warmup_ok {
+                local.record_error();
+                stats.add_task(&local);
+                return local.latencies_us;
+            }
             while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let result = async {
