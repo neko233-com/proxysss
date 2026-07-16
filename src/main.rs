@@ -27,6 +27,7 @@ mod verify;
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -787,11 +788,11 @@ async fn main() -> Result<()> {
         },
         Commands::Bench { protocol } => {
             init_cli_logging();
-            bench::run(protocol).await
+            run_configured_command_runtime("benchmark", bench::run(protocol)).await
         }
         Commands::Demo { kind } => {
             init_cli_logging();
-            demo::run(kind).await
+            run_configured_command_runtime("demo", demo::run(kind)).await
         }
         Commands::PrintDefaultConfig { format } => {
             match format {
@@ -992,6 +993,66 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn parse_command_runtime_workers(value: Option<&str>) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(1);
+    };
+    let workers = value.parse::<usize>().with_context(|| {
+        format!("TOKIO_WORKER_THREADS must be a positive integer, got {value:?}")
+    })?;
+    anyhow::ensure!(
+        workers > 0,
+        "TOKIO_WORKER_THREADS must be a positive integer"
+    );
+    Ok(workers)
+}
+
+async fn run_configured_command_runtime<F>(label: &'static str, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let configured = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let workers = parse_command_runtime_workers(configured.as_deref())?;
+    run_command_runtime(label, workers, future).await
+}
+
+async fn run_command_runtime<F>(label: &'static str, workers: usize, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tracing::info!(
+        runtime = label,
+        runtime_workers = workers,
+        "starting command runtime"
+    );
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name_fn(move || {
+                static COMMAND_RUNTIME_THREAD: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let index =
+                    COMMAND_RUNTIME_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("proxysss-{label}-{index}")
+            })
+            .enable_all()
+            .build()
+            .with_context(|| format!("failed building {label} runtime with {workers} workers"))?;
+        let actual_workers = runtime.metrics().num_workers();
+        anyhow::ensure!(
+            actual_workers == workers,
+            "{label} runtime worker mismatch: requested {workers}, actual {actual_workers}"
+        );
+        println!("runtime workers : {actual_workers}");
+        let task = runtime.spawn(future);
+        runtime
+            .block_on(task)
+            .with_context(|| format!("{label} runtime future panicked"))?
+    })
+    .await
+    .with_context(|| format!("{label} runtime task panicked"))?
 }
 
 fn merge_config_arg(
@@ -2481,7 +2542,36 @@ mod tests {
         assert!(runner.contains("BENCHMARK_REPETITIONS * 2 + LATENCY_REPETITIONS * 2"));
         assert!(runner.contains("CLIENT_WAVE_GRACE_SECS"));
         assert!(runner.contains("settle_resumed_gateway"));
+        assert!(runner.contains("runtime workers : $runtime_workers"));
         assert!(!runner.contains("MATRIX_VALIDATION_DEADLINE_SECS"));
+    }
+
+    #[test]
+    fn command_runtime_worker_count_honors_benchmark_environment() {
+        assert_eq!(parse_command_runtime_workers(None).expect("default"), 1);
+        assert_eq!(
+            parse_command_runtime_workers(Some("16")).expect("configured"),
+            16
+        );
+        assert!(parse_command_runtime_workers(Some("0")).is_err());
+        assert!(parse_command_runtime_workers(Some("many")).is_err());
+    }
+
+    #[tokio::test]
+    async fn command_runtime_executes_on_named_child_runtime() {
+        run_command_runtime("bench-test", 2, async {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            anyhow::ensure!(
+                name.starts_with("proxysss-bench-test-"),
+                "unexpected runtime thread: {name}"
+            );
+            Ok(())
+        })
+        .await
+        .expect("child runtime");
     }
 
     #[test]

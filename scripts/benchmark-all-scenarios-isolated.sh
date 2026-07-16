@@ -739,7 +739,7 @@ launch_client() {
     printf ' --start-at-unix-ms "$start_at" > %q 2>&1 &\n' "/tmp/proxysss-bench-results/$scenario.txt"
     printf 'pids+=("$!")\n'
   } >>"$WAVE_SCRIPT"
-  printf '%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" "$runtime_workers" >>"$RUN_DIR/clients.meta"
 }
 
 run_candidate() {
@@ -804,7 +804,7 @@ CLIENT_WAVE
     docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
-  local name row_scenario protocol target concurrency gateway result_phase
+  local name row_scenario protocol target concurrency gateway result_phase runtime_workers
   local stats_name="$phase-$kind"
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
   if [[ "$CAPTURE_DOCKER_STATS" == "1" ]]; then
@@ -851,9 +851,13 @@ THREAD_TICKS
     echo "client wave $WAVE_CLIENT_NAME failed with exit $exit_code" >&2
     return 1
   fi
-  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase; do
+  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase runtime_workers; do
     local output
     output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
+    if ! grep -qx "runtime workers : $runtime_workers" "$WAVE_RESULTS_DIR/$row_scenario.txt"; then
+      echo "client runtime worker mismatch for $row_scenario: expected $runtime_workers" >&2
+      return 1
+    fi
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
     local row planned_target="-1"
     if [[ "$result_phase" == "equal-load" ]]; then
