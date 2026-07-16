@@ -1174,28 +1174,10 @@ fn tune_tcp_stream_for_latency(stream: &TcpStream) {
     tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
-fn tune_tcp_stream_for_static_transfer(stream: &TcpStream) {
-    tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::StaticTransfer);
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
     Realtime,
-    StaticTransfer,
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn tcp_profile_uses_deep_send_queue(profile: TcpSocketTuneProfile) -> bool {
-    matches!(
-        profile,
-        TcpSocketTuneProfile::Gateway | TcpSocketTuneProfile::StaticTransfer
-    )
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn tcp_profile_uses_deep_receive_queue(profile: TcpSocketTuneProfile) -> bool {
-    matches!(profile, TcpSocketTuneProfile::Gateway)
 }
 
 #[cfg(target_os = "linux")]
@@ -1238,7 +1220,7 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
     // realtime game/MQTT/tool streams on Linux autotuning: forcing deep queues per
     // direction wastes kernel memory at 100k connections and can add queueing
     // without helping one-frame-at-a-time traffic.
-    if tcp_profile_uses_deep_send_queue(profile) {
+    if matches!(profile, TcpSocketTuneProfile::Gateway) {
         let buf_size: libc::c_int = match level {
             linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
@@ -1252,15 +1234,13 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
                 &buf_size as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&buf_size) as libc::socklen_t,
             );
-            if tcp_profile_uses_deep_receive_queue(profile) {
-                let _ = libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &buf_size as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
-                );
-            }
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
         }
     }
 
@@ -1269,7 +1249,7 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
         linux_tune::RuntimeSocketTuneLevel::Ubuntu24Extreme
             | linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme
     ) {
-        if tcp_profile_uses_deep_send_queue(profile) {
+        if matches!(profile, TcpSocketTuneProfile::Gateway) {
             let lowat: libc::c_int = match level {
                 linux_tune::RuntimeSocketTuneLevel::FutureLinuxExtreme => 8 * 1024 * 1024,
                 _ => 4 * 1024 * 1024,
@@ -5191,7 +5171,6 @@ impl Gateway {
                 config.runtime.performance.traffic_profile,
                 RuntimePerformanceTrafficProfile::Balanced
             );
-        let tune_static_transfer_socket = yield_after_sendfile_response;
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
         let mut fairness_batch = plain_fast_lane_fairness_batch_for(
@@ -5208,7 +5187,6 @@ impl Gateway {
         let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
-        let mut static_transfer_socket_tuned = false;
         let outcome = 'fast_lane: loop {
             let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
                 .await
@@ -5240,11 +5218,6 @@ impl Gateway {
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
-                );
-                tune_static_transfer_socket_once(
-                    &stream,
-                    tune_static_transfer_socket && cached.sendfile.is_some(),
-                    &mut static_transfer_socket_tuned,
                 );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
@@ -5443,11 +5416,6 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tune_static_transfer_socket_once(
-                    &stream,
-                    tune_static_transfer_socket && cached.sendfile.is_some(),
-                    &mut static_transfer_socket_tuned,
-                );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -5507,11 +5475,6 @@ impl Gateway {
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
-                );
-                tune_static_transfer_socket_once(
-                    &stream,
-                    tune_static_transfer_socket && cached.sendfile.is_some(),
-                    &mut static_transfer_socket_tuned,
                 );
                 send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
@@ -5575,11 +5538,6 @@ impl Gateway {
                     &mut balanced_sendfile_response_sequence,
                     force_yield,
                 );
-                tune_static_transfer_socket_once(
-                    &stream,
-                    tune_static_transfer_socket && cached.sendfile.is_some(),
-                    &mut static_transfer_socket_tuned,
-                );
                 send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
@@ -5603,13 +5561,6 @@ impl Gateway {
                 && candidate.cached_body.is_some()
                 && static_header.len() + candidate.len as usize <= POOL_BUFFER_BYTES;
 
-            tune_static_transfer_socket_once(
-                &stream,
-                tune_static_transfer_socket
-                    && request.method == "GET"
-                    && candidate.sendfile.is_some(),
-                &mut static_transfer_socket_tuned,
-            );
             let send_result = if small_single_write {
                 let body = candidate
                     .cached_body
@@ -12176,7 +12127,6 @@ async fn sendfile_all_async(
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
-    let mut bytes_since_cooperative_yield = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
     let data_plane_cores = adaptive_data_plane_workers(1);
     let max_chunk_bytes = if cooperative_mid_yield {
@@ -12217,43 +12167,33 @@ async fn sendfile_all_async(
     }
 
     while sent < len {
-        let remaining = len - sent;
-        let count = remaining.min(max_chunk_bytes) as usize;
-        let written = stream
+        let chunk_start = sent;
+        let chunk_end = sent.saturating_add(max_chunk_bytes).min(len);
+        stream
             .async_io(tokio::io::Interest::WRITABLE, || {
-                let mut batch_written = 0_usize;
-                loop {
-                    let written = unsafe {
-                        libc::sendfile(out_fd, in_fd, &mut offset, count - batch_written)
-                    };
+                while sent < chunk_end {
+                    let count = (chunk_end - sent) as usize;
+                    let written = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count) };
                     if written > 0 {
-                        batch_written = batch_written.saturating_add(written as usize);
-                        if batch_written >= count {
-                            return Ok(batch_written);
-                        }
+                        sent = sent.saturating_add(written as u64);
                         continue;
                     }
                     if written == 0 {
-                        return Ok(batch_written);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "sendfile source ended before configured length",
+                        ));
                     }
 
                     let error = std::io::Error::last_os_error();
                     if error.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    if error.kind() == std::io::ErrorKind::WouldBlock && batch_written > 0 {
-                        return Ok(batch_written);
-                    }
                     return Err(error);
                 }
+                Ok(())
             })
             .await?;
-        if written == 0 {
-            break;
-        }
-        sent = sent.saturating_add(written as u64);
-        bytes_since_cooperative_yield =
-            bytes_since_cooperative_yield.saturating_add(written as u64);
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 // Keep small-file and realtime tasks runnable without paying
@@ -12261,8 +12201,7 @@ async fn sendfile_all_async(
                 // chunk. A cooperative yield preserves backpressure/fairness
                 // while immediately resuming when no sibling task is ready.
                 tokio::task::yield_now().await;
-            } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
-                bytes_since_cooperative_yield = 0;
+            } else if cooperative_mid_yield && sent.saturating_sub(chunk_start) >= max_chunk_bytes {
                 tokio::task::yield_now().await;
             }
         }
@@ -12557,17 +12496,6 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
     // the three response phases across connections so large-file owners do
     // not all hit the 8 MiB cooperative yield in the same scheduler wave.
     usize::from(remote_addr.port()) % 3
-}
-
-fn tune_static_transfer_socket_once(stream: &TcpStream, sendfile: bool, tuned: &mut bool) {
-    if static_transfer_socket_tune_needed(sendfile, *tuned) {
-        tune_tcp_stream_for_static_transfer(stream);
-        *tuned = true;
-    }
-}
-
-fn static_transfer_socket_tune_needed(sendfile: bool, tuned: bool) -> bool {
-    sendfile && !tuned
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -23180,6 +23108,51 @@ mod tests {
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_sendfile_preserves_progress_across_writable_waits() {
+        use std::ffi::CString;
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd;
+
+        let name = CString::new("proxysss-direct-sendfile-test").expect("memfd name");
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+        let expected = (0..8 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        file.write_all(&expected).expect("write sendfile fixture");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sendfile fixture");
+        let address = listener.local_addr().expect("sendfile fixture address");
+        let client = TcpStream::connect(address)
+            .await
+            .expect("connect sendfile fixture");
+        let (mut server, _) = listener.accept().await.expect("accept sendfile fixture");
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut received = Vec::new();
+            let mut client = client;
+            client
+                .read_to_end(&mut received)
+                .await
+                .expect("read sendfile fixture");
+            received
+        });
+
+        assert_eq!(
+            sendfile_all_async(&server, file.as_raw_fd(), expected.len() as u64, false)
+                .await
+                .expect("send direct file"),
+            expected.len() as u64
+        );
+        server.shutdown().await.expect("finish sendfile fixture");
+        assert_eq!(reader.await.expect("join sendfile reader"), expected);
+    }
+
     #[tokio::test]
     async fn raw_http_pool_discards_upstream_socket_closed_while_idle() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -24538,24 +24511,6 @@ mod tests {
             sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
             3
         );
-        assert!(tcp_profile_uses_deep_send_queue(
-            TcpSocketTuneProfile::Gateway
-        ));
-        assert!(tcp_profile_uses_deep_send_queue(
-            TcpSocketTuneProfile::StaticTransfer
-        ));
-        assert!(!tcp_profile_uses_deep_send_queue(
-            TcpSocketTuneProfile::Realtime
-        ));
-        assert!(tcp_profile_uses_deep_receive_queue(
-            TcpSocketTuneProfile::Gateway
-        ));
-        assert!(!tcp_profile_uses_deep_receive_queue(
-            TcpSocketTuneProfile::StaticTransfer
-        ));
-        assert!(static_transfer_socket_tune_needed(true, false));
-        assert!(!static_transfer_socket_tune_needed(true, true));
-        assert!(!static_transfer_socket_tune_needed(false, false));
         let mut config = GatewayConfig::default();
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
         assert_eq!(

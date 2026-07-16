@@ -21,7 +21,10 @@ import (
 	"time"
 )
 
-const realtimeCompletionGuardMicros int64 = 1_000
+const (
+	realtimeCompletionGuardMicros  int64 = 1_000
+	websocketCompletionGuardMicros int64 = 5_000
+)
 
 type BenchRow struct {
 	Scenario        string   `json:"scenario,omitempty"`
@@ -919,7 +922,15 @@ func runWriteEqualLoadPlan(args []string) error {
 			// millisecond for the final bounded round trip: a slot 200-900 us
 			// before the hard deadline is schedulable but cannot reliably finish
 			// inside a one-second sample on either gateway.
-			executableMicros := durationMicros - realtimeCompletionGuardMicros
+			completionGuardMicros := realtimeCompletionGuardMicros
+			if proxy.Protocol == "websocket" || nginx.Protocol == "websocket" {
+				// A WebSocket echo includes framing plus two user-space protocol
+				// transitions. One millisecond is enough for raw TCP/UDP but
+				// makes the final synchronized WebSocket tick client-limited at
+				// 128 connections even when both gateways have spare capacity.
+				completionGuardMicros = websocketCompletionGuardMicros
+			}
+			executableMicros := durationMicros - completionGuardMicros
 			if executableMicros < 1 {
 				executableMicros = 1
 			}

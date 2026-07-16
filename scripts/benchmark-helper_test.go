@@ -254,6 +254,31 @@ func TestEqualLoadPlanReservesRealtimeCompletionGuard(t *testing.T) {
 	}
 }
 
+func TestEqualLoadPlanReservesWebSocketCompletionGuard(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "websocket-long-connection", Gateway: "nginx", Protocol: "websocket", Concurrency: 128, OpsPerSec: 8211},
+		{Scenario: "websocket-long-connection", Gateway: "proxysss", Protocol: "websocket", Concurrency: 128, OpsPerSec: 10381},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|1920.000000\n") {
+		t.Fatalf("websocket target must leave five milliseconds for final framing and completion: %s", raw)
+	}
+}
+
 func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "saturation.json")
