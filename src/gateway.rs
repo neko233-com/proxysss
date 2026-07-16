@@ -825,11 +825,12 @@ async fn copy_tcp_bidirectional_adaptive(
     left: TcpStream,
     right: TcpStream,
     performance_enabled: bool,
+    _traffic_profile: RuntimePerformanceTrafficProfile,
     profile: TcpRelayProfile,
 ) -> Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
-    if LINUX_STREAM_REACTOR_ENABLED
-        && performance_enabled
+    if performance_enabled
+        && native_stream_reactor_profile_enabled(_traffic_profile)
         && matches!(profile, TcpRelayProfile::RealtimeSmall)
     {
         match crate::stream_reactor::dispatch_with_completion(
@@ -884,6 +885,7 @@ struct DirectTcpFastPath<'a> {
     first_payload: BytesMut,
     remote_addr: SocketAddr,
     worker_index: usize,
+    traffic_profile: RuntimePerformanceTrafficProfile,
 }
 
 async fn relay_direct_tcp_fast_path(
@@ -899,6 +901,7 @@ async fn relay_direct_tcp_fast_path(
         first_payload,
         remote_addr,
         worker_index,
+        traffic_profile,
     } = context;
 
     let mut outbound = tokio::time::timeout(
@@ -941,6 +944,7 @@ async fn relay_direct_tcp_fast_path(
         inbound,
         outbound,
         true,
+        traffic_profile,
         tcp_relay_profile(protocol, first_payload_len),
     )
     .await
@@ -1539,8 +1543,6 @@ const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
 // that mixed-load knee while preserving the lower-overhead 1x path.
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "linux")]
-const LINUX_STREAM_REACTOR_ENABLED: bool = false;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
 // With the Linux fair scheduler enabled, a hot listen backlog can keep
 // `accept()` immediately ready long enough to queue hundreds of TLS tasks
@@ -6432,6 +6434,11 @@ impl Gateway {
                                     first_payload: BytesMut::new(),
                                     remote_addr,
                                     worker_index: connection_worker,
+                                    traffic_profile: state
+                                        .config
+                                        .runtime
+                                        .performance
+                                        .traffic_profile,
                                 },
                             )
                             .await?;
@@ -6570,6 +6577,11 @@ impl Gateway {
                                     first_payload,
                                     remote_addr,
                                     worker_index: connection_worker,
+                                    traffic_profile: state
+                                        .config
+                                        .runtime
+                                        .performance
+                                        .traffic_profile,
                                 },
                             )
                             .await?;
@@ -6696,6 +6708,7 @@ impl Gateway {
                         inbound,
                         outbound,
                         state.config.runtime.performance.enabled,
+                        state.config.runtime.performance.traffic_profile,
                         tcp_relay_profile(&listener_protocol, first_payload.len()),
                     )
                     .await
@@ -9359,7 +9372,10 @@ impl Gateway {
         }
 
         #[cfg(target_os = "linux")]
-        if LINUX_STREAM_REACTOR_ENABLED && plain_downstream_fd.is_some() {
+        if config.runtime.performance.enabled
+            && native_stream_reactor_profile_enabled(config.runtime.performance.traffic_profile)
+            && plain_downstream_fd.is_some()
+        {
             let downstream_fd = plain_downstream_fd.expect("plain downstream fd checked");
             match crate::stream_reactor::dispatch(
                 downstream_fd,
@@ -12303,10 +12319,9 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // One movable owner per four CPUs avoids a permanently-runnable CFS
-        // sibling on every HTTP shard. The count still scales with the full
-        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 5,
+        // The sparse balanced relay pool removes per-connection Tokio tasks.
+        // Keep it at nice 0 so fixed game ticks retain low p95/p99.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12322,9 +12337,14 @@ fn shared_tls_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool
 
 #[cfg(any(test, target_os = "linux"))]
 fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Small)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn native_stream_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(
         profile,
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
     )
 }
 
@@ -24278,7 +24298,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            5
+            0
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -24298,10 +24318,19 @@ mod tests {
         assert!(shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(shared_udp_runtime_profile(
+        assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
+        assert!(!native_stream_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(native_stream_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(native_stream_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
         assert_eq!(

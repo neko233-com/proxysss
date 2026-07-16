@@ -84,7 +84,7 @@ CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
 # absolute lead lets plain HTTP clients preconnect their declared concurrency
 # while keeping all one-second measurement windows aligned. Only active windows
 # consume the 20-second measurement budget; orchestration is wall time.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-1000}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-2000}"
 GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-250}"
 UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
 CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-4}"

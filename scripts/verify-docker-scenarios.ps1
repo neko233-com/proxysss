@@ -55,7 +55,9 @@ grep -q 'mapping api-from-consul registry=consul-main service=spring-api' /tmp/p
     $containerScript = $containerScript.Replace("`r", "")
 
     docker run --rm `
+        -e CARGO_HOME=/cargo `
         -e CARGO_TARGET_DIR=/target `
+        -v proxysss-scenario-cargo:/cargo `
         -v proxysss-scenario-target:/target `
         -v "${repoRoot}:/work" `
         -w /work `

@@ -24,7 +24,8 @@ tcp:
       bind: 127.0.0.1:{tcp_listen_port}
       upstream: 127.0.0.1:{upstream_port}
 "#,
-        base = base_gateway_yaml(gateway_port),
+        base = base_gateway_yaml(gateway_port)
+            .replace("traffic_profile: small", "traffic_profile: balanced"),
         tcp_listen_port = tcp_listen_port,
         upstream_port = upstream_port
     );

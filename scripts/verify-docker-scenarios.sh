@@ -51,7 +51,9 @@ docker run --rm "$image" bash -lc '
 '
 
 docker run --rm \
+  -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/target \
+  -v proxysss-scenario-cargo:/cargo \
   -v proxysss-scenario-target:/target \
   -v "$repo_root:/work" \
   -w /work \

@@ -100,6 +100,9 @@ plugins:
 admin:
   enabled: false
 runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
   hot_reload:
     enabled: false
 load_balance:
