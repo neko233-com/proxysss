@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
@@ -1495,7 +1496,7 @@ impl HyperBody for GatewayBody {
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -1534,7 +1535,11 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // polling substantially more frequent than Tokio's throughput-oriented
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_PLANE_STATS_SHARDS: usize = 256;
+thread_local! {
+    static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
+}
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
@@ -1687,6 +1692,7 @@ fn data_plane_cpu_ids() -> &'static [usize] {
 
 #[cfg(target_os = "linux")]
 fn pin_current_data_plane_thread(worker_index: usize) {
+    DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
     let cpus = data_plane_cpu_ids();
     let cpu = cpus[worker_index % cpus.len()];
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
@@ -1701,7 +1707,9 @@ fn pin_current_data_plane_thread(worker_index: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_current_data_plane_thread(_worker_index: usize) {}
+fn pin_current_data_plane_thread(worker_index: usize) {
+    DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
+}
 
 #[cfg(target_os = "linux")]
 fn set_current_thread_nice(nice: i32) {
@@ -1941,9 +1949,22 @@ struct SniResolver {
     on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
-#[derive(Default)]
+#[repr(align(128))]
+struct PaddedAtomicU64(AtomicU64);
+
+impl Default for PaddedAtomicU64 {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
 struct GatewayStats {
+    // Request counters are written by every HTTP data-plane shard. A single
+    // global atomic bounces one cache line across all gateway cores and makes
+    // metrics collection part of request latency. Each pinned shard owns one
+    // padded cell; control-plane threads use the fallback counter.
     http_requests: AtomicU64,
+    http_request_shards: [PaddedAtomicU64; DATA_PLANE_STATS_SHARDS],
     http_errors: AtomicU64,
     tcp_sessions_total: AtomicU64,
     tcp_sessions_active: AtomicU64,
@@ -1963,6 +1984,31 @@ struct GatewayStats {
     /// successful connection already implies a warm data plane.
     warm: AtomicBool,
     process_metrics: Mutex<ProcessMetricsSampler>,
+}
+
+impl Default for GatewayStats {
+    fn default() -> Self {
+        Self {
+            http_requests: AtomicU64::new(0),
+            http_request_shards: std::array::from_fn(|_| PaddedAtomicU64::default()),
+            http_errors: AtomicU64::new(0),
+            tcp_sessions_total: AtomicU64::new(0),
+            tcp_sessions_active: AtomicU64::new(0),
+            udp_packets_total: AtomicU64::new(0),
+            udp_bytes_total: AtomicU64::new(0),
+            reload_success_total: AtomicU64::new(0),
+            reload_failure_total: AtomicU64::new(0),
+            admin_requests_total: AtomicU64::new(0),
+            admin_auth_fail_total: AtomicU64::new(0),
+            script_fail_total: AtomicU64::new(0),
+            blocked_requests_total: AtomicU64::new(0),
+            ddos_bans_total: AtomicU64::new(0),
+            critical_task_failures_total: AtomicU64::new(0),
+            watchdog_heartbeat_total: AtomicU64::new(0),
+            warm: AtomicBool::new(false),
+            process_metrics: Mutex::new(ProcessMetricsSampler::default()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2449,7 +2495,7 @@ impl Gateway {
                 .watchdog_heartbeat_total
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
-                http_requests = self.stats.http_requests.load(Ordering::Relaxed),
+                http_requests = self.stats.http_requests_total(),
                 tcp_sessions_active = self.stats.tcp_sessions_active.load(Ordering::Relaxed),
                 udp_packets_total = self.stats.udp_packets_total.load(Ordering::Relaxed),
                 critical_task_failures_total = self
@@ -5480,7 +5526,7 @@ impl Gateway {
                 .write_all(&response)
                 .await
                 .context("failed writing TLS static fast-lane response")?;
-            self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_http_request();
             if config.logging.access_log {
                 tracing::info!(
                     target: "access",
@@ -7230,7 +7276,7 @@ impl Gateway {
         remote_addr: SocketAddr,
         scheme: &'static str,
     ) -> Result<GatewayResponse, Infallible> {
-        self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+        self.stats.record_http_request();
 
         match self
             .try_http_static_success_fast_path(&request, scheme)
@@ -11790,9 +11836,10 @@ async fn sendfile_all_async(
         if sent < len {
             if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
                 // Keep small-file and realtime tasks runnable without paying
-                // Linux timer-wheel granularity after every 2 MiB sendfile
-                // chunk. A cooperative yield preserves backpressure/fairness
-                // while immediately resuming when no sibling task is ready.
+                // The small profile uses a 16 MiB ceiling, so sendfile normally
+                // reaches socket WouldBlock before this branch. Yield only
+                // after a full immediately-writable chunk; ordinary kernel
+                // backpressure already returns control through async_io.
                 tokio::task::yield_now().await;
             } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
                 bytes_since_cooperative_yield = 0;
@@ -12243,10 +12290,32 @@ fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> Ga
 }
 
 impl GatewayStats {
+    fn record_http_request(&self) {
+        let recorded = DATA_PLANE_STATS_SHARD.with(|shard| {
+            let Some(index) = shard.get() else {
+                return false;
+            };
+            self.http_request_shards[index]
+                .0
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        if !recorded {
+            self.http_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn http_requests_total(&self) -> u64 {
+        self.http_request_shards.iter().fold(
+            self.http_requests.load(Ordering::Relaxed),
+            |total, shard| total.saturating_add(shard.0.load(Ordering::Relaxed)),
+        )
+    }
+
     fn snapshot_json(&self) -> serde_json::Value {
         let process = self.process_snapshot();
         serde_json::json!({
-            "http_requests": self.http_requests.load(Ordering::Relaxed),
+            "http_requests": self.http_requests_total(),
             "http_errors": self.http_errors.load(Ordering::Relaxed),
             "tcp_sessions_total": self.tcp_sessions_total.load(Ordering::Relaxed),
             "tcp_sessions_active": self.tcp_sessions_active.load(Ordering::Relaxed),
@@ -12277,7 +12346,7 @@ impl GatewayStats {
             (
                 "proxysss_http_requests_total",
                 "Total HTTP requests handled by the gateway",
-                self.http_requests.load(Ordering::Relaxed),
+                self.http_requests_total(),
             ),
             (
                 "proxysss_http_errors_total",
@@ -24158,6 +24227,17 @@ mod tests {
             Some(std::process::id() as u64)
         );
         assert!(payload["process"]["memory_mb"].as_f64().is_some());
+    }
+
+    #[test]
+    fn http_request_stats_aggregate_fallback_and_data_shards() {
+        let stats = GatewayStats::default();
+        stats.http_requests.store(2, Ordering::Relaxed);
+        DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(7)));
+        stats.record_http_request();
+        stats.record_http_request();
+        DATA_PLANE_STATS_SHARD.with(|shard| shard.set(None));
+        assert_eq!(stats.http_requests_total(), 4);
     }
 
     #[test]
