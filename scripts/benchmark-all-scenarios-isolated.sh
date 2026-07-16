@@ -89,6 +89,7 @@ GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-250}"
 UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
 CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-4}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
+LATENCY_REPETITIONS="${LATENCY_REPETITIONS:-2}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -135,7 +136,7 @@ ROLE_MACHINE_ID_HASH="$(printf '%s' "$(docker info --format '{{.ID}}')" | sha256
   echo "NGINX_WORKERS must be a positive integer" >&2
   exit 1
 }
-for value_name in BENCHMARK_REPETITIONS ISOLATED_REPETITIONS; do
+for value_name in BENCHMARK_REPETITIONS LATENCY_REPETITIONS ISOLATED_REPETITIONS; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$value_name must be a positive integer" >&2
@@ -306,8 +307,9 @@ case "$TRAFFIC_PROFILE" in
   *) echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2; exit 1 ;;
 esac
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]] \
-  && (( BENCHMARK_REPETITIONS < 4 || BENCHMARK_REPETITIONS % 2 != 0 )); then
-  echo "BENCHMARK_REPETITIONS must be an even number >= 4 for balanced gateway order" >&2
+  && (( BENCHMARK_REPETITIONS < 4 || BENCHMARK_REPETITIONS % 2 != 0 \
+    || LATENCY_REPETITIONS < 4 || LATENCY_REPETITIONS % 2 != 0 )); then
+  echo "BENCHMARK_REPETITIONS and LATENCY_REPETITIONS must be even numbers >= 4 for balanced gateway order" >&2
   exit 1
 fi
 
@@ -635,7 +637,7 @@ for _scale in $LOAD_SCALES; do
 done
 required_active_measurement_secs=0
 if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
-  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * BENCHMARK_REPETITIONS * 4 * DURATION_SECS))
+  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * (BENCHMARK_REPETITIONS * 2 + LATENCY_REPETITIONS * 2) * DURATION_SECS))
 fi
 if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
   required_active_measurement_secs=$((required_active_measurement_secs + scale_count * ${#SCENARIOS[@]} * ISOLATED_REPETITIONS * 2 * DURATION_SECS))
@@ -953,7 +955,7 @@ write_scale_reports() {
       --require-latency-percentiles=true --require-zero-errors=true \
       --gate-ops=false --gate-latency=true --min-target-achievement="$MIN_TARGET_ACHIEVEMENT" --phase=equal-offered-load \
       --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
-      --traffic-profile "$TRAFFIC_PROFILE" --samples-per-gateway "$BENCHMARK_REPETITIONS" \
+      --traffic-profile "$TRAFFIC_PROFILE" --samples-per-gateway "$LATENCY_REPETITIONS" \
       --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
       --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
       --sse-concurrency "$SSE_CONCURRENCY" --stream-connections "$STREAM_CONNECTIONS"
@@ -967,6 +969,7 @@ load_scale=$scale
 run_order=$RUN_ORDER
 latency_run_order=$LATENCY_RUN_ORDER
 benchmark_repetitions=$BENCHMARK_REPETITIONS
+latency_repetitions=$LATENCY_REPETITIONS
 isolated_repetitions=$ISOLATED_REPETITIONS
 equal_load_fraction=$EQUAL_LOAD_FRACTION
 min_target_achievement=$MIN_TARGET_ACHIEVEMENT
@@ -1026,7 +1029,7 @@ run_scale() {
     "$HELPER" aggregate-bench-medians --in "$SATURATION_RESULTS_JSONL" --out "$SATURATION_RESULTS_JSON"
     "$HELPER" write-equal-load-plan --results "$SATURATION_RESULTS_JSON" --out "$EQUAL_LOAD_PLAN" \
       --fraction "$EQUAL_LOAD_FRACTION" --duration-secs "$DURATION_SECS"
-    for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+    for repetition in $(seq 1 "$LATENCY_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$LATENCY_RUN_ORDER" "$repetition")"
       for kind in $repetition_order; do run_candidate equal-load "$kind" || return $?; done
     done

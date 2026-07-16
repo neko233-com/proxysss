@@ -1501,6 +1501,8 @@ const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
+const STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -1545,6 +1547,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 32;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1558,6 +1561,8 @@ static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
 static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static ACTIVE_SENDFILE_TRANSFERS: AtomicUsize = AtomicUsize::new(0);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
@@ -1927,8 +1932,10 @@ async fn drive_h2_connection_tasks(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<H2ConnectionTask>,
 ) {
     let mut tasks = FuturesUnordered::new();
+    let mut consecutive_ready = 0_usize;
     loop {
         if tasks.is_empty() {
+            consecutive_ready = 0;
             match receiver.recv().await {
                 Some(task) => tasks.push(task),
                 None => break,
@@ -1946,7 +1953,13 @@ async fn drive_h2_connection_tasks(
                     }
                 }
             }
-            _ = tasks.next() => {}
+            _ = tasks.next() => {
+                consecutive_ready = consecutive_ready.saturating_add(1);
+                if consecutive_ready >= H2_CONNECTION_TASK_FAIRNESS_BATCH {
+                    consecutive_ready = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
         }
     }
 }
@@ -2149,6 +2162,29 @@ impl ActivePlainHttpConnectionGuard {
 impl Drop for ActivePlainHttpConnectionGuard {
     fn drop(&mut self) {
         PLAIN_HTTP_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ActiveSendfileTransferGuard {
+    active: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl ActiveSendfileTransferGuard {
+    fn enter() -> Self {
+        Self {
+            active: ACTIVE_SENDFILE_TRANSFERS
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ActiveSendfileTransferGuard {
+    fn drop(&mut self) {
+        ACTIVE_SENDFILE_TRANSFERS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -11938,17 +11974,20 @@ async fn sendfile_all_async(
     if len == 0 {
         return Ok(0);
     }
+    let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let mut bytes_since_cooperative_yield = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
+    let data_plane_cores = adaptive_data_plane_workers(1);
     let max_chunk_bytes = if cooperative_mid_yield {
         configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
+    } else if transfer_guard.active <= data_plane_cores {
+        configured_chunk_bytes.max(STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES)
     } else {
         configured_chunk_bytes
     };
-    let data_plane_cores = adaptive_data_plane_workers(1);
     let sendfile_reactor_workers = data_plane_cores.div_ceil(
         STATIC_SENDFILE_REACTOR_CPU_DIVISOR
             .load(Ordering::Relaxed)
