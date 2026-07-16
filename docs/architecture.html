@@ -738,7 +738,7 @@ udp:
         - name: zone-a-udp
           upstreams:
             - addr: "10.0.1.10:7001"</code></pre>
-          <p class="subtle">Linux 性能模式从 cgroup effective cpuset 发现完整 CPU 集，再建立全核 `SO_REUSEPORT` listener fanout。默认 small 把 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 放进一个 CPU-sized Tokio runtime，每个允许核心一个 nice 0 worker，并允许 ready connection work-steal。Tokio LIFO slot 保留。global injection queue 每 31 次 poll、I/O driver 每 16 次 poll 检查；8-poll 实验降低了 4x HTTP 吞吐且没有修复尾延迟。低密度 HTTP/TLS 显式 yield 摊到每 256 响应；高密度 plain HTTP 使用每 128 响应的公平边界。静态文件重验证独立使用 256-hit budget。WebSocket 使用 readiness-bounded 64-poll normal relay turn。持续 UDP burst 每 8 包 cooperative yield。balanced UDP 复用该 runtime，TLS 保持 bounded runtime；bulk 才启用专用 transfer owner。</p>
+          <p class="subtle">Linux 性能模式从 cgroup effective cpuset 发现完整 CPU 集，再建立全核 `SO_REUSEPORT` listener fanout。默认 small 把 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 放进一个 CPU-sized Tokio runtime，每个允许核心一个 nice 0 worker，并允许 ready connection work-steal。Tokio LIFO slot 保留。global injection queue 每 31 次 poll、I/O driver 每 16 次 poll 检查；8-poll 实验降低了 4x HTTP 吞吐且没有修复尾延迟。低密度 HTTP/TLS 显式 yield 摊到每 256 响应；高密度 plain HTTP 使用每 128 响应的公平边界。静态文件重验证独立使用 256-hit budget。WebSocket 使用 readiness-bounded 64-poll normal relay turn。持续 UDP burst 每 8 包 cooperative yield。balanced UDP 复用该 runtime，TLS 保持 bounded runtime 并以 nice 5 运行，避免 H2 worker 在共享 cpuset 上抢占 nice-0 HTTP/realtime shard；bulk 才启用专用 transfer owner。</p>
           <p class="subtle">每次 level-triggered readiness 最多连续 drain 8 个 16 KiB read batch，合并已排队 WebSocket/game/TCP 小帧的 epoll/hash dispatch；达到上限就归还 event loop，partial write 立即进入显式 pending/backpressure。普通数据事件只在本端已经观察到 EOF 后才做完整 pair-finished 查询，去掉每帧两端状态查找。</p>
           <p class="subtle">Linux 性能模式下 UDP 使用全核 CPU 自适应 `SO_REUSEPORT` socket fanout并复用有界 UDP buffer pool；默认 small 与 balanced 的 recv loop、association reader 都留在对应 per-core HTTP data shard。无 policy worker 本地缓存 upstream/config 快照；pending 去重使用分片集合，association prune 按时间、创建数量和容量压力节流。</p>
         </section>
@@ -863,17 +863,17 @@ plugins:
             <article class="card">
               <span class="tag expert">Warm-up</span>
               <h3>配置加载后先自我预热</h3>
-              <p class="subtle">静态热文件、sendfile 描述符、反向代理 keepalive 池都会先准备好，避免首个真实请求承担冷启动成本。</p>
+              <p class="subtle">静态热文件、sendfile 描述符、小对象完整 HTTP/1 keep-alive 响应 bytes、反向代理 keepalive 池都会先准备好。上游预拨按 CPU 并行、按 pool 去重并受每池/全局上限约束，避免首个真实请求承担序列化、拷贝或冷连接成本。</p>
             </article>
             <article class="card">
               <span class="tag expert">Validation</span>
               <h3>只赢一项，不算赢</h3>
-              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 与透明 QCP 都要一起看；角色隔离脚本默认在每个 1×/2×/4× 尺度对每个 gateway/phase 跑 1 个同步 1 秒样本。完整矩阵最多使用 20 秒 active client measurement；`validation_elapsed_secs` 累加采样窗口，`validation_wall_elapsed_secs` 单独记录进程启动、结果复制和报告解析。显式多轮时比较中位数，任一轮错误取最大值，equal-offered-load 再严格判 p50/p95/p99。KCP/QCP frame termination 不拿 nginx 做伪对照；QCP 行只验证与等价 nginx UDP listener 的透明 edge forwarding。</p>
+              <p class="subtle">generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 与透明 QCP 都要一起看；角色隔离脚本默认在每个 1×/2×/4× 尺度运行 1 次 saturation 和 2 次反向 candidate order 的 equal-load 1 秒样本，共 18 秒 active client measurement，并硬限制在 20 秒内。`validation_elapsed_secs` 累加采样窗口，`validation_wall_elapsed_secs` 单独记录进程启动、结果复制和报告解析。latency report 使用两次样本 median，任一轮错误取最大值，equal-offered-load 严格判 p50/p95/p99。KCP/QCP frame termination 不拿 nginx 做伪对照；QCP 行只验证与等价 nginx UDP listener 的透明 edge forwarding。</p>
             </article>
             <article class="card">
               <span class="tag expert">Fast lane</span>
               <h3>默认头语义也要能吃到快路径</h3>
-              <p class="subtle">plain HTTP 的 raw reverse proxy 和 raw SSE fast lane 保留 `X-Forwarded-*` / `Forwarded`。Plain/TLS fast-lane request reader 直接读入 persistent per-connection BytesMut。同一 keep-alive connection 重复的 exact static GET head 命中 connection response cache；一秒 revalidation clock 每 256 次 exact hit 检查一次。低密度连接每 256 响应 cooperative yield；高密度 plain HTTP 使用每 128 响应的 saturated fairness boundary。WebSocket relay 使用 64-poll normal budget。HTTP/2 使用固定大窗口与 warm-up immutable snapshot。raw reverse 复用 upstream lane、request/response buffer 与 framing cache，只有尚未收全的 body 才进入 bounded ByteBufferPool relay。</p>
+              <p class="subtle">plain HTTP 的 raw reverse proxy 和 raw SSE fast lane 保留 `X-Forwarded-*` / `Forwarded`。Plain/TLS fast-lane request reader 直接读入 persistent per-connection BytesMut。warm-up 为小静态对象预构建完整 HTTP/1 keep-alive 响应 bytes；同一 connection 后续 exact static GET head 命中 connection response cache，一秒 revalidation clock 每 256 次 exact hit 检查一次。低密度连接每 256 响应 cooperative yield；高密度 plain HTTP 使用每 128 响应的 saturated fairness boundary。WebSocket relay 使用 64-poll normal budget。HTTP/2 使用固定大窗口与 warm-up immutable snapshot。raw reverse 复用 upstream lane、request/response buffer 与 framing cache，只有尚未收全的 body 才进入 bounded ByteBufferPool relay。</p>
             </article>
             <article class="card">
               <span class="tag expert">WebSocket relay</span>
@@ -883,7 +883,7 @@ plugins:
             <article class="card">
               <span class="tag expert">Static sendfile</span>
               <h3>零拷贝也要保证并行公平</h3>
-              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder。warm-up 构建 ArcSwap/FxHashMap 只读静态响应表。每条 H2 connection 使用本地 `FuturesUnordered` executor；连续完成 32 个 ready stream 后 cooperative yield，队列空闲时重置计数，因此低负载没有周期性 yield。过期文件继续 stale-while-revalidate 并原子替换快照。</p>
+              <p class="subtle">ALPN 已确认的 HTTP/2 直接进入 Hyper H2 builder。warm-up 构建 ArcSwap/FxHashMap 只读静态响应表。每条 H2 connection 使用本地 `FuturesUnordered` executor，并在每个 ready stream 完成后 cooperative yield，防止热 H2 connection 长驻 Tokio LIFO slot，阻塞同 shard 的 HTTP/1、SSE、WebSocket、TCP、UDP/QCP。过期文件继续 stale-while-revalidate 并原子替换快照。</p>
             </article>
           </div>
 

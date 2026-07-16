@@ -224,6 +224,22 @@ fn raw_http_pool_idle_capacity() -> usize {
     adaptive_data_plane_workers(1).saturating_mul(64).max(64)
 }
 
+const RAW_HTTP_PREWARM_CONNECTIONS_PER_CORE: usize = 16;
+const RAW_HTTP_PREWARM_TOTAL_CONNECTIONS_PER_CORE: usize = 64;
+
+fn raw_http_prewarm_limits_for(cores: usize, pool_capacity: usize) -> (usize, usize) {
+    let cores = cores.max(1);
+    let pool_capacity = pool_capacity.max(1);
+    let per_upstream = cores
+        .saturating_mul(RAW_HTTP_PREWARM_CONNECTIONS_PER_CORE)
+        .min(pool_capacity)
+        .max(1);
+    let total = cores
+        .saturating_mul(RAW_HTTP_PREWARM_TOTAL_CONNECTIONS_PER_CORE)
+        .max(per_upstream);
+    (per_upstream, total)
+}
+
 /// Bounded, lock-free pool of reusable heap buffers for hot-path relay and
 /// streaming loops. Caps steady-state allocation churn under very high
 /// connection counts (target 100k-1M concurrent sockets) without unbounded
@@ -1547,7 +1563,12 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // default while amortizing both checks across a useful ready-task batch.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
-const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 32;
+// HTTP/2 stream futures are deliberately driven inside their owning
+// connection to avoid one Tokio task allocation per small response. Yield
+// after every completed stream, though: a continuously-ready H2 connection
+// otherwise stays in the worker LIFO slot and can delay unrelated HTTP/1,
+// TCP, UDP and WebSocket I/O on the shared balanced/small data shards.
+const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
 const DATA_PLANE_STATS_SHARDS: usize = 256;
 thread_local! {
     static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1892,6 +1913,7 @@ struct CachedStaticFile {
     sendfile: Option<Arc<std::fs::File>>,
     content_type: HeaderValue,
     content_length: HeaderValue,
+    http1_keep_alive_response: Option<Bytes>,
     checked_at: Instant,
     revalidating: bool,
 }
@@ -2447,22 +2469,38 @@ impl Gateway {
             );
         }
 
+        let data_plane_cores = adaptive_data_plane_workers(1);
+        let (per_upstream, mut remaining_budget) =
+            raw_http_prewarm_limits_for(data_plane_cores, raw_http_pool_idle_capacity());
+        let mut seen_pools = HashSet::new();
         let mut predialed = 0_usize;
         for upstream in upstreams {
             let Ok(Some((key, host, port))) = raw_http_pool_parts_from_upstream(&upstream) else {
                 continue;
             };
+            if !seen_pools.insert(key.clone()) || remaining_budget == 0 {
+                continue;
+            }
             let pool = self.raw_http_pool_for_parts(key, host, port);
-            let mut warmed = Vec::with_capacity(2);
-            for _ in 0..2 {
-                match tokio::time::timeout(Duration::from_millis(250), pool.checkout()).await {
-                    Ok(Ok(stream)) => {
-                        warmed.push(stream);
-                        predialed = predialed.saturating_add(1);
-                    }
-                    _ => break,
+            let target = per_upstream.min(remaining_budget);
+            let mut attempts = FuturesUnordered::new();
+            for _ in 0..target {
+                let pool = pool.clone();
+                attempts.push(async move {
+                    tokio::time::timeout(Duration::from_millis(250), pool.checkout())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                });
+            }
+            let mut warmed = Vec::with_capacity(target);
+            while let Some(stream) = attempts.next().await {
+                if let Some(stream) = stream {
+                    warmed.push(stream);
                 }
             }
+            remaining_budget = remaining_budget.saturating_sub(warmed.len());
+            predialed = predialed.saturating_add(warmed.len());
             for stream in warmed {
                 pool.checkin(stream);
             }
@@ -5392,13 +5430,15 @@ impl Gateway {
                 && request.keep_alive
                 && (candidate.cached_body.is_some() || candidate.sendfile.is_some())
             {
-                let combined_response = candidate.cached_body.as_ref().and_then(|body| {
-                    (static_header.len() + body.len() <= POOL_BUFFER_BYTES).then(|| {
-                        small_static_response.clear();
-                        small_static_response.reserve(static_header.len() + body.len());
-                        small_static_response.extend_from_slice(static_header.as_bytes());
-                        small_static_response.extend_from_slice(body);
-                        Bytes::copy_from_slice(&small_static_response)
+                let combined_response = candidate.combined_response.clone().or_else(|| {
+                    candidate.cached_body.as_ref().and_then(|body| {
+                        (static_header.len() + body.len() <= POOL_BUFFER_BYTES).then(|| {
+                            small_static_response.clear();
+                            small_static_response.reserve(static_header.len() + body.len());
+                            small_static_response.extend_from_slice(static_header.as_bytes());
+                            small_static_response.extend_from_slice(body);
+                            Bytes::copy_from_slice(&small_static_response)
+                        })
                     })
                 });
                 let cached = ConnectionStaticFastPathCache {
@@ -11195,6 +11235,7 @@ struct StaticFastPathCandidate {
     len: u64,
     content_type: &'static str,
     cached_body: Option<Bytes>,
+    combined_response: Option<Bytes>,
     sendfile: Option<Arc<std::fs::File>>,
 }
 
@@ -11869,11 +11910,15 @@ async fn resolve_large_static_fast_path_candidate(
         None
     };
 
+    let combined_response = cached_body.as_ref().and_then(|body| {
+        build_static_http1_keep_alive_response(static_content_type(&target), metadata.len(), body)
+    });
     Ok(Some(StaticFastPathCandidate {
         content_type: static_content_type(&target),
         len: metadata.len(),
         path: target,
         cached_body,
+        combined_response,
         sendfile,
     }))
 }
@@ -12279,7 +12324,13 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // Balanced keeps a bounded TLS/H2 runtime beside the CPU-sized
+        // HTTP/realtime shards. A continuously runnable H2 worker at nice 0
+        // otherwise competes with one data shard on the same cgroup CPU and
+        // periodically pushes roughly one core's HTTP/TCP/UDP work into p95.
+        // H2 retains dedicated ownership and ample throughput while CFS lets
+        // latency-sensitive shared-shard I/O run first.
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -18391,6 +18442,29 @@ async fn static_range_response(
     Ok(response)
 }
 
+fn build_static_http1_keep_alive_response(
+    content_type: &'static str,
+    len: u64,
+    body: &Bytes,
+) -> Option<Bytes> {
+    let mut header = String::with_capacity(160);
+    std::fmt::Write::write_fmt(
+        &mut header,
+        format_args!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {len}\r\nconnection: keep-alive\r\n\r\n"
+        ),
+    )
+    .expect("writing static response header to String cannot fail");
+    if header.len().saturating_add(body.len()) > POOL_BUFFER_BYTES {
+        return None;
+    }
+
+    let mut response = Vec::with_capacity(header.len() + body.len());
+    response.extend_from_slice(header.as_bytes());
+    response.extend_from_slice(body);
+    Some(Bytes::from(response))
+}
+
 async fn cached_static_file_body(
     target: &Path,
     metadata: &std::fs::Metadata,
@@ -18459,6 +18533,12 @@ async fn cached_static_file_body(
     {
         let current = static_file_cache_bytes.load(Ordering::Relaxed);
         if current.saturating_add(body_len) <= STATIC_FILE_CACHE_MAX_BYTES {
+            let content_type_value = static_content_type(target);
+            let content_type = HeaderValue::from_static(content_type_value);
+            let content_length = HeaderValue::from_str(&metadata.len().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0"));
+            let http1_keep_alive_response =
+                build_static_http1_keep_alive_response(content_type_value, metadata.len(), &body);
             let sendfile = static_file_cache
                 .get(&key)
                 .and_then(|entry| entry.sendfile.clone());
@@ -18469,9 +18549,9 @@ async fn cached_static_file_body(
                     modified,
                     body: body.clone(),
                     sendfile,
-                    content_type: HeaderValue::from_static(static_content_type(target)),
-                    content_length: HeaderValue::from_str(&metadata.len().to_string())
-                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    content_type,
+                    content_length,
+                    http1_keep_alive_response,
                     checked_at: Instant::now(),
                     revalidating: false,
                 },
@@ -18682,6 +18762,7 @@ fn stale_cached_static_file_candidate(
         len: entry.len,
         content_type: static_content_type(target),
         cached_body,
+        combined_response: entry.http1_keep_alive_response.clone(),
         sendfile,
     };
     drop(entry);
@@ -18736,6 +18817,7 @@ fn fresh_cached_static_file_candidate(
         len: entry.len,
         content_type: static_content_type(target),
         cached_body,
+        combined_response: entry.http1_keep_alive_response.clone(),
         sendfile,
     })
 }
@@ -18784,6 +18866,7 @@ fn cached_static_sendfile(
             content_type: HeaderValue::from_static(static_content_type(target)),
             content_length: HeaderValue::from_str(&metadata.len().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            http1_keep_alive_response: None,
             checked_at: Instant::now(),
             revalidating: false,
         },
@@ -23201,6 +23284,7 @@ mod tests {
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
+                http1_keep_alive_response: None,
                 checked_at: Instant::now(),
                 revalidating: false,
             },
@@ -23233,6 +23317,7 @@ mod tests {
 
     #[tokio::test]
     async fn h2_connection_executor_drives_streams_without_tokio_spawn_per_request() {
+        assert_eq!(H2_CONNECTION_TASK_FAIRNESS_BATCH, 1);
         let (executor, receiver) = h2_connection_executor();
         let completed = Arc::new(AtomicUsize::new(0));
         let task_completed = completed.clone();
@@ -23248,6 +23333,12 @@ mod tests {
     #[test]
     fn plain_static_stale_candidate_serves_body_and_coalesces_revalidation() {
         let cache = DashMap::new();
+        let prebuilt = build_static_http1_keep_alive_response(
+            "application/javascript; charset=utf-8",
+            4,
+            &Bytes::from_static(b"test"),
+        )
+        .expect("prebuilt HTTP/1 response");
         cache.insert(
             "asset.js".to_string(),
             CachedStaticFile {
@@ -23257,6 +23348,7 @@ mod tests {
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
+                http1_keep_alive_response: Some(prebuilt.clone()),
                 checked_at: Instant::now() - Duration::from_secs(2),
                 revalidating: false,
             },
@@ -23271,6 +23363,7 @@ mod tests {
         .expect("stale cached candidate");
         assert!(revalidate);
         assert_eq!(candidate.cached_body.as_deref(), Some(b"test".as_slice()));
+        assert_eq!(candidate.combined_response, Some(prebuilt));
 
         let (_, duplicate_revalidate) = stale_cached_static_file_candidate(
             Path::new("asset.js"),
@@ -23303,6 +23396,7 @@ mod tests {
                 content_type: HeaderValue::from_static("application/octet-stream"),
                 content_length: HeaderValue::from_str(&metadata.len().to_string())
                     .expect("content length"),
+                http1_keep_alive_response: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
                 revalidating: true,
             },
@@ -24144,6 +24238,9 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
+        assert_eq!(raw_http_prewarm_limits_for(1, 64), (16, 64));
+        assert_eq!(raw_http_prewarm_limits_for(8, 512), (128, 512));
+        assert_eq!(raw_http_prewarm_limits_for(8, 32), (32, 512));
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
@@ -24220,7 +24317,7 @@ mod tests {
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            5
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
