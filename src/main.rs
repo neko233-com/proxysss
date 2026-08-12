@@ -430,6 +430,10 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
         "monitoring.path (default /metrics) exposes Prometheus text or JSON counters via monitoring.format",
     ),
     (
+        "readonly mobile monitor",
+        "admin.monitor exposes a dedicated HTTPS-only password login and monitor:read session for /v1/health, /v1/summary, /v1/stats, and /v1/ssl; it never accepts admin bearer tokens or write methods",
+    ),
+    (
         "weighted load balancing",
         "load_balance.algorithm=weighted with per-upstream upstream_weights on HTTP and stream routes",
     ),
@@ -1419,6 +1423,14 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         }
     );
     println!(
+        "monitor           : {}",
+        if config.admin.monitor.enabled {
+            &config.admin.monitor.path_prefix
+        } else {
+            "disabled"
+        }
+    );
+    println!(
         "config model      : single YAML file (default proxysss.yaml, custom via -config/--config/-c)"
     );
     println!(
@@ -1815,6 +1827,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("[restart_required]\n");
     output.push_str("http.plain_bind/http.tls_bind/http.h3_bind\n");
     output.push_str("admin.enabled/admin.bind\n");
+    output.push_str("admin.monitor.path_prefix (hot reload applies password/path/host settings)\n");
     output.push_str("tcp listener name/bind set\n");
     output.push_str("udp listener name/bind set\n");
     output.push_str("services.ftp.enabled/services.ftp.bind\n");

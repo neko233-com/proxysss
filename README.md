@@ -102,6 +102,20 @@ proxysss service status
 
 Access and error logs default to `logs/access.log` and `logs/error.log`, with level `info`. Security and performance settings include defaults and recommendations in the [security and platform guide](https://neko233-com.github.io/proxysss/security-performance.html).
 
+For mobile or desktop read-only monitoring, enable the separate HTTPS-only monitor surface with a unique password:
+
+```yaml
+admin:
+  monitor:
+    enabled: true
+    path_prefix: /_proxysss/monitor
+    password: use-a-separate-12-plus-character-password
+    session_ttl_secs: 43200
+    hosts: [monitor.example.com]
+```
+
+It provides `POST .../v1/login`, then read-only `GET` endpoints for `health`, `summary`, `stats`, and `ssl`. It cannot use the admin bearer token or mutate configuration.
+
 Performance validation runs locally on Linux. GitHub Actions validates release materials and packages six platforms; it does not run tests or benchmarks. A functional release does not establish strict performance superiority over nginx.
 
 ## Documentation
