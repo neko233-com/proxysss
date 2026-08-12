@@ -23,6 +23,7 @@ Clients ──► proxysss core (Rust/async)
 | `script` | Embedded QuickJS + in-process TypeScript strip for hooks |
 | `install` | Background service, init layout, updater integration |
 | `admin` (in gateway) | Dashboard, stats, upstream drain, automation upserts |
+| `admin.monitor` (in gateway) | HTTPS-only password login and fixed read-only health/summary/stats/SSL API for iOS, iPad, macOS, and Android clients |
 
 ## Request path (HTTP)
 
@@ -31,6 +32,18 @@ Clients ──► proxysss core (Rust/async)
 3. Serve `/metrics`, `/.well-known/acme-challenge/*`, built-in `/`, `/docs`, `/healthz`.
 4. Enforce `services.access_control` and `services.rate_limit`.
 5. Match static site, WebDAV, domain route, reverse-proxy route, or script hook.
+
+## Read-only mobile monitor path
+
+The monitor is a separate control-plane path on the main HTTPS listener. It does not reuse the administrator bearer token or expose the administrator route table.
+
+1. `POST /_proxysss/monitor/v1/login` accepts the dedicated `admin.monitor.password`.
+2. The server returns a short-lived `monitor:read` Bearer session signed from that password.
+3. Authenticated clients may call only `GET /v1/health`, `/v1/summary`, `/v1/stats`, and `/v1/ssl` below the configured prefix.
+4. Any non-GET method returns `403 monitor_read_only`; HTTP is rejected and the monitor is HTTPS-only.
+5. SSL output is server-redacted: it contains public domain/status information but no certificate/key paths, private keys, DNS credentials, or config mutation surface.
+
+This protocol is intentionally platform-neutral so iOS/iPad/macOS and Android can share fixtures and acceptance tests. One proxysss process is one client location; multi-location grouping belongs to the clients or a later account service.
 6. Apply cache lookup, upstream selection (LB algorithm + health), retries, and passive quarantine.
 7. Proxy request/response (including WebSocket upgrade, generic SSE streaming, New API-compatible routes, and gRPC-over-h2), or serve static files with bounded memory cache, mmap-backed hot objects on supported builds, Range/206 resumable downloads, and a Linux plain-HTTP fast lane whose cache/sendfile behavior follows `runtime.performance.traffic_profile`.
 8. Optionally compress response and write access log entry. Successful requests on manual-reload deployments skip the extra post-dispatch config lock used only for error-page decoration or live logging changes.

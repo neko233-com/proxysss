@@ -14,6 +14,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Configuration must be more human-friendly than nginx while still covering nginx-level gateway duties.
 - Runtime configuration should live in a single YAML file by default, normally `proxysss.yaml`; custom locations are selected with `-config`, `--config`, or `-c`.
 - Admin API automation may update `services.domain_routes`, `services.reverse_proxy.routes`, `tcp.listeners`, `udp.listeners`, `tcp.stream_routes`, `http.tls.*`, `services.filecloud`, and dynamic blacklist entries over token-authenticated HTTP; loopback admin bootstraps TLS/ACME, then `admin.https` exposes the same `/v1/*` surface on the main TLS listener.
+- Mobile and desktop monitoring must use the separate `admin.monitor` HTTPS-only surface with its own password and `monitor:read` session; it may expose only health, summary, stats, and SSL status, never admin bearer tokens or write APIs.
 - Local token inspection and rotation should go through `proxysss token show` / `proxysss token set`; general config display paths should redact secrets instead of exposing them.
 - Domain-only automatic WSS uses built-in managed ACME with `http.tls.auto_https.domains`; its production default is zero-external-tool TLS-ALPN-01 (DNS plus public 443), while explicit `challenge: http01` remains supported for existing port-80 deployments.
 - Wildcard ACME certificates use built-in managed DNS-01: `http.tls.mode: acme_managed`, `http.tls.acme.challenge: dns01`, `http.tls.acme.dns.provider`, and redacted `http.tls.acme.dns.credentials`. One cloud vendor = one provider strategy (`aliyun_cn` vs `aliyun_intl` are separate). Legacy `acme_dns_external` + `acme.sh` remains for non-built-in providers only.
@@ -61,7 +62,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 | --- | --- |
 | Core gateway (Rust) | nginx-equivalent protocol termination, routing, static files, WebDAV, stream proxy, TLS, rate limits, logging, reload |
 | Extension scripts (TS/JS via embedded proxysss runtime target) | Optional business routing, plugins, affinity, custom upstream selection — like nginx + Lua |
-| Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload, token-authenticated route/listener upsert |
+| Admin API (`127.0.0.1:7777`) | Health, stats, config inspect, plugin load/unload, manual reload, token-authenticated route/listener upsert; separate `admin.monitor` exposes password-authenticated read-only mobile data |
 
 Do **not** describe proxysss as "more business gateway than nginx". Describe it as a **general gateway with script/plugin extension hooks**.
 

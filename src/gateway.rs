@@ -80,13 +80,13 @@ use std::sync::OnceLock;
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
     on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
-    AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
-    FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig,
-    HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig,
-    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile, StaticSiteConfig,
-    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    AdminConfig, AdminMonitorConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig,
+    DomainTlsMode, FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig,
+    HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat,
+    OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
+    ResponseCompressionConfig, ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile,
+    StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig,
+    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::linux_tune::{self, TcpTuneProfile};
@@ -127,6 +127,7 @@ pub struct Gateway {
     dynamic_blacklist: DynamicBlacklist,
     ftp_session_users: Arc<DashMap<SocketAddr, String>>,
     admin_auth_guard: AdminAuthGuard,
+    monitor_auth_guard: AdminAuthGuard,
 }
 
 struct DynamicState {
@@ -1952,6 +1953,8 @@ struct GatewayStats {
     reload_failure_total: AtomicU64,
     admin_requests_total: AtomicU64,
     admin_auth_fail_total: AtomicU64,
+    monitor_requests_total: AtomicU64,
+    monitor_auth_fail_total: AtomicU64,
     script_fail_total: AtomicU64,
     blocked_requests_total: AtomicU64,
     ddos_bans_total: AtomicU64,
@@ -2220,6 +2223,7 @@ impl Gateway {
             dynamic_blacklist,
             ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
+            monitor_auth_guard: AdminAuthGuard::default(),
         });
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
@@ -2847,6 +2851,161 @@ impl Gateway {
         };
         self.serve_admin_api(method, path, headers, body, remote_addr, transport)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_monitor_api(
+        &self,
+        method: Method,
+        path: String,
+        headers: HeaderMap,
+        body: Bytes,
+        remote_addr: SocketAddr,
+        scheme: &str,
+        host: &str,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        self.stats
+            .monitor_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let state = self.current_state().await;
+        let monitor = &state.config.admin.monitor;
+        if !monitor.enabled {
+            return Ok(text_response(StatusCode::NOT_FOUND, "monitor API disabled"));
+        }
+        if scheme != "https" {
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                "monitor API requires HTTPS",
+            ));
+        }
+        if !monitor_https_host_allowed(monitor, host) {
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                "monitor host is not allowed",
+            ));
+        }
+
+        let auth_key = AdminAuthGuard::key_for(remote_addr);
+        if self
+            .monitor_auth_guard
+            .is_locked(&auth_key, &state.config.admin.auth_rate_limit)
+        {
+            return Ok(text_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "monitor authentication temporarily locked",
+            ));
+        }
+
+        if method == Method::POST && path == "/v1/login" {
+            let payload = match serde_json::from_slice::<MonitorLoginRequest>(&body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(monitor_json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": format!("invalid login payload: {error}")}),
+                    ));
+                }
+            };
+            if !monitor_password_matches(&monitor.password, &payload.password) {
+                self.stats
+                    .monitor_auth_fail_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.monitor_auth_guard
+                    .record_failure(&auth_key, &state.config.admin.auth_rate_limit);
+                return Ok(monitor_json_response(
+                    StatusCode::UNAUTHORIZED,
+                    serde_json::json!({"ok": false, "error": "invalid monitor password"}),
+                ));
+            }
+            self.monitor_auth_guard.clear_failures(&auth_key);
+            let Some((token, expires_at)) = issue_monitor_session_token(monitor) else {
+                return Ok(monitor_json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": "failed to issue monitor session"}),
+                ));
+            };
+            return Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "token_type": "Bearer",
+                    "access_token": token,
+                    "expires_at": expires_at,
+                    "expires_in": monitor.session_ttl_secs,
+                    "scope": "monitor:read",
+                }),
+            ));
+        }
+
+        if method != Method::GET {
+            return Ok(monitor_json_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"ok": false, "error": "monitor_read_only"}),
+            ));
+        }
+
+        if !is_monitor_authorized(headers.get(AUTHORIZATION), monitor) {
+            self.stats
+                .monitor_auth_fail_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.monitor_auth_guard
+                .record_failure(&auth_key, &state.config.admin.auth_rate_limit);
+            return Ok(monitor_json_response(
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({"ok": false, "error": "monitor authentication required"}),
+            ));
+        }
+
+        self.monitor_auth_guard.clear_failures(&auth_key);
+        let server_time = now_unix_secs();
+        match path.as_str() {
+            "/v1/health" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "service": "proxysss",
+                    "server_time": server_time,
+                    "warm": self.stats.warm.load(Ordering::Relaxed),
+                }),
+            )),
+            "/v1/summary" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "service": "proxysss",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "server_time": server_time,
+                    "warm": self.stats.warm.load(Ordering::Relaxed),
+                    "stats": self.stats.snapshot_json(),
+                    "ssl": monitor_tls_summary(&state.config),
+                }),
+            )),
+            "/v1/stats" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "stats": self.stats.snapshot_json(),
+                }),
+            )),
+            "/v1/ssl" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "ssl": monitor_tls_summary(&state.config),
+                }),
+            )),
+            _ => Ok(monitor_json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"ok": false, "error": "monitor endpoint not found"}),
+            )),
+        }
     }
 
     async fn serve_admin_api(
@@ -7757,6 +7916,39 @@ impl Gateway {
             }
         }
 
+        if let Some(internal_path) = map_monitor_gateway_path(&state.config.admin, uri.path()) {
+            let response = self
+                .serve_monitor_api(
+                    method,
+                    internal_path,
+                    headers,
+                    body,
+                    remote_addr,
+                    scheme,
+                    &host,
+                )
+                .await
+                .expect("monitor handler is infallible");
+            let (parts, response_body) = response.into_parts();
+            let body_bytes = response_body
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .unwrap_or_default();
+            let headers_out = parts
+                .headers
+                .into_iter()
+                .filter_map(|(name, value)| name.map(|name| (name, value)))
+                .collect::<Vec<_>>();
+            return Ok(GatewayHttpResponse {
+                status: parts.status,
+                headers: headers_out,
+                body: body_bytes,
+                stream_body: None,
+                upstream: "proxysss://monitor".to_string(),
+            });
+        }
+
         if scheme == "http" && should_redirect_http_to_https(&state.config, &host, &uri) {
             let target = format!(
                 "https://{}{}",
@@ -12208,6 +12400,8 @@ impl GatewayStats {
             "reload_failure_total": self.reload_failure_total.load(Ordering::Relaxed),
             "admin_requests_total": self.admin_requests_total.load(Ordering::Relaxed),
             "admin_auth_fail_total": self.admin_auth_fail_total.load(Ordering::Relaxed),
+            "monitor_requests_total": self.monitor_requests_total.load(Ordering::Relaxed),
+            "monitor_auth_fail_total": self.monitor_auth_fail_total.load(Ordering::Relaxed),
             "script_fail_total": self.script_fail_total.load(Ordering::Relaxed),
             "blocked_requests_total": self.blocked_requests_total.load(Ordering::Relaxed),
             "ddos_bans_total": self.ddos_bans_total.load(Ordering::Relaxed),
@@ -12270,6 +12464,16 @@ impl GatewayStats {
                 "proxysss_admin_auth_fail_total",
                 "Admin API authentication failures",
                 self.admin_auth_fail_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_monitor_requests_total",
+                "Read-only monitor API requests served",
+                self.monitor_requests_total.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_monitor_auth_fail_total",
+                "Read-only monitor API authentication failures",
+                self.monitor_auth_fail_total.load(Ordering::Relaxed),
             ),
             (
                 "proxysss_script_fail_total",
@@ -14898,6 +15102,19 @@ fn map_admin_gateway_path(admin: &AdminConfig, request_path: &str) -> Option<Str
     Some(format!("/{rest}"))
 }
 
+fn map_monitor_gateway_path(admin: &AdminConfig, request_path: &str) -> Option<String> {
+    if !admin.monitor.enabled {
+        return None;
+    }
+    let prefix = crate::config::normalize_admin_monitor_path_prefix(&admin.monitor.path_prefix);
+    if request_path == prefix.as_str() || request_path == format!("{prefix}/").as_str() {
+        return Some("/".to_string());
+    }
+    let nested = format!("{prefix}/");
+    let rest = request_path.strip_prefix(&nested)?;
+    Some(format!("/{rest}"))
+}
+
 fn admin_https_host_allowed(admin: &AdminConfig, host: &str) -> bool {
     let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
     if admin.https.hosts.is_empty() {
@@ -14905,6 +15122,17 @@ fn admin_https_host_allowed(admin: &AdminConfig, host: &str) -> bool {
     }
     admin
         .https
+        .hosts
+        .iter()
+        .any(|pattern| crate::config::domain_matches_pattern(&host, pattern))
+}
+
+fn monitor_https_host_allowed(monitor: &AdminMonitorConfig, host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if monitor.hosts.is_empty() {
+        return true;
+    }
+    monitor
         .hosts
         .iter()
         .any(|pattern| crate::config::domain_matches_pattern(&host, pattern))
@@ -15014,14 +15242,66 @@ fn is_authorized(header: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
     username == admin.username && password == admin.password
 }
 
+fn is_monitor_authorized(header: Option<&HeaderValue>, monitor: &AdminMonitorConfig) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let Ok(value) = header.to_str() else {
+        return false;
+    };
+
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return verify_monitor_session_token(token, monitor);
+    }
+
+    let Some(encoded) = value.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return false;
+    };
+    let Some((username, password)) = decoded.split_once(':') else {
+        return false;
+    };
+    username == "monitor" && monitor_password_matches(&monitor.password, password)
+}
+
+fn monitor_password_matches(expected: &str, presented: &str) -> bool {
+    constant_time_equal(expected.as_bytes(), presented.as_bytes())
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= usize::from(*a ^ *b);
+    }
+    difference == 0
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminLoginRequest {
     username: String,
     password: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MonitorLoginRequest {
+    password: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AdminSessionClaims {
+    sub: String,
+    exp: u64,
+    iat: u64,
+    scope: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MonitorSessionClaims {
     sub: String,
     exp: u64,
     iat: u64,
@@ -15322,6 +15602,51 @@ fn verify_admin_session_token(token: &str, admin: &AdminConfig) -> bool {
     claims.sub == admin.username && claims.scope == "admin" && claims.exp > now_unix_secs()
 }
 
+fn monitor_session_signing_key(monitor: &AdminMonitorConfig) -> Vec<u8> {
+    format!("proxysss-monitor-session:{}", monitor.password).into_bytes()
+}
+
+fn issue_monitor_session_token(monitor: &AdminMonitorConfig) -> Option<(String, u64)> {
+    let now = now_unix_secs();
+    let expires_at = now.saturating_add(monitor.session_ttl_secs.max(1));
+    let claims = MonitorSessionClaims {
+        sub: "monitor".to_string(),
+        exp: expires_at,
+        iat: now,
+        scope: "monitor:read".to_string(),
+    };
+    let payload = serde_json::to_vec(&claims).ok()?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(&monitor_session_signing_key(monitor)).ok()?;
+    mac.update(payload.as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Some((format!("{payload}.{signature}"), expires_at))
+}
+
+fn verify_monitor_session_token(token: &str, monitor: &AdminMonitorConfig) -> bool {
+    let Some((payload, signature)) = token.split_once('.') else {
+        return false;
+    };
+    let Ok(signature) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(&monitor_session_signing_key(monitor)) else {
+        return false;
+    };
+    mac.update(payload.as_bytes());
+    if mac.verify_slice(&signature).is_err() {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<MonitorSessionClaims>(&decoded) else {
+        return false;
+    };
+    claims.sub == "monitor" && claims.scope == "monitor:read" && claims.exp > now_unix_secs()
+}
+
 #[derive(Debug, Deserialize)]
 struct PluginUnloadRequest {
     name: String,
@@ -15527,6 +15852,46 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
             "loopback_bind": config.admin.bind,
             "agent_note": "Bootstrap TLS/ACME on loopback admin; after cert material exists, drive automation over HTTPS at path_prefix/v1/*",
         },
+    })
+}
+
+fn monitor_tls_summary(config: &GatewayConfig) -> serde_json::Value {
+    let tls = &config.http.tls;
+    let mode = serde_json::to_value(tls.mode).unwrap_or(serde_json::Value::Null);
+    let challenge = serde_json::to_value(tls.acme.challenge).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mode": mode,
+        "challenge": challenge,
+        "server_name": tls.server_name,
+        "cert_exists": tls.cert_path.exists(),
+        "key_exists": tls.key_path.exists(),
+        "auto_https": {
+            "enabled": tls.auto_https.enabled,
+            "domains": tls.auto_https.domains,
+            "production": tls.auto_https.production,
+            "email_configured": !tls.auto_https.email.trim().is_empty(),
+        },
+        "acme": {
+            "email_configured": !tls.acme.email.trim().is_empty(),
+            "domains": tls.acme.domains,
+            "directory_production": tls.acme.directory_production,
+            "dns_provider": tls.acme.dns.provider,
+            "dns_credentials_configured": !tls.acme.dns.credentials.is_empty(),
+        },
+        "domain_routes_count": config.services.domain_routes.len(),
+        "on_demand": {
+            "enabled": tls.on_demand.enabled,
+            "allow": tls.on_demand.allow,
+            "max_active_certs": tls.on_demand.max_active_certs,
+            "max_issues_per_hour": tls.on_demand.max_issues_per_hour,
+        },
+        "sni_certificates": tls.certificates.iter().map(|cert| {
+            serde_json::json!({
+                "domains": cert.domains,
+                "cert_exists": cert.cert_path.exists(),
+                "key_exists": cert.key_path.exists(),
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -16499,6 +16864,20 @@ fn json_response(status: StatusCode, payload: serde_json::Value) -> Response<Ful
             text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to build json response",
+            )
+        })
+}
+
+fn monitor_json_response(status: StatusCode, payload: serde_json::Value) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(payload.to_string())))
+        .unwrap_or_else(|_| {
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build monitor json response",
             )
         })
 }
@@ -22537,7 +22916,7 @@ fn absolutize_script_path(cwd: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::{
-        AdminConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
+        AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
 
@@ -23010,6 +23389,169 @@ mod tests {
         let header = HeaderValue::from_static("Bearer cluster-secret");
 
         assert!(is_authorized(Some(&header), &admin));
+    }
+
+    #[test]
+    fn monitor_path_maps_only_its_nested_api() {
+        let mut admin = AdminConfig::default();
+        admin.monitor.enabled = true;
+        admin.monitor.path_prefix = "/_proxysss/monitor".to_string();
+
+        assert_eq!(
+            map_monitor_gateway_path(&admin, "/_proxysss/monitor/v1/summary").as_deref(),
+            Some("/v1/summary")
+        );
+        assert_eq!(
+            map_monitor_gateway_path(&admin, "/_proxysss/monitor").as_deref(),
+            Some("/")
+        );
+        assert!(map_monitor_gateway_path(&admin, "/_proxysss/monitoring/v1/summary").is_none());
+    }
+
+    #[test]
+    fn monitor_auth_accepts_dedicated_password_and_rejects_admin_credentials() {
+        let monitor = AdminMonitorConfig {
+            enabled: true,
+            password: "monitor-password-123".to_string(),
+            ..AdminMonitorConfig::default()
+        };
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("monitor:monitor-password-123");
+        let header = HeaderValue::from_str(&format!("Basic {encoded}")).expect("valid header");
+        assert!(is_monitor_authorized(Some(&header), &monitor));
+
+        let admin_header = HeaderValue::from_static("Bearer neko233");
+        assert!(!is_monitor_authorized(Some(&admin_header), &monitor));
+
+        let (token, _) = issue_monitor_session_token(&monitor).expect("monitor token");
+        let session_header = HeaderValue::from_str(&format!("Bearer {token}")).expect("header");
+        assert!(is_monitor_authorized(Some(&session_header), &monitor));
+    }
+
+    #[tokio::test]
+    async fn monitor_handler_issues_read_session_and_rejects_write_methods() {
+        let mut config = GatewayConfig::default();
+        config.admin.monitor.enabled = true;
+        config.admin.monitor.password = "monitor-password-123".to_string();
+        let fast_lane = FastLaneState::compile(&config);
+        let gateway = Gateway {
+            config_path: PathBuf::from("proxysss.yaml"),
+            bootstrap_config: config.clone(),
+            bootstrap_fast_lane: fast_lane.clone(),
+            dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
+                config,
+                fast_lane,
+                http_client: reqwest::Client::new(),
+                http_fast_client: HyperClient::builder(TokioExecutor::new())
+                    .build(HttpConnector::new()),
+                script: None,
+            }))),
+            stats: Arc::new(GatewayStats::default()),
+            sticky_affinity: Arc::new(DashMap::new()),
+            round_robin_state: Arc::new(DashMap::new()),
+            upstream_runtime: Arc::new(DashMap::new()),
+            http_rate_limits: Arc::new(DashMap::new()),
+            stream_rate_limits: Arc::new(DashMap::new()),
+            http_connection_limits: Arc::new(DashMap::new()),
+            http_cache: Arc::new(DashMap::new()),
+            raw_http_pools: Arc::new(DashMap::new()),
+            static_route_cache: Arc::new(DashMap::new()),
+            static_file_cache: Arc::new(DashMap::new()),
+            static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
+            static_file_load_locks: Arc::new(DashMap::new()),
+            acme_http_challenges: Arc::new(DashMap::new()),
+            acme_tls_alpn_certs: Arc::new(DashMap::new()),
+            on_demand_certs: Arc::new(DashMap::new()),
+            on_demand_trigger: tokio::sync::mpsc::unbounded_channel().0,
+            on_demand_issue_counts: Arc::new(DashMap::new()),
+            ddos_guard: DdosGuard::default(),
+            dynamic_blacklist: DynamicBlacklist::default(),
+            ftp_session_users: Arc::new(DashMap::new()),
+            admin_auth_guard: AdminAuthGuard::default(),
+            monitor_auth_guard: AdminAuthGuard::default(),
+        };
+        let remote_addr = "203.0.113.10:443".parse().expect("remote address");
+        let login = gateway
+            .serve_monitor_api(
+                Method::POST,
+                "/v1/login".to_string(),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"password":"monitor-password-123"}"#),
+                remote_addr,
+                "https",
+                "monitor.example.com",
+            )
+            .await
+            .expect("login response");
+        assert_eq!(login.status(), StatusCode::OK);
+        let login_body = login
+            .into_body()
+            .collect()
+            .await
+            .expect("login body")
+            .to_bytes();
+        let login_json: serde_json::Value =
+            serde_json::from_slice(&login_body).expect("login json");
+        let token = login_json["access_token"].as_str().expect("monitor token");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("auth header"),
+        );
+        let write = gateway
+            .serve_monitor_api(
+                Method::POST,
+                "/v1/summary".to_string(),
+                headers.clone(),
+                Bytes::from_static(b"{}"),
+                remote_addr,
+                "https",
+                "monitor.example.com",
+            )
+            .await
+            .expect("write rejection");
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
+        let read = gateway
+            .serve_monitor_api(
+                Method::GET,
+                "/v1/summary".to_string(),
+                headers,
+                Bytes::new(),
+                remote_addr,
+                "https",
+                "monitor.example.com",
+            )
+            .await
+            .expect("summary response");
+        assert_eq!(read.status(), StatusCode::OK);
+        let read_body = read
+            .into_body()
+            .collect()
+            .await
+            .expect("summary body")
+            .to_bytes();
+        let summary: serde_json::Value = serde_json::from_slice(&read_body).expect("summary json");
+        assert_eq!(summary["schema_version"], 1);
+        assert!(summary["ssl"].get("cert_path").is_none());
+    }
+
+    #[test]
+    fn monitor_tls_summary_does_not_expose_material_paths_or_secrets() {
+        let mut config = GatewayConfig::default();
+        config
+            .http
+            .tls
+            .acme
+            .dns
+            .credentials
+            .insert("api_token".to_string(), "should-not-appear".to_string());
+
+        let summary = monitor_tls_summary(&config);
+        assert!(summary.get("cert_path").is_none());
+        assert!(summary.get("key_path").is_none());
+        assert!(!summary.to_string().contains("should-not-appear"));
     }
 
     #[test]
@@ -24114,6 +24656,7 @@ mod tests {
             dynamic_blacklist: DynamicBlacklist::default(),
             ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
+            monitor_auth_guard: AdminAuthGuard::default(),
         };
         let mut weights = BTreeMap::new();
         weights.insert("http://127.0.0.1:9000".to_string(), 1);

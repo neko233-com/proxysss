@@ -540,6 +540,10 @@
           <div class="meta-value">127.0.0.1:7777</div>
         </div>
         <div class="meta-item">
+          <div class="meta-label">Read-only monitor</div>
+          <div class="meta-value">HTTPS + monitor:read</div>
+        </div>
+        <div class="meta-item">
           <div class="meta-label">Main config</div>
           <div class="meta-value">proxysss.yaml</div>
         </div>
@@ -554,6 +558,7 @@
           <a href="#http-flow">HTTP 数据路径</a>
           <a href="#stream-flow">TCP / UDP 数据路径</a>
           <a href="#hooks">脚本与插件位置</a>
+          <a href="#monitor-flow">移动端只读数据路径</a>
           <a href="#reload">热重载边界</a>
           <a href="#performance">性能与压测纪律</a>
           <a href="#config-map">架构对应配置案例</a>
@@ -792,6 +797,40 @@ plugins:
   auto_load_dir: "./plugins"</code></pre>
 
           <p class="subtle">这两条配置说明的是“脚本从哪里来”，不是“把所有能力都交给脚本”。固定网关能力优先用 YAML，本体能力缺口再推动 Rust / YAML 面完善。</p>
+        </section>
+
+        <section id="monitor-flow" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Read-only monitor control plane</div>
+              <h2>手机和桌面端只看数据，不进入管理员写面</h2>
+            </div>
+            <p class="subtle">iOS、iPad、macOS 和后续 Android 共用同一套 HTTPS JSON 协议；一个 proxysss 实例作为一个监控位置。</p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="tag beginner">1 / Login</span>
+              <h3>独立监控密码</h3>
+              <p class="subtle">`admin.monitor.password` 与管理员密码、管理员 bearer token 分离。登录成功后只签发短期 `monitor:read` 会话。</p>
+            </article>
+            <article class="card">
+              <span class="tag expert">2 / Read</span>
+              <h3>固定查询白名单</h3>
+              <p class="subtle">只允许 `/v1/health`、`/v1/summary`、`/v1/stats`、`/v1/ssl`。POST/PUT/PATCH/DELETE 不会被转发到管理员 API。</p>
+            </article>
+            <article class="card">
+              <span class="tag expert">3 / Redact</span>
+              <h3>服务端先脱敏</h3>
+              <p class="subtle">SSL 状态返回证书域名、存在性和 ACME 配置摘要，不返回证书路径、私钥路径、DNS 凭据或写操作配置。</p>
+            </article>
+          </div>
+
+          <pre><code>POST https://host/_proxysss/monitor/v1/login
+  {"password":"..."}
+
+GET https://host/_proxysss/monitor/v1/summary
+  Authorization: Bearer &lt;monitor:read token&gt;</code></pre>
         </section>
 
         <section id="reload" class="panel">

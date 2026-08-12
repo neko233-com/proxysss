@@ -549,6 +549,24 @@ pub struct AdminHttpsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminMonitorConfig {
+    /// Enable the public HTTPS read-only monitor API for mobile and desktop clients.
+    #[serde(default)]
+    pub enabled: bool,
+    /// URL prefix on the main HTTPS listener. Only the monitor API is exposed below it.
+    #[serde(default = "default_admin_monitor_path_prefix")]
+    pub path_prefix: String,
+    /// Dedicated monitor password. It is never accepted by admin write endpoints.
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_admin_monitor_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Optional host allowlist; empty means every TLS host already routed to proxysss.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -571,6 +589,8 @@ pub struct AdminConfig {
     pub loopback_only: bool,
     #[serde(default)]
     pub https: AdminHttpsConfig,
+    #[serde(default)]
+    pub monitor: AdminMonitorConfig,
     #[serde(default)]
     pub auth_rate_limit: AdminAuthRateLimitConfig,
 }
@@ -1773,6 +1793,44 @@ impl GatewayConfig {
             }
         }
 
+        if self.admin.monitor.enabled {
+            let prefix = normalize_admin_monitor_path_prefix(&self.admin.monitor.path_prefix);
+            if prefix == "/" {
+                errors.push("admin.monitor.path_prefix cannot be /".to_string());
+            }
+            if !prefix.starts_with('/') {
+                errors.push("admin.monitor.path_prefix must start with /".to_string());
+            }
+            if self.admin.monitor.password.len() < 12 {
+                errors.push(
+                    "admin.monitor.password must be at least 12 characters when admin.monitor.enabled is true"
+                        .to_string(),
+                );
+            }
+            if self.admin.monitor.session_ttl_secs == 0 {
+                errors.push("admin.monitor.session_ttl_secs must be greater than 0".to_string());
+            }
+            if self.http.tls_bind.trim().is_empty() {
+                errors.push(
+                    "http.tls_bind cannot be empty when admin.monitor.enabled is true".to_string(),
+                );
+            }
+            for reserved in ["/docs", "/healthz", "/metrics", "/filecloud"] {
+                if prefix == reserved || prefix.starts_with(&format!("{reserved}/")) {
+                    errors.push(format!(
+                        "admin.monitor.path_prefix cannot overlap reserved path {reserved}"
+                    ));
+                }
+            }
+            if self.admin.https.enabled
+                && prefix == normalize_admin_https_path_prefix(&self.admin.https.path_prefix)
+            {
+                errors.push(
+                    "admin.monitor.path_prefix cannot equal admin.https.path_prefix".to_string(),
+                );
+            }
+        }
+
         if self.monitoring.enabled && !self.monitoring.path.starts_with('/') {
             errors.push("monitoring.path must start with '/'".to_string());
         }
@@ -2106,6 +2164,9 @@ impl GatewayConfig {
         self.admin.https.path_prefix =
             normalize_admin_https_path_prefix(&self.admin.https.path_prefix);
         normalize_vec_lowercase(&mut self.admin.https.hosts);
+        self.admin.monitor.path_prefix =
+            normalize_admin_monitor_path_prefix(&self.admin.monitor.path_prefix);
+        normalize_vec_lowercase(&mut self.admin.monitor.hosts);
 
         if self.logging.filter.trim().is_empty() {
             self.logging.filter = default_filter_for_level(self.logging.level);
@@ -2581,6 +2642,18 @@ impl Default for AdminHttpsConfig {
     }
 }
 
+impl Default for AdminMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_admin_monitor_path_prefix(),
+            password: String::new(),
+            session_ttl_secs: default_admin_monitor_session_ttl_secs(),
+            hosts: Vec::new(),
+        }
+    }
+}
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -2593,6 +2666,7 @@ impl Default for AdminConfig {
             enable_write_ops: false,
             loopback_only: default_true(),
             https: AdminHttpsConfig::default(),
+            monitor: AdminMonitorConfig::default(),
             auth_rate_limit: AdminAuthRateLimitConfig::default(),
         }
     }
@@ -3280,6 +3354,27 @@ pub fn normalize_admin_https_path_prefix(prefix: &str) -> String {
     with_slash.trim_end_matches('/').to_string()
 }
 
+fn default_admin_monitor_path_prefix() -> String {
+    "/_proxysss/monitor".to_string()
+}
+
+pub fn normalize_admin_monitor_path_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return default_admin_monitor_path_prefix();
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    with_slash.trim_end_matches('/').to_string()
+}
+
+fn default_admin_monitor_session_ttl_secs() -> u64 {
+    12 * 60 * 60
+}
+
 fn default_admin_auth_max_failures() -> u32 {
     8
 }
@@ -3847,6 +3942,36 @@ mod tests {
         assert_eq!(config.admin.username, DEFAULT_ADMIN_USERNAME);
         assert_eq!(config.admin.password, DEFAULT_ADMIN_PASSWORD);
         assert_eq!(config.admin.bearer_token, DEFAULT_ADMIN_BEARER_TOKEN);
+        assert!(!config.admin.monitor.enabled);
+        assert_eq!(config.admin.monitor.path_prefix, "/_proxysss/monitor");
+    }
+
+    #[test]
+    fn monitor_requires_a_strong_password_when_enabled() {
+        let mut config = GatewayConfig::default();
+        config.admin.monitor.enabled = true;
+        config.admin.monitor.password = "too-short".to_string();
+
+        let error = config
+            .validate()
+            .expect_err("monitor password must be rejected");
+        assert!(error.to_string().contains("admin.monitor.password"));
+    }
+
+    #[test]
+    fn monitor_rejects_admin_path_overlap() {
+        let mut config = GatewayConfig::default();
+        config.admin.https.enabled = true;
+        config.admin.monitor.enabled = true;
+        config.admin.monitor.password = "monitor-password-123".to_string();
+        config.admin.monitor.path_prefix = config.admin.https.path_prefix.clone();
+
+        let error = config
+            .validate()
+            .expect_err("monitor path must not overlap admin path");
+        assert!(error
+            .to_string()
+            .contains("admin.monitor.path_prefix cannot equal admin.https.path_prefix"));
     }
 
     #[test]

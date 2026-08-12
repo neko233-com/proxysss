@@ -413,6 +413,20 @@ admin:
   loopback_only: true
 ```
 
+For iOS/iPad/macOS and future Android read-only monitoring, configure a separate HTTPS-only monitor password. It has no route, certificate, user, or config mutation capability:
+
+```yaml
+admin:
+  monitor:
+    enabled: true
+    path_prefix: /_proxysss/monitor
+    password: use-a-separate-12-plus-character-password
+    session_ttl_secs: 43200
+    hosts: [monitor.example.com]
+```
+
+The cross-platform client logs in at `POST /_proxysss/monitor/v1/login`, then reads `GET /v1/health`, `/v1/summary`, `/v1/stats`, and `/v1/ssl` under that prefix with a short-lived `monitor:read` Bearer token. The monitor password must not be reused as the admin password or stored in logs/iCloud ordinary data.
+
 Example route upsert:
 
 ```bash

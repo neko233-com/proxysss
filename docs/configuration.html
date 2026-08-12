@@ -650,6 +650,19 @@ services:
             </article>
 
             <article class="card">
+              <span class="tag beginner">Mobile / Desktop Monitor</span>
+              <h3>给手机单独的只读密码</h3>
+              <pre><code>admin:
+  monitor:
+    enabled: true
+    path_prefix: /_proxysss/monitor
+    password: "12-plus-character-monitor-password"
+    session_ttl_secs: 43200
+    hosts: [monitor.example.com]</code></pre>
+              <p class="subtle">客户端只能调用 HTTPS 下的 health、summary、stats、ssl 查询接口；监控密码不接受管理员写 API，也不进入普通 iCloud 数据。</p>
+            </article>
+
+            <article class="card">
               <span class="tag expert">Game + UDP</span>
               <h3>游戏长连接和 UDP 同时接入</h3>
               <pre><code>tcp:
@@ -686,6 +699,7 @@ udp:
                 <li>`proxysss.yaml`</li>
                 <li>主脚本与自动加载插件脚本</li>
                 <li>`services.reverse_proxy.routes`、`services.service_discovery`、`static_sites`、`webdav`、FTP upstream</li>
+                <li>`admin.monitor.path_prefix`、`admin.monitor.password`、`admin.monitor.hosts`</li>
               </ul>
             </article>
 

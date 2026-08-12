@@ -483,7 +483,40 @@ admin:
 - `enable_write_ops` 只有在你明确要做自动化改配时才开启。
 - 配置查看尽量走 `proxysss config *` CLI，避免把敏感信息直接铺给外部系统。
 
-### 3.4 游戏长连接 + UDP 同时接入
+### 3.4 手机/桌面只读监控面
+
+给 iPhone、iPad、macOS 和后续 Android 客户端使用的不是管理员密码，而是独立的 `admin.monitor.password`。它只在主 HTTPS listener 下提供查询接口：
+
+```yaml
+admin:
+  monitor:
+    enabled: true
+    path_prefix: /_proxysss/monitor
+    password: "至少 12 位的独立监控密码"
+    session_ttl_secs: 43200
+    hosts: [monitor.example.com]
+```
+
+客户端先调用：
+
+```bash
+curl -X POST https://monitor.example.com/_proxysss/monitor/v1/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"至少 12 位的独立监控密码"}'
+```
+
+然后使用返回的 `monitor:read` Bearer token 查询：
+
+```text
+GET /_proxysss/monitor/v1/health
+GET /_proxysss/monitor/v1/summary
+GET /_proxysss/monitor/v1/stats
+GET /_proxysss/monitor/v1/ssl
+```
+
+只读监控面拒绝所有非 GET 查询方法，不能使用管理员 bearer token，也不会返回配置文件路径、证书私钥路径或 DNS 凭据。生产环境必须使用真实 HTTPS 证书；不要把这个密码放进 Git、日志、剪贴板或 iCloud 普通数据。
+
+### 3.5 游戏长连接 + UDP 同时接入
 
 ```yaml
 tcp:
@@ -543,6 +576,7 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - `static_sites`
 - `webdav`
 - FTP upstream
+- `admin.monitor.path_prefix`、`admin.monitor.password`、`admin.monitor.hosts`
 
 需要重启：
 
@@ -641,6 +675,10 @@ proxysss token show
 ### 7.3 管理面一上来就开公网写操作
 
 默认的 loopback + `enable_write_ops=false` 是刻意设计的安全姿势。自动化需要时再显式开启。
+
+### 7.4 把管理员密码直接给手机
+
+手机/桌面客户端只应使用 `admin.monitor` 的独立密码。它绑定 `monitor:read` 会话和固定查询接口，即使服务器管理员为了自动化开启了写操作，监控凭据也不能改路由、证书、用户或配置。
 
 ## 8. 继续往下看什么
 

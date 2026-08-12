@@ -11,6 +11,9 @@ proxysss is designed as an **agent-native edge gateway** with secure defaults an
 | `admin.enable_write_ops` | `false` | Mutations require explicit enablement |
 | `admin.expose_config` | `false` | Full config export disabled by default |
 | `admin.auth_rate_limit.enabled` | `true` | Brute-force protection on admin auth |
+| `admin.monitor.enabled` | `false` | Dedicated mobile/desktop read-only API is opt-in |
+| `admin.monitor.password` | empty | Separate password, minimum 12 characters when enabled |
+| `admin.monitor.path_prefix` | `/_proxysss/monitor` | HTTPS-only monitor URL prefix |
 | `security.validate_admin_mutations` | `true` | Validate route/listener payloads from the admin API |
 | `security.block_ssrf_targets` | `true` | Block metadata/private IPs in admin mutation upstreams |
 | `security.reject_ambiguous_http1` | `true` | Reject ambiguous `Content-Length` + `Transfer-Encoding` |
@@ -39,6 +42,17 @@ admin:
 ### Path traversal
 
 Static and WebDAV handlers reject `..` segments and unsafe encodings.
+
+### Read-only mobile monitor
+
+`admin.monitor` is intentionally separate from the administrator credential. The login endpoint issues a short-lived `monitor:read` session, and the session can access only:
+
+- `GET /v1/health`
+- `GET /v1/summary`
+- `GET /v1/stats`
+- `GET /v1/ssl`
+
+The monitor endpoint is served only through the main HTTPS listener. It rejects non-GET methods with `monitor_read_only`, does not accept the administrator bearer token, and redacts certificate/key paths and DNS credentials from the SSL summary. Keep the monitor password in iOS Keychain, Android Keystore, or an equivalent secure store; never place it in logs, source control, ordinary iCloud records, URLs, or clipboard contents.
 
 ### SSRF via admin API
 
@@ -105,8 +119,9 @@ Admin mutations write via a temp file + rename so partial YAML is not left on di
 2. Keep `admin.loopback_only: true` or bind admin to a private interface only.
 3. Set `admin.enable_write_ops: true` only on nodes that run cluster automation.
 4. Leave `admin.expose_config: false` unless config export is required.
-5. Review `security.blocked_upstream_hosts` for your cloud metadata endpoints.
-6. Scrape `/metrics` from an internal network; do not expose admin on `0.0.0.0` without a firewall.
+5. If a mobile monitor is needed, enable `admin.monitor` with a unique 12+ character password and an explicit `hosts` allowlist.
+6. Review `security.blocked_upstream_hosts` for your cloud metadata endpoints.
+7. Scrape `/metrics` from an internal network; do not expose admin on `0.0.0.0` without a firewall.
 
 ## Reporting issues
 
