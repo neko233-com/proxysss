@@ -16,3 +16,11 @@ services:
         path_prefix: /
         upstream: http://127.0.0.1:3001
         rewrite_base_path: /v1
+      - name: ai-router-gray
+        provider: ai-router
+        match_host: ai-gray.local
+        path_prefix: /v1
+        upstream: http://127.0.0.1:4080
+        rewrite_base_path: /v1
+        emit_metadata_headers: false
+        strip_headers: [x-admin-token]
