@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.7 - 2026-08-13
+
+- Added the production api.neko233.com AI gateway route for ai-router, including root/admin, health, OpenAI Responses, and Chat Completions paths while keeping the upstream listener loopback-only.
+- Removed admin-token forwarding at the edge and kept the AI route on the low-allocation streaming path with hot-reloadable configuration.
+
 ## Unreleased
 
 - Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.

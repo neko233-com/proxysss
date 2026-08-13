@@ -1,4 +1,4 @@
-# ai-router gray release behind proxysss.
+# ai-router production API behind proxysss.
 # Merge this block into the existing proxysss.yaml. It binds public TLS at
 # proxysss and keeps ai-router private on 127.0.0.1:4080.
 http:
@@ -10,8 +10,8 @@ http:
     mode: acme_managed
     auto_https:
       enabled: true
-      domains: [ai.example.com]
-      email: ops@example.com
+      domains: [api.neko233.com]
+      email: admin@neko233.com
       production: true
 
 # Keep proxysss administration loopback-only and write-disabled for gray.
@@ -51,12 +51,12 @@ services:
     enabled: true
     header_prefix: proxysss-
     routes:
-      - name: ai-router-gray
+      - name: ai-router-api
         provider: ai-router
-        match_host: ai.example.com
-        path_prefix: /v1
+        match_host: api.neko233.com
+        path_prefix: /
         upstream: http://127.0.0.1:4080
-        rewrite_base_path: /v1
+        rewrite_base_path: /
         forward_headers: true
         emit_metadata_headers: false
         strip_headers:
