@@ -1,0 +1,99 @@
+# ai-router production API behind proxysss.
+# Merge this block into the existing proxysss.yaml. It binds public TLS at
+# proxysss and keeps ai-router private on 127.0.0.1:4080.
+http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+  request_timeout_ms: 300000
+  allow_insecure_upstreams: false
+  tls:
+    mode: acme_managed
+    auto_https:
+      enabled: true
+      domains: [api.neko233.com]
+      email: admin@neko233.com
+      production: true
+
+# Keep proxysss administration loopback-only and write-disabled for gray.
+# Replace all placeholder values before deployment.
+admin:
+  enabled: true
+  bind: 127.0.0.1:7777
+  username: replace-with-admin-username
+  password: replace-with-a-random-admin-password
+  bearer_token: replace-with-a-random-admin-bearer-token
+  expose_config: false
+  enable_write_ops: false
+  loopback_only: true
+  auth_rate_limit:
+    enabled: true
+    max_failures: 5
+    window_secs: 60
+    lockout_secs: 300
+
+services:
+  access_control:
+    http:
+      enabled: true
+      deny: []
+      status: 403
+  rate_limit:
+    http:
+      enabled: true
+      algorithm: token_bucket
+      key: remote_addr
+      requests: 120
+      window_ms: 60000
+      burst: 30
+      max_connections: 1024
+      status: 429
+  ai_proxy:
+    enabled: true
+    header_prefix: proxysss-
+    routes:
+      - name: ai-router-api
+        provider: ai-router
+        match_host: api.neko233.com
+        path_prefix: /
+        upstream: http://127.0.0.1:4080
+        rewrite_base_path: /
+        forward_headers: true
+        emit_metadata_headers: false
+        strip_headers:
+          - x-admin-token
+
+load_balance:
+  active_health:
+    enabled: true
+    http_enabled: true
+    tcp_enabled: false
+    udp_enabled: false
+    interval_secs: 10
+    timeout_ms: 2000
+    path: /health
+    expected_statuses: [200]
+    failure_threshold: 2
+    success_threshold: 2
+
+security:
+  block_ssrf_targets: true
+  reject_ambiguous_http1: true
+  ddos:
+    enabled: true
+    max_connections: 10000
+    window_secs: 10
+    ban_secs: 60
+    burst: 200
+
+runtime:
+  performance:
+    enabled: true
+    profile: edge
+    traffic_profile: small
+    adaptive_system: true
+    socket_extreme: true
+  watchdog:
+    enabled: true
+    restart_critical_tasks: true
+    restart_backoff_secs: 2
+    heartbeat_interval_secs: 30
