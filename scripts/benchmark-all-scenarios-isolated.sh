@@ -7,6 +7,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 # Preserve Linux paths passed to containers under Git Bash/MSYS. Host paths
 # rooted in the checkout are converted explicitly for Docker Desktop.
@@ -105,11 +108,11 @@ RUN_MIXED_MATRIX="${RUN_MIXED_MATRIX:-1}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 ISOLATED_SCENARIOS="${ISOLATED_SCENARIOS:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 RUN_DIR="$BENCH_ROOT/runs/all-scenarios-isolated/$RUN_ID"
 BASE_RUN_DIR="$RUN_DIR"
 PROXY_BIN="${PROXY_BIN:-$ROOT/target/release/proxysss}"
 IMAGE="${IMAGE:-proxysss-isolated-all-bench:local}"
+register_benchmark_docker_image "$IMAGE"
 NETWORK="proxysss-all-isolated-$RUN_ID"
 PREFIX="proxysss-all-isolated-$RUN_ID"
 CLIENT_CONTAINER="$PREFIX-client"
@@ -333,6 +336,8 @@ cleanup() {
   set +e
   docker ps -aq --filter "name=^/${PREFIX}" | xargs -r docker rm -f >/dev/null 2>&1
   docker network rm "$NETWORK" >/dev/null 2>&1
+  cleanup_benchmark_docker_images
+  cleanup_benchmark_artifacts
 }
 trap cleanup EXIT
 docker network create --driver bridge --subnet "$SUBNET" "$NETWORK" >/dev/null

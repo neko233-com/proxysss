@@ -41,6 +41,7 @@ proxy-key.pem
 /tmp-*
 /benchmark-helper
 /benchmark-helper.exe
+/performance-evidence/development/local-docker/
 *.log
 !/performance-evidence/development/**/*.log
 *.tmp

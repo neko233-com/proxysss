@@ -14,6 +14,9 @@ FEEDBACK_START_SECS="$(date +%s)"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 # Git Bash/MSYS rewrites Linux container paths such as /work into paths under
 # its own installation directory. Disable that implicit conversion at Docker
@@ -117,19 +120,28 @@ EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
 EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
+register_benchmark_docker_image "$IMAGE" "$REUSE_BENCH_IMAGE"
 COMMIT="$(git rev-parse HEAD)"
 RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${COMMIT:0:12}}"
 if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "BENCH_RUN_ID contains unsupported characters: $RUN_ID" >&2
   exit 1
 fi
-OUTPUT_REL=".benchmark/direct-ubuntu24-amd64/$RUN_ID"
+BENCH_ROOT_REL="${BENCH_ROOT#"$ROOT"/}"
+[[ "$BENCH_ROOT" == "$ROOT"/* && "$BENCH_ROOT_REL" != "$BENCH_ROOT" ]] || {
+  echo "BENCH_ROOT must be inside checkout so Docker can mount benchmark artifacts: $BENCH_ROOT" >&2
+  exit 1
+}
+OUTPUT_REL="$BENCH_ROOT_REL/direct-ubuntu24-amd64/$RUN_ID"
+register_benchmark_docker_image "proxysss-isolated-ubuntu24-amd64:$RUN_ID"
 OUTPUT_ROOT="$ROOT/$OUTPUT_REL"
 CURRENT_BENCH_ROOT="$OUTPUT_ROOT/current"
-TARGET_DIR="/work/.benchmark/ubuntu24-amd64-target"
-CROSS_TARGET_REL=".benchmark/ubuntu24-amd64-cross-target"
+TARGET_REL="$BENCH_ROOT_REL/ubuntu24-amd64-target"
+TARGET_DIR="/work/$TARGET_REL"
+CROSS_TARGET_REL="$BENCH_ROOT_REL/ubuntu24-amd64-cross-target"
 CROSS_TARGET_DIR="$ROOT/$CROSS_TARGET_REL"
-CARGO_HOME_DIR="/work/.benchmark/ubuntu24-amd64-cargo-home"
+CARGO_HOME_REL="$BENCH_ROOT_REL/ubuntu24-amd64-cargo-home"
+CARGO_HOME_DIR="/work/$CARGO_HOME_REL"
 
 require_positive_integer DURATION_SECS "$DURATION_SECS"
 require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
@@ -188,10 +200,10 @@ restore_ownership() {
     -v "$ROOT:/work" \
     "$IMAGE" \
     chown -R "$(id -u):$(id -g)" "/work/$OUTPUT_REL" \
-      /work/.benchmark/ubuntu24-amd64-target \
-      /work/.benchmark/ubuntu24-amd64-cargo-home >/dev/null 2>&1 || true
+      "/work/$TARGET_REL" \
+      "/work/$CARGO_HOME_REL" >/dev/null 2>&1 || true
 }
-trap restore_ownership EXIT
+trap 'restore_ownership; cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 if [[ "$REUSE_BENCH_IMAGE" == "1" ]]; then
   echo "==> reusing locally cached Ubuntu 24 benchmark image: $IMAGE"
@@ -316,7 +328,7 @@ else
     -e CARGO_TARGET_DIR="$TARGET_DIR" \
     "$IMAGE" \
     cargo build --locked --release
-  PROXY_BIN_HOST_PATH="$ROOT/.benchmark/ubuntu24-amd64-target/release/proxysss"
+  PROXY_BIN_HOST_PATH="$ROOT/$TARGET_REL/release/proxysss"
   PROXY_BIN_PATH="$TARGET_DIR/release/proxysss"
 fi
 

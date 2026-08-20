@@ -10,6 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "benchmark-websocket-production-gate.sh requires Linux" >&2
@@ -43,8 +46,10 @@ RUN_SATURATION_MATRIX="${RUN_SATURATION_MATRIX:-1}"
 RUN_LATENCY_MATRIX="${RUN_LATENCY_MATRIX:-1}"
 RUN_CAPACITY_MATRIX="${RUN_CAPACITY_MATRIX:-1}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
-PROXY_BIN="${PROXY_BIN:-$ROOT/target/release-fast/proxysss}"
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
+DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}"
+PROXY_BIN="${PROXY_BIN:-$DEFAULT_TARGET_DIR/release-fast/proxysss}"
+BENCHMARK_IMAGE="${IMAGE:-proxysss-isolated-ws-bench:local}"
+register_benchmark_docker_image "$BENCHMARK_IMAGE"
 BENCH_SUBNET="${BENCH_SUBNET:-172.30.0.0/16}"
 # benchmark-websocket-isolated.sh assigns fixed role addresses within a /16.
 # Keep every Latin-square tuple inside the caller-selected subnet rather than
@@ -176,6 +181,7 @@ for connections in $ACTIVE_SCALES; do
     ACTIVE_DURATION_SECS="$ACTIVE_DURATION_SECS" \
     ACTIVE_PAYLOAD_BYTES="$ACTIVE_PAYLOAD_BYTES" \
     CLIENT_MEMORY="$ACTIVE_CLIENT_MEMORY" \
+    IMAGE="$BENCHMARK_IMAGE" \
     PROXY_BIN="$PROXY_BIN" BENCH_ROOT="$BENCH_ROOT" \
       bash "$ROOT/scripts/benchmark-websocket-isolated.sh"
   done
@@ -211,6 +217,7 @@ for connections in $ACTIVE_SCALES; do
       ACTIVE_PAYLOAD_BYTES="$ACTIVE_PAYLOAD_BYTES" \
       ACTIVE_MESSAGE_INTERVAL_MICROS="$interval_micros" \
       CLIENT_MEMORY="$ACTIVE_CLIENT_MEMORY" \
+      IMAGE="$BENCHMARK_IMAGE" \
       PROXY_BIN="$PROXY_BIN" BENCH_ROOT="$BENCH_ROOT" \
         bash "$ROOT/scripts/benchmark-websocket-isolated.sh"
     done
@@ -238,6 +245,7 @@ for connections in $CAPACITY_SCALES; do
     CAPACITY_SETTLE_SECS="$CAPACITY_SETTLE_SECS" \
     CAPACITY_CONNECT_WORKERS="$CAPACITY_CONNECT_WORKERS" \
     CLIENT_MEMORY="$CAPACITY_CLIENT_MEMORY" \
+    IMAGE="$BENCHMARK_IMAGE" \
     PROXY_BIN="$PROXY_BIN" BENCH_ROOT="$BENCH_ROOT" \
       bash "$ROOT/scripts/benchmark-websocket-isolated.sh"
   done

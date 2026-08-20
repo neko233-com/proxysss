@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Compare static-file throughput: proxysss vs nginx.
-# All downloads and run artifacts stay under .benchmark/ (gitignored).
+# Downloads and run artifacts use disposable .benchmark/ by default.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 CONCURRENCY="${CONCURRENCY:-512}"
 DURATION_SECS="${DURATION_SECS:-30}"
@@ -16,7 +19,6 @@ if [[ "$QUICK" == "1" ]]; then
   DURATION_SECS=10
 fi
 
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 VENDOR_DIR="$BENCH_ROOT/vendors"
 RUN_DIR="$BENCH_ROOT/runs/latest"
 WWW_DIR="$RUN_DIR/www"
@@ -29,7 +31,8 @@ BUILD_PROFILE="${BUILD_PROFILE:-release}"
 if [[ "$QUICK" == "1" && -z "$BUILD_PROFILE_WAS_SET" ]]; then
   BUILD_PROFILE="release-fast"
 fi
-PROXY_BIN="${PROXY_BIN:-$ROOT/target/$BUILD_PROFILE/proxysss}"
+DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}"
+PROXY_BIN="${PROXY_BIN:-$DEFAULT_TARGET_DIR/$BUILD_PROFILE/proxysss}"
 
 stop_bench_processes() {
   if [[ -f "$PID_FILE" ]]; then
@@ -41,7 +44,7 @@ stop_bench_processes() {
 }
 
 if [[ ! -x "$PROXY_BIN" ]]; then
-  cargo build --profile "$BUILD_PROFILE" --locked
+  CARGO_TARGET_DIR="$DEFAULT_TARGET_DIR" cargo build --profile "$BUILD_PROFILE" --locked
 fi
 command -v go >/dev/null 2>&1 || {
   echo "missing required command: go" >&2
@@ -151,7 +154,7 @@ run_bench() {
     --duration "$DURATION_SECS"
 }
 
-trap 'stop_bench_processes' EXIT
+trap 'stop_bench_processes; cleanup_benchmark_artifacts' EXIT
 
 "$PROXY_BIN" -config "$PROXY_DIR/proxysss.yaml" >/dev/null 2>&1 &
 echo $! >"$PID_FILE"

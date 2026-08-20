@@ -557,6 +557,19 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - `http.tls.mode`
 - 日志路径和级别核心设置
 
+### 4.3 Windows 后台自启动
+
+Windows 下执行 `service install` 会优先写入当前用户的 HKCU Run，并通过 `wscript //B //Nologo` 隐藏启动 proxysss；这样登录时不会弹出 cmd。安装时还会清理旧版本留下的直接执行型计划任务，避免两个入口重复启动。
+
+```powershell
+proxysss service install
+proxysss service status
+proxysss service start
+proxysss service stop
+```
+
+如果旧计划任务曾经以 `HighestAvailable` 权限创建，普通 PowerShell 可能无法删除它；只需用“以管理员身份运行”的 PowerShell 执行一次 `proxysss service install`，之后保持 HKCU Run 单一入口即可。`service status` 会提示重复入口或仍有弹窗风险的旧任务。
+
 ## 5. 性能建议要这样理解
 
 ### 5.1 先调 Linux，再谈结论

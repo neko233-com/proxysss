@@ -1,12 +1,12 @@
 # Changelog
 
-## v1.3.7 - 2026-08-13
+## v1.3.7 - 2026-08-20
 
 - Added the production api.neko233.com AI gateway route for ai-router, including root/admin, health, OpenAI Responses, and Chat Completions paths while keeping the upstream listener loopback-only.
 - Removed admin-token forwarding at the edge and kept the AI route on the low-allocation streaming path with hot-reloadable configuration.
 
-## Unreleased
-
+- Hardened Windows auto-start repair: HKCU Run is now the single preferred hidden entry, legacy direct-console scheduled tasks are detected and removed, status reports duplicate or unsafe startup entries, and installer errors preserve the underlying permission failure.
+- Bounded local benchmark disk usage: default Rust targets and reports are disposable, and proxysss-owned Docker benchmark images are removed after a run unless artifact retention is explicitly enabled.
 - Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.
 - Locked the default TLS ALPN order so ordinary clients prefer HTTP/2 on port 443 while ACME TLS-ALPN-01 remains available, and added default-config coverage for self-signed TLS bootstrap.
 - Hardened the Ubuntu 24 Docker benchmark entrypoints for Windows Docker Desktop path handling and emitted a same-run fairness manifest proving matching ports, CPU/FD/sysctl limits, protocol surfaces, and nginx/proxysss optimizations. Strict measured validation remains capped at 60 seconds.

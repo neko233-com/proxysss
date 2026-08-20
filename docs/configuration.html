@@ -448,6 +448,7 @@
           <a href="#surfaces">怎么选配置面</a>
           <a href="#combos">常用组合</a>
           <a href="#reload">热重载和预热</a>
+          <a href="#windows-startup">Windows 后台启动</a>
           <a href="#performance">性能建议</a>
           <a href="#ops">排障命令</a>
           <a href="#mistakes">常见误区</a>
@@ -701,6 +702,22 @@ udp:
               </ul>
             </article>
           </div>
+        </section>
+
+        <section id="windows-startup" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Windows Operations</div>
+              <h2>Windows 登录时保持真正的后台启动。</h2>
+            </div>
+            <p class="subtle">`service install` 优先使用当前用户的 HKCU Run，并通过 `wscript //B //Nologo` 隐藏启动；同时清理旧版本的直接执行型计划任务，避免 cmd 弹窗和重复进程。</p>
+          </div>
+
+          <pre><code>proxysss service install
+proxysss service status
+proxysss service start
+proxysss service stop</code></pre>
+          <p class="subtle">如果旧计划任务曾经以 `HighestAvailable` 权限创建，普通 PowerShell 可能无法删除它；用“以管理员身份运行”的 PowerShell 执行一次 `proxysss service install`。`service status` 会提示重复入口或仍有弹窗风险的旧任务。</p>
         </section>
 
         <section id="performance" class="panel">

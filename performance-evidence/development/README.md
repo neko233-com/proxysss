@@ -1,8 +1,8 @@
 # 开发期性能证据
 
-`local-docker/` 保存从本机 `.benchmark/direct-ubuntu24-amd64/` 筛选出的历史报告，用于跨电脑继续性能分析。当前快照覆盖 89 个 run；归档包含 host fingerprint、validation timing、matrix 日志、run metadata、equal-load plan、Markdown/HTML summary、JSON/JSONL 结果和 cgroup 内存 current/peak。`local-docker/INDEX.tsv` 提供 run、commit、执行模式、验证耗时、已生成尺度和状态的机器可读索引。
+`local-docker/` 是本机 benchmark 归档目录，不再随仓库提交。默认 benchmark 结束会清理 `.benchmark/`；需要留存时显式设置 `KEEP_BENCH_ARTIFACTS=1` 或 `BENCH_ROOT`，再按需将筛选结果存入本目录。
 
-这里不保存交叉编译 target、Docker image context、临时二进制、client 容器文件或完整原始 payload；这些本地产物超过 9 GiB，并不增加报告可审计性。
+这里不保存交叉编译 target、Docker image context、临时二进制、client 容器文件或完整原始 payload；这些本地产物超过 9 GiB，并不增加报告可审计性。benchmark 默认把 Rust target 放在可清理的 `.benchmark/target`，并在运行结束移除本次创建的 proxysss benchmark 镜像；只有显式设置 `BENCH_ROOT`、`KEEP_BENCH_ARTIFACTS=1` 或 `CARGO_TARGET_DIR` 才保留这些产物。
 
 更新归档：
 
@@ -10,7 +10,7 @@
 scripts/archive-local-benchmark-reports.sh
 ```
 
-查看最近一次报告：
+查看本机最近一次报告（目录存在时）：
 
 ```bash
 latest=$(find performance-evidence/development/local-docker -mindepth 1 -maxdepth 1 -type d | sort | tail -1)

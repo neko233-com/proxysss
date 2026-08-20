@@ -1,5 +1,7 @@
 # proxysss vs nginx — Ubuntu 24 LTS 混合压测报告（v1.3.0）
 
+默认 benchmark 结束会清理 `.benchmark/` 下的 Rust target、构建物与报告，并移除本次创建的 proxysss benchmark 镜像，避免反复测试占满本地磁盘。需要保留报告、target 或镜像时，运行前设置 `KEEP_BENCH_ARTIFACTS=1` 或 `BENCH_ROOT=/path/to/benchmark-output`；显式设置 `CARGO_TARGET_DIR` 也表示由操作者自行管理该 target。
+
 > 注意：本页是 v1.3.0 附近的历史 mixed-load 报告，用来做整体网关基线对照。它包含旧矩阵里的 `new-api-sse` 和 `kcp-style-udp` 行；当前 benchmark 脚本已经改成通用 `generic-sse`，并且不再把 KCP/QCP 特殊 UDP 封装放进 nginx 性能对标。v1.3.5 UDP fast path 已经有新的 UDP-only 结果：`udp-stream` Docker Ubuntu 24 官方脚本路径为 **`4.045x`**，`proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`，两边 0 错误。不要把本页历史 `udp-stream 0.855x / 0.861x` 当成当前 UDP 优化后的结论。
 
 > 面向超大规模游戏服务器（LOL / DNF 长连接 TCP + HTTP/2 SDK 服务）的极致性能 + 极致稳定性验证。

@@ -38,7 +38,7 @@ Use `QUICK=1` only when you need a shorter mixed smoke gate:
 QUICK=1 scripts/benchmark-all-scenarios.sh
 ```
 
-Single-scenario benchmark runs are root-cause diagnostics only. Do not promote a performance build because one isolated module beats nginx while the combined CDN/static/reverse-proxy/SSE/WebSocket/TCP/UDP gateway load does not. Results are written to `.benchmark/runs/all-scenarios/results.json`, `summary.md`, and `summary.html`; the default gate fails on unexpected errors, any default critical stream scenario below `CRITICAL_RATIO=0.97`, non-diagnostic scenarios below `MIN_RATIO`, or aggregate mixed-load ratio below `AGGREGATE_RATIO=0.97`.
+Single-scenario benchmark runs are root-cause diagnostics only. Do not promote a performance build because one isolated module beats nginx while the combined CDN/static/reverse-proxy/SSE/WebSocket/TCP/UDP gateway load does not. Results are written to `.benchmark/runs/all-scenarios/results.json`, `summary.md`, and `summary.html` during the run; default benchmark cleanup removes them afterward unless `KEEP_BENCH_ARTIFACTS=1` or explicit `BENCH_ROOT` is set. The default gate fails on unexpected errors, any default critical stream scenario below `CRITICAL_RATIO=0.97`, non-diagnostic scenarios below `MIN_RATIO`, or aggregate mixed-load ratio below `AGGREGATE_RATIO=0.97`.
 
 ## Protocol smoke baselines
 

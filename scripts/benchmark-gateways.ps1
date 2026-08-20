@@ -73,17 +73,42 @@ function Invoke-GatewayBench {
     return [pscustomobject]$result
 }
 
+# Default benchmark output is disposable. Set BENCH_ROOT or
+# KEEP_BENCH_ARTIFACTS=1 to retain it.
 $Root = (Resolve-Path ".").Path
-$ReleaseProxysss = Join-Path $Root "target\release\proxysss.exe"
+$BenchRootWasExplicit = -not [string]::IsNullOrWhiteSpace($env:BENCH_ROOT)
+$KeepBenchArtifacts = $env:KEEP_BENCH_ARTIFACTS -eq "1"
+$BenchRoot = if ($BenchRootWasExplicit) {
+    [System.IO.Path]::GetFullPath($env:BENCH_ROOT)
+} else {
+    Join-Path $Root ".benchmark"
+}
+$CargoTargetWasExplicit = -not [string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)
+$CargoTargetDir = if ($CargoTargetWasExplicit) {
+    [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path $BenchRoot "target"
+}
+$ReleaseProxysss = Join-Path $CargoTargetDir "release\proxysss.exe"
+
 if (-not (Test-Path $ReleaseProxysss)) {
-    cargo build --release --locked
+    $previousCargoTarget = $env:CARGO_TARGET_DIR
+    try {
+        $env:CARGO_TARGET_DIR = $CargoTargetDir
+        cargo build --release --locked
+    } finally {
+        if ($null -eq $previousCargoTarget) { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue } else { $env:CARGO_TARGET_DIR = $previousCargoTarget }
+    }
 }
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "go not found; install Go to build benchmark helpers"
 }
 
-# All vendor downloads and per-run artifacts stay under .benchmark/ (gitignored).
-$BenchRoot = Join-Path $Root ".benchmark"
+function Remove-BenchmarkArtifacts {
+    if (-not $BenchRootWasExplicit -and -not $KeepBenchArtifacts -and (Test-Path $BenchRoot)) {
+        Remove-Item -LiteralPath $BenchRoot -Recurse -Force
+    }
+}
 $Vendor = Join-Path $BenchRoot "vendors"
 $RunDir = Join-Path $BenchRoot "runs\latest"
 $Www = Join-Path $RunDir "www"
@@ -92,6 +117,7 @@ $BenchHelperExe = Join-Path $RunDir "benchmark-helper.exe"
 $PidFile = Join-Path $RunDir "pids.txt"
 $ResultsFile = Join-Path $RunDir "results.json"
 
+try {
 Stop-BenchProcesses -PidFile $PidFile
 if (Test-Path $RunDir) {
     Remove-Item -Recurse -Force $RunDir
@@ -198,7 +224,7 @@ Write-Host ""
 Write-Host "=== throughput summary (ops/sec) ===" -ForegroundColor Green
 $Results | Sort-Object ops_per_sec -Descending | Format-Table name, ops_per_sec, throughput_mib_s, latency_p50_ms, latency_p95_ms, success, errors -AutoSize
 Write-Host "results saved to $ResultsFile"
-Write-Host "vendor binaries cached under $Vendor (gitignored under .benchmark/)"
+Write-Host "vendor binaries cached under $Vendor (disposable by default; set BENCH_ROOT or KEEP_BENCH_ARTIFACTS=1 to retain)"
 
 & $BenchHelperExe write-gateway-report --results $ResultsFile --out-dir $RunDir --concurrency $Concurrency --duration $DurationSecs
 if ($LASTEXITCODE -ne 0) { throw "write-gateway-report failed with exit code $LASTEXITCODE" }
@@ -212,4 +238,8 @@ Write-Host "nginx compare html:        $(Join-Path $RunDir 'nginx-compare.html')
 
 if (-not $SkipGate) {
     & (Join-Path $PSScriptRoot "benchmark-gate-check.ps1") -ResultsFile $ResultsFile
+}
+} finally {
+    Stop-BenchProcesses -PidFile $PidFile
+    Remove-BenchmarkArtifacts
 }

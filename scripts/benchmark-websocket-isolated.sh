@@ -10,6 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "benchmark-websocket-isolated.sh requires Linux Docker (Ubuntu 24 is the reference host)." >&2
@@ -155,14 +158,16 @@ TLS_KEY_TYPE="${TLS_KEY_TYPE:-ecdsa}"
 REFRESH_BASE_IMAGE="${REFRESH_BASE_IMAGE:-0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
-RUN_DIR="${BENCH_ROOT:-$ROOT/.benchmark}/runs/isolated-websocket/$RUN_ID"
+RUN_DIR="$BENCH_ROOT/runs/isolated-websocket/$RUN_ID"
 ROLE_MACHINE_ID_HASH="$(sha256sum /etc/machine-id | awk '{print $1}')"
 CONTEXT_DIR="$RUN_DIR/image-context"
 PREBUILT_BENCH_HELPER="${PREBUILT_BENCH_HELPER:-}"
 BENCH_HELPER_BIN="${PREBUILT_BENCH_HELPER:-$RUN_DIR/benchmark-helper}"
 NETWORK="proxysss-ws-isolated-$RUN_ID"
 PREFIX="proxysss-ws-isolated-$RUN_ID"
-PROXY_BIN="${PROXY_BIN:-$ROOT/target/$BUILD_PROFILE/proxysss}"
+DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}"
+PROXY_BIN="${PROXY_BIN:-$DEFAULT_TARGET_DIR/$BUILD_PROFILE/proxysss}"
+register_benchmark_docker_image "$IMAGE"
 
 if [[ "$RUN_ACTIVE" != "1" && "$RUN_CAPACITY" != "1" ]]; then
   echo "at least one of RUN_ACTIVE or RUN_CAPACITY must be 1" >&2
@@ -191,7 +196,8 @@ fi
 validate_role_cpusets
 
 if [[ "$FORCE_BUILD" == "1" || ! -x "$PROXY_BIN" ]]; then
-  cargo build --profile "$BUILD_PROFILE" --locked
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}" \
+    cargo build --profile "$BUILD_PROFILE" --locked
 fi
 
 mkdir -p "$RUN_DIR" "$CONTEXT_DIR"
@@ -216,6 +222,8 @@ cleanup() {
   set +e
   docker ps -aq --filter "name=^/${PREFIX}" | xargs -r docker rm -f >/dev/null 2>&1
   docker network rm "$NETWORK" >/dev/null 2>&1
+  cleanup_benchmark_docker_images
+  cleanup_benchmark_artifacts
 }
 trap cleanup EXIT
 
