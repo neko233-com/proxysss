@@ -19,4 +19,4 @@ cat "$latest/host-fingerprint.txt"
 find "$latest" -name '*-summary.md' -print -exec cat {} \;
 ```
 
-这些是开发期诊断证据，包含通过与失败的实验。只有 `performance-evidence/vX.Y.Z.json` 严格 manifest 才能作为 release tag 的生产证据；不要把本目录中的 emulated-amd64 报告描述为物理 x86 证据。
+这些是开发期诊断证据，包含通过与失败的实验。若要把性能结果作为 release 附件，才需要另外提交并验证 `performance-evidence/vX.Y.Z.json`；它不阻塞功能版本发布。不要把本目录中的 emulated-amd64 报告描述为物理 x86 证据。

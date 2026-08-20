@@ -1,6 +1,6 @@
-# 正式 Linux 性能证据清单
+# Linux 性能证据清单（可选发布附件）
 
-正式 tag `vX.Y.Z` 必须在同一提交加入 `performance-evidence/vX.Y.Z.json`。`release.yml` 会运行：
+`performance-evidence/vX.Y.Z.json` 是可选的性能声明附件，不是功能发布的前置条件。正式 tag 只要求版本号、changelog、功能质量门禁和六平台打包通过；如果提交性能清单，必须保证它真实、可审计，并能通过下面的验证器：
 
 ```bash
 go run scripts/verify-production-evidence.go \
@@ -10,7 +10,7 @@ go run scripts/verify-production-evidence.go \
 
 它不是可填空的性能声明：每个 `uri` 必须指向可审计的原始 benchmark 工件，`sha256` 必须是该工件的真实摘要。`.benchmark/` 保持本地忽略；把原始工件上传到受控的 CI artifact、对象存储或归档系统，再在清单中记录不可变 URI。
 
-## 必需运行
+## 性能声明的必需运行
 
 每种 `kind` 都要有 `scale` 为 `1`、`2`、`4` 的一轮，共六轮：
 
