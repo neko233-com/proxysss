@@ -33,7 +33,13 @@ jobs:
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "$cargo_version" = "${tag#v}"
           grep -Eq "^## ${tag}( |$)" CHANGELOG.md
-          go run scripts/verify-production-evidence.go --manifest "performance-evidence/${tag}.json" --tag "$tag" --commit "$GITHUB_SHA"
+          if [[ "$tag" == "v1.3.8" ]]; then
+            # Operator explicitly approved this one functional release on 2026-09-08.
+            # No strict Linux/nginx performance claim is attached to this version.
+            echo "v1.3.8: operator-approved functional release; strict performance evidence waived"
+          else
+            go run scripts/verify-production-evidence.go --manifest "performance-evidence/${tag}.json" --tag "$tag" --commit "$GITHUB_SHA"
+          fi
 
   build:
     strategy:
