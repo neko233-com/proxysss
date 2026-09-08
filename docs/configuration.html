@@ -412,9 +412,9 @@
     </div>
 
     <header class="hero">
-      <div class="eyebrow">configuration / human guide</div>
+      <div class="eyebrow">proxysss 使用文档</div>
       <h1>按场景配置你的网关。</h1>
-      <p>proxysss 的 YAML 目标不是重写一份 nginx 指令百科，而是让你能更快把 HTTP、HTTPS、AI SSE、静态站点、TCP、UDP、MQTT/IoT 边缘流量和自动化管理面放到正确的配置面里。</p>
+      <p>从最小配置开始，按场景添加 HTTP、HTTPS、静态站点、AI 流式代理、TCP/UDP 和 MQTT 转发。本页同时说明配置的生效范围、热重载条件与日常检查命令。</p>
       <div class="hero-actions">
         <a class="dark" href="#beginner">先跑第一条链路</a>
         <a class="warm" href="#surfaces">先选配置面</a>
@@ -422,23 +422,23 @@
       </div>
       <div class="meta">
         <div class="meta-item">
-          <div class="meta-label">Default HTTP</div>
+          <div class="meta-label">HTTP 端口</div>
           <div class="meta-value">80</div>
         </div>
         <div class="meta-item">
-          <div class="meta-label">Default HTTPS / H2 / H3</div>
+          <div class="meta-label">HTTPS / HTTP2 / HTTP3</div>
           <div class="meta-value">443</div>
         </div>
         <div class="meta-item">
-          <div class="meta-label">Admin</div>
+          <div class="meta-label">管理地址</div>
           <div class="meta-value">127.0.0.1:7777</div>
         </div>
         <div class="meta-item">
-          <div class="meta-label">Main config</div>
+          <div class="meta-label">主配置文件</div>
           <div class="meta-value">proxysss.yaml</div>
         </div>
       </div>
-      <p class="subtle">未配置用户根路由时，`/` 返回只含 GitHub 与 GitHub Docs 的 `Welcome to proxysss` 页面。默认 443 TLS 会生成缺省自签证书，普通客户端 ALPN 优先协商 HTTP/2；生产环境应改为 managed ACME 或显式证书。</p>
+      <p class="subtle">未配置用户根路由时，<code>/</code> 返回只含 GitHub 与 GitHub Docs 的 <code>Welcome to proxysss</code> 页面。默认 443 TLS 会生成缺省自签证书，普通客户端 ALPN 优先协商 HTTP/2；生产环境应改为 managed ACME 或显式证书。</p>
     </header>
 
     <div class="layout">
@@ -470,7 +470,7 @@
             <article class="card">
               <span class="tag beginner">第一个站点</span>
               <h3>最小反向代理</h3>
-              <p class="subtle">适合先把 `app.example.com` 代理到本机服务，确认域名、监听端口和上游路径都正常。</p>
+              <p class="subtle">适合先把 <code>app.example.com</code> 代理到本机服务，确认域名、监听端口和上游路径都正常。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
 
@@ -488,7 +488,7 @@ services:
             <article class="card">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就把 WebSocket 升为 WSS</h3>
-              <p class="subtle">只填写域名即可启用免费的内建 ACME：默认正式 Let's Encrypt + TLS-ALPN-01 + ECDSA P-256，只要求 A/AAAA 指向网关且公网 443 可达，不需要 certbot、acme.sh、DNS API 或账号邮箱。极老旧客户端可设置 `http.tls.acme.key_algorithm: rsa2048`；显式 `challenge: http01` 仍兼容，需要公网 80。</p>
+              <p class="subtle">只填写域名即可启用免费的内建 ACME：默认正式 Let's Encrypt + TLS-ALPN-01 + ECDSA P-256，只要求 A/AAAA 指向网关且公网 443 可达，不需要 certbot、acme.sh、DNS API 或账号邮箱。极老旧客户端可设置 <code>http.tls.acme.key_algorithm: rsa2048</code>；显式 <code>challenge: http01</code> 仍兼容，需要公网 80。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
@@ -507,7 +507,7 @@ services:
             <article class="card">
               <span class="tag beginner">官网 + API</span>
               <h3>静态站点和 API 分开声明</h3>
-              <p class="subtle">静态文件适合单独走 `static_sites`，API 保持在 `reverse_proxy.routes`。HTML/CSS/JS/图片/字体/音视频和大文件下载支持 Range 断点续传，这样排障、缓存和性能预热都更清楚。</p>
+              <p class="subtle">静态文件适合单独走 <code>static_sites</code>，API 保持在 <code>reverse_proxy.routes</code>。HTML/CSS/JS/图片/字体/音视频和大文件下载支持 Range 断点续传，这样排障、缓存和性能预热都更清楚。</p>
               <pre><code>services:
   static_sites:
     - name: homepage
@@ -687,18 +687,18 @@ udp:
               <span class="tag expert">可热重载</span>
               <ul>
                 <li>大部分合并后的配置值</li>
-                <li>`proxysss.yaml`</li>
+                <li><code>proxysss.yaml</code></li>
                 <li>主脚本与自动加载插件脚本</li>
-                <li>`services.reverse_proxy.routes`、`services.service_discovery`、`static_sites`、`webdav`、FTP upstream</li>
+                <li><code>services.reverse_proxy.routes</code>、<code>services.service_discovery</code>、<code>static_sites</code>、<code>webdav</code>、FTP upstream</li>
               </ul>
             </article>
 
             <article class="card">
               <span class="tag expert">需要重启</span>
               <ul>
-                <li>`http.plain_bind`、`http.tls_bind`、`http.h3_bind`</li>
-                <li>`admin.bind`、TCP / UDP listener bind 集合</li>
-                <li>`http.tls.mode`</li>
+                <li><code>http.plain_bind</code>、<code>http.tls_bind</code>、<code>http.h3_bind</code></li>
+                <li><code>admin.bind</code>、TCP / UDP listener bind 集合</li>
+                <li><code>http.tls.mode</code></li>
                 <li>日志路径与核心日志级别设置</li>
               </ul>
             </article>
@@ -711,14 +711,14 @@ udp:
               <div class="kicker">Windows Operations</div>
               <h2>Windows 后台运行与登录自启动</h2>
             </div>
-            <p class="subtle">`service install` 优先使用当前用户的 HKCU Run，并通过 `wscript //B //Nologo` 隐藏启动；同时清理旧版本的直接执行型计划任务，避免 cmd 弹窗和重复进程。</p>
+            <p class="subtle"><code>service install</code> 优先使用当前用户的 HKCU Run，并通过 <code>wscript //B //Nologo</code> 隐藏启动；同时清理旧版本的直接执行型计划任务，避免 cmd 弹窗和重复进程。</p>
           </div>
 
           <pre><code>proxysss service install
 proxysss service status
 proxysss service start
 proxysss service stop</code></pre>
-          <p class="subtle">如果旧计划任务曾经以 `HighestAvailable` 权限创建，普通 PowerShell 可能无法删除它；用“以管理员身份运行”的 PowerShell 执行一次 `proxysss service install`。`service status` 会提示重复入口或仍有弹窗风险的旧任务。</p>
+          <p class="subtle">如果旧计划任务曾经以 <code>HighestAvailable</code> 权限创建，普通 PowerShell 可能无法删除它；用“以管理员身份运行”的 PowerShell 执行一次 <code>proxysss service install</code>。<code>service status</code> 会提示重复入口或仍有弹窗风险的旧任务。</p>
         </section>
 
         <section id="performance" class="panel">
@@ -745,7 +745,7 @@ scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
 
             <article class="card">
               <span class="tag expert">traffic_profile</span>
-              <p class="subtle">`small` 适合小文件、SSE、HTTP2、小包 flush；`balanced` 是默认推荐；`bulk` 适合明显偏大文件和下载分发。</p>
+              <p class="subtle"><code>small</code> 适合小文件、SSE、HTTP2、小包 flush；<code>balanced</code> 是默认推荐；<code>bulk</code> 适合明显偏大文件和下载分发。</p>
               <pre><code>runtime:
   performance:
     enabled: true
@@ -797,7 +797,7 @@ proxysss token show</code></pre>
             <article class="card">
               <span class="tag beginner">误区 3</span>
               <h3>一上来就开公网写管理面</h3>
-              <p class="subtle">默认的 loopback + `enable_write_ops=false` 是刻意设计的安全姿势。自动化需要时再显式开启。</p>
+              <p class="subtle">默认的 loopback + <code>enable_write_ops=false</code> 是刻意设计的安全姿势。自动化需要时再显式开启。</p>
             </article>
           </div>
         </section>

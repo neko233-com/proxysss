@@ -217,9 +217,9 @@
 <body>
   <div class="shell">
     <header class="hero">
-      <div class="eyebrow">migration / caddy to proxysss</div>
+      <div class="eyebrow">proxysss 使用文档</div>
       <h1>从 Caddy 迁移到 proxysss。</h1>
-      <p>从 `caddy` 迁到 `proxysss`，不只是改语法。你会从“很顺手的站点代理”切到“更完整的通用网关”，所以文档会一边给你直接可抄的 YAML，一边告诉你哪些能力应该拆到独立配置面。</p>
+      <p>将 Caddyfile 中的站点、反向代理、静态文件和自动 HTTPS 配置迁移到 proxysss。下面提供对应示例，并说明证书申请、脚本扩展和部署验证的差异。</p>
       <div class="actions">
         <a class="dark" href="#beginner">先迁最常见场景</a>
         <a class="warm" href="#advanced">再看高级迁移</a>
@@ -234,7 +234,7 @@
             <div class="kicker">Migration mindset</div>
             <h2>先理解 Caddy 和 proxysss 的思路差别</h2>
           </div>
-          <p class="subtle">`Caddy` 的强项是上手快和自动 HTTPS；`proxysss` 的目标是把 nginx 级网关能力放进一套更容易维护的单文件 YAML。没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 static site/route。</p>
+          <p class="subtle"><code>Caddy</code> 的强项是上手快和自动 HTTPS；<code>proxysss</code> 的目标是把 nginx 级网关能力放进一套更容易维护的单文件 YAML。没有用户路由命中 <code>/</code> 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 static site/route。</p>
         </div>
 
         <table>
@@ -247,28 +247,28 @@
           </thead>
           <tbody>
             <tr>
-              <td>`reverse_proxy`</td>
-              <td>`services.reverse_proxy.routes`</td>
+              <td><code>reverse_proxy</code></td>
+              <td><code>services.reverse_proxy.routes</code></td>
               <td>普通站点反代</td>
             </tr>
             <tr>
-              <td>`handle_path /api/*`</td>
-              <td>`match.path_prefix` + `strip_prefix`</td>
+              <td><code>handle_path /api/*</code></td>
+              <td><code>match.path_prefix</code> + <code>strip_prefix</code></td>
               <td>API 前缀改写</td>
             </tr>
             <tr>
-              <td>`file_server`</td>
-              <td>`services.static_sites`</td>
+              <td><code>file_server</code></td>
+              <td><code>services.static_sites</code></td>
               <td>静态站点</td>
             </tr>
             <tr>
               <td>自动 HTTPS</td>
-              <td>`http.tls.mode: acme_managed`</td>
+              <td><code>http.tls.mode: acme_managed</code></td>
               <td>默认推荐</td>
             </tr>
             <tr>
-              <td>`layer4` 场景</td>
-              <td>`tcp.listeners` / `udp.listeners`</td>
+              <td><code>layer4</code> 场景</td>
+              <td><code>tcp.listeners</code> / <code>udp.listeners</code></td>
               <td>原生 TCP / UDP</td>
             </tr>
           </tbody>
@@ -301,7 +301,7 @@
 
           <article class="card">
             <span class="tag beginner">API path</span>
-            <h3>`handle_path /api/*`</h3>
+            <h3><code>handle_path /api/*</code></h3>
             <pre><code>services:
   reverse_proxy:
     routes:
@@ -316,7 +316,7 @@
 
           <article class="card">
             <span class="tag beginner">Static site</span>
-            <h3>`file_server`</h3>
+            <h3><code>file_server</code></h3>
             <pre><code>services:
   static_sites:
     - name: homepage
@@ -334,7 +334,7 @@
   tls:
     auto_https:
       domains: [wss.example.com]</code></pre>
-            <p class="subtle">只给域名即可免费走内建 managed ACME 的正式 TLS-ALPN-01 与默认 ECDSA P-256，无需 certbot、acme.sh、DNS API 或邮箱。A/AAAA 必须指向网关，且公网 443 可达；极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。</p>
+            <p class="subtle">只给域名即可免费走内建 managed ACME 的正式 TLS-ALPN-01 与默认 ECDSA P-256，无需 certbot、acme.sh、DNS API 或邮箱。A/AAAA 必须指向网关，且公网 443 可达；极老旧客户端可设 <code>http.tls.acme.key_algorithm: rsa2048</code>。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。</p>
           </article>
         </div>
       </section>
@@ -345,7 +345,7 @@
             <div class="kicker">Advanced path</div>
             <h2>从站点代理走向完整网关</h2>
           </div>
-          <p class="subtle">这是 Caddy 用户最容易低估的一步：proxysss 不是另一个语法不同的 `Caddyfile`，而是更完整的网关面。</p>
+          <p class="subtle">这是 Caddy 用户最容易低估的一步：proxysss 不是另一个语法不同的 <code>Caddyfile</code>，而是更完整的网关面。</p>
         </div>
 
         <div class="cards">
@@ -384,7 +384,7 @@ services:
 
           <article class="card">
             <span class="tag expert">TCP / UDP</span>
-            <h3>`layer4` 迁移</h3>
+            <h3><code>layer4</code> 迁移</h3>
             <pre><code>tcp:
   listeners:
     - name: mqtt-tcp
@@ -426,7 +426,7 @@ proxysss config explain
 proxysss config capabilities
 proxysss config reload-plan
 scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
-        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移后的性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
+        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移后的性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>。</p>
       </section>
     <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
 <section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
@@ -434,7 +434,7 @@ scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
 </main>
 
     <footer class="footer">
-      <strong>迁移原则：</strong> 先迁最简单的 `reverse_proxy`，再拆 `static_sites`、`ai_proxy`、`tcp.listeners`、`udp.listeners`，最后补 TLS、health、cache 和 benchmark。这样最容易看清能力边界，也最容易发现副作用。
+      <strong>迁移原则：</strong> 先迁最简单的 <code>reverse_proxy</code>，再拆 <code>static_sites</code>、<code>ai_proxy</code>、<code>tcp.listeners</code>、<code>udp.listeners</code>，最后补 TLS、health、cache 和 benchmark。这样最容易看清能力边界，也最容易发现副作用。
     </footer>
   </div>
 

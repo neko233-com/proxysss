@@ -393,34 +393,34 @@
 <body>
   <div class="shell">
     <header class="hero">
-      <div class="eyebrow">proxysss docs / nginx-level gateway, but readable</div>
-      <h1>从安装到运行，逐步配置你的网关。</h1>
-      <p>这套文档分成两条路线：新手先复制成功，再理解每个字段；高手直接定位 `HTTP / TLS / AI SSE / TCP / UDP / reload / performance` 的真实边界，不用在宣传文案里兜圈子。</p>
+      <div class="eyebrow">proxysss 使用文档</div>
+      <h1>从第一个站点开始。</h1>
+      <p>用一个 YAML 文件配置网站、反向代理和实时连接。先完成安装，运行一个最小站点，再按需要添加 TLS、静态文件、TCP/UDP 转发和安全规则。</p>
       <div class="actions">
-        <a class="button primary" href="#beginner">我是新手，先跑起来</a>
-        <a class="button warm" href="#recipes">直接抄配置案例</a>
-        <a class="button cool" href="#expert">我是高手，直接看结构</a>
-        <a class="button warm" href="benchmark-linux.html">看性能对比数据</a>
+        <a class="button primary" href="#beginner">开始安装</a>
+        <a class="button warm" href="#recipes">查看配置示例</a>
+        <a class="button cool" href="#expert">配置项速查</a>
+        <a class="button warm" href="benchmark-linux.html">性能验证</a>
       </div>
       <div class="meta-strip">
         <div class="meta-card">
-          <div class="meta-label">Default HTTP</div>
+          <div class="meta-label">HTTP 端口</div>
           <div class="meta-value">80</div>
         </div>
         <div class="meta-card">
-          <div class="meta-label">Default HTTPS / H2 / H3</div>
+          <div class="meta-label">HTTPS / HTTP2 / HTTP3</div>
           <div class="meta-value">443</div>
         </div>
         <div class="meta-card">
-          <div class="meta-label">Admin</div>
+          <div class="meta-label">管理地址</div>
           <div class="meta-value">127.0.0.1:7777</div>
         </div>
         <div class="meta-card">
-          <div class="meta-label">Main config</div>
+          <div class="meta-label">主配置文件</div>
           <div class="meta-value">proxysss.yaml</div>
         </div>
       </div>
-      <p>默认 `/` 是零外部资源的 `Welcome to proxysss` fallback，只显示 GitHub 与 GitHub Docs；用户 route/static site 优先。默认 443 TLS 可自签启动，普通客户端 ALPN 优先 HTTP/2。</p>
+      <p>启动后，80 端口显示欢迎页；配置网站路由后即可提供你的站点。管理后台默认位于本机 7777 端口，HTTPS 使用 443 端口。</p>
     </header>
 
     <div class="layout">
@@ -450,7 +450,7 @@
             <article class="path">
               <span class="tag beginner">5 分钟可用</span>
               <h3>第一个反向代理</h3>
-              <p class="subtle">你只有一个站点，要把 `app.example.com` 代理到本机 9000 端口。</p>
+              <p class="subtle">你只有一个站点，要把 <code>app.example.com</code> 代理到本机 9000 端口。</p>
               <pre><code>http:
   plain_bind: 0.0.0.0:80
 
@@ -612,7 +612,7 @@ tcp:
             <article class="recipe">
               <span class="tag expert">Wildcard TLS</span>
               <h3>泛域名证书 + DNS-01</h3>
-              <p class="subtle">做 `*.example.com` 或多节点证书管理时，直接走内建 `acme_managed` 的 DNS provider 工厂。</p>
+              <p class="subtle">做 <code>*.example.com</code> 或多节点证书管理时，直接走内建 <code>acme_managed</code> 的 DNS provider 工厂。</p>
               <pre><code>http:
   tls:
     mode: acme_managed
@@ -703,7 +703,7 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 proxysss token show</code></pre>
 
-          <p class="subtle">性能相关的判断也应该按这个顺序做：先确认能力、热重载边界和 warm-up，再在本机 Docker 或原生 amd64 Docker 运行 `benchmark-ubuntu24-amd64-docker.sh`，由脚本硬校验 Ubuntu 24.04 x86_64 容器并把通用场景与透明 QCP 按 1x/2x/4x 一起放大；arm64 daemon 的结果明确标记为 emulated-amd64，不能冒充物理 x86。涉及公网/NIC 延迟时，再从独立 client 主机运行 `benchmark-cross-host-wss.sh`，由 systemd cgroup 强制 4 CPU / 300k nofile 并记录内存峰值与每连接成本后保存原始证据。GitHub Actions 只做打包，不得运行性能压测；内存上限仅在声明生产预算时设置，而不是只截一张单场景好看的图。</p>
+          <p class="subtle">性能相关的判断也应该按这个顺序做：先确认能力、热重载边界和 warm-up，再在本机 Docker 或原生 amd64 Docker 运行 <code>benchmark-ubuntu24-amd64-docker.sh</code>，由脚本硬校验 Ubuntu 24.04 x86_64 容器并把通用场景与透明 QCP 按 1x/2x/4x 一起放大；arm64 daemon 的结果明确标记为 emulated-amd64，不能冒充物理 x86。涉及公网/NIC 延迟时，再从独立 client 主机运行 <code>benchmark-cross-host-wss.sh</code>，由 systemd cgroup 强制 4 CPU / 300k nofile 并记录内存峰值与每连接成本后保存原始证据。GitHub Actions 只做打包，不得运行性能压测；内存上限仅在声明生产预算时设置，而不是只截一张单场景好看的图。</p>
         </section>
 
         <section id="more" class="panel">
@@ -734,7 +734,7 @@ proxysss token show</code></pre>
             <a class="link-card" href="caddy-to-proxysss.html">
               <span class="tag expert">迁移子页</span>
               <h3>caddy -> proxysss</h3>
-              <p class="subtle">独立 HTML 迁移页。适合先抄配置，再理解 `reverse_proxy`、`static_sites`、`ai_proxy`、`tcp/udp` 的分层。</p>
+              <p class="subtle">独立 HTML 迁移页。适合先抄配置，再理解 <code>reverse_proxy</code>、<code>static_sites</code>、<code>ai_proxy</code>、<code>tcp/udp</code> 的分层。</p>
             </a>
             <a class="link-card" href="ts-how-to-use.html">
               <span class="tag expert">脚本扩展</span>

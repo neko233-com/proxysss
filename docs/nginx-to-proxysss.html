@@ -225,9 +225,9 @@
 <body>
   <div class="shell">
     <header class="hero">
-      <div class="eyebrow">migration / nginx to proxysss</div>
+      <div class="eyebrow">proxysss 使用文档</div>
       <h1>从 nginx 迁移到 proxysss。</h1>
-      <p>这页的目标不是讲一堆能力名词，而是把常见 `nginx` 配置翻译成适合 `proxysss` 的 YAML。先有能跑的配置，再理解该把能力落在哪个面。</p>
+      <p>将常见 nginx 配置对应到 proxysss 的 YAML 配置项，逐步迁移网站、静态文件、TLS 和 TCP/UDP 转发。迁移后检查路由、访问控制和实际流量。</p>
       <div class="actions">
         <a class="dark" href="#beginner">先迁最常见场景</a>
         <a class="warm" href="#advanced">再看高级迁移</a>
@@ -242,7 +242,7 @@
             <div class="kicker">Migration mindset</div>
             <h2>先记住该把配置写在哪里</h2>
           </div>
-          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 `reverse_proxy`、`domain_routes`、`static_sites` 还是 `tcp/udp listeners`。没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 route/static site。</p>
+          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 <code>reverse_proxy</code>、<code>domain_routes</code>、<code>static_sites</code> 还是 <code>tcp/udp listeners</code>。没有用户路由命中 <code>/</code> 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 route/static site。</p>
         </div>
 
         <table>
@@ -255,23 +255,23 @@
           </thead>
           <tbody>
             <tr>
-              <td>`server_name + location /`</td>
-              <td>`services.reverse_proxy.routes`</td>
+              <td><code>server_name + location /</code></td>
+              <td><code>services.reverse_proxy.routes</code></td>
               <td>普通整站反代</td>
             </tr>
             <tr>
-              <td>`location /api/` + `proxy_pass`</td>
-              <td>`match.path_prefix` + `strip_prefix`</td>
+              <td><code>location /api/</code> + <code>proxy_pass</code></td>
+              <td><code>match.path_prefix</code> + <code>strip_prefix</code></td>
               <td>API 前缀代理</td>
             </tr>
             <tr>
               <td>同域名多个路径拼成整站</td>
-              <td>`services.domain_routes`</td>
+              <td><code>services.domain_routes</code></td>
               <td>站点级编排</td>
             </tr>
             <tr>
-              <td>`stream {}`</td>
-              <td>`tcp.listeners` / `udp.listeners`</td>
+              <td><code>stream {}</code></td>
+              <td><code>tcp.listeners</code> / <code>udp.listeners</code></td>
               <td>数据库、游戏、MQTT、UDP</td>
             </tr>
           </tbody>
@@ -290,7 +290,7 @@
         <div class="cards">
           <article class="card">
             <span class="tag beginner">API prefix</span>
-            <h3>`location /api/`</h3>
+            <h3><code>location /api/</code></h3>
             <pre><code>services:
   reverse_proxy:
     routes:
@@ -337,7 +337,7 @@
   tls:
     auto_https:
       domains: [wss.example.com]</code></pre>
-            <p class="subtle">只给域名就会启用免费的内建 managed ACME，默认正式环境 TLS-ALPN-01 与 ECDSA P-256；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`；显式 HTTP-01（需 80）、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
+            <p class="subtle">只给域名就会启用免费的内建 managed ACME，默认正式环境 TLS-ALPN-01 与 ECDSA P-256；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。极老旧客户端可设 <code>http.tls.acme.key_algorithm: rsa2048</code>；显式 HTTP-01（需 80）、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
           </article>
         </div>
       </section>
@@ -395,7 +395,7 @@ services:
 
           <article class="card">
             <span class="tag expert">TCP / UDP</span>
-            <h3>`stream` 迁移</h3>
+            <h3><code>stream</code> 迁移</h3>
             <pre><code>tcp:
   listeners:
     - name: postgres
@@ -425,7 +425,7 @@ proxysss config explain
 proxysss config routes
 proxysss config nginx-parity --format yaml
 scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
-        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`，旧历史 mixed-load UDP 行不要当成当前结论。</p>
+        <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>，旧历史 mixed-load UDP 行不要当成当前结论。</p>
       </section>
     <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
 <section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
@@ -433,7 +433,7 @@ scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
 </main>
 
     <footer class="footer">
-      <strong>迁移原则：</strong> 先把一条 `reverse_proxy.routes` 跑通，再拆 `static_sites`、`ai_proxy`、`tcp.listeners`、`udp.listeners`，最后补 TLS、health、cache 和 benchmark。这样最容易发现副作用回归。
+      <strong>迁移原则：</strong> 先把一条 <code>reverse_proxy.routes</code> 跑通，再拆 <code>static_sites</code>、<code>ai_proxy</code>、<code>tcp.listeners</code>、<code>udp.listeners</code>，最后补 TLS、health、cache 和 benchmark。这样最容易发现副作用回归。
     </footer>
   </div>
 
