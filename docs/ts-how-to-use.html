@@ -391,6 +391,7 @@
       h1 { font-size: 40px; }
     }
   </style>
+  <link rel="stylesheet" href="site.css">
 </head>
 <body>
   <div class="shell">
@@ -412,7 +413,7 @@
 
     <header class="hero">
       <div class="eyebrow">typescript / extension layer</div>
-      <h1>先判断你该不该写 TS，再决定写哪一个 hook。</h1>
+      <h1>使用 TypeScript 扩展网关。</h1>
       <p>proxysss 的 TypeScript 运行时是内嵌 QuickJS，不依赖 node、deno 或 tsc。它的目标是给你业务感知、亲和选路、实验逻辑和插件扩展点，而不是替代 YAML 主配置面。</p>
       <div class="hero-actions">
         <a class="dark" href="#when">先判断该不该写脚本</a>
@@ -457,7 +458,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">First decision</div>
-              <h2>先判断这件事该不该交给脚本。</h2>
+              <h2>选择配置或脚本</h2>
             </div>
             <p class="subtle">如果规则脱离业务上下文后仍然成立，它大概率应该写在 YAML；只有业务感知、租户感知、player_id 感知和特殊上游选择，才适合进入 TS。</p>
           </div>
@@ -483,7 +484,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">Setup</div>
-              <h2>最小可用脚本应该足够小，先验证加载链路。</h2>
+              <h2>创建第一个脚本</h2>
             </div>
             <p class="subtle">推荐布局是 `gateway.ts` 作为主入口，`plugins/*.ts` 放可选插件，`proxysss-script.d.ts` 提供类型提示。</p>
           </div>
@@ -529,7 +530,7 @@ export default plugin;</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Hooks</div>
-              <h2>最常用的几个 hook，一次把职责边界讲清。</h2>
+              <h2>选择扩展钩子</h2>
             </div>
             <p class="subtle">hook 应该保持同步、快速、可解释。它是扩展点，不是长期业务 worker。</p>
           </div>
@@ -601,7 +602,7 @@ export default plugin;</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Fields</div>
-              <h2>最常用字段不要拍脑袋猜，先对照类型声明。</h2>
+              <h2>请求字段与类型声明</h2>
             </div>
             <p class="subtle">HTTP 和流式 listener 的字段不同。想用哪个字段，先对照 `proxysss-script.d.ts`，不要发明不存在的属性名。</p>
           </div>
@@ -626,7 +627,7 @@ export default plugin;</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Return values</div>
-              <h2>返回值的理解顺序：先 upstream，再 path，再 header。</h2>
+              <h2>修改上游、路径与请求头</h2>
             </div>
             <p class="subtle">最常见的写法是覆盖 `upstream`，其次是 `rewrite_path`，最后才是 `set_headers` / `strip_headers` 这类附加动作。</p>
           </div>
@@ -667,7 +668,7 @@ export default plugin;</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Mistakes</div>
-              <h2>写 TS 时最容易走歪的四个方向</h2>
+              <h2>脚本使用注意事项</h2>
             </div>
             <p class="subtle">这些错误的共同点是：把脚本当成主配置面、把 QuickJS 当 Node、把 hook 当 worker。</p>
           </div>
@@ -699,6 +700,8 @@ export default plugin;</code></pre>
           </div>
         </section>
       <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
+<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+<section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 </main>
     </div>
 
@@ -706,6 +709,8 @@ export default plugin;</code></pre>
       <strong>文档分工写清楚：</strong> 这页负责给人讲清脚本扩展边界；仓库里另有面向 agent、检索和差异跟踪的机器文档入口。
     </footer>
   </div>
-<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+
+
+<script src="site.js" defer></script>
 </body>
 </html>

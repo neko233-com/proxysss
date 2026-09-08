@@ -15,7 +15,7 @@ $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
 try {
     $stage = Reset-ProjectArtifactDirectory '.tmp/release-package'
     Copy-Item -LiteralPath $source -Destination $stage
-    foreach ($name in @('README.md','CHANGELOG.md','proxysss-script.d.ts','ts-how-to-use.md','nginx-to-proxysss.md','caddy-to-proxysss.md','benchmark-linux.md','docs','examples','templates')) {
+    foreach ($name in @('README.md','README-CN.md','CHANGELOG.md','proxysss-script.d.ts','ts-how-to-use.md','nginx-to-proxysss.md','caddy-to-proxysss.md','benchmark-linux.md','docs','examples','templates')) {
         Copy-Item -LiteralPath (Join-Path $script:ProjectRoot $name) -Destination $stage -Recurse
     }
     $scriptDir = New-Item -ItemType Directory -Path (Join-Path $stage 'scripts')
@@ -38,7 +38,7 @@ try {
     $entries = & tar -tf $pending
     if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release archive.' }
     $entries = $entries | ForEach-Object { $_ -replace '^\./', '' }
-    foreach ($required in @($binary,'CHANGELOG.md','docs/cdn-origin.html','docs/security-performance.html','templates/cdn-origin.example.yaml','examples/security-performance.example.yaml','scripts/install.sh','scripts/install.ps1')) {
+    foreach ($required in @($binary,'README.md','README-CN.md','docs/site.css','docs/site.js','templates/admin.html','templates/admin.css','templates/docs.html','CHANGELOG.md','docs/cdn-origin.html','docs/security-performance.html','templates/cdn-origin.example.yaml','examples/security-performance.example.yaml','scripts/install.sh','scripts/install.ps1')) {
         if ($entries -notcontains $required) { throw "Release archive is missing $required" }
     }
     if ($entries -match '(^|/)(\.git|\.ssh|\.cache|\.tmp|target|logs)(/|$)|(^|/)proxysss\.yaml$') {

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -34,7 +34,7 @@
     .welcome {
       display: grid;
       justify-items: center;
-      gap: 48px;
+      gap: 28px;
       width: min(100%, 900px);
       text-align: center;
     }
@@ -42,7 +42,7 @@
     h1 {
       margin: 0;
       color: #090d1a;
-      font-size: clamp(3.25rem, 7vw, 6rem);
+      font-size: clamp(2.75rem, 6vw, 5rem);
       font-weight: 760;
       line-height: 0.98;
       letter-spacing: -0.055em;
@@ -114,9 +114,10 @@
   <main>
     <section class="welcome" aria-labelledby="welcome-title">
       <h1 id="welcome-title">Welcome to proxysss</h1>
-      <nav aria-label="Project links">
-        <a href="https://github.com/neko233-com/proxysss">GitHub</a>
-        <a href="https://neko233-com.github.io/proxysss/">GitHub Docs</a>
+      <p style="margin:0;color:#68788d;font-size:15px;line-height:1.8">网关已就绪。查看使用文档，开始配置你的网站与服务。</p>
+      <nav aria-label="项目入口">
+        <a href="https://github.com/neko233-com/proxysss">GitHub <span style="font-size:12px;font-weight:400;opacity:.65">源代码 ↗</span></a>
+        <a href="https://neko233-com.github.io/proxysss/">GitHub Docs <span style="font-size:12px;font-weight:400;opacity:.65">使用文档 ↗</span></a>
       </nav>
     </section>
   </main>

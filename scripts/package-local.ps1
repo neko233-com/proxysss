@@ -14,7 +14,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $output) | Out-Null
     $exe = if ($env:OS -eq 'Windows_NT') { 'proxysss.exe' } else { 'proxysss' }
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "$Profile/$exe") -Destination $stage
-    foreach ($name in @('README.md','CHANGELOG.md','proxysss-script.d.ts','docs','examples','templates')) {
+    foreach ($name in @('README.md','README-CN.md','CHANGELOG.md','proxysss-script.d.ts','docs','examples','templates')) {
         Copy-Item -LiteralPath (Join-Path $script:ProjectRoot $name) -Destination $stage -Recurse
     }
     # Stable entry times make unchanged repeated builds produce identical archives.

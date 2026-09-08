@@ -255,12 +255,13 @@
       th, td { padding: 12px; }
     }
   </style>
+  <link rel="stylesheet" href="site.css">
 </head>
 <body>
   <div class="shell">
     <section class="hero">
       <div class="eyebrow">Linux benchmark</div>
-      <h1>Linux benchmark 先看当前结果，再看历史基线。</h1>
+      <h1>Linux 性能验证与历史结果。</h1>
       <p>这页把 v1.3.5 UDP fast path 的新结果放在前面：Docker Ubuntu 24 官方脚本路径 `udp-stream` 跑到 4.045x。历史 mixed-load 数字继续保留，但不再让旧 UDP 行看起来像当前结论。</p>
       <div class="actions">
         <a class="button primary" href="index.html">回到 docs 首页</a>
@@ -290,7 +291,7 @@
 
     <div class="layout">
       <section class="panel">
-        <h2>这页到底在讲什么</h2>
+        <h2>验证范围与数据说明</h2>
         <p>这是 Linux benchmark 的人类可读解释页。v1.3.5 之后，页面先展示当前 UDP fast path 的专项结果，再展示旧 mixed-load 历史基线。这样打开页面时不会把历史 `udp-stream 0.855x` 误读成这次 UDP 优化后的性能。</p>
         <div class="two-up">
           <div class="note good">
@@ -521,5 +522,6 @@ PROXY_BIN=/usr/local/bin/proxysss QUICK=1 DURATION_SECS=12 MIXED_MATRIX=1 \
       GitHub Actions 只负责打包且禁止性能压测；性能判断必须直连 Linux 专机运行 mixed-load 和必要的单场景诊断。v1.3.5 的 UDP fast path 当前专项结果是 4.045x，历史 mixed-load 表只作为整体基线保留。
     </div>
   </div>
+<script src="site.js" defer></script>
 </body>
 </html>

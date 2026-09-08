@@ -149,8 +149,9 @@
       background: linear-gradient(135deg, var(--accent), #baf4ff);
     }
   </style>
+  <link rel="stylesheet" href="site.css">
 </head>
-<body>
+<body class="docs-error">
   <main class="card">
     <div class="toolbar">
       <span id="eyebrow" class="eyebrow">GitHub Pages path mismatch</span>
@@ -217,7 +218,7 @@
       if (saved === "en" || saved === "zh") {
         return saved;
       }
-      return navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+      return "zh";
     }
 
     function applyLanguage(lang) {
@@ -243,5 +244,6 @@
     document.getElementById("langZh").addEventListener("click", () => applyLanguage("zh"));
     applyLanguage(detectLanguage());
   </script>
+<script src="site.js" defer></script>
 </body>
 </html>

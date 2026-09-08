@@ -391,6 +391,7 @@
       h1 { font-size: 40px; }
     }
   </style>
+  <link rel="stylesheet" href="site.css">
 </head>
 <body>
   <div class="shell">
@@ -412,7 +413,7 @@
 
     <header class="hero">
       <div class="eyebrow">configuration / human guide</div>
-      <h1>配置页先解决“该配哪里”，不是先把字段全砸给你。</h1>
+      <h1>按场景配置你的网关。</h1>
       <p>proxysss 的 YAML 目标不是重写一份 nginx 指令百科，而是让你能更快把 HTTP、HTTPS、AI SSE、静态站点、TCP、UDP、MQTT/IoT 边缘流量和自动化管理面放到正确的配置面里。</p>
       <div class="hero-actions">
         <a class="dark" href="#beginner">先跑第一条链路</a>
@@ -460,7 +461,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">Beginner path</div>
-              <h2>先把一条工作链路跑通，再学抽象。</h2>
+              <h2>最小可用配置</h2>
             </div>
             <p class="subtle">这页先给你生产形态的最小配置，再解释为什么它应该落在这个能力面，而不是别处。</p>
           </div>
@@ -530,7 +531,7 @@ services:
           <div class="section-head">
             <div>
               <div class="kicker">Choose the surface</div>
-              <h2>大部分配置问题，真正的核心是“你选错层了”。</h2>
+              <h2>选择对应的配置项</h2>
             </div>
             <p class="subtle">proxysss 把通用网关能力拆成多个清晰配置面。先选对面，再谈字段。</p>
           </div>
@@ -587,7 +588,7 @@ services:
           <div class="section-head">
             <div>
               <div class="kicker">Common combinations</div>
-              <h2>高手最常用的组合不是“更复杂”，而是“边界更清楚”。</h2>
+              <h2>组合网站、代理与流量转发</h2>
             </div>
             <p class="subtle">这些组合都围绕真实上线情境写：缓存、健康检查、DNS-01、管理自动化、游戏长连接和 UDP 并行接入。</p>
           </div>
@@ -676,7 +677,7 @@ udp:
           <div class="section-head">
             <div>
               <div class="kicker">Reload + warm-up</div>
-              <h2>热重载不是“只会重新读 YAML”，还会做预热。</h2>
+              <h2>热重载与启动预热</h2>
             </div>
               <p class="subtle">proxysss 在配置加载和热重载后会重新计算路由，读取 service_discovery 映射，预热静态文件缓存或 sendfile 描述符，并为 reverse proxy / AI proxy 预拨 keepalive 池。</p>
           </div>
@@ -708,7 +709,7 @@ udp:
           <div class="section-head">
             <div>
               <div class="kicker">Windows Operations</div>
-              <h2>Windows 登录时保持真正的后台启动。</h2>
+              <h2>Windows 后台运行与登录自启动</h2>
             </div>
             <p class="subtle">`service install` 优先使用当前用户的 HKCU Run，并通过 `wscript //B //Nologo` 隐藏启动；同时清理旧版本的直接执行型计划任务，避免 cmd 弹窗和重复进程。</p>
           </div>
@@ -724,7 +725,7 @@ proxysss service stop</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Performance</div>
-              <h2>性能结论必须看 mixed-load，不看单场景截图。</h2>
+              <h2>验证混合流量下的性能</h2>
             </div>
               <p class="subtle">proxysss 的性能优化必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。</p>
           </div>
@@ -757,7 +758,7 @@ scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Operations</div>
-              <h2>真正排障时，还是要回到 CLI 可观察面。</h2>
+              <h2>使用命令行排查问题</h2>
             </div>
             <p class="subtle">这些命令是给人和 agent 都能快速看懂的，不需要自己翻 YAML 猜最终效果。</p>
           </div>
@@ -775,7 +776,7 @@ proxysss token show</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Mistakes</div>
-              <h2>最常见的三个方向性错误</h2>
+              <h2>常见配置问题</h2>
             </div>
             <p class="subtle">这些不是单个字段的拼写错误，而是会把整个网关越配越乱的思路问题。</p>
           </div>
@@ -801,6 +802,8 @@ proxysss token show</code></pre>
           </div>
         </section>
       <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
+<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+<section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 </main>
     </div>
 
@@ -808,6 +811,8 @@ proxysss token show</code></pre>
       <strong>文档分工写清楚：</strong> 这页负责给人讲清配置落地路径；仓库里另有面向 agent、检索和差异跟踪的机器文档入口。
     </footer>
   </div>
-<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+
+
+<script src="site.js" defer></script>
 </body>
 </html>

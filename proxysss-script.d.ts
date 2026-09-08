@@ -1,3 +1,4 @@
+// 运维文档：管理监听器 /docs.html；README.md（English）与 README-CN.md（中文）。
 /** 安全开关建议由 config security 输出；系统 socket 适配由 config performance 检查。
  * CDN/FTP 开关属于原生配置，不增加读取秘密的脚本 API。详见 docs/security-performance.html。
  */

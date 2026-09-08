@@ -1,564 +1,116 @@
 # proxysss
 
-proxysss is a same-level replacement for nginx as a general-purpose edge gateway. It keeps HTTP, HTTPS, HTTP/2, HTTP/3, gRPC-over-HTTP/2, WebSocket, TCP, UDP, MQTT/IoT edge patterns, FTP, WebDAV, AI reverse proxy routes, TLS automation, logs, and reload behavior in one Rust binary and one YAML file.
+**English** · [简体中文](README-CN.md) · [Documentation](https://neko233-com.github.io/proxysss/) · [Downloads](https://github.com/neko233-com/proxysss/releases/latest)
 
-It also keeps practical gateway features like static asset serving with Range downloads, cache/proxy cache, compression, Consul/etcd/Nacos discovery configuration, Kubernetes ingress-style mappings, CDN origin routes, IPv6 CIDR access policy, and rate limiting algorithms including fixed-window, token-bucket, and leaky-bucket in the same configuration surface.
+One Rust binary and one YAML file for websites, APIs, and realtime connections. proxysss is a general-purpose gateway designed to replace nginx. Optional embedded TypeScript scripts and plugins handle application-specific extensions.
 
-If you only remember one thing, remember this: `proxysss` is for ordinary gateway work first, and optional TypeScript plugins second.
+## Install and run in the background
 
-## Read This README In Two Ways
+Windows PowerShell:
 
-### Beginner path
+```powershell
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
+```
 
-Use this path if you want to:
-
-- put one website or API behind a gateway
-- understand which YAML block to touch
-- get a copy-paste example and a plain-language explanation
-
-### Expert path
-
-Use this path if you want to:
-
-- choose between `domain_routes`, `reverse_proxy`, `ai_proxy`, `tcp.listeners`, and `udp.listeners`
-- benchmark against nginx
-- expose the admin API safely
-- tune Linux for production without hurting other traffic shapes
-
-## Beginner Path
-
-### 1. Install and initialize
-
-Linux and macOS:
+Linux / macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
 ```
 
-Windows PowerShell:
+Check the installation and startup registration:
 
-```powershell
-irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1 | iex
-```
-
-To pin the installer to a specific release instead of following `latest`:
-
-```powershell
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version 1.3.7
-```
-
-On Windows, `proxysss service install` registers a hidden HKCU Run launcher (`wscript //B //Nologo`) and removes legacy direct-console scheduled tasks. If an old task was created with elevated privileges, run the command once from an elevated PowerShell window. Check the result with:
-
-```powershell
+```bash
+proxysss --version
+proxysss check-config
 proxysss service status
 ```
 
-Create a starter workspace:
+For a manual first installation, run `proxysss init`, then `proxysss service install`. Windows uses a hidden launcher at user logon; Linux uses systemd, and macOS uses a LaunchAgent. Linux listeners on ports 80/443 require the appropriate port permissions.
 
-```bash
-proxysss init
-```
+| Address | Purpose |
+| --- | --- |
+| `http://127.0.0.1/` | Minimal welcome page and documentation links on port 80 |
+| `http://127.0.0.1:7777/` | Admin console, bound to loopback by default |
+| `http://127.0.0.1:7777/docs.html` | Built-in documentation from the admin listener |
+| `http://127.0.0.1/docs.html` | Built-in documentation from the public listener |
 
-This gives you:
+Fresh installations use `root` / `root` for the console. Change these credentials before production use. Configuration exposure and write operations are disabled by default; viewing runtime status does not require enabling either. The console retains login and session verification.
 
-- `proxysss.yaml`
-- `gateway.ts`
-- `proxysss-script.d.ts`
-- `ts-how-to-use.md`
-- `nginx-to-proxysss.md`
-- example plugins and self-signed certs
+## Configure your first website
 
-### 2. Your first working reverse proxy
-
-If you have an app listening on `127.0.0.1:9000`, this is the easiest production-shaped starting point:
+The default configuration file is `proxysss.yaml`. Select another path with `-c`, `--config`, or `-config`. Merge this example into the corresponding block of your existing configuration:
 
 ```yaml
-http:
-  plain_bind: 0.0.0.0:80
-  tls_bind: 0.0.0.0:443
-  h3_bind: 0.0.0.0:443
-
 services:
-  domain_routes:
-    - name: app
-      domains: [example.com, www.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
+  reverse_proxy:
+    routes:
+      - name: my-app
+        hosts: [app.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:3000
 ```
 
-What each part means:
-
-- `plain_bind` exposes public HTTP on port `80`.
-- `tls_bind` exposes HTTPS and default-preferred HTTP/2 on port `443`; a fresh default config bootstraps a self-signed certificate until production TLS is configured.
-- `h3_bind` exposes HTTP/3 on port `443/udp`.
-- `domain_routes` is the recommended HTTP routing model when you care about hostnames.
-- `domains` is the host list this route should answer for.
-- `upstream` is the backend app that will receive the request.
-
-When no user route owns `/`, the Rust gateway returns a zero-asset `Welcome to proxysss` page with only GitHub and GitHub Docs links.
-
-Check the file before you run it:
+Point the domain to your server and make sure the upstream is running. Validate the configuration, inspect reload boundaries, and restart the background process:
 
 ```bash
-proxysss -config ./proxysss.yaml check-config
+proxysss check-config
+proxysss config reload-plan
+proxysss restart
 ```
 
-Start the gateway:
-
-```bash
-proxysss -config ./proxysss.yaml
-```
-
-### 3. Add automatic HTTPS
-
-If you want managed TLS without writing certificate files yourself:
+To serve a static website:
 
 ```yaml
-http:
-  plain_bind: 0.0.0.0:80
-  tls_bind: 0.0.0.0:443
-  h3_bind: 0.0.0.0:443
-  tls:
-    auto_https:
-      domains: [wss.example.com]
-
-services:
-  domain_routes:
-    - name: game-wss
-      domains: [wss.example.com]
-      path_prefix: /
-      upstream: http://127.0.0.1:9000
-```
-
-How to think about it:
-
-- `auto_https.domains` 非空就自动启用免费的内建 managed ACME。生产默认使用 TLS-ALPN-01 与 ECDSA P-256 证书密钥，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。极老旧客户端可显式设置 `http.tls.acme.key_algorithm: rsa2048`；原有 `challenge: http01` 仍完整兼容（需开放 80）。
-- The domain's public A/AAAA record must reach this host and ports 80 and 443 must be reachable. `email` is optional; adding it enables certificate-expiry/security notices.
-- The route still lives in `domain_routes`; TLS automation does not change how you declare backends.
-
-### 4. Serve a static site
-
-If you just want to serve files from disk:
-
-```yaml
-http:
-  plain_bind: 0.0.0.0:80
-
 services:
   static_sites:
-    - name: marketing
+    - name: my-static-site
       path_prefix: /
       root: ./public
       index_files: [index.html]
       autoindex: false
 ```
 
-What matters here:
+Static delivery supports HTML, images, fonts, audio/video, streaming large files, HEAD, byte Range downloads, and cache validators. Directory listings are opt-in. Dotfiles are hidden by default, and resolved paths remain within the site root. See the [static and CDN origin guide](https://neko233-com.github.io/proxysss/cdn-origin.html).
 
-- `path_prefix` is the URL path the static site owns.
-- `root` is the local directory to serve from.
-- `index_files` controls which file becomes `/`.
-- `autoindex: false` is the normal public-site default.
+## Capabilities
 
-### 5. Proxy AI streaming / SSE correctly
+| Area | Support |
+| --- | --- |
+| Websites and APIs | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, gRPC-over-HTTP/2, WebSocket, reverse proxying, compression, cache/proxy cache |
+| Traffic policy | IP/CIDR access control, fixed-window / token-bucket / leaky-bucket rate limiting, health checks, weighted upstreams, retries and passive quarantine |
+| Files and CDN | Static sites, authenticated CDN origin requests, signed URLs, WebDAV, FTP and FileCloud |
+| Realtime protocols | TCP/UDP, game connections, MQTT TCP/TLS/WebSocket, CoAP-style UDP, transparent KCP/QCP forwarding |
+| AI and discovery | New API / sub2api / OpenAI-compatible forwarding; Consul / etcd / Nacos registry integration |
+| Certificates and extensions | Built-in ACME, wildcard DNS-01, configuration reload, in-process TypeScript and optional plugins |
 
-Use `services.ai_proxy` when you want the gateway to understand New API, sub2api, or OpenAI-compatible upstreams instead of treating them as generic HTTP:
+MQTT application behavior remains in the upstream broker; proxysss forwards edge traffic. TypeScript runs through embedded QuickJS and in-process type stripping, without Node, Deno, or an external compiler.
 
-```yaml
-services:
-  ai_proxy:
-    enabled: true
-    routes:
-      - name: new-api
-        provider: new-api
-        match_host: ai.example.com
-        path_prefix: /v1
-        upstream: http://127.0.0.1:3000
-        rewrite_base_path: /v1
-        emit_metadata_headers: false
-        forward_headers: false
-```
+Use `http.tls.auto_https.domains` for automatic certificates on ordinary domains. Wildcards use `http.tls.acme.challenge: dns01` and a configured DNS provider. See the [configuration guide](https://neko233-com.github.io/proxysss/configuration.html).
 
-Why this is different from a normal reverse proxy:
-
-- `provider` selects the built-in AI gateway behavior.
-- `rewrite_base_path` lets the public URL and upstream URL differ cleanly.
-- `emit_metadata_headers: false` is useful for nginx-parity and SSE-sensitive paths.
-- `forward_headers: false` is useful when the upstream does not need `X-Forwarded-*` and you want the leanest path.
-
-## Expert Path
-
-### Pick the right routing surface
-
-| If you need to route... | Use this | Why |
-| --- | --- | --- |
-| one or more hostnames to HTTP backends | `services.domain_routes` | best default for websites and APIs |
-| path/host-based HTTP without domain-first grouping | `services.reverse_proxy.routes` | lower-level HTTP route model |
-| New API / sub2api / OpenAI-compatible traffic | `services.ai_proxy.routes` | native AI path rewrite and streaming-friendly behavior |
-| static files | `services.static_sites` | built-in file serving and welcome page fallback |
-| large downloads / CDN origin assets | `services.static_sites` + `services.response_policy.cache` | byte Range downloads, hot small-file cache, streaming large files |
-| WebDAV | `services.webdav` | built-in authoring file surface |
-| raw TCP | `tcp.listeners` | long-lived binary streams, games, tools, MQTT |
-| raw UDP, KCP-style UDP, or QCP UDP traffic | `udp.listeners` | realtime datagram traffic with TTL and cap control |
-| TLS SNI stream routing | `tcp.stream_routes` | Redis/MySQL/PostgreSQL/MongoDB-style passthrough |
-| Consul / etcd / Nacos linkage | `services.service_discovery` | registry metadata that automation can map into HTTP/TCP/UDP upstream pools |
-
-### Reverse proxy with cache, rate limit, and health
-
-```yaml
-load_balance:
-  algorithm: weighted
-  retries:
-    enabled: true
-    max_retries: 2
-  active_health:
-    enabled: true
-    http_enabled: true
-    tcp_enabled: true
-    udp_enabled: false
-    path: /healthz
-    interval_secs: 10
-    timeout_ms: 2000
-
-services:
-  domain_routes:
-    - name: api
-      domains: [api.example.com]
-      path_prefix: /v1
-      upstream: http://127.0.0.1:8080
-      upstreams:
-        - http://127.0.0.1:8080
-        - http://127.0.0.1:8081
-      upstream_weights:
-        "http://127.0.0.1:8080": 1
-        "http://127.0.0.1:8081": 3
-      strip_prefix: true
-      cache:
-        enabled: true
-        ttl_secs: 30
-        stale_while_revalidate_secs: 15
-      rate_limit:
-        enabled: true
-        algorithm: token_bucket
-        requests: 120
-        window_ms: 60000
-        burst: 30
-```
-
-What this does in practice:
-
-- gives you one hot route with a weighted upstream pool
-- retries failed upstream attempts
-- actively probes `/healthz`
-- caches short-lived API responses
-- rate-limits the edge before bad traffic reaches the app
-
-For the broad production matrix, start from `examples/all-scenarios.example.yaml`. It covers static HTML/CSS/JS/image/font/audio/video assets, Range downloads, HTTP/1.1 and HTTP/2/gRPC reverse proxying, WebSocket, API gateway policy chains, ACME, WAF/anti-CC primitives, hotlink/crawler plugin hooks, TCP/UDP stream load balancing, Consul/etcd/Nacos discovery mappings, Kubernetes ingress-style service mapping, CDN origin routes, and IPv6 access rules.
-
-### MQTT / IoT edge
-
-```yaml
-tcp:
-  listeners:
-    - name: mqtt
-      bind: 0.0.0.0:1883
-      protocol: mqtt
-      nodelay: true
-      connect_timeout_ms: 3000
-      upstreams:
-        - 127.0.0.1:18831
-        - 127.0.0.1:18832
-  stream_routes:
-    - name: mqtt-tls
-      domains: [mqtt.example.com]
-      listen: 0.0.0.0:8883
-      upstream: 127.0.0.1:88831
-      protocol: mqtt
-      tls_mode: passthrough
-
-udp:
-  listeners:
-    - name: coap
-      bind: 0.0.0.0:5683
-      protocol: coap
-      session_ttl_secs: 120
-      max_associations: 262144
-      upstreams:
-        - 127.0.0.1:56831
-
-services:
-  reverse_proxy:
-    routes:
-      - name: mqtt-websocket
-        hosts: [mqtt-ws.example.com]
-        path_prefix: /mqtt
-        upstream: ws://127.0.0.1:8083
-```
-
-How to read this example:
-
-- plain MQTT is just TCP at the edge
-- MQTT TLS passthrough is a stream route keyed by SNI
-- MQTT over WebSocket stays on the HTTP/WebSocket surface
-- CoAP-style device traffic stays on `udp.listeners`
-
-### Game TCP, KCP-style UDP, and QCP UDP
-
-```yaml
-tcp:
-  listeners:
-    - name: game-tcp
-      bind: 0.0.0.0:7000
-      protocol: game_tcp
-      nodelay: true
-      connect_timeout_ms: 3000
-      upstreams:
-        - 127.0.0.1:9000
-        - 127.0.0.1:9001
-
-udp:
-  listeners:
-    - name: game-kcp
-      bind: 0.0.0.0:7001
-      protocol: kcp
-      session_ttl_secs: 180
-      max_associations: 262144
-      upstreams:
-        - 127.0.0.1:9100
-        - 127.0.0.1:9101
-    - name: game-qcp
-      bind: 0.0.0.0:7002
-      protocol: qcp
-      session_ttl_secs: 180
-      max_associations: 262144
-      upstreams:
-        - 127.0.0.1:9200
-        - 127.0.0.1:9201
-```
-
-Important knobs:
-
-- `nodelay: true` keeps latency-sensitive TCP from waiting on Nagle batching.
-- `connect_timeout_ms` controls how long a new upstream dial may block.
-- `session_ttl_secs` should be comfortably above your client heartbeat interval.
-- `max_associations` protects the box from unbounded UDP churn.
-- KCP and QCP are configured as independent UDP listeners. Use `protocol: kcp` for KCP-style traffic and `protocol: qcp` for neko233-com/QCP.
-- `protocol: qcp` is transparent UDP forwarding; QCP framing and reliability stay in your upstream service.
-
-### Built-in wildcard TLS with DNS-01
-
-```yaml
-http:
-  tls:
-    mode: acme_managed
-    cert_path: certs/proxysss-cert.pem
-    key_path: certs/proxysss-key.pem
-    generate_self_signed_if_missing: false
-    server_name: example.com
-    acme:
-      email: admin@example.com
-      challenge: dns01
-      key_algorithm: ecdsa_p256 # 推荐默认；老旧客户端可改 rsa2048
-      domains: [example.com, "*.example.com"]
-      directory_production: true
-      renew_interval_hours: 12
-      dns:
-        provider: cloudflare
-        credentials:
-          api_token: your-cloudflare-api-token
-```
-
-Use this when:
-
-- you need a wildcard certificate
-- you want DNS-01 inside the gateway instead of external `acme.sh`
-- your provider is one of the built-in strategies: `cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`
-
-## Commands You Will Actually Use
-
-Inspect the effective config:
+## Operate and inspect
 
 ```bash
-proxysss -config ./proxysss.yaml check-config
-proxysss -config ./proxysss.yaml config explain
-proxysss -config ./proxysss.yaml config routes
-proxysss -config ./proxysss.yaml config reload-plan
-proxysss -config ./proxysss.yaml config capabilities
-proxysss -config ./proxysss.yaml config nginx-parity --format yaml
+proxysss config explain
+proxysss config routes
+proxysss config security
+proxysss config performance
+proxysss config watched-scripts
+proxysss config nginx-parity --format yaml
+proxysss service status
 ```
 
-Validate the full scenario sample in Docker when you need Linux-grounded evidence:
+Access and error logs default to `logs/access.log` and `logs/error.log`, with level `info`. Security and performance settings include defaults and recommendations in the [security and platform guide](https://neko233-com.github.io/proxysss/security-performance.html).
 
-```bash
-scripts/verify-docker-scenarios.sh
-```
+Performance validation runs locally on Linux. GitHub Actions validates release materials and packages six platforms; it does not run tests or benchmarks. A functional release does not establish strict performance superiority over nginx.
 
-On Windows PowerShell:
+## Documentation
 
-```powershell
-.\scripts\verify-docker-scenarios.ps1
-```
+The official detailed guides are Chinese first; both README editions cover installation and everyday operation.
 
-Manage the local automation token:
+- [Getting started and examples](https://neko233-com.github.io/proxysss/)
+- [Configuration](https://neko233-com.github.io/proxysss/configuration.html) · [Architecture](https://neko233-com.github.io/proxysss/architecture.html)
+- [TypeScript and plugins](https://neko233-com.github.io/proxysss/ts-how-to-use.html)
+- [Migrate from nginx](https://neko233-com.github.io/proxysss/nginx-to-proxysss.html) · [Migrate from Caddy](https://neko233-com.github.io/proxysss/caddy-to-proxysss.html)
 
-```bash
-proxysss token show
-proxysss token set
-proxysss token set my-custom-cluster-token
-```
-
-Run the embedded TypeScript runtime:
-
-```bash
-proxysss script run-file ./examples/gateway.ts
-proxysss script eval "console.log('proxysss ts runtime ok')"
-```
-
-## Admin API Example
-
-The admin plane is loopback-first and write-disabled by default. Turn on write operations only when you intentionally want automation to mutate `proxysss.yaml`.
-
-```yaml
-admin:
-  enabled: true
-  bind: 127.0.0.1:7777
-  bearer_token: change-this-cluster-token
-  enable_write_ops: true
-  expose_config: false
-  loopback_only: true
-```
-
-Example route upsert:
-
-```bash
-curl -X POST http://127.0.0.1:7777/v1/domain-routes/upsert \
-  -H "Authorization: Bearer change-this-cluster-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "node-17-api",
-    "domains": ["api.example.com"],
-    "path_prefix": "/",
-    "upstream": "http://10.0.0.17:8080"
-  }'
-```
-
-What happens after this call:
-
-- the token is checked
-- the named route is inserted or updated in the main YAML file
-- the updated file is written back to disk
-- hot-reloadable parts are reloaded in process
-
-## Performance And Production Rules
-
-Performance work in `proxysss` follows two rules:
-
-- benchmark the path you changed
-- prove you did not make sibling paths worse
-
-That means a faster SSE path is not accepted if it makes static delivery, reverse proxy, WebSocket, TCP, UDP, or transparent QCP forwarding slower or less stable without explicit approval. KCP/QCP protocol termination stays outside the nginx comparison; the strict local matrix compares only QCP-labelled transparent UDP edge forwarding against an equivalent nginx UDP listener.
-
-Production validation flow:
-
-```bash
-proxysss tune linux --apply
-bash scripts/benchmark-ubuntu24-amd64-docker.sh
-STRICT_SUPERIORITY=1 PROXY_BIN=target/release/proxysss \
-  scripts/benchmark-all-scenarios-isolated.sh
-PROXY_BIN=target/release/proxysss \
-  scripts/benchmark-production-scale-matrix.sh
-```
-
-The default matrix uses 18 seconds of active client measurement under a hard 20-second limit: one saturation sample and two reversed-order equal-load samples per gateway at each 1x/2x/4x scale. Process startup, connection/resource/session warm-up, result copying, and report parsing are excluded and reported separately as wall time. Each wave still has a four-second process grace that terminates stuck in-container generators and fails the run. `proxysss bench` and fixture `demo` commands create a child Tokio runtime from `TOKIO_WORKER_THREADS`, so the recorded saturation/equal-load client and backend CPU budgets are the workers that actually execute I/O rather than metadata-only settings hidden by the single-thread gateway supervisor. The synchronized future-start lead is 2000 ms so the 4x wave can finish all 11 process-local connection pools and protocol warm-ups before the shared timestamp; before it, both candidates preconnect plain HTTP/1 pools at the declared concurrency while HTTPS/H2 preconnects its multiplexed session, execute two real GET/SSE requests, and complete one WebSocket/TCP/UDP/QCP echo per connection. Static/reverse cache fill, stale-while-revalidate, stream relay activation, and UDP association creation therefore stay outside the active window for both gateways. The UDP/QCP response timeout remains 500 ms outside active measurement.
-
-`benchmark-ubuntu24-amd64-docker.sh` accepts either a native amd64 Docker daemon or a local arm64 daemon with `linux/amd64` emulation, but hard-checks the controller and benchmark images as Ubuntu 24.04 x86_64. Windows Docker Desktop is supported from Git Bash through its local `npipe://` endpoint; Linux/macOS use the local Unix socket. It builds the current checkout there, records `native-amd64` versus `emulated-amd64`, then pins gateway, backend, and load-client containers to disjoint CPU sets before running strict 1x/2x/4x mixed and equal-offered-load waves. When registry metadata is temporarily unavailable, `REUSE_BENCH_IMAGE=1` reuses the local controller image without skipping the Ubuntu 24.04/amd64 probe. `TRAFFIC_PROFILE=small|balanced|bulk`, `RUN_ORDER`, `LATENCY_RUN_ORDER`, `BENCH_SUBNET` and explicit role IPs are forwarded and written to the run fingerprint for reproducible default/profile and order checks. The full mixed gate requires at least 24 Docker CPUs. Each wave creates one client container containing 11 independent protocol processes; every process waits on the same absolute `--start-at-unix-ms`, but `taskset` gives every scenario a disjoint CPU partition. Backend HTTP, SSE, WebSocket, TCP, UDP, and QCP echo processes are likewise partitioned, with UDP and QCP using separate upstream listeners. Per scale, one backend plus both gateway containers stay warm; the inactive gateway is paused on the shared cpuset, so only the measured candidate runs. Container creation and emulated startup therefore cannot shorten or stagger the measurement window. Every scale expands HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP and transparent QCP together. The default feedback gate takes one synchronized one-second saturation sample plus two reversed-order equal-load samples per gateway/scale, reports the equal-load median, and uses 18 seconds of active client measurement under a hard 20-second cap; build, image setup, container preparation, warm-up, process startup, result collection, and parsing are excluded from `validation_elapsed_secs`, while `validation_wall_elapsed_secs` records orchestration time. It requires zero errors. Benchmark artifacts under `.benchmark/` are disposable and removed by default; set `KEEP_BENCH_ARTIFACTS=1` or `BENCH_ROOT` to retain raw evidence. Per-scenario and per-service CPU partitions prevent a faster closed-loop stream path from consuming extra client/backend CPU and falsely starving sibling gateway paths. Emulated local results compare both gateways under the same cost but must not be presented as physical-x86 evidence. On an arm64 Docker host the wrapper requires Zig, cargo-zigbuild, and the Rust x86_64-unknown-linux-gnu target; it compiles the release ELF at native host speed, then hard-verifies that exact binary inside Ubuntu 24 amd64 before measuring, instead of spending minutes compiling under QEMU. nginx is mainline 1.31.2 built with `-O3 -fno-plt` and receives the same gateway cpuset. Equal-load defaults to 25% of the slower gateway's measured saturation rate, leaving real latency headroom while all 11 isolated generators run; fixed-load rows must still complete at least 98% of target and beat every latency percentile. Optional serial per-scenario saturation is disabled by default and uses the full client cpuset when explicitly enabled. Memory is observed and reported by default; set a Docker or systemd memory limit only for a real declared production envelope.
-
-For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, then uses a remote systemd cgroup to enforce `AllowedCPUs=0-3` and `LimitNOFILE=300000` for both nginx and proxysss. It records cgroup current/peak memory plus per-connection cost, host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. `GATEWAY_MEMORY_MAX` is optional (default `infinity`); set it to `8G` only when that is the declared production envelope. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
-
-```bash
-GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
-GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
-  bash scripts/benchmark-cross-host-wss.sh
-```
-
-For the release-evidence 1x/2x/4x cross-host replay, keep the realistic 20k idle hold and scale only active WSS load by default:
-
-```bash
-GATEWAY_HOST=gw-ssh BACKEND_HOST=be-ssh \
-GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
-  bash scripts/benchmark-cross-host-scale-matrix.sh
-```
-
-When a stale Docker benchmark network occupies the default subnet, set an unused `/16` such as `BENCH_SUBNET=172.31.0.0/16`; the WSS scripts derive every role address from it. A restricted Linux controller may use a trusted, same-architecture Go-native helper with `PREBUILT_BENCH_HELPER=/opt/benchmark-helper`; build it from this repository with `GOOS=linux GOARCH=amd64 go build -o /opt/benchmark-helper scripts/benchmark-helper.go`.
-
-Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles. Functional release quality is checked by the release workflow with rustfmt, tests, and Clippy; performance benchmarks remain operator-run on local Ubuntu 24 x86_64 Docker containers or dedicated Linux hosts. A release tag does not require a performance manifest: `performance-evidence/vX.Y.Z.json` is optional evidence for performance claims. When present, the v2 manifest records direct per-scenario ops/s, p50/p95/p99, errors, WSS capacity metrics, and proxysss/nginx current/peak/per-connection memory; the release validator rejects a missing scenario, non-zero error, equality/regression in any metric, proxysss memory above 2x nginx, or a synthetic 100k capacity claim.
-
-Current UDP fast-path evidence for v1.3.5:
-
-- Docker Ubuntu 24 UDP-only official script path: `4.045x`
-- `proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`
-- errors: `0 / 0`
-
-What that benchmark means:
-
-- it is Linux-only release evidence
-- it is a UDP-only diagnostic from the official Go helper path, not proof that the full mixed matrix passed
-- the release gate separately compares nginx-comparable static, reverse proxy, generic SSE, WebSocket, game TCP, generic TCP, and UDP together
-- New API provider routes and KCP/QCP special UDP encapsulations stay supported as product capabilities but remain outside the protocol-termination matrix; transparent QCP-labelled UDP forwarding is included in the strict local Docker comparison
-- it uses a fair default ratio floor instead of pretending every feature-rich gateway must win every micro-benchmark outright
-
-For WebSocket capacity, distinguish active-message `ops/s` from concurrent connections. The native hold mode opens and keeps sockets without converting every connection into an echo-rate workload:
-
-```bash
-proxysss bench websocket --url ws://gateway.example.com/gateway/ws \
-  --connections 20000 --hold-connections --connect-workers 128 \
-  --connect-timeout-ms 10000 --connect-retries 4 --duration-secs 30
-```
-
-The production gate defaults to 20k idle WSS connections and up to 4096 active message connections on a 4c gateway. It records resource use and only applies a Docker/systemd memory limit when the operator declares one. If you intentionally raise the capacity target above one source address's ephemeral-port range, use multiple client source IPs and multiple backend `IP:port` tuples (or a proxy source-IP pool); that four-tuple limit is a TCP constraint rather than a gateway implementation detail.
-
-For a production-style WSS gateway comparison, run `bash scripts/benchmark-websocket-production-gate.sh` on a 16-core-or-larger Linux Docker host with enough RAM for four backends and multiple client containers. It compares nginx and proxysss with the same active WSS workload (ops/s, p50/p95/p99) and a 20k idle-connection hold test, with repeated interleaved runs and median gates. The Docker roles are cgroup/network-namespace isolated; resource snapshots are mandatory, while Docker memory limits are opt-in declared budgets. Use `benchmark-cross-host-wss.sh` before making a physical-network latency claim.
-
-## Docs Map
-
-- [docs/configuration.html](docs/configuration.html) — human-facing configuration guide
-- [docs/PRODUCTION-HARDENING.md](docs/PRODUCTION-HARDENING.md) — Linux tuning, benchmark gates, and production guardrails
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — text architecture walkthrough
-- [docs/architecture.html](docs/architecture.html) — visual architecture lab
-- [docs/AGENT-API.md](docs/AGENT-API.md) — admin API automation examples
-- [docs/SECURITY.md](docs/SECURITY.md) — security defaults and hardening
-- [docs/nginx-to-proxysss.html](docs/nginx-to-proxysss.html) — human-facing nginx migration guide
-- [docs/caddy-to-proxysss.html](docs/caddy-to-proxysss.html) — human-facing Caddy migration guide
-- [docs/ts-how-to-use.html](docs/ts-how-to-use.html) — human-facing embedded TypeScript guide
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — machine-facing configuration cookbook
-- [nginx-to-proxysss.md](nginx-to-proxysss.md) — machine-facing nginx migration notes
-- [caddy-to-proxysss.md](caddy-to-proxysss.md) — machine-facing Caddy migration notes
-- [ts-how-to-use.md](ts-how-to-use.md) — machine-facing embedded TypeScript runtime guide
-- [proxysss-script.d.ts](proxysss-script.d.ts) — scripting types
-
-Public docs site:
-
-- [https://neko233-com.github.io/proxysss/](https://neko233-com.github.io/proxysss/)
-- [https://neko233-com.github.io/proxysss/configuration.html](https://neko233-com.github.io/proxysss/configuration.html)
-- [https://neko233-com.github.io/proxysss/architecture.html](https://neko233-com.github.io/proxysss/architecture.html)
-- [https://neko233-com.github.io/proxysss/nginx-to-proxysss.html](https://neko233-com.github.io/proxysss/nginx-to-proxysss.html)
-- [https://neko233-com.github.io/proxysss/caddy-to-proxysss.html](https://neko233-com.github.io/proxysss/caddy-to-proxysss.html)
-- [https://neko233-com.github.io/proxysss/ts-how-to-use.html](https://neko233-com.github.io/proxysss/ts-how-to-use.html)
-
-Runtime-built docs inside a live gateway:
-
-- `http://localhost/docs`
-- `http://localhost/docs.html`
-
-## CDN 回源、安全下载与幂等验证
-
-新增 CDN 回源令牌、真实对端 CIDR、短期签名 URL、站点限流与安全目录索引。
-
-完整说明：[CDN 回源与安全下载](docs/CDN-ORIGIN.md)；面向人的入口：[HTML 文档](docs/cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
-
-`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
-
-
-## 安全开关与跨系统性能适配
-
-`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。
+Local validation, caches and packages use fixed project-local `.tmp`, `.cache`, `target` and `dist` paths. On Windows, run `test.cmd` or `scripts/verify-docker-scenarios.ps1`. Scenario validation uses the fixed Docker container `proxysss-verify` and removes it when finished.

@@ -169,3 +169,11 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 ## 安全开关与跨系统性能适配
 
 `proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。
+
+
+## 内置界面维护
+
+- 管理后台模板为 `templates/admin.html` 与 `templates/admin.css`，内置文档模板为 `templates/docs.html`，共享公开文档资源 `docs/site.css` / `docs/site.js`；全部嵌入二进制。公开文档只链接 HTML。
+- 管理监听器 `/docs` 和 `/docs.html` 在管理传输访问检查后提供静态使用文档，不暴露实际运行配置或凭据。后台中文默认，原始 JSON 诊断默认折叠，保持登录、会话与只读安全边界。
+- `README.md` 使用英文，`README-CN.md` 使用中文，两者的配置示例和运维说明同步维护并随安装包分发。
+- 网页视觉和交互验收仅使用已安装的应用内 Browser 插件。

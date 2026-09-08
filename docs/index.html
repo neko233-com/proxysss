@@ -388,12 +388,13 @@
       }
     }
   </style>
+  <link rel="stylesheet" href="site.css">
 </head>
 <body>
   <div class="shell">
     <header class="hero">
       <div class="eyebrow">proxysss docs / nginx-level gateway, but readable</div>
-      <h1>先给你能跑的配置，再给你完整能力地图。</h1>
+      <h1>从安装到运行，逐步配置你的网关。</h1>
       <p>这套文档分成两条路线：新手先复制成功，再理解每个字段；高手直接定位 `HTTP / TLS / AI SSE / TCP / UDP / reload / performance` 的真实边界，不用在宣传文案里兜圈子。</p>
       <div class="actions">
         <a class="button primary" href="#beginner">我是新手，先跑起来</a>
@@ -440,7 +441,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">Beginner path</div>
-              <h2>如果你是新手，先把一条链路跑通。</h2>
+              <h2>快速开始</h2>
             </div>
             <p class="subtle">这不是“先背概念再动手”的文档。你应该先有一个能工作的配置，然后再知道为什么它工作。</p>
           </div>
@@ -482,7 +483,7 @@ services:
           <div class="section-head">
             <div>
               <div class="kicker">Copy-paste recipes</div>
-              <h2>核心场景都给你现成配置，不让你猜。</h2>
+              <h2>常用配置示例</h2>
             </div>
             <p class="subtle">每个案例都围绕真实落地场景写：为什么要这样配、哪些字段必须改、最容易踩的坑是什么。</p>
           </div>
@@ -632,7 +633,7 @@ tcp:
           <div class="section-head">
             <div>
               <div class="kicker">Expert path</div>
-              <h2>如果你是高手，先看能力面边界，再决定配置落点。</h2>
+              <h2>进阶配置与能力边界</h2>
             </div>
             <p class="subtle">这张表不是营销词汇表，而是“应该配到哪里”的决策速查。</p>
           </div>
@@ -689,7 +690,7 @@ tcp:
           <div class="section-head">
             <div>
               <div class="kicker">Operations</div>
-              <h2>文档不是终点，真正排障要回到 CLI。</h2>
+              <h2>检查运行状态与排查问题</h2>
             </div>
             <p class="subtle">下面这些命令都是给人和 agent 都能快速看懂的，不需要翻 YAML 原文猜最终效果。</p>
           </div>
@@ -709,7 +710,7 @@ proxysss token show</code></pre>
           <div class="section-head">
             <div>
               <div class="kicker">Read next</div>
-              <h2>继续往下看什么</h2>
+              <h2>更多使用指南</h2>
             </div>
             <p class="subtle">把文档入口按角色拆开，避免新手一进来就掉进参数海，也避免高手被迫看一页介绍性废话。</p>
           </div>
@@ -748,6 +749,8 @@ proxysss token show</code></pre>
           </div>
         </section>
       <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
+<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+<section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 </main>
     </div>
 
@@ -755,6 +758,8 @@ proxysss token show</code></pre>
       <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
     </footer>
   </div>
-<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
+
+
+<script src="site.js" defer></script>
 </body>
 </html>

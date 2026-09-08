@@ -1,0 +1,1520 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>proxysss · 管理控制台</title>
+    <style>__ADMIN_STYLE__</style>
+</head>
+<body data-write-ops="__ADMIN_WRITE_OPS__">
+    <section id="login-screen" class="login-screen">
+        <form id="login-form" class="login-panel">
+            <div class="login-logo">p</div>
+            <div class="login-title">
+                <div class="eyebrow" data-i18n="adminConsole">Admin Console</div>
+                <h1 data-i18n="loginTitle">登录 proxysss</h1>
+                <p class="muted" data-i18n="loginSubtitle">进入网关管理后台。</p>
+            </div>
+            <div class="login-form">
+                <div class="filter">
+                    <label for="login-username" data-i18n="username">Username</label>
+                    <input id="login-username" autocomplete="username" value="__ADMIN_USER__" autofocus />
+                </div>
+                <div class="filter">
+                    <label for="login-password" data-i18n="password">Password</label>
+                    <input id="login-password" type="password" autocomplete="current-password" />
+                </div>
+                <button id="login-submit" class="primary" type="submit" data-i18n="login">登录</button>
+                <div id="login-error" class="login-error"></div>
+            </div>
+        </form>
+    </section>
+
+    <header id="admin-top" class="admin-top app-hidden">
+        <div><strong>proxysss</strong> <span class="muted" data-i18n="adminConsole">Admin Console</span></div>
+        <div class="top-actions"><a class="docs-link" href="/docs.html" target="_blank" rel="noopener">使用文档 ↗</a>
+            <select id="language-select" class="language-select ghost" aria-label="Language">
+                <option value="auto">默认中文</option>
+                <option value="zh-CN">中文</option>
+                <option value="en-US">English</option>
+            </select>
+            <button id="logout" class="ghost" type="button" data-i18n="logout">退出登录</button>
+        </div>
+    </header>
+
+    <main id="admin-app" class="shell app-hidden">
+        <aside class="sidebar" aria-label="控制台导航">
+            <p id="write-mode" class="write-mode" role="status"></p>
+            <div class="brand">
+                <div class="eyebrow" data-i18n="adminConsole">admin console</div>
+                <h1>proxysss</h1>
+                <p class="muted" data-i18n="brandSubtitle">Reverse proxy health, upstream state, and runtime stats.</p>
+            </div>
+
+            <section class="meta-card nav-card">
+                <h3 data-i18n="consoleViews">Console Views</h3>
+                <div class="button-row">
+                    <button class="ghost nav-btn active" data-view="dashboard" data-i18n="dashboard">Dashboard</button>
+                    <button class="ghost nav-btn" data-view="tls">TLS / ACME</button>
+                    <button class="ghost nav-btn" data-view="domains" data-i18n="domainRoutes">Domain Routes</button>
+                    <button class="ghost nav-btn" data-view="reverse" data-i18n="reverseProxy">Reverse Proxy</button>
+                    <button class="ghost nav-btn" data-view="listeners" data-i18n="listeners">Listeners</button>
+                    <button class="ghost nav-btn" data-view="filecloud">FileCloud</button>
+                    <button class="ghost nav-btn" data-view="security" data-i18n="security">Security</button>
+                </div>
+            </section>
+
+            <section class="meta-card">
+                <h3 data-i18n="controls">Controls</h3>
+                <div class="button-row">
+                    <button id="load" class="primary" data-i18n="refreshDashboard">Refresh Dashboard</button>
+                    <button id="toggle-auto" class="ghost">Auto Refresh: Off</button>
+                </div>
+            </section>
+
+            <details class="meta-card">
+                <summary data-i18n="apiEndpoints">API Endpoints</summary>
+                <div class="meta-list muted">
+                    <span>Stats: <strong>/v1/stats</strong></span>
+                    <span>Upstreams: <strong>/v1/upstreams</strong></span>
+                    <span>Config: <strong>/v1/config</strong></span>
+                    <span>Routes: <strong>/v1/domain-routes/upsert</strong></span>
+                    <span>Auth: <strong>Bearer token</strong></span>
+                    <span>__ADMIN_HTTPS_HINT__</span>
+                </div>
+            </details>
+        </aside>
+
+        <section class="content" id="view-dashboard">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow" data-i18n="runtimeOverview">Runtime Overview</div>
+                    <h2 data-i18n="reverseProxyHealth">Reverse Proxy Health</h2>
+                </div>
+                <div id="load-state" class="status-dot" data-i18n="waitingRefresh">Waiting for refresh</div>
+            </div>
+
+            <section class="cards">
+                <article class="card">
+                    <span class="muted" data-i18n="httpRequests">HTTP Requests</span>
+                    <strong id="card-http-requests">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="httpErrors">HTTP Errors</span>
+                    <strong id="card-http-errors">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="healthyUpstreams">Healthy Upstreams</span>
+                    <strong id="card-healthy">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="degradedUpstreams">Degraded Upstreams</span>
+                    <strong id="card-degraded">0</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="processCpu">Process CPU</span>
+                    <strong id="card-process-cpu">warming</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="processMemory">Process Memory</span>
+                    <strong id="card-process-memory">0 MB</strong>
+                </article>
+                <article class="card">
+                    <span class="muted" data-i18n="memoryPercent">Memory %</span>
+                    <strong id="card-process-memory-percent">0%</strong>
+                </article>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head">
+                    <div class="surface-title">
+                        <h3 data-i18n="groupedView">Grouped View</h3>
+                    </div>
+                    <div class="surface-actions">
+                        <div class="compact-controls">
+                            <input id="search" placeholder="Search route / upstream / listener" data-i18n-placeholder="searchPlaceholder" />
+                            <select id="health-filter">
+                                <option value="all" data-i18n="allHealth">All health</option>
+                                <option value="healthy" data-i18n="healthy">Healthy</option>
+                                <option value="degraded" data-i18n="degraded">Degraded</option>
+                                <option value="manual" data-i18n="manualOffline">Manual offline</option>
+                            </select>
+                            <select id="group-by">
+                                <option value="route" data-i18n="groupRoute">Group: route</option>
+                                <option value="listener" data-i18n="groupListener">Group: listener</option>
+                                <option value="protocol" data-i18n="groupProtocol">Group: protocol</option>
+                                <option value="none" data-i18n="flat">Flat</option>
+                            </select>
+                        </div>
+                        <span class="muted" id="group-count">0 groups</span>
+                    </div>
+                </div>
+                <div id="group-view-wrap" class="empty" data-i18n="refreshGroupsHint">Refresh the dashboard to build aggregated health groups.</div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head">
+                    <div>
+                        <h3 data-i18n="upstreamHealthTable">Upstream Health Table</h3>
+                        <p class="muted" data-i18n="upstreamTableHint">Health, target, probe, and drain controls.</p>
+                    </div>
+                    <span class="muted" id="upstream-count">0 upstreams</span>
+                </div>
+                <div id="upstream-table-wrap" class="empty" data-i18n="refreshUpstreamsHint">Refresh the dashboard to load upstream health data.</div>
+            </section>
+
+            <details class="diagnostics"><summary>开发者诊断 · JSON</summary><section class="raw-grid">
+                <article class="surface">
+                    <div class="surface-head">
+                        <h3>Stats JSON</h3>
+                        <span class="muted">/v1/stats</span>
+                    </div>
+                    <pre id="stats-json">{}</pre>
+                </article>
+                <article class="surface">
+                    <div class="surface-head">
+                        <h3>Upstreams JSON</h3>
+                        <span class="muted">/v1/upstreams</span>
+                    </div>
+                    <pre id="upstreams-json">[]</pre>
+                </article>
+            </section></details>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-tls">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow">内建证书管理</div>
+                    <h2>TLS 与证书</h2>
+                    <p class="hint">自动申请免费证书，无需安装外部工具。普通域名使用 HTTP-01 或 TLS-ALPN-01；泛域名使用 DNS-01。默认 ECDSA P-256，也支持旧客户端需要的 RSA-2048。</p>
+                </div>
+                <div id="tls-state" class="status-dot">正在读取证书状态</div>
+            </div>
+
+            <section class="cards">
+                <article class="card"><span class="muted">证书模式</span><strong id="tls-mode">-</strong></article>
+                <article class="card"><span class="muted">验证方式</span><strong id="tls-challenge">-</strong></article>
+                <article class="card"><span class="muted">证书就绪</span><strong id="tls-cert-ready">-</strong></article>
+                <article class="card"><span class="muted">域名路由</span><strong id="tls-route-count">0</strong></article>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>当前证书状态</h3><p class="muted">实时状态来源 <code>/v1/tls/summary</code></p></div></div>
+                <details class="diagnostics"><summary>开发者诊断 · JSON</summary><pre id="tls-summary-json">{}</pre></details>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>自动 HTTPS · 普通域名</h3><p class="muted">域名指向本机即可开始，无需提供 DNS API 密钥。</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="auto-domains">域名（每行一个）</label><textarea id="auto-domains" placeholder="example.com&#10;www.example.com"></textarea></div>
+                    <div class="filter"><label for="auto-email">ACME Email（可选）</label><input id="auto-email" placeholder="admin@example.com（留空也可自动签发；不会收到到期提醒）" /></div>
+                    <div class="filter"><label for="auto-production">签发环境</label><select id="auto-production"><option value="true">正式环境</option><option value="false">测试环境</option></select></div>
+                    <div class="filter full"><button id="save-auto-https" class="primary">保存自动 HTTPS</button><span class="hint" id="auto-https-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>泛域名证书 · DNS-01</h3><p class="muted">支持 Cloudflare、阿里云、腾讯云、火山引擎、AWS、Azure、Google，也可选择 <code>manual</code> 手动添加 DNS 记录。</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="wildcard-domains">域名（支持 <code>*.example.com</code>)</label><textarea id="wildcard-domains" placeholder="example.com&#10;*.example.com"></textarea></div>
+                    <div class="filter"><label for="wildcard-email">ACME 联系邮箱</label><input id="wildcard-email" placeholder="admin@example.com" /></div>
+                    <div class="filter"><label for="wildcard-provider">DNS 服务商</label><select id="wildcard-provider"></select></div>
+                    <div class="filter full" id="dns-credentials"></div>
+                    <div class="filter full"><button id="save-wildcard-tls" class="primary">保存泛域名配置</button><span class="hint" id="wildcard-tls-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>按需申请证书</h3><p class="muted">允许列表中的域名首次访问时申请证书。</p></div></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="on-demand-enabled">启用</label><select id="on-demand-enabled"><option value="false">false</option><option value="true">true</option></select></div>
+                    <div class="filter full"><label for="on-demand-allow">允许的域名模式（每行一个）</label><textarea id="on-demand-allow" placeholder="*.example.com"></textarea></div>
+                    <div class="filter full"><button id="save-on-demand" class="primary">保存按需申请配置</button><button id="issue-tls-now" class="ghost">立即申请证书</button><span class="hint" id="on-demand-result"></span></div>
+                </div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>手动管理 SNI 证书</h3><p class="muted">按域名配置证书，配置项为 <code>http.tls.certificates</code>。可粘贴 PEM 内容，或填写已有文件的路径。</p></div></div>
+                <div id="sni-certs-wrap" class="empty">正在读取 SNI 证书…</div>
+                <div class="tls-grid">
+                    <div class="filter full"><label for="sni-domains">域名（每行一个）</label><textarea id="sni-domains" placeholder="api.example.com&#10;*.internal.example.com"></textarea></div>
+                    <div class="filter"><label for="sni-cert-path">证书路径（与下方 PEM 二选一）</label><input id="sni-cert-path" placeholder="./certs/sni/api.crt" /></div>
+                    <div class="filter"><label for="sni-key-path">私钥路径（与下方 PEM 二选一）</label><input id="sni-key-path" placeholder="./certs/sni/api.key" /></div>
+                    <div class="filter full"><label for="sni-cert-pem">证书 PEM 内容（可选）</label><textarea id="sni-cert-pem" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+                    <div class="filter full"><label for="sni-key-pem">私钥 PEM 内容（可选）</label><textarea id="sni-key-pem" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+                    <div class="filter full"><button id="save-sni-cert" class="primary">保存 SNI 证书</button><span class="hint" id="sni-cert-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-domains">
+            <div class="topbar">
+                <div>
+                    <div class="eyebrow">域名转发</div>
+                    <h2>域名路由</h2>
+                    <p class="hint">配置保存至 <code>proxysss.yaml</code> 并自动重载。写入操作需要开启 <code>admin.enable_write_ops=true</code>.</p>
+                </div>
+                <div id="domain-state" class="status-dot">正在读取路由</div>
+            </div>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>当前域名路由</h3></div><span class="muted" id="domain-route-count">0 条路由</span></div>
+                <div id="domain-routes-wrap" class="empty">刷新后查看域名路由。</div>
+            </section>
+
+            <section class="surface">
+                <div class="surface-head"><div><h3>添加或更新域名路由</h3></div></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="route-name">路由名称</label><input id="route-name" placeholder="api" /></div>
+                    <div class="filter"><label for="route-upstream">上游地址</label><input id="route-upstream" placeholder="http://127.0.0.1:8080" /></div>
+                    <div class="filter"><label for="route-path-prefix">路径前缀</label><input id="route-path-prefix" value="/" /></div>
+                    <div class="filter full"><label for="route-domains">域名（逗号分隔）</label><input id="route-domains" placeholder="api.example.com, *.api.example.com" /></div>
+                    <div class="filter full"><label for="route-upstreams">其他上游（每行一个，可选）</label><textarea id="route-upstreams" placeholder="http://10.0.0.13:8080"></textarea></div>
+                    <div class="filter full"><label><input id="route-strip-prefix" type="checkbox" /> 转发时移除路径前缀</label></div>
+                    <div class="filter full"><button id="save-domain-route" class="primary">保存域名路由</button><span class="hint" id="domain-route-result"></span><span class="hint">权重、缓存和 TLS 等高级选项请参阅配置指南中的管理 API。</span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-reverse">
+            <div class="topbar"><div><div class="eyebrow">路径转发</div><h2>反向代理路由</h2></div><div id="reverse-state" class="status-dot">正在读取</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>当前路由</h3><span class="muted" id="reverse-count">0 条路由</span></div>
+                <div id="reverse-routes-wrap" class="empty">正在读取…</div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>添加或更新路由</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="reverse-name">名称</label><input id="reverse-name" placeholder="api" /></div>
+                    <div class="filter"><label for="reverse-prefix">路径前缀</label><input id="reverse-prefix" value="/api" /></div>
+                    <div class="filter"><label for="reverse-upstream">上游地址</label><input id="reverse-upstream" placeholder="http://127.0.0.1:8080" /></div>
+                    <div class="filter full"><label for="reverse-hosts">匹配域名（逗号分隔，可选）</label><input id="reverse-hosts" placeholder="api.example.com" /></div>
+                    <div class="filter full"><label for="reverse-upstreams">其他上游（每行一个，可选）</label><textarea id="reverse-upstreams" placeholder="http://127.0.0.1:9001"></textarea></div>
+                    <div class="filter full"><label><input id="reverse-strip-prefix" type="checkbox" checked /> 转发时移除路径前缀</label></div>
+                    <div class="filter full"><button id="save-reverse-route" class="primary">保存路由</button><span class="hint" id="reverse-route-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-listeners">
+            <div class="topbar"><div><div class="eyebrow">流量转发</div><h2>TCP、UDP 与 SNI 路由</h2></div><div id="listeners-state" class="status-dot">正在读取</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>TCP 监听器</h3></div>
+                <div id="tcp-listeners-wrap" class="empty">正在读取…</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="tcp-name">名称</label><input id="tcp-name" placeholder="game" /></div>
+                    <div class="filter"><label for="tcp-bind">监听地址</label><input id="tcp-bind" placeholder="0.0.0.0:7000" /></div>
+                    <div class="filter"><label for="tcp-upstream">上游地址</label><input id="tcp-upstream" placeholder="127.0.0.1:9000" /></div>
+                    <div class="filter full"><button id="save-tcp-listener" class="primary">保存 TCP 监听器</button><span class="hint" id="tcp-listener-result"></span></div>
+                </div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>UDP 监听器</h3></div>
+                <div id="udp-listeners-wrap" class="empty">正在读取…</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="udp-name">名称</label><input id="udp-name" placeholder="voice" /></div>
+                    <div class="filter"><label for="udp-bind">监听地址</label><input id="udp-bind" placeholder="0.0.0.0:7001" /></div>
+                    <div class="filter"><label for="udp-upstream">上游地址</label><input id="udp-upstream" placeholder="127.0.0.1:9001" /></div>
+                    <div class="filter full"><button id="save-udp-listener" class="primary">保存 UDP 监听器</button><span class="hint" id="udp-listener-result"></span></div>
+                </div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>SNI 流路由</h3></div>
+                <div id="stream-routes-wrap" class="empty">正在读取…</div>
+                <div class="tls-grid" style="margin-top:14px">
+                    <div class="filter"><label for="stream-name">名称</label><input id="stream-name" placeholder="redis-prod" /></div>
+                    <div class="filter"><label for="stream-listen">监听地址</label><input id="stream-listen" placeholder="6379" /></div>
+                    <div class="filter"><label for="stream-upstream">上游地址</label><input id="stream-upstream" placeholder="127.0.0.1:6379" /></div>
+                    <div class="filter full"><label for="stream-domains">域名（逗号分隔）</label><input id="stream-domains" placeholder="redis.example.com" /></div>
+                    <div class="filter full"><button id="save-stream-route" class="primary">保存流路由</button><span class="hint" id="stream-route-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-filecloud">
+            <div class="topbar"><div><div class="eyebrow">FileCloud</div><h2>文件空间</h2><p class="hint">使用独立访问密码的文件空间，支持浏览与文件管理。 <a id="filecloud-open-link" href='#' target="_blank" rel="noopener" style="display:none">打开文件空间</a></p></div><div id="filecloud-state" class="status-dot">正在读取</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>当前文件空间状态</h3></div>
+                <details class="diagnostics"><summary>开发者诊断 · JSON</summary><pre id="filecloud-summary-json">{}</pre></details>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>配置文件空间</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="fc-enabled">启用</label><select id="fc-enabled"><option value="false">false</option><option value="true">true</option></select></div>
+                    <div class="filter"><label for="fc-prefix">路径前缀</label><input id="fc-prefix" value="/filecloud" /></div>
+                    <div class="filter"><label for="fc-root">根目录</label><input id="fc-root" placeholder="./filecloud-data" /></div>
+                    <div class="filter"><label for="fc-title">页面标题</label><input id="fc-title" placeholder="Shared Files" /></div>
+                    <div class="filter"><label for="fc-password">访问密码（留空保留现有密码）</label><input id="fc-password" type="password" placeholder="new password" /></div>
+                    <div class="filter"><label for="fc-max-upload">上传大小上限（字节）</label><input id="fc-max-upload" type="number" placeholder="536870912" /></div>
+                    <div class="filter"><label for="fc-cdn-cache">CDN 缓存时间（秒）</label><input id="fc-cdn-cache" type="number" placeholder="86400" /></div>
+                    <div class="filter full"><label><input id="fc-allow-upload" type="checkbox" checked /> 允许上传</label> <label><input id="fc-allow-delete" type="checkbox" checked /> 删除</label> <label><input id="fc-allow-mkdir" type="checkbox" checked /> 创建目录</label> <label><input id="fc-allow-move" type="checkbox" checked /> 移动</label></div>
+                    <div class="filter full"><button id="save-filecloud" class="primary">保存文件空间配置</button><span class="hint" id="filecloud-result"></span></div>
+                </div>
+            </section>
+        </section>
+
+        <section class="content view-hidden tls-panel" id="view-security">
+            <div class="topbar"><div><div class="eyebrow">安全策略</div><h2>动态 IP 黑名单</h2><p class="hint">启用以下配置后保存封禁记录： <code>security.dynamic_blacklist.enabled=true</code>.</p></div><div id="security-state" class="status-dot">正在读取</div></div>
+            <section class="surface">
+                <div class="surface-head"><h3>当前封禁</h3></div>
+                <div id="blacklist-wrap" class="empty">正在读取…</div>
+            </section>
+            <section class="surface">
+                <div class="surface-head"><h3>Add Ban</h3></div>
+                <div class="tls-grid">
+                    <div class="filter"><label for="blacklist-ip">IP</label><input id="blacklist-ip" placeholder="203.0.113.5" /></div>
+                    <div class="filter"><label for="blacklist-ban-secs">封禁时长（秒）</label><input id="blacklist-ban-secs" type="number" placeholder="3600" /></div>
+                    <div class="filter full"><button id="save-blacklist-add" class="primary">Add Ban</button><span class="hint" id="blacklist-result"></span></div>
+                </div>
+            </section>
+        </section>
+    </main>
+
+    <script>
+        const stateNode = document.getElementById('load-state');
+        const statsJson = document.getElementById('stats-json');
+        const upstreamsJson = document.getElementById('upstreams-json');
+        const upstreamWrap = document.getElementById('upstream-table-wrap');
+        const groupWrap = document.getElementById('group-view-wrap');
+        const upstreamCount = document.getElementById('upstream-count');
+        const groupCount = document.getElementById('group-count');
+        const autoToggle = document.getElementById('toggle-auto');
+        const searchInput = document.getElementById('search');
+        const healthFilter = document.getElementById('health-filter');
+        const groupBy = document.getElementById('group-by');
+        const sessionKey = 'proxysss.admin.auth';
+        const loginScreen = document.getElementById('login-screen');
+        const adminTop = document.getElementById('admin-top');
+        const adminApp = document.getElementById('admin-app');
+        const loginForm = document.getElementById('login-form');
+        const loginError = document.getElementById('login-error');
+        const languageSelect = document.getElementById('language-select');
+        const i18n = {
+            'en-US': {
+                adminConsole: 'Admin Console',
+                loginTitle: 'Sign in to proxysss',
+                loginSubtitle: 'Enter the gateway admin console.',
+                username: 'Username',
+                password: 'Password',
+                login: 'Sign in',
+                logout: 'Sign out',
+                brandSubtitle: 'Reverse proxy health, upstream state, and runtime stats.',
+                consoleViews: 'Console Views',
+                dashboard: 'Dashboard',
+                domainRoutes: 'Domain Routes',
+                reverseProxy: 'Reverse Proxy',
+                listeners: 'Listeners',
+                security: 'Security',
+                controls: 'Controls',
+                refreshDashboard: 'Refresh Dashboard',
+                autoRefreshOff: 'Auto Refresh: Off',
+                autoRefreshOn: 'Auto Refresh: On',
+                apiEndpoints: 'API Endpoints',
+                runtimeOverview: 'Runtime Overview',
+                reverseProxyHealth: 'Reverse Proxy Health',
+                waitingRefresh: 'Waiting for refresh',
+                refreshingDashboard: 'Refreshing dashboard',
+                dashboardFresh: 'Dashboard fresh',
+                refreshFailed: 'Refresh failed',
+                httpRequests: 'HTTP Requests',
+                httpErrors: 'HTTP Errors',
+                healthyUpstreams: 'Healthy Upstreams',
+                degradedUpstreams: 'Degraded Upstreams',
+                processCpu: 'Process CPU',
+                processMemory: 'Process Memory',
+                memoryPercent: 'Memory %',
+                groupedView: 'Grouped View',
+                searchPlaceholder: 'Search route / upstream / listener',
+                allHealth: 'All health',
+                healthy: 'Healthy',
+                degraded: 'Degraded',
+                manualOffline: 'Manual offline',
+                groupRoute: 'Group: route',
+                groupListener: 'Group: listener',
+                groupProtocol: 'Group: protocol',
+                flat: 'Flat',
+                refreshGroupsHint: 'Refresh the dashboard to build aggregated health groups.',
+                noUpstreamsMatch: 'No upstreams match the current filters.',
+                upstreamHealthTable: 'Upstream Health Table',
+                upstreamTableHint: 'Health, target, probe, and drain controls.',
+                refreshUpstreamsHint: 'Refresh the dashboard to load upstream health data.',
+                noUpstreamState: 'No upstream runtime state recorded yet. Send traffic or enable active health checks.',
+                groups: 'groups',
+                upstreams: 'upstreams',
+                invalidCredentials: 'Invalid username or password',
+                loginExpired: 'Session expired. Please sign in again.',
+                takeOffline: 'Take Offline',
+                restore: 'Restore',
+                tableHealth: 'Health',
+                tableTarget: 'Target',
+                tableActive: 'Active',
+                tableProbe: 'Probe',
+                tableManual: 'Manual',
+                tableAction: 'Action',
+                tableLastCheck: 'Last Check',
+                warming: 'warming',
+                unknown: 'unknown',
+                pass: 'pass',
+                fail: 'fail',
+                quarantined: 'quarantined',
+                unmapped: 'unmapped',
+                active: 'active',
+                passive: 'passive',
+                rtt: 'rtt',
+                failureShort: 'fail',
+                quarantine: 'quarantine',
+            },
+            'zh-CN': {
+                adminConsole: '管理控制台',
+                loginTitle: '登录 proxysss',
+                loginSubtitle: '进入网关管理后台。',
+                username: '用户名',
+                password: '密码',
+                login: '登录',
+                logout: '退出登录',
+                brandSubtitle: '反向代理健康、上游状态、运行指标。',
+                consoleViews: '控制台视图',
+                dashboard: '仪表盘',
+                domainRoutes: '域名路由',
+                reverseProxy: '反向代理',
+                listeners: '监听器',
+                security: '安全',
+                controls: '操作',
+                refreshDashboard: '刷新仪表盘',
+                autoRefreshOff: '自动刷新：关',
+                autoRefreshOn: '自动刷新：开',
+                apiEndpoints: 'API 端点',
+                runtimeOverview: '运行概览',
+                reverseProxyHealth: '反向代理健康',
+                waitingRefresh: '等待刷新',
+                refreshingDashboard: '正在刷新',
+                dashboardFresh: '仪表盘已刷新',
+                refreshFailed: '刷新失败',
+                httpRequests: 'HTTP 请求',
+                httpErrors: 'HTTP 错误',
+                healthyUpstreams: '健康上游',
+                degradedUpstreams: '异常上游',
+                processCpu: '进程 CPU',
+                processMemory: '进程内存',
+                memoryPercent: '内存占比',
+                groupedView: '分组视图',
+                searchPlaceholder: '搜索路由 / 上游 / 监听器',
+                allHealth: '全部健康状态',
+                healthy: '健康',
+                degraded: '异常',
+                manualOffline: '手动下线',
+                groupRoute: '分组：路由',
+                groupListener: '分组：监听器',
+                groupProtocol: '分组：协议',
+                flat: '平铺',
+                refreshGroupsHint: '刷新仪表盘后显示聚合健康分组。',
+                noUpstreamsMatch: '没有上游匹配当前筛选。',
+                upstreamHealthTable: '上游健康表',
+                upstreamTableHint: '健康、目标、探测和摘流操作。',
+                refreshUpstreamsHint: '刷新仪表盘后加载上游健康数据。',
+                noUpstreamState: '暂无上游运行状态。请先产生流量或开启主动健康检查。',
+                groups: '组',
+                upstreams: '上游',
+                invalidCredentials: '用户名或密码错误',
+                loginExpired: '登录已失效，请重新登录',
+                takeOffline: '下线',
+                restore: '恢复',
+                tableHealth: '健康',
+                tableTarget: '目标',
+                tableActive: '活跃',
+                tableProbe: '探测',
+                tableManual: '手动',
+                tableAction: '操作',
+                tableLastCheck: '最后检查',
+                warming: '预热中',
+                unknown: '未知',
+                pass: '通过',
+                fail: '失败',
+                quarantined: '隔离',
+                unmapped: '未映射',
+                active: '主动',
+                passive: '被动',
+                rtt: '延迟',
+                failureShort: '失败',
+                quarantine: '隔离',
+            },
+        };
+        const writeOpsEnabled = document.body.dataset.writeOps === 'true';
+        document.getElementById('write-mode').textContent = writeOpsEnabled
+            ? '可编辑 · 修改将保存并重载' : '只读模式 · 开启 admin.enable_write_ops 后可编辑';
+        function applyWriteMode() {
+            if (writeOpsEnabled) return;
+            document.querySelectorAll('[id^="save-"], #issue-tls-now, .table-actions button, button.danger').forEach(button => {
+                button.disabled = true;
+                button.title = '只读模式：请在配置文件中开启 admin.enable_write_ops 后重载';
+            });
+        }
+        applyWriteMode();
+        new MutationObserver(applyWriteMode).observe(adminApp, { childList: true, subtree: true });
+        let currentLocale = 'zh-CN';
+        let authValue = '';
+        let autoRefresh = false;
+        let autoTimer = null;
+        let latestUpstreams = [];
+        let latestStats = null;
+
+        function authHeader() {
+            return authValue;
+        }
+
+        function detectLocale() {
+            const saved = localStorage.getItem('proxysss.admin.locale') || 'auto';
+            languageSelect.value = saved;
+            if (saved !== 'auto') return saved;
+            return 'zh-CN';
+        }
+
+        function t(key) {
+            return (i18n[currentLocale] && i18n[currentLocale][key]) || i18n['en-US'][key] || key;
+        }
+
+        function applyLocale() {
+            currentLocale = detectLocale();
+            document.documentElement.lang = currentLocale;
+            document.querySelectorAll('[data-i18n]').forEach(node => {
+                node.textContent = t(node.dataset.i18n);
+            });
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(node => {
+                node.placeholder = t(node.dataset.i18nPlaceholder);
+            });
+            autoToggle.textContent = autoRefresh ? t('autoRefreshOn') : t('autoRefreshOff');
+            if (stateNode.dataset.stateKey) stateNode.textContent = t(stateNode.dataset.stateKey);
+        }
+
+        function persistAuth(user, token, expiresAt) {
+            authValue = 'Bearer ' + token;
+            sessionStorage.setItem(sessionKey, JSON.stringify({ user, auth: authValue, expiresAt }));
+        }
+
+        function clearAuth() {
+            authValue = '';
+            sessionStorage.removeItem(sessionKey);
+        }
+
+        function showLogin(message) {
+            loginScreen.classList.remove('hidden');
+            adminTop.classList.add('app-hidden');
+            adminApp.classList.add('app-hidden');
+            if (message) loginError.textContent = message;
+        }
+
+        function showApp() {
+            loginScreen.classList.add('hidden');
+            adminTop.classList.remove('app-hidden');
+            adminApp.classList.remove('app-hidden');
+            loginError.textContent = '';
+        }
+
+        async function loginWithPassword(user, pass) {
+            const response = await fetch('/v1/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: user, password: pass }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || t('invalidCredentials'));
+            }
+            persistAuth(data.username || user, data.access_token, data.expires_at);
+            return data;
+        }
+
+        async function verifyAuth() {
+            const response = await fetch('/v1/stats', {
+                headers: { Authorization: authHeader() },
+            });
+            if (!response.ok) {
+                throw new Error(response.status === 401 ? t('invalidCredentials') : `/v1/stats -> ${response.status}`);
+            }
+            return response.json();
+        }
+
+        function setState(message, kind, key) {
+            stateNode.textContent = key ? t(key) : message;
+            stateNode.dataset.stateKey = key || '';
+            stateNode.className = 'status-dot ' + (kind || '');
+        }
+
+        function formatNumber(value) {
+            return new Intl.NumberFormat().format(value || 0);
+        }
+
+        function formatPercent(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return t('warming');
+            return Number(value).toFixed(1) + '%';
+        }
+
+        function formatMegabytes(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return t('unknown');
+            return Number(value).toFixed(1) + ' MB';
+        }
+
+        function formatTimestamp(value) {
+            if (!value) return 'never';
+            try {
+                return new Date(value).toLocaleString();
+            } catch {
+                return 'invalid';
+            }
+        }
+
+        function renderSummary(stats, upstreams) {
+            const healthy = upstreams.filter(item => item.healthy).length;
+            const degraded = upstreams.length - healthy;
+            document.getElementById('card-http-requests').textContent = formatNumber(stats.http_requests);
+            document.getElementById('card-http-errors').textContent = formatNumber(stats.http_errors);
+            document.getElementById('card-healthy').textContent = formatNumber(healthy);
+            document.getElementById('card-degraded').textContent = formatNumber(degraded);
+            const process = stats.process || {};
+            document.getElementById('card-process-cpu').textContent = formatPercent(process.cpu_percent);
+            document.getElementById('card-process-memory').textContent = formatMegabytes(process.memory_mb);
+            document.getElementById('card-process-memory-percent').textContent = formatPercent(process.memory_percent);
+            upstreamCount.textContent = `${upstreams.length} ${t('upstreams')}`;
+        }
+
+        function healthPill(item) {
+            if (item.manually_disabled) return `<span class="pill warn">${t('manualOffline')}</span>`;
+            if (item.healthy) return `<span class="pill good">${t('healthy')}</span>`;
+            if (item.active_healthy === null || item.active_healthy === undefined) return `<span class="pill warn">${t('warming')}</span>`;
+            return `<span class="pill bad">${t('degraded')}</span>`;
+        }
+
+        function probePill(item) {
+            if (item.active_healthy === true) return `<span class="pill good">${t('pass')}</span>`;
+            if (item.active_healthy === false) return `<span class="pill bad">${t('fail')}</span>`;
+            return `<span class="pill warn">${t('unknown')}</span>`;
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+        }
+
+        function confirmAction(message) {
+            return new Promise(resolve => {
+                const dialog = document.createElement('dialog');
+                dialog.className = 'confirm-dialog';
+                dialog.setAttribute('aria-labelledby', 'confirm-title');
+                dialog.innerHTML = '<h3 id="confirm-title">确认删除</h3><p></p><div class="button-row"><button class="ghost" data-cancel>取消</button><button class="danger" data-confirm>确认删除</button></div>';
+                dialog.querySelector('p').textContent = message;
+                const finish = accepted => { dialog.close(); dialog.remove(); resolve(accepted); };
+                dialog.querySelector('[data-cancel]').onclick = () => finish(false);
+                dialog.querySelector('[data-confirm]').onclick = () => finish(true);
+                dialog.addEventListener('cancel', event => { event.preventDefault(); finish(false); });
+                document.body.append(dialog);
+                dialog.showModal();
+                dialog.querySelector('[data-cancel]').focus();
+            });
+        }
+
+        function routeLabel(item) {
+            return (item.route_names && item.route_names.length ? item.route_names.join(', ') : t('unmapped'));
+        }
+
+        function filteredUpstreams() {
+            const query = searchInput.value.trim().toLowerCase();
+            const filter = healthFilter.value;
+
+            return latestUpstreams.filter(item => {
+                if (filter === 'healthy' && !item.healthy) return false;
+                if (filter === 'degraded' && item.healthy) return false;
+                if (filter === 'manual' && !item.manually_disabled) return false;
+
+                if (!query) return true;
+                const haystack = [
+                    item.protocol,
+                    item.listener,
+                    item.upstream,
+                    routeLabel(item),
+                    item.key,
+                ].join(' ').toLowerCase();
+                return haystack.includes(query);
+            });
+        }
+
+        function groupKey(item) {
+            switch (groupBy.value) {
+                case 'protocol': return item.protocol || 'unknown';
+                case 'listener': return item.listener || 'default';
+                case 'none': return item.key;
+                case 'route':
+                default:
+                    return (item.route_names && item.route_names.length ? item.route_names[0] : `${item.protocol}:${item.listener}`);
+            }
+        }
+
+        function renderGroups(upstreams) {
+            if (!upstreams.length) {
+                groupWrap.className = 'empty';
+                groupWrap.textContent = t('noUpstreamsMatch');
+                groupCount.textContent = `0 ${t('groups')}`;
+                return;
+            }
+
+            const grouped = new Map();
+            for (const item of upstreams) {
+                const key = groupKey(item);
+                if (!grouped.has(key)) grouped.set(key, []);
+                grouped.get(key).push(item);
+            }
+
+            groupCount.textContent = `${grouped.size} ${t('groups')}`;
+            groupWrap.className = 'group-grid';
+            groupWrap.innerHTML = Array.from(grouped.entries()).map(([key, items]) => {
+                const healthy = items.filter(item => item.healthy).length;
+                const manual = items.filter(item => item.manually_disabled).length;
+                const protocols = Array.from(new Set(items.map(item => item.protocol))).join(', ');
+                return `
+                    <article class="group-card">
+                        <strong>${escapeHtml(key)}</strong>
+                        <div class="group-meta">
+                            <span class="pill ${healthy === items.length ? 'good' : healthy === 0 ? 'bad' : 'warn'}">${healthy}/${items.length} ${t('healthy')}</span>
+                            ${manual ? `<span class="pill warn">${manual} ${t('manualOffline')}</span>` : ''}
+                            <span class="pill">${escapeHtml(protocols)}</span>
+                        </div>
+                        <div class="muted">${items.map(item => escapeHtml(item.upstream)).join('<br/>')}</div>
+                    </article>`;
+            }).join('');
+        }
+
+        async function toggleUpstream(action, key) {
+            if (!writeOpsEnabled) throw new Error('当前为只读模式，请在配置文件中开启 admin.enable_write_ops 后重载。');
+            const reason = action === 'disable' ? window.prompt('请输入下线上游的原因', '手动下线') : null;
+            if (action === 'disable' && reason === null) return;
+            const response = await fetch(`/v1/upstreams/${action}`, {
+                method: 'POST',
+                headers: {
+                    Authorization: authHeader(),
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ key, reason }),
+            });
+            if (!response.ok) {
+                throw new Error(`/v1/upstreams/${action} -> ${response.status} ${response.statusText}`);
+            }
+            await refreshDashboard();
+        }
+
+        function renderUpstreams(upstreams) {
+            if (!upstreams.length) {
+                upstreamWrap.className = 'empty';
+                upstreamWrap.textContent = t('noUpstreamState');
+                return;
+            }
+
+            const rows = upstreams.map(item => {
+                const status = item.active_probe_status ?? '-';
+                const error = item.active_probe_error ? `<div class="muted">${escapeHtml(item.active_probe_error)}</div>` : '';
+                const quarantine = item.quarantine_remaining_secs > 0 ? `${item.quarantine_remaining_secs}s` : '-';
+                const rtt = item.active_probe_rtt_ms ?? '-';
+                const routeNames = routeLabel(item);
+                const targetMeta = `${item.protocol} / ${item.listener}`;
+                const probeMeta = [
+                    `${t('active')} ${probePill(item)}`,
+                    `${t('passive')} ${item.passive_healthy ? `<span class="pill good">${t('pass')}</span>` : `<span class="pill bad">${t('quarantined')}</span>`}`,
+                    `http ${escapeHtml(status)}`,
+                    `${t('rtt')} ${escapeHtml(rtt)}ms`,
+                    `${t('failureShort')} ${escapeHtml(item.consecutive_failures)}`,
+                    quarantine !== '-' ? `${t('quarantine')} ${quarantine}` : '',
+                ].filter(Boolean).join(' ');
+                const actionButton = item.manually_disabled
+                    ? `<button class="success" data-action="enable" data-key="${escapeHtml(item.key)}">${t('restore')}</button>`
+                    : `<button class="danger" data-action="disable" data-key="${escapeHtml(item.key)}">${t('takeOffline')}</button>`;
+                return `
+                    <tr>
+                        <td>${healthPill(item)}</td>
+                        <td><code>${escapeHtml(item.upstream)}</code><div class="muted">${escapeHtml(routeNames)}</div><div class="muted">${escapeHtml(targetMeta)}</div>${error}</td>
+                        <td>${escapeHtml(item.active_connections)}</td>
+                        <td><div class="group-meta">${probeMeta}</div><div class="muted">${escapeHtml(item.active_probe_kind ?? '-')}</div></td>
+                        <td>${escapeHtml(item.manual_reason ?? '-')}</td>
+                        <td><div class="table-actions">${actionButton}</div></td>
+                        <td>${formatTimestamp(item.active_probe_checked_at_unix_ms)}</td>
+                    </tr>`;
+            }).join('');
+
+            upstreamWrap.className = '';
+            upstreamWrap.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>${t('tableHealth')}</th>
+                            <th>${t('tableTarget')}</th>
+                            <th>${t('tableActive')}</th>
+                            <th>${t('tableProbe')}</th>
+                            <th>${t('tableManual')}</th>
+                            <th>${t('tableAction')}</th>
+                            <th>${t('tableLastCheck')}</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>`;
+        }
+
+        async function loadJson(path) {
+            const response = await fetch(path, {
+                headers: { Authorization: authHeader() },
+            });
+            if (response.status === 401) {
+                clearAuth();
+                showLogin(t('loginExpired'));
+            }
+            if (!response.ok) {
+                throw new Error(`${path} -> ${response.status} ${response.statusText}`);
+            }
+            return response.json();
+        }
+
+        async function refreshDashboard() {
+            setState('', '', 'refreshingDashboard');
+            try {
+                const [stats, upstreamsPayload] = await Promise.all([
+                    loadJson('/v1/stats'),
+                    loadJson('/v1/upstreams'),
+                ]);
+                latestStats = stats;
+                latestUpstreams = upstreamsPayload.items || [];
+                const upstreams = filteredUpstreams();
+                statsJson.textContent = JSON.stringify(stats, null, 2);
+                upstreamsJson.textContent = JSON.stringify(upstreamsPayload, null, 2);
+                renderSummary(stats, latestUpstreams);
+                renderGroups(upstreams);
+                renderUpstreams(upstreams);
+                setState('', upstreams.every(item => item.healthy) ? 'ok' : 'bad', 'dashboardFresh');
+            } catch (error) {
+                setState('', 'bad', 'refreshFailed');
+                statsJson.textContent = String(error);
+                upstreamsJson.textContent = String(error);
+                upstreamWrap.className = 'empty';
+                upstreamWrap.textContent = String(error);
+                groupWrap.className = 'empty';
+                groupWrap.textContent = String(error);
+            }
+        }
+
+        document.getElementById('load').addEventListener('click', refreshDashboard);
+        loginForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            loginError.textContent = '';
+            const user = document.getElementById('login-username').value.trim();
+            const pass = document.getElementById('login-password').value;
+            try {
+                await loginWithPassword(user, pass);
+                const stats = await verifyAuth();
+                showApp();
+                document.getElementById('login-password').value = '';
+                statsJson.textContent = JSON.stringify(stats, null, 2);
+                await refreshDashboard();
+            } catch (error) {
+                clearAuth();
+                showLogin(String(error.message || error));
+            }
+        });
+        document.getElementById('logout').addEventListener('click', () => {
+            clearAuth();
+            clearInterval(autoTimer);
+            autoRefresh = false;
+            autoToggle.textContent = t('autoRefreshOff');
+            showLogin('');
+            document.getElementById('login-password').value = '';
+        });
+        languageSelect.addEventListener('change', () => {
+            localStorage.setItem('proxysss.admin.locale', languageSelect.value);
+            applyLocale();
+            if (latestUpstreams.length) {
+                const upstreams = filteredUpstreams();
+                if (latestStats) renderSummary(latestStats, latestUpstreams);
+                renderGroups(upstreams);
+                renderUpstreams(upstreams);
+            }
+        });
+        [searchInput, healthFilter, groupBy].forEach(node => {
+            node.addEventListener('input', refreshDashboard);
+            node.addEventListener('change', refreshDashboard);
+        });
+        upstreamWrap.addEventListener('click', async (event) => {
+            const button = event.target.closest('button[data-action]');
+            if (!button) return;
+            try {
+                await toggleUpstream(button.dataset.action, button.dataset.key);
+            } catch (error) {
+                setState(String(error), 'bad');
+            }
+        });
+        autoToggle.addEventListener('click', () => {
+            autoRefresh = !autoRefresh;
+            autoToggle.textContent = autoRefresh ? t('autoRefreshOn') : t('autoRefreshOff');
+            clearInterval(autoTimer);
+            if (autoRefresh) {
+                autoTimer = setInterval(refreshDashboard, 5000);
+                refreshDashboard();
+            }
+        });
+
+        const views = {
+            dashboard: document.getElementById('view-dashboard'),
+            tls: document.getElementById('view-tls'),
+            domains: document.getElementById('view-domains'),
+            reverse: document.getElementById('view-reverse'),
+            listeners: document.getElementById('view-listeners'),
+            filecloud: document.getElementById('view-filecloud'),
+            security: document.getElementById('view-security'),
+        };
+        let dnsProviders = [];
+
+        function switchView(name) {
+            Object.entries(views).forEach(([key, node]) => {
+                if (!node) return;
+                node.classList.toggle('view-hidden', key !== name);
+            });
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === name);
+            });
+            if (name === 'tls') refreshTlsPanel();
+            if (name === 'domains') refreshDomainRoutes();
+            if (name === 'reverse') refreshReverseRoutes();
+            if (name === 'listeners') refreshListenersPanel();
+            if (name === 'filecloud') refreshFileCloudPanel();
+            if (name === 'security') refreshSecurityPanel();
+        }
+
+        document.querySelectorAll('.nav-btn').forEach(btn => {
+            btn.addEventListener('click', () => switchView(btn.dataset.view));
+        });
+
+        function parseDomainLines(value) {
+            return value.split(/[\n,]+/).map(item => item.trim()).filter(Boolean);
+        }
+
+        function renderCredentialFields(providerId) {
+            const container = document.getElementById('dns-credentials');
+            container.innerHTML = '';
+            const provider = dnsProviders.find(item => item.id === providerId);
+            if (!provider || provider.id === 'manual') {
+                container.innerHTML = '<p class="hint">manual 模式无需 API Key：proxysss 会输出 TXT 记录并通过公网 DNS 轮询验证。</p>';
+                return;
+            }
+            for (const spec of provider.credential_keys || []) {
+                const optional = spec.endsWith('?');
+                const keys = spec.replace(/\?$/, '').split('+');
+                for (const key of keys) {
+                    const id = `cred-${escapeHtml(key)}`;
+                    container.insertAdjacentHTML('beforeend', `
+                        <div class="filter">
+                            <label for="${id}">${escapeHtml(key)}${optional ? '（可选）' : ''}</label>
+                            <input id="${id}" data-cred-key="${escapeHtml(key)}" placeholder="${escapeHtml(key)}" />
+                        </div>`);
+                }
+            }
+        }
+
+        function collectCredentials() {
+            const credentials = {};
+            document.querySelectorAll('#dns-credentials [data-cred-key]').forEach(input => {
+                if (input.value.trim()) credentials[input.dataset.credKey] = input.value.trim();
+            });
+            return credentials;
+        }
+
+        async function postJson(path, payload) {
+            if (!writeOpsEnabled) throw new Error('当前为只读模式，请在配置文件中开启 admin.enable_write_ops 后重载。');
+            const response = await fetch(path, {
+                method: 'POST',
+                headers: {
+                    Authorization: authHeader(),
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || `${path} -> ${response.status}`);
+            }
+            return data;
+        }
+
+        async function refreshTlsPanel() {
+            const tlsState = document.getElementById('tls-state');
+            try {
+                const [summaryPayload, providerPayloadRaw] = await Promise.all([
+                    loadJson('/v1/tls/summary'),
+                    dnsProviders.length ? Promise.resolve({ providers: dnsProviders }) : loadJson('/v1/tls/dns-providers'),
+                ]);
+                const tls = summaryPayload.tls || {};
+                const providerPayload = providerPayloadRaw.providers ? providerPayloadRaw : { providers: providerPayloadRaw.providers || [] };
+                dnsProviders = providerPayload.providers || providerPayloadRaw.providers || dnsProviders;
+                document.getElementById('tls-summary-json').textContent = JSON.stringify(tls, null, 2);
+                document.getElementById('tls-mode').textContent = ({self_signed:'自签名',acme_managed:'自动证书',manual:'手动证书'}[tls.mode]) || tls.mode || '-';
+                document.getElementById('tls-challenge').textContent = tls.challenge || '-';
+                document.getElementById('tls-cert-ready').textContent = (tls.cert_exists && tls.key_exists) ? '已就绪' : '未就绪';
+                document.getElementById('tls-route-count').textContent = tls.domain_routes_count || 0;
+                if (tls.auto_https?.domains?.length) {
+                    document.getElementById('auto-domains').value = tls.auto_https.domains.join('\n');
+                    document.getElementById('auto-email').value = tls.auto_https.email || '';
+                }
+                if (tls.acme?.domains?.length) {
+                    document.getElementById('wildcard-domains').value = tls.acme.domains.join('\n');
+                    document.getElementById('wildcard-email').value = tls.acme.email || '';
+                }
+                const providerSelect = document.getElementById('wildcard-provider');
+                if (!providerSelect.options.length) {
+                    providerSelect.innerHTML = dnsProviders.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.display_name)} (${escapeHtml(item.id)})</option>`).join('');
+                    providerSelect.addEventListener('change', () => renderCredentialFields(providerSelect.value));
+                }
+                if (tls.acme?.dns_provider) providerSelect.value = tls.acme.dns_provider;
+                renderCredentialFields(providerSelect.value);
+                if (tls.on_demand) {
+                    document.getElementById('on-demand-enabled').value = tls.on_demand.enabled ? 'true' : 'false';
+                    document.getElementById('on-demand-allow').value = (tls.on_demand.allow || []).join('\n');
+                }
+                await refreshSniCertificates();
+                tlsState.textContent = tls.write_ops_enabled ? '已开启写入操作' : '只读模式 · 可在配置文件中开启写入';
+                tlsState.className = 'status-dot ' + (tls.write_ops_enabled ? 'ok' : 'warn');
+            } catch (error) {
+                tlsState.textContent = String(error);
+                tlsState.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshSniCertificates() {
+            const wrap = document.getElementById('sni-certs-wrap');
+            try {
+                const payload = await loadJson('/v1/tls/sni-certificates');
+                const items = payload.items || [];
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = '尚未配置 SNI 证书。';
+                    return;
+                }
+                wrap.className = '';
+                wrap.innerHTML = `<table><thead><tr><th>域名</th><th>证书</th><th>私钥</th><th>就绪</th><th>操作</th></tr></thead><tbody>${items.map(item => `
+                    <tr>
+                        <td>${(item.domains || []).map(escapeHtml).join('<br/>')}</td>
+                        <td><code>${escapeHtml(item.cert_path)}</code></td>
+                        <td><code>${escapeHtml(item.key_path)}</code></td>
+                        <td>${item.cert_exists && item.key_exists ? '已就绪' : '未就绪'}</td>
+                        <td><button class="danger" data-delete-sni-domain="${escapeHtml((item.domains || [])[0] || '')}" data-delete-sni-cert="${escapeHtml(item.cert_path)}">删除</button></td>
+                    </tr>`).join('')}</tbody></table>`;
+                wrap.querySelectorAll('[data-delete-sni-cert]').forEach(button => {
+                    button.onclick = async () => {
+                        if (!await confirmAction(`确认删除 SNI 证书 ${button.dataset.deleteSniCert}?`)) return;
+                        await postJson('/v1/tls/sni-certificates/delete', {
+                            cert_path: button.dataset.deleteSniCert,
+                            domain: button.dataset.deleteSniDomain || undefined,
+                        });
+                        await refreshSniCertificates();
+                    };
+                });
+            } catch (error) {
+                wrap.className = 'empty';
+                wrap.textContent = String(error);
+            }
+        }
+
+        async function refreshSecurityPanel() {
+            const state = document.getElementById('security-state');
+            const wrap = document.getElementById('blacklist-wrap');
+            try {
+                const payload = await loadJson('/v1/security/blacklist');
+                const items = payload.items || [];
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = '当前没有被封禁的 IP。';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>IP</th><th>操作</th></tr></thead><tbody>${items.map(item => {
+                        const ip = typeof item === 'string' ? item : item.ip;
+                        return `<tr><td><code>${escapeHtml(ip)}</code></td><td><button class="danger" data-remove-blacklist="${escapeHtml(ip)}">解除封禁</button></td></tr>`;
+                    }).join('')}</tbody></table>`;
+                    wrap.querySelectorAll('[data-remove-blacklist]').forEach(button => {
+                        button.onclick = async () => {
+                            await postJson('/v1/security/blacklist/remove', { ip: button.dataset.removeBlacklist });
+                            await refreshSecurityPanel();
+                        };
+                    });
+                }
+                state.textContent = `${items.length} 个 IP 已封禁`;
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshDomainRoutes() {
+            const domainState = document.getElementById('domain-state');
+            const wrap = document.getElementById('domain-routes-wrap');
+            try {
+                const payload = await loadJson('/v1/domain-routes');
+                const items = payload.items || [];
+                document.getElementById('domain-route-count').textContent = `${items.length} 条路由`;
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = '尚未配置域名路由。';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>名称</th><th>域名</th><th>路径前缀</th><th>上游地址</th><th>操作</th></tr></thead><tbody>${items.map(item => `
+                        <tr>
+                            <td><code>${escapeHtml(item.name)}</code></td>
+                            <td>${(item.domains || []).map(escapeHtml).join('<br/>')}</td>
+                            <td><code>${escapeHtml(item.path_prefix || '/')}</code></td>
+                            <td><code>${escapeHtml(item.upstream || '')}</code></td>
+                            <td><button class="danger" data-delete-domain="${escapeHtml(item.name)}">删除</button></td>
+                        </tr>`).join('')}</tbody></table>`;
+                }
+                domainState.textContent = '路由已加载';
+                domainState.className = 'status-dot ok';
+            } catch (error) {
+                domainState.textContent = String(error);
+                domainState.className = 'status-dot bad';
+                wrap.className = 'empty';
+                wrap.textContent = String(error);
+            }
+        }
+
+        document.getElementById('save-auto-https').addEventListener('click', async () => {
+            const result = document.getElementById('auto-https-result');
+            try {
+                const data = await postJson('/v1/tls/auto-https/upsert', {
+                    domains: parseDomainLines(document.getElementById('auto-domains').value),
+                    email: document.getElementById('auto-email').value.trim(),
+                    production: document.getElementById('auto-production').value === 'true',
+                });
+                result.textContent = `已保存 ${data.mode} 配置：${(data.domains || []).join(', ')}`;
+                await refreshTlsPanel();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('save-wildcard-tls').addEventListener('click', async () => {
+            const result = document.getElementById('wildcard-tls-result');
+            try {
+                const data = await postJson('/v1/tls/wildcard-dns/upsert', {
+                    domains: parseDomainLines(document.getElementById('wildcard-domains').value),
+                    email: document.getElementById('wildcard-email').value.trim(),
+                    dns_provider: document.getElementById('wildcard-provider').value,
+                    credentials: collectCredentials(),
+                });
+                result.textContent = `已保存 DNS-01（${data.challenge}）配置：${(data.domains || []).join(', ')}`;
+                await refreshTlsPanel();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('save-domain-route').addEventListener('click', async () => {
+            const result = document.getElementById('domain-route-result');
+            try {
+                const domains = document.getElementById('route-domains').value.split(',').map(item => item.trim()).filter(Boolean);
+                const upstreams = document.getElementById('route-upstreams').value.split('\n').map(item => item.trim()).filter(Boolean);
+                const payload = {
+                    name: document.getElementById('route-name').value.trim(),
+                    upstream: document.getElementById('route-upstream').value.trim(),
+                    path_prefix: document.getElementById('route-path-prefix').value.trim() || '/',
+                    domains,
+                    strip_prefix: document.getElementById('route-strip-prefix').checked,
+                };
+                if (upstreams.length) payload.upstreams = upstreams;
+                const data = await postJson('/v1/domain-routes/upsert', payload);
+                result.textContent = `路由已保存：${data.name}`;
+                await refreshDomainRoutes();
+            } catch (error) {
+                result.textContent = String(error);
+            }
+        });
+
+        document.getElementById('domain-routes-wrap').addEventListener('click', async (event) => {
+            const button = event.target.closest('[data-delete-domain]');
+            if (!button) return;
+            if (!await confirmAction(`确认删除域名路由 ${button.dataset.deleteDomain}?`)) return;
+            try {
+                await postJson('/v1/domain-routes/delete', { name: button.dataset.deleteDomain });
+                await refreshDomainRoutes();
+            } catch (error) {
+                document.getElementById('domain-route-result').textContent = String(error);
+            }
+        });
+
+        async function refreshReverseRoutes() {
+            const state = document.getElementById('reverse-state');
+            const wrap = document.getElementById('reverse-routes-wrap');
+            try {
+                const payload = await loadJson('/v1/reverse-proxy-routes');
+                const items = payload.items || [];
+                document.getElementById('reverse-count').textContent = `${items.length} 条路由`;
+                if (!items.length) {
+                    wrap.className = 'empty';
+                    wrap.textContent = '尚未配置反向代理路由。';
+                } else {
+                    wrap.className = '';
+                    wrap.innerHTML = `<table><thead><tr><th>名称</th><th>路径前缀</th><th>上游地址</th><th>域名</th><th>操作</th></tr></thead><tbody>${items.map(item => `
+                        <tr><td><code>${escapeHtml(item.name)}</code></td><td><code>${escapeHtml(item.path_prefix || '/')}</code></td><td><code>${escapeHtml(item.upstream)}</code></td><td>${(item.hosts || []).map(escapeHtml).join('<br/>') || '-'}</td>
+                        <td><button class="danger" data-delete-reverse="${escapeHtml(item.name)}">删除</button></td></tr>`).join('')}</tbody></table>`;
+                    wrap.querySelectorAll('[data-delete-reverse]').forEach(button => {
+                        button.onclick = async () => {
+                            if (!await confirmAction(`确认删除反向代理路由 ${button.dataset.deleteReverse}?`)) return;
+                            await postJson('/v1/reverse-proxy-routes/delete', { name: button.dataset.deleteReverse });
+                            await refreshReverseRoutes();
+                        };
+                    });
+                }
+                state.textContent = '路由已加载';
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        function renderListenerTable(items, wrap, deletePath, attr) {
+            if (!items.length) {
+                wrap.className = 'empty';
+                wrap.textContent = '尚未配置监听器。';
+                return;
+            }
+            wrap.className = '';
+            wrap.innerHTML = `<table><thead><tr><th>名称</th><th>监听地址</th><th>上游地址</th><th>操作</th></tr></thead><tbody>${items.map(item => `
+                <tr><td><code>${escapeHtml(item.name)}</code></td><td><code>${escapeHtml(item.bind || item.listen)}</code></td><td><code>${escapeHtml(item.upstream)}</code></td>
+                <td><button class="danger" data-${attr}="${escapeHtml(item.name)}">删除</button></td></tr>`).join('')}</tbody></table>`;
+            wrap.querySelectorAll(`[data-${attr}]`).forEach(button => {
+                button.onclick = async () => {
+                    if (!await confirmAction(`确认删除 ${button.getAttribute('data-' + attr)}？`)) return;
+                    await postJson(deletePath, { name: button.getAttribute('data-' + attr) });
+                    await refreshListenersPanel();
+                };
+            });
+        }
+
+        async function refreshListenersPanel() {
+            const state = document.getElementById('listeners-state');
+            try {
+                const [tcp, udp, stream] = await Promise.all([
+                    loadJson('/v1/tcp-listeners'),
+                    loadJson('/v1/udp-listeners'),
+                    loadJson('/v1/stream-routes'),
+                ]);
+                renderListenerTable(tcp.items || [], document.getElementById('tcp-listeners-wrap'), '/v1/tcp-listeners/delete', 'delete-tcp');
+                renderListenerTable(udp.items || [], document.getElementById('udp-listeners-wrap'), '/v1/udp-listeners/delete', 'delete-udp');
+                const streamWrap = document.getElementById('stream-routes-wrap');
+                const streamItems = stream.items || [];
+                if (!streamItems.length) {
+                    streamWrap.className = 'empty';
+                    streamWrap.textContent = '尚未配置 TCP 流路由。';
+                } else {
+                    streamWrap.className = '';
+                    streamWrap.innerHTML = `<table><thead><tr><th>名称</th><th>监听地址</th><th>上游地址</th><th>域名</th><th>操作</th></tr></thead><tbody>${streamItems.map(item => `
+                        <tr><td><code>${escapeHtml(item.name)}</code></td><td><code>${escapeHtml(item.listen)}</code></td><td><code>${escapeHtml(item.upstream)}</code></td><td>${(item.domains || []).map(escapeHtml).join('<br/>')}</td>
+                        <td><button class="danger" data-delete-stream="${escapeHtml(item.name)}">删除</button></td></tr>`).join('')}</tbody></table>`;
+                    streamWrap.querySelectorAll('[data-delete-stream]').forEach(button => {
+                        button.onclick = async () => {
+                            if (!await confirmAction(`确认删除流路由 ${button.dataset.deleteStream}?`)) return;
+                            await postJson('/v1/stream-routes/delete', { name: button.dataset.deleteStream });
+                            await refreshListenersPanel();
+                        };
+                    });
+                }
+                state.textContent = '监听器已加载';
+                state.className = 'status-dot ok';
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        async function refreshFileCloudPanel() {
+            const state = document.getElementById('filecloud-state');
+            try {
+                const payload = await loadJson('/v1/filecloud/summary');
+                const fc = payload.filecloud || {};
+                document.getElementById('filecloud-summary-json').textContent = JSON.stringify(fc, null, 2);
+                document.getElementById('fc-enabled').value = fc.enabled ? 'true' : 'false';
+                document.getElementById('fc-prefix').value = fc.path_prefix || '/filecloud';
+                document.getElementById('fc-root').value = fc.root || '';
+                document.getElementById('fc-title').value = fc.title || 'FileCloud';
+                document.getElementById('fc-max-upload').value = fc.max_upload_bytes || '';
+                document.getElementById('fc-cdn-cache').value = fc.cdn_cache_secs || '';
+                document.getElementById('fc-allow-upload').checked = fc.allow_upload !== false;
+                document.getElementById('fc-allow-delete').checked = fc.allow_delete !== false;
+                document.getElementById('fc-allow-mkdir').checked = fc.allow_mkdir !== false;
+                document.getElementById('fc-allow-move').checked = fc.allow_move !== false;
+                const openLink = document.getElementById('filecloud-open-link');
+                if (fc.enabled && fc.ui_url) {
+                    openLink.href = fc.ui_url;
+                    openLink.style.display = '';
+                    state.textContent = `已启用 · ${fc.ui_url}`;
+                } else {
+                    openLink.style.display = 'none';
+                    state.textContent = '未启用';
+                }
+                state.className = 'status-dot ' + (fc.enabled ? 'ok' : '');
+            } catch (error) {
+                state.textContent = String(error);
+                state.className = 'status-dot bad';
+            }
+        }
+
+        document.getElementById('save-on-demand').addEventListener('click', async () => {
+            const result = document.getElementById('on-demand-result');
+            try {
+                await postJson('/v1/tls/on-demand/upsert', {
+                    enabled: document.getElementById('on-demand-enabled').value === 'true',
+                    allow: parseDomainLines(document.getElementById('on-demand-allow').value),
+                });
+                result.textContent = '按需申请配置已保存';
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('issue-tls-now').addEventListener('click', async () => {
+            const result = document.getElementById('on-demand-result');
+            try {
+                const data = await postJson('/v1/tls/issue-now', {});
+                result.textContent = `Issued: cert=${data.issued?.cert_exists} key=${data.issued?.key_exists}`;
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-reverse-route').addEventListener('click', async () => {
+            const result = document.getElementById('reverse-route-result');
+            try {
+                const hosts = document.getElementById('reverse-hosts').value.split(',').map(v => v.trim()).filter(Boolean);
+                const upstreams = document.getElementById('reverse-upstreams').value.split('\n').map(v => v.trim()).filter(Boolean);
+                const payload = {
+                    name: document.getElementById('reverse-name').value.trim(),
+                    path_prefix: document.getElementById('reverse-prefix').value.trim() || '/',
+                    upstream: document.getElementById('reverse-upstream').value.trim(),
+                    hosts,
+                    strip_prefix: document.getElementById('reverse-strip-prefix').checked,
+                };
+                if (upstreams.length) payload.upstreams = upstreams;
+                const data = await postJson('/v1/reverse-proxy-routes/upsert', payload);
+                result.textContent = `已保存：${data.name}`;
+                await refreshReverseRoutes();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-tcp-listener').addEventListener('click', async () => {
+            const result = document.getElementById('tcp-listener-result');
+            try {
+                await postJson('/v1/tcp-listeners/upsert', {
+                    name: document.getElementById('tcp-name').value.trim(),
+                    bind: document.getElementById('tcp-bind').value.trim(),
+                    upstream: document.getElementById('tcp-upstream').value.trim(),
+                });
+                result.textContent = 'TCP 监听器已保存';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-udp-listener').addEventListener('click', async () => {
+            const result = document.getElementById('udp-listener-result');
+            try {
+                await postJson('/v1/udp-listeners/upsert', {
+                    name: document.getElementById('udp-name').value.trim(),
+                    bind: document.getElementById('udp-bind').value.trim(),
+                    upstream: document.getElementById('udp-upstream').value.trim(),
+                });
+                result.textContent = 'UDP 监听器已保存';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-stream-route').addEventListener('click', async () => {
+            const result = document.getElementById('stream-route-result');
+            try {
+                await postJson('/v1/stream-routes/upsert', {
+                    name: document.getElementById('stream-name').value.trim(),
+                    listen: document.getElementById('stream-listen').value.trim(),
+                    upstream: document.getElementById('stream-upstream').value.trim(),
+                    domains: document.getElementById('stream-domains').value.split(',').map(v => v.trim()).filter(Boolean),
+                });
+                result.textContent = '流路由已保存';
+                await refreshListenersPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-filecloud').addEventListener('click', async () => {
+            const result = document.getElementById('filecloud-result');
+            try {
+                await postJson('/v1/filecloud/upsert', {
+                    enabled: document.getElementById('fc-enabled').value === 'true',
+                    path_prefix: document.getElementById('fc-prefix').value.trim(),
+                    root: document.getElementById('fc-root').value.trim(),
+                    password: document.getElementById('fc-password').value,
+                    title: document.getElementById('fc-title').value.trim(),
+                    allow_upload: document.getElementById('fc-allow-upload').checked,
+                    allow_delete: document.getElementById('fc-allow-delete').checked,
+                    allow_mkdir: document.getElementById('fc-allow-mkdir').checked,
+                    allow_move: document.getElementById('fc-allow-move').checked,
+                    max_upload_bytes: Number(document.getElementById('fc-max-upload').value) || undefined,
+                    cdn_cache_secs: Number(document.getElementById('fc-cdn-cache').value) || undefined,
+                });
+                result.textContent = '文件空间配置已保存';
+                document.getElementById('fc-password').value = '';
+                await refreshFileCloudPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-sni-cert').addEventListener('click', async () => {
+            const result = document.getElementById('sni-cert-result');
+            try {
+                const payload = {
+                    domains: parseDomainLines(document.getElementById('sni-domains').value),
+                    cert_path: document.getElementById('sni-cert-path').value.trim() || undefined,
+                    key_path: document.getElementById('sni-key-path').value.trim() || undefined,
+                    cert_pem: document.getElementById('sni-cert-pem').value.trim() || undefined,
+                    key_pem: document.getElementById('sni-key-pem').value.trim() || undefined,
+                };
+                const data = await postJson('/v1/tls/sni-certificates/upsert', payload);
+                result.textContent = `SNI 证书已保存：${(data.domains || []).join(', ')}`;
+                document.getElementById('sni-cert-pem').value = '';
+                document.getElementById('sni-key-pem').value = '';
+                await refreshSniCertificates();
+                await refreshTlsPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        document.getElementById('save-blacklist-add').addEventListener('click', async () => {
+            const result = document.getElementById('blacklist-result');
+            try {
+                const banSecs = Number(document.getElementById('blacklist-ban-secs').value);
+                await postJson('/v1/security/blacklist/add', {
+                    ip: document.getElementById('blacklist-ip').value.trim(),
+                    ban_secs: banSecs > 0 ? banSecs : undefined,
+                });
+                result.textContent = '已添加封禁';
+                await refreshSecurityPanel();
+            } catch (error) { result.textContent = String(error); }
+        });
+
+        applyLocale();
+
+        (async function bootAdmin() {
+            try {
+                const saved = JSON.parse(sessionStorage.getItem(sessionKey) || 'null');
+                if (!saved || !saved.auth) {
+                    showLogin('');
+                    return;
+                }
+                if (saved.expiresAt && Number(saved.expiresAt) <= Math.floor(Date.now() / 1000)) {
+                    clearAuth();
+                    showLogin('');
+                    return;
+                }
+                authValue = saved.auth;
+                if (saved.user) document.getElementById('login-username').value = saved.user;
+                await verifyAuth();
+                showApp();
+                await refreshDashboard();
+            } catch {
+                clearAuth();
+                showLogin('');
+            }
+        })();
+    </script>
+</body>
+</html>

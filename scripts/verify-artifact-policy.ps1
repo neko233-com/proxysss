@@ -40,7 +40,7 @@ if ($Package) {
         $zip = [IO.Compression.ZipFile]::OpenRead($archive)
         try {
             $names = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\','/') })
-            foreach ($required in @('proxysss.exe','README.md','docs/cdn-origin.html','templates/cdn-origin.example.yaml','docs/security-performance.html','templates/security-performance.example.yaml')) {
+            foreach ($required in @('proxysss.exe','README.md','README-CN.md','docs/site.css','docs/site.js','templates/admin.html','templates/admin.css','templates/docs.html','docs/cdn-origin.html','templates/cdn-origin.example.yaml','docs/security-performance.html','templates/security-performance.example.yaml')) {
                 if ($names -notcontains $required) { throw "Package is missing $required" }
             }
             if ($names | Where-Object { $_ -match '(^|/)(\.git|\.ssh|\.tmp|\.cache|target|logs|certs)(/|$)' -or $_ -eq 'proxysss.yaml' }) {
