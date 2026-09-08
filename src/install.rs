@@ -61,7 +61,17 @@ pub fn init_layout(dir: Option<PathBuf>, overwrite: bool) -> Result<()> {
             base_dir.display().to_string().replace('\\', "/")
         ),
     );
+    write_if_needed(
+        &base_dir.join("cdn-origin.example.yaml"),
+        include_str!("../templates/cdn-origin.example.yaml"),
+        overwrite,
+    )?;
     write_if_needed(&config_path, &config_yaml, overwrite)?;
+    write_if_needed(
+        &base_dir.join("security-performance.example.yaml"),
+        include_str!("../templates/security-performance.example.yaml"),
+        overwrite,
+    )?;
     write_if_needed(&script_path, DEFAULT_GATEWAY_SCRIPT, overwrite)?;
     write_if_needed(&dts_path, DEFAULT_TYPESCRIPT_DECLARATIONS, overwrite)?;
     write_if_needed(&ts_how_to_use_path, DEFAULT_TS_HOW_TO_USE, overwrite)?;

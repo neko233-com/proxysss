@@ -231,7 +231,7 @@ impl Reactors {
                 wake_fd,
             });
             let reactor_worker = worker.clone();
-            let cpu = reactor_worker_cpu(index, worker_count, &allowed_cpus);
+            let cpu = reactor_worker_cpu(index, worker_count, allowed_cpus);
             thread::Builder::new()
                 .name(format!("proxysss-ws-epoll-{index}"))
                 .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice, allowed_cpus))
@@ -355,7 +355,11 @@ fn run_reactor(
                 // 32-poll loop that starved sibling HTTP work.
                 active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
-                active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
+                // The zero-valued knob deliberately disables dense spinning.
+                #[allow(clippy::unnecessary_min_or_max)]
+                {
+                    active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
+                }
             }
             let flags = event.events as i32;
             if flags & libc::EPOLLERR != 0 {
@@ -735,7 +739,9 @@ mod tests {
 
     #[test]
     fn dense_spin_budget_is_bounded() {
-        assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
+        const {
+            assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
+        }
         assert_eq!(quiet_reply_spin_polls(16), 1);
         assert_eq!(quiet_reply_spin_polls(17), 2);
         assert_eq!(quiet_reply_spin_polls(32), 2);

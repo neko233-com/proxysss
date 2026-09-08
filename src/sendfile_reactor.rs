@@ -112,6 +112,7 @@ pub(crate) fn warm(requested_workers: usize, scheduler_nice: i32) {
     let _ = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit ownership/limits on the existing reactor boundary.
 pub(crate) fn dispatch(
     socket_fd: RawFd,
     file_fd: RawFd,
@@ -356,7 +357,6 @@ fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
     };
     if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
         finish_unregistered_job(jobs, fd, Err(io::Error::last_os_error()));
-        return;
     }
 }
 
@@ -469,6 +469,29 @@ fn set_current_thread_nice(scheduler_nice: i32) {
     }
 }
 
+fn finish_sendfile_result(
+    socket: &TcpStream,
+    result: io::Result<u64>,
+) -> io::Result<SendfileCompletion> {
+    result.map(|bytes| SendfileCompletion {
+        bytes,
+        uncorked: uncork_sendfile_socket(socket),
+    })
+}
+
+fn uncork_sendfile_socket(socket: &TcpStream) -> bool {
+    let disabled: libc::c_int = 0;
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            (&disabled as *const libc::c_int).cast(),
+            mem::size_of_val(&disabled) as libc::socklen_t,
+        ) == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,28 +589,5 @@ mod tests {
         assert!(jobs.remove(fd).is_some());
         assert!(!jobs.contains(fd));
         drop(client);
-    }
-}
-
-fn finish_sendfile_result(
-    socket: &TcpStream,
-    result: io::Result<u64>,
-) -> io::Result<SendfileCompletion> {
-    result.map(|bytes| SendfileCompletion {
-        bytes,
-        uncorked: uncork_sendfile_socket(socket),
-    })
-}
-
-fn uncork_sendfile_socket(socket: &TcpStream) -> bool {
-    let disabled: libc::c_int = 0;
-    unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_CORK,
-            (&disabled as *const libc::c_int).cast(),
-            mem::size_of_val(&disabled) as libc::socklen_t,
-        ) == 0
     }
 }

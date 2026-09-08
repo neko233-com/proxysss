@@ -120,7 +120,7 @@ pub struct HttpConfig {
     pub h3_bind: String,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub allow_insecure_upstreams: bool,
     #[serde(default)]
     pub error_pages: HttpErrorPagesConfig,
@@ -395,7 +395,7 @@ pub struct ScriptConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginsConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_plugins_auto_load_dir")]
     pub auto_load_dir: PathBuf,
@@ -621,7 +621,7 @@ pub struct SecurityConfig {
     pub blocked_upstream_cidrs: Vec<String>,
     #[serde(default)]
     pub ddos: DdosProtectionConfig,
-    /// MAC deny list (Linux L2 only; ignored on Windows/macOS).
+    /// Reserved unsupported legacy surface; nonempty values are rejected.
     #[serde(default)]
     pub mac_deny: Vec<String>,
     #[serde(default)]
@@ -684,41 +684,11 @@ pub struct RuntimeConfig {
     pub performance: RuntimePerformanceConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimePerformanceConfig {
-    /// Default-on adaptive OS/runtime tuning. This never writes sysctl files;
-    /// persistent host tuning stays explicit through `proxysss tune linux --apply`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub profile: RuntimePerformanceProfile,
-    #[serde(default)]
-    pub traffic_profile: RuntimePerformanceTrafficProfile,
-    #[serde(default = "default_true")]
-    pub adaptive_system: bool,
-    #[serde(default = "default_true")]
-    pub socket_extreme: bool,
-    #[serde(default = "default_true")]
-    pub log_on_start: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimePerformanceProfile {
-    #[default]
-    Edge,
-    Bulk,
-    Latency,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimePerformanceTrafficProfile {
-    #[default]
-    Small,
-    Balanced,
-    Bulk,
-}
+mod performance;
+pub use performance::{
+    DesktopPerformanceConfig, RuntimePerformanceConfig, RuntimePerformanceProfile,
+    RuntimePerformanceTrafficProfile,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchdogConfig {
@@ -1128,6 +1098,72 @@ pub struct StaticSiteConfig {
     pub index_files: Vec<String>,
     #[serde(default)]
     pub autoindex: bool,
+    #[serde(default = "default_true")]
+    pub hide_dotfiles: bool,
+    #[serde(default = "default_autoindex_max_entries")]
+    pub autoindex_max_entries: usize,
+    #[serde(default)]
+    pub cache_control: String,
+    #[serde(default)]
+    pub security: StaticSecurityConfig,
+    #[serde(default)]
+    pub rate_limit: HttpRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticSecurityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub origin_token_enabled: bool,
+    #[serde(default = "default_true")]
+    pub allowed_peers_enabled: bool,
+    #[serde(default)]
+    pub origin_token: String,
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
+    #[serde(default)]
+    pub signed_url: StaticSignedUrlConfig,
+}
+
+impl Default for StaticSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            origin_token_enabled: true,
+            allowed_peers_enabled: true,
+            origin_token: String::new(),
+            allowed_peers: Vec::new(),
+            signed_url: StaticSignedUrlConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticSignedUrlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default = "default_signed_url_max_ttl")]
+    pub max_ttl_secs: u64,
+}
+impl Default for StaticSignedUrlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: String::new(),
+            max_ttl_secs: default_signed_url_max_ttl(),
+        }
+    }
+}
+fn default_signed_url_max_ttl() -> u64 {
+    300
+}
+fn default_autoindex_max_entries() -> usize {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1190,6 +1226,14 @@ pub struct FtpConfig {
     pub passive_port_end: u16,
     #[serde(default = "default_true")]
     pub passive_hint: bool,
+    #[serde(default = "default_true")]
+    pub access_control_enabled: bool,
+    #[serde(default = "default_true")]
+    pub command_policy_enabled: bool,
+    #[serde(default = "default_true")]
+    pub transfer_policy_enabled: bool,
+    #[serde(default = "default_true")]
+    pub user_policy_enabled: bool,
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
@@ -1243,6 +1287,10 @@ impl GatewayConfig {
 
     pub fn validate(&self) -> Result<()> {
         let mut errors = Vec::<String>::new();
+        crate::runtime_tuning::validate(&self.runtime.performance, &mut errors);
+        if !self.security.mac_deny.is_empty() {
+            errors.push("security.mac_deny is unsupported: use services.access_control IP/CIDR rules or a host L2 firewall; MAC addresses do not cross routers".into());
+        }
 
         if self.http.plain_bind.trim().is_empty()
             && self.http.tls_bind.trim().is_empty()
@@ -1703,6 +1751,14 @@ impl GatewayConfig {
 
         let mut static_names = HashSet::<String>::new();
         for site in &self.services.static_sites {
+            if let Err(error) = crate::static_security::validate(site) {
+                errors.push(format!("services.static_sites.{}: {error}", site.name));
+            }
+            validate_http_rate_limit_config(
+                &site.rate_limit,
+                "services.static_sites.rate_limit",
+                &mut errors,
+            );
             if site.name.trim().is_empty() {
                 errors.push("services.static_sites.name cannot be empty".to_string());
             }
@@ -1724,7 +1780,7 @@ impl GatewayConfig {
             if site
                 .index_files
                 .iter()
-                .any(|item| item.contains('/') || item.contains('\\'))
+                .any(|item| !crate::static_security::allowed_component(item, site.hide_dotfiles))
             {
                 errors.push(format!(
                     "services.static_sites.{}.index_files must contain file names only",
@@ -2674,19 +2730,6 @@ impl Default for WatchdogConfig {
     }
 }
 
-impl Default for RuntimePerformanceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_true(),
-            profile: RuntimePerformanceProfile::default(),
-            traffic_profile: RuntimePerformanceTrafficProfile::default(),
-            adaptive_system: default_true(),
-            socket_extreme: default_true(),
-            log_on_start: default_true(),
-        }
-    }
-}
-
 impl Default for WebDavConfig {
     fn default() -> Self {
         Self {
@@ -2726,6 +2769,11 @@ impl Default for StaticSiteConfig {
             root: default_static_root(),
             index_files: default_static_index_files(),
             autoindex: false,
+            hide_dotfiles: true,
+            autoindex_max_entries: default_autoindex_max_entries(),
+            cache_control: String::new(),
+            security: StaticSecurityConfig::default(),
+            rate_limit: HttpRateLimitConfig::default(),
         }
     }
 }
@@ -2908,6 +2956,10 @@ impl Default for FtpConfig {
             passive_port_start: default_ftp_passive_port_start(),
             passive_port_end: default_ftp_passive_port_end(),
             passive_hint: default_true(),
+            access_control_enabled: true,
+            command_policy_enabled: true,
+            transfer_policy_enabled: true,
+            user_policy_enabled: true,
             allow: Vec::new(),
             deny: Vec::new(),
             command_allow: Vec::new(),
@@ -3991,8 +4043,8 @@ mod tests {
 
     #[test]
     fn logging_level_derives_filter_when_filter_is_omitted() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-log-level-test-{}", std::process::id()));
+        let base_dir = crate::test_support::temp_base()
+            .join(format!("proxysss-log-level-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.yaml");
         fs::write(
@@ -4010,8 +4062,8 @@ mod tests {
 
     #[test]
     fn config_loader_accepts_utf8_bom_yaml() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-bom-yaml-test-{}", std::process::id()));
+        let base_dir = crate::test_support::temp_base()
+            .join(format!("proxysss-bom-yaml-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.yaml");
         fs::write(
@@ -4028,8 +4080,8 @@ mod tests {
 
     #[test]
     fn auto_https_expands_to_managed_acme_config() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-auto-https-test-{}", std::process::id()));
+        let base_dir = crate::test_support::temp_base()
+            .join(format!("proxysss-auto-https-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.yaml");
         fs::write(
@@ -4064,7 +4116,7 @@ mod tests {
 
     #[test]
     fn domain_only_auto_https_enables_production_tls_alpn01_without_contact_email() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-domain-only-auto-https-test-{}",
             std::process::id()
         ));
@@ -4092,7 +4144,7 @@ mod tests {
 
     #[test]
     fn domain_auto_ssl_expands_into_global_auto_https() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-domain-auto-ssl-test-{}",
             std::process::id()
         ));
@@ -4136,7 +4188,7 @@ mod tests {
 
     #[test]
     fn acme_managed_dns01_accepts_builtin_provider_credentials() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-acme-managed-dns01-test-{}",
             std::process::id()
         ));
@@ -4159,7 +4211,7 @@ mod tests {
 
     #[test]
     fn acme_dns_external_accepts_acme_sh_dns_provider_credentials() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-acme-dns-external-test-{}",
             std::process::id()
         ));
@@ -4192,7 +4244,7 @@ mod tests {
 
     #[test]
     fn domain_manual_ssl_paths_are_absolutized_into_sni_certificates() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-domain-manual-ssl-test-{}",
             std::process::id()
         ));
@@ -4217,7 +4269,7 @@ mod tests {
 
     #[test]
     fn access_control_accepts_blacklist_alias_and_cidr_rules() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-access-control-test-{}",
             std::process::id()
         ));
@@ -4240,7 +4292,7 @@ mod tests {
 
     #[test]
     fn service_discovery_accepts_registry_mappings() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-service-discovery-test-{}",
             std::process::id()
         ));
@@ -4332,6 +4384,7 @@ mod tests {
             root: PathBuf::from("public"),
             index_files: vec!["../index.html".to_string()],
             autoindex: false,
+            ..Default::default()
         });
 
         let error = config
@@ -4502,7 +4555,7 @@ udp:
 
     #[test]
     fn explicit_include_merges_child_config() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-include-unsupported-test-{}",
             std::process::id()
         ));
@@ -4524,7 +4577,7 @@ udp:
 
     #[test]
     fn legacy_external_script_runtime_is_rejected() {
-        let base_dir = std::env::temp_dir().join(format!(
+        let base_dir = crate::test_support::temp_base().join(format!(
             "proxysss-legacy-script-test-{}",
             std::process::id()
         ));
@@ -4558,8 +4611,8 @@ udp:
 
     #[test]
     fn json_config_files_are_rejected() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-json-config-test-{}", std::process::id()));
+        let base_dir = crate::test_support::temp_base()
+            .join(format!("proxysss-json-config-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.json");
         fs::write(&config_path, "{\"plugins\":{\"enabled\":false}}").expect("write json config");
@@ -4631,8 +4684,8 @@ udp:
 
     #[test]
     fn managed_acme_accepts_rsa2048_certificate_keys() {
-        let base_dir =
-            std::env::temp_dir().join(format!("proxysss-rsa2048-acme-test-{}", std::process::id()));
+        let base_dir = crate::test_support::temp_base()
+            .join(format!("proxysss-rsa2048-acme-test-{}", std::process::id()));
         fs::create_dir_all(&base_dir).expect("create temp config dir");
         let config_path = base_dir.join("proxysss.yaml");
         fs::write(

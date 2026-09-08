@@ -1,3 +1,12 @@
+/** 安全开关建议由 config security 输出；系统 socket 适配由 config performance 检查。
+ * CDN/FTP 开关属于原生配置，不增加读取秘密的脚本 API。详见 docs/security-performance.html。
+ */
+/**
+ * CDN 源站鉴权与短期 URL 属于原生 services.static_sites.security，先于文件缓存/Range/304。
+ * static-sign 从 YAML 读取密钥；脚本 API 不暴露 origin_token 或 signed_url.secret。
+ * 原生静态站点不调用脚本路由钩子；业务 Referer/UA 规则应放在 CDN WAF 或脚本代理路由。
+ * 配置与安全边界：docs/cdn-origin.html。
+ */
 /**
  * The built-in `Welcome to proxysss` root page is a Rust fallback, not a script API;
  * configured user routes take precedence. / 内建欢迎页属于 Rust fallback，不属于脚本 API；用户路由优先。

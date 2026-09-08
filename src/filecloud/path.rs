@@ -133,7 +133,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("proxysss-filecloud-{nanos}"))
+        crate::test_support::temp_base().join(format!("proxysss-filecloud-{nanos}"))
     }
 
     #[test]

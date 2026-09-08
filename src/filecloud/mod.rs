@@ -696,7 +696,8 @@ mod tests {
 
     #[tokio::test]
     async fn filecloud_login_upload_tree_download_flow() {
-        let root = std::env::temp_dir().join(format!("proxysss-filecloud-flow-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-filecloud-flow-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.expect("create root");
         let config = test_config(root.clone());
 

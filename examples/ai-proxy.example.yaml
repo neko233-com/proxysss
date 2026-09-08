@@ -1,4 +1,4 @@
-# New API / sub2api / OpenAI-compatible routes for ai.local
+# New API / sub2api / ai-router gray routes. Existing services stay online.
 services:
   ai_proxy:
     enabled: true

@@ -1158,8 +1158,8 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("proxysss-script-test-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_support::temp_base()
+            .join(format!("proxysss-script-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -20,6 +20,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+Initialize-ProjectArtifacts
 
 if (-not $Binary) {
     $exe = if ($IsWindows -or $env:OS -eq "Windows_NT") { "proxysss.exe" } else { "proxysss" }
@@ -37,8 +39,7 @@ function Fail([string]$Message) { throw "VERIFY FAILED: $Message" }
 # embedded engine needs no external runtime.
 $env:Path = ($env:Path -split [IO.Path]::PathSeparator | Where-Object { $_ -notmatch 'deno' }) -join [IO.Path]::PathSeparator
 
-$work = Join-Path ([IO.Path]::GetTempPath()) ("proxysss-verify-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $work | Out-Null
+$work = Reset-ProjectArtifactDirectory '.tmp/embedded-ts'
 
 try {
     # ----------------------------------------------------------------------
@@ -161,5 +162,5 @@ runtime:
     Write-Host "proxysss is a single self-contained binary: no external deno required." -ForegroundColor Green
 }
 finally {
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    Reset-ProjectArtifactDirectory '.tmp/embedded-ts' | Out-Null
 }

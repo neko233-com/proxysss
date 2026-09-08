@@ -13,6 +13,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+Initialize-ProjectArtifacts
 
 if (-not $Binary) {
     $exe = if ($IsWindows -or $env:OS -eq "Windows_NT") { "proxysss.exe" } else { "proxysss" }
@@ -23,6 +25,7 @@ if (-not (Test-Path -LiteralPath $Binary)) {
     Push-Location $repoRoot
     try {
         cargo build --release --locked
+        if ($LASTEXITCODE -ne 0) { throw "Release build failed" }
     } finally {
         Pop-Location
     }
@@ -45,8 +48,7 @@ Write-Step "2/3 embedded TypeScript engine verification"
 & (Join-Path $repoRoot "scripts/verify-embedded-ts.ps1") -Binary $Binary
 
 Write-Step "3/3 fresh-init gateway smoke (no legacy config)"
-$work = Join-Path ([IO.Path]::GetTempPath()) ("proxysss-e2e-smoke-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $work | Out-Null
+$work = Reset-ProjectArtifactDirectory '.tmp/e2e-smoke'
 try {
     & $Binary init --dir $work --overwrite | Out-Null
     $port = 19001
@@ -83,7 +85,7 @@ try {
         }
     }
 } finally {
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    Reset-ProjectArtifactDirectory '.tmp/e2e-smoke' | Out-Null
 }
 
 Write-Host ""

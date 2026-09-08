@@ -1,0 +1,42 @@
+# CDN 静态源站。复制到 proxysss.yaml 后修改 root、令牌和回源 CIDR。
+# CHANGE_ME 故意无法通过 check-config，防止忘记修改示例密钥。
+# CDN 必须覆盖 X-Proxysss-Origin-Token，回源使用 HTTPS。
+# CDN 边缘负责每个访客的签名校验、反盗刷与费用限制。
+services:
+  static_sites:
+    - name: cdn
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false
+      hide_dotfiles: true
+      autoindex_max_entries: 1000
+      cache_control: public, max-age=300
+      security:
+        enabled: true
+        origin_token_enabled: true
+        allowed_peers_enabled: true
+        origin_token: CHANGE_ME
+        allowed_peers: [192.0.2.0/24, '2001:db8::/32']
+        # 私有源站签名模式返回 no-store，不能被 CDN 强制缓存。
+        # 开启前将 secret 替换为独立的至少 32 字节随机密钥。
+        signed_url:
+          enabled: false
+          secret: ''
+          max_ttl_secs: 300
+      rate_limit:
+        enabled: true
+        zone: cdn-origin
+        requests: 300
+        window_ms: 1000
+        burst: 100
+
+# 公开目录服务器可单独使用以下站点；不要在私有资源上开启 autoindex。
+# services:
+#   static_sites:
+#     - name: downloads
+#       path_prefix: /
+#       root: ./downloads
+#       autoindex: true
+#       hide_dotfiles: true
+#       autoindex_max_entries: 1000

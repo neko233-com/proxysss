@@ -58,3 +58,5 @@ proxy-key.pem
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+/.tmp/

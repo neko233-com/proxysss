@@ -367,3 +367,16 @@ hook 应保持同步和快速。它是扩展点，不是业务 worker。
 ## 11. 一句脚本策略
 
 脚本应该让 proxysss 更灵活，而不是让基础网关能力变得更难找、更难配、更难测。
+
+## CDN 回源、安全下载与幂等验证
+
+原生 `static_sites` 通过 Rust 执行回源鉴权和签名校验，不调用脚本路由钩子，也不向脚本暴露签名密钥。业务 Referer/User-Agent 规则请放在 CDN WAF 或脚本代理路由；Referer 不能替代授权。
+
+完整说明：[CDN 回源与安全下载](docs/CDN-ORIGIN.md)；面向人的入口：[HTML 文档](docs/cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
+
+`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
+
+
+## 安全开关与跨系统性能适配
+
+`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。

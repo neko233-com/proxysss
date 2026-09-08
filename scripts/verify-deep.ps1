@@ -17,15 +17,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+Initialize-ProjectArtifacts
 $startedAt = Get-Date
 
 if (-not $ReportDir) {
     $ReportDir = Join-Path $repoRoot ".benchmark\verify-deep\latest"
 }
-if (Test-Path $ReportDir) {
-    Remove-Item -Recurse -Force $ReportDir
-}
-New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
+$reportAbsolute = [IO.Path]::GetFullPath($ReportDir)
+if (-not $reportAbsolute.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'ReportDir must stay inside the project' }
+$ReportDir = Reset-ProjectArtifactDirectory ($reportAbsolute.Substring($repoRoot.Length + 1))
 
 $results = [System.Collections.Generic.List[object]]::new()
 $benchRoot = Join-Path $repoRoot ".benchmark\verify-deep\benchmark-run"
@@ -57,10 +58,12 @@ Push-Location $repoRoot
 try {
     Write-Step "1/7 cargo fmt --check"
     cargo fmt --all -- --check
+    if ($LASTEXITCODE -ne 0) { throw "rustfmt failed" }
     Add-Result "quality" "rustfmt" $true
 
     Write-Step "2/7 cargo clippy"
     cargo clippy --workspace --all-targets -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw "clippy failed" }
     Add-Result "quality" "clippy" $true
 
     Write-Step "3/7 cargo test (full unit + integration suite)"

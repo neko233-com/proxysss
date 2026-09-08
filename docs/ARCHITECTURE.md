@@ -110,3 +110,16 @@ Open [architecture.html](./architecture.html) in a browser for an animated first
 - [IMPROVEMENT-BACKLOG.md](./IMPROVEMENT-BACKLOG.md) — stability, performance, protocol, security, and operations backlog
 - [../nginx-to-proxysss.md](../nginx-to-proxysss.md) — migration mapping
 - [../ts-how-to-use.md](../ts-how-to-use.md) — scripting guide
+
+## CDN 回源、安全下载与幂等验证
+
+静态请求先经过当前配置的对端 ACL/限流和回源令牌/签名，再解析真实路径、index/目录、条件请求与 Range，最后读取有界缓存或流式文件。热重载清理静态路由映射并重新预热；启用热重载或管理更新时不复用连接免策略快路径。不可变无策略 H2 热路由保持连接 OnceLock 与 ArcSwap payload。
+
+完整说明：[CDN 回源与安全下载](CDN-ORIGIN.md)；面向人的入口：[HTML 文档](cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
+
+`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
+
+
+## 安全开关与跨系统性能适配
+
+`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](SECURITY-PERFORMANCE.md)。

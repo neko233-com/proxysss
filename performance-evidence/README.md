@@ -1,6 +1,6 @@
-# Linux 性能证据清单（可选发布附件）
+# Linux 性能证据清单
 
-`performance-evidence/vX.Y.Z.json` 是可选的性能声明附件，不是功能发布的前置条件。正式 tag 只要求版本号、changelog、功能质量门禁和六平台打包通过；如果提交性能清单，必须保证它真实、可审计，并能通过下面的验证器：
+按仓库发布规则，正式 tag 要求匹配的版本号、changelog 和同一提交的严格 Linux 性能证据。功能测试与性能测试在本地运行，GitHub Actions 仅校验发布材料并完成六平台打包。性能清单必须真实、可审计，并通过下面的验证器；Windows/macOS 适配检查或单机开关对比不能替代这份证据：
 
 ```bash
 go run scripts/verify-production-evidence.go \

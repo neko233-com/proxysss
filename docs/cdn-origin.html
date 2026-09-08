@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CDN 回源与安全下载 · proxysss</title><style>body{font:16px/1.8 system-ui,"Microsoft YaHei",sans-serif;background:#f5efe6;color:#182434;margin:0}main,nav{max-width:1050px;margin:auto;padding:28px}main{background:#fffcf7;border-radius:20px;margin-bottom:48px}h1{font-size:36px;line-height:1.3}h2{margin-top:44px;border-bottom:1px solid #d8cec2;padding-bottom:12px}a{color:#096b69}code{font-family:Consolas,monospace;overflow-wrap:anywhere}pre{background:#172938;color:#edf6f6;padding:22px;border-radius:12px;overflow:auto;font-size:14px}nav a{margin-right:24px}p{overflow-wrap:anywhere}@media(max-width:640px){main,nav{padding:18px}main{border-radius:0}h1{font-size:27px}}</style></head><body><nav><a href="index.html">proxysss 文档</a><a href="configuration.html">配置</a><a href="architecture.html">架构</a></nav><main><h1>CDN 回源、安全下载与目录索引</h1>
+<p>proxysss 可以直接作为 CDN 的静态源站。公开资源使用源站令牌和缓存策略；私有资源增加短期签名 URL。源站校验发生在目录解析、文件缓存、<code>HEAD</code>、<code>Range</code>、<code>304</code> 之前。</p>
+<h2>公开资源作为 CDN 源站</h2>
+<pre><code>services:
+  static_sites:
+    - name: cdn
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false
+      hide_dotfiles: true
+      cache_control: public, max-age=300
+      security:
+        origin_token: CHANGE_ME
+        allowed_peers: [192.0.2.0/24, '2001:db8::/32']
+      rate_limit:
+        enabled: true
+        zone: cdn-origin
+        requests: 300
+        window_ms: 1000
+        burst: 100</code></pre>
+<p><code>CHANGE_ME</code> 故意不满足校验：启动前必须替换成至少 32 字节的随机令牌。示例 IP 是文档地址，必须替换成你的 CDN 回源 IP/CIDR。CDN 回源时<strong>覆盖</strong> <code>X-Proxysss-Origin-Token</code>，不要把访客提交的同名 header 透传；回源使用 HTTPS。令牌用于鉴别回源方，不代表访客已获资源权限。</p>
+<p><code>allowed_peers</code> 检查 TCP 对端 IP，不信任 <code>X-Forwarded-For</code>、<code>X-Real-IP</code>。IPv4、IPv6、IPv4-mapped IPv6 均可处理。源站的 <code>remote_addr</code> 限流会把同一 CDN 出口合并计数，额度应按出口设置；访客防盗刷、限速和费用封顶还需在 CDN 边缘执行。下载内容已缓存在 CDN 时，请求不会抵达源站。</p>
+<p>公开文件支持 <code>GET</code> / <code>HEAD</code>、MIME、大文件流式发送、单段 <code>Range</code>、<code>206</code> / <code>416</code>、弱 <code>ETag</code>、<code>Last-Modified</code>、<code>If-None-Match</code>、<code>If-Modified-Since</code>。<code>If-Range</code> 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 <code>200</code>。配置 <code>cache_control</code> 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。</p>
+<h2>私有资源与短期签名 URL</h2>
+<p>在同一站点增加：</p>
+<pre><code>security:
+  origin_token: CHANGE_ME
+  signed_url:
+    enabled: true
+    secret: CHANGE_ME
+    max_ttl_secs: 300</code></pre>
+<p>两种密钥都至少 32 字节，分别生成；仅保存在服务端 YAML，配置展示和管理 API 会脱敏。<code>max_ttl_secs</code> 范围为 1–86400 秒，默认 300。签名 URL 与源站令牌同时配置时必须全部通过。独立私有下载服务器可以只配置 <code>signed_url</code>；此时不要给客户端源站令牌。</p>
+<pre><code>proxysss -c proxysss.yaml static-sign --site cdn --path /assets/bundle.bin --ttl-secs 120</code></pre>
+<p>输出相对 URL：<code>/assets/bundle.bin?expires=…&amp;signature=…</code>。<code>--path</code> 使用 URL 编码后的绝对路径，不带 query/fragment；中文、空格、<code>#</code>、<code>?</code> 等应先编码。CLI 从配置读取密钥，密钥不会出现在命令参数中。签发算法供后端实现：</p>
+<pre><code>message = &quot;proxysss-static-v1\n&quot; + site.name + &quot;\n&quot; + URI.path + &quot;\n&quot; + expires
+signature = base64url_no_padding(HMAC_SHA256(secret_utf8, message_utf8))</code></pre>
+<p><code>expires</code> 为 Unix 秒，必须是规范的十进制正整数且满足 <code>now &lt; expires &lt;= now + max_ttl_secs</code>。仅允许一个 <code>expires</code> 和一个 <code>signature</code>；重复、额外或编码别名参数都会拒绝。签名绑定站点名、编码后的路径和到期时间，<code>GET</code> / <code>HEAD</code> / <code>Range</code> 可复用；不绑定用户、设备或 IP，也不是一次性链接。链路中各节点时钟应同步。</p>
+<p>所有签名响应和静态错误响应都发送 <code>Cache-Control: private, no-store</code> 与 <code>CDN-Cache-Control: no-store</code>。源站无法撤销已经命中的 CDN 缓存：若需要私有资源仍享受共享缓存，应由 CDN 在<strong>每次访客请求、包括缓存命中时</strong>验证其自身签名，然后只用源站令牌回源。不要对源站签名下载配置强制缓存、忽略 query、忽略 <code>no-store</code>；不要缓存鉴权失败响应。</p>
+<h2>像 nginx 一样浏览目录</h2>
+<pre><code>services:
+  static_sites:
+    - name: downloads
+      path_prefix: /
+      root: ./downloads
+      index_files: [index.html, index.htm]
+      autoindex: true
+      hide_dotfiles: true
+      autoindex_max_entries: 1000</code></pre>
+<p>显式配置 <code>/</code> 站点可以作为文件服务器根目录；未配置站点时 <code>/</code> 仍显示 <code>Welcome to proxysss</code>。优先返回 index 文件，目录路径缺少 <code>/</code> 时重定向并保留 query。没有 index 且 <code>autoindex: false</code> 返回 <code>403</code>。多个静态站点按 YAML 顺序取第一个匹配项，具体路径必须放在 <code>/</code> 之前。公开根目录不要包含私有站点的数据。</p>
+<p>索引使用 HTML，显示文件名、字节数、GMT 修改时间，目录排在前面，提供站点内的上级目录链接；文件名经过 URL 编码和 HTML 转义。<code>HEAD</code> 不返回页面正文。索引响应不缓存，并设置 CSP、<code>nosniff</code>、<code>no-referrer</code>。本实现不声称支持 nginx 的 XML/JSON/JSONP 索引格式。</p>
+<p><code>autoindex_max_entries</code> 默认 1000、范围 1–10000，限制单次目录扫描条目，超过返回 <code>413</code>，不生成不完整索引。隐藏项也计入扫描上限。<code>hide_dotfiles: true</code> 同时禁止直接访问 <code>.env</code>、<code>.git</code> 等点文件/目录，并从预加载和索引中排除；显式改成 <code>false</code> 会公开这些文件，公开目录应独立存放。</p>
+<p>禁止 <code>..</code>、反斜杠、控制字符、Windows ADS 冒号和结尾点/空格；文件、index 和符号链接的真实路径必须留在站点根目录内。文件系统根目录属于可信运维边界，应由部署账号维护，不应向访客开放任意文件/符号链接写入权限。目录索引与 <code>signed_url.enabled=true</code> 不能同时启用，目录授权不会自动签发子文件链接。</p>
+<h2>热重载、日志与脚本边界</h2>
+<p>站点安全配置随 YAML 热重载；新请求读取新策略，预热和 readiness 会重新执行。启用鉴权、站点限流、自定义缓存策略、热重载或管理更新时，使用完整静态处理链，避免连接缓存复用旧授权。普通无策略、不可变配置继续使用预加载的静态快路径。</p>
+<p>访问日志保留路径、状态、对端地址和耗时，不记录签名 query 或源站令牌。业务 Referer/User-Agent/bot-score 规则由 CDN WAF 或脚本代理路由处理；原生 <code>static_sites</code> 不调用脚本路由钩子。Referer 可以伪造，不能替代身份认证。客户端 AES、manifest 校验、运行时防逆向不属于通用网关职责；短期链接也不能防止已获授权的客户端复制资源。</p>
+<h2>幂等验证与本地打包</h2>
+<p>Windows 运行 <code>test.cmd</code>，等价于 <code>scripts/verify-local.ps1 -Repeat 2</code>：格式、clippy、全量测试连续两轮，然后本地打包。<code>-SkipPackage</code> 可仅验证代码。测试结束（含失败）清理本轮测试沙箱；报告覆盖写入 <code>.tmp/verification/latest/</code>。单独 <code>cargo test</code> 的 Rust fixture 也位于 <code>.tmp/tests/</code>，新测试使用作用域清理；异常中断留下的旧 fixture 会在下次统一验证时清理。</p>
+<p>构建缓存使用 <code>target/</code>、依赖缓存使用 <code>.cache/</code>，编译临时文件位于 <code>.tmp/toolchain/</code>。<code>scripts/package-local.ps1</code> 固定输出 <code>dist/proxysss-local.zip</code>，打包 staging 位于 <code>.tmp/package-local/</code> 并在完成或失败时清理。只打包明确列出的二进制、文档和示例，不带本地 YAML、令牌、证书、日志、Git、缓存和测试数据。验证/打包有进程锁，清理前检查绝对路径和链接边界。</p>
+<p>这些是功能与幂等性检查，不是 Linux 性能发布证据；Linux 混合矩阵和跨主机性能门禁仍按项目原有要求执行。</p>
+<p>参考：<a href="https://nginx.org/en/docs/http/ngx_http_autoindex_module.html">nginx autoindex</a>、<a href="https://developers.cloudflare.com/cache/how-to/cache-rules/settings/">Cloudflare 缓存规则</a>、<a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html">CloudFront 签名 URL</a>。</p>
+</main></body></html>

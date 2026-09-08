@@ -1,0 +1,76 @@
+# 先运行 config security / config performance 阅读本机建议。
+# 此模板展示开关；上线前按流量和身份边界调整，不自动修改系统。
+security:
+  validate_admin_mutations: true
+  block_ssrf_targets: true
+  reject_ambiguous_http1: true
+  ddos:
+    enabled: false # 公网按真实峰值开启并设置窗口/burst/封禁时间
+  dynamic_blacklist:
+    enabled: false
+admin:
+  enabled: true
+  bind: 127.0.0.1:7777
+  loopback_only: true
+  enable_write_ops: false
+  expose_config: false
+  https:
+    enabled: false
+  auth_rate_limit:
+    enabled: true
+http:
+  allow_insecure_upstreams: false # 生产校验上游 TLS 证书
+runtime:
+  performance:
+    enabled: true
+    adaptive_system: true
+    socket_extreme: true # 仅 Linux 支持极限策略
+    traffic_profile: small
+    windows:
+      enabled: true
+      tcp_keepalive_secs: 60
+      tcp_keepalive_interval_secs: 15
+      tcp_send_buffer_bytes: 0
+      tcp_receive_buffer_bytes: 0
+      udp_buffer_bytes: 262144
+      tcp_notsent_lowat_bytes: 0
+    macos:
+      enabled: true
+      tcp_keepalive_secs: 60
+      tcp_keepalive_interval_secs: 15
+      tcp_send_buffer_bytes: 0
+      tcp_receive_buffer_bytes: 0
+      udp_buffer_bytes: 262144
+      tcp_notsent_lowat_bytes: 0
+services:
+  access_control:
+    http:
+      enabled: false
+    stream:
+      enabled: false
+  rate_limit:
+    http:
+      enabled: false
+    stream:
+      enabled: false
+  webdav:
+    enabled: false
+    allow_write: false
+  ftp:
+    enabled: false
+    access_control_enabled: true
+    command_policy_enabled: true
+    transfer_policy_enabled: true
+    user_policy_enabled: true
+    max_login_attempts: 3
+  filecloud:
+    enabled: false
+    require_auth_for_download: true
+    allow_upload: false
+    allow_delete: false
+    allow_move: false
+    allow_mkdir: false
+
+plugins:
+  enabled: false
+  allow_admin_manage: false # 无远程插件运维需求时关闭

@@ -418,3 +418,16 @@ proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy�
 3. 最后补健康检查、缓存、TLS 和 benchmark
 
 这样最稳，也最容易发现有没有副作用回归。
+
+## CDN 回源、安全下载与幂等验证
+
+`autoindex on/off` 对应 `static_sites[].autoindex`，`index` 对应 `index_files`，`root` 对应 `root`；目录索引仅提供 HTML。源站令牌和 HMAC 签名用 `security` 配置，不兼容 nginx secure_link 的签名格式。
+
+完整说明：[CDN 回源与安全下载](docs/CDN-ORIGIN.md)；面向人的入口：[HTML 文档](docs/cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
+
+`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
+
+
+## 安全开关与跨系统性能适配
+
+`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。

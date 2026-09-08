@@ -84,9 +84,9 @@ Agent API (requires `admin.enable_write_ops`):
 - `POST /v1/security/blacklist/add` — body `{"ip":"203.0.113.5","ban_secs":3600}`
 - `POST /v1/security/blacklist/remove` — body `{"ip":"203.0.113.5"}`
 
-### MAC deny list
+### MAC 黑名单的支持边界
 
-`security.mac_deny` is documented for Linux L2 deployments. MAC-based blocking is **not enforced on Windows** (no reliable L2 hook in userspace).
+`security.mac_deny` 从未接入实际数据路径，现统一拒绝非空配置，避免造成防护已生效的错觉。使用 `services.access_control` 的 IP/CIDR 策略；需要二层 MAC 过滤时在主机防火墙或网络设备上配置。
 
 ### TLS
 
@@ -112,3 +112,16 @@ Admin mutations write via a temp file + rename so partial YAML is not left on di
 ## Reporting issues
 
 Open security-related reports in the GitHub repository with reproduction steps and affected version.
+
+## CDN 回源、安全下载与幂等验证
+
+静态源站令牌、签名、真实对端 ACL 在缓存之前校验。签名资源默认 no-store；默认隐藏点文件并拒绝越过根目录的真实路径。CDN 缓存命中时的访客授权和流量费用限制由边缘执行。
+
+完整说明：[CDN 回源与安全下载](CDN-ORIGIN.md)；面向人的入口：[HTML 文档](cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
+
+`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
+
+
+## 安全开关与跨系统性能适配
+
+`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](SECURITY-PERFORMANCE.md)。

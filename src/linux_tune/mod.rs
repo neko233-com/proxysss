@@ -52,6 +52,8 @@ pub struct LinuxDistroDetails {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSocketTuneLevel {
     Disabled,
+    WindowsIocp,
+    MacosKqueue,
     PortableLinux,
     Ubuntu24Extreme,
     FutureLinuxExtreme,

@@ -427,11 +427,13 @@ proxysss config reload-plan
 scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
         <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止任何性能压测 workflow；迁移后的性能判断在本机或原生 Docker 跑上面的 Ubuntu 24 amd64 mixed-load，模拟结果不冒充物理 x86。v1.3.5 UDP fast path 当前专项结果是 `udp-stream 4.045x`。</p>
       </section>
-    </main>
+    <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
+</main>
 
     <footer class="footer">
       <strong>迁移原则：</strong> 先迁最简单的 `reverse_proxy`，再拆 `static_sites`、`ai_proxy`、`tcp.listeners`、`udp.listeners`，最后补 TLS、health、cache 和 benchmark。这样最容易看清能力边界，也最容易发现副作用。
     </footer>
   </div>
+<section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
 </body>
 </html>

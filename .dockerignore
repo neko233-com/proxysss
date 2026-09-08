@@ -6,3 +6,7 @@ logs
 certs
 runtime
 *.log
+
+.tmp
+.cache
+dist

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.8 - 2026-09-08
+
+- 六平台打包统一附带 CHANGELOG、中文 HTML 文档、配置示例、模板和安装脚本，使用项目内固定 staging 并检查归档内容；GitHub Actions 保持纯打包，功能测试在本地执行。
+- 基于远端 v1.3.7 更新，新增静态 CDN 回源令牌/真实对端 CIDR、短期 HMAC-SHA256 URL、站点限流、缓存验证器；私有响应禁止共享缓存。
+- 加固静态根目录边界、隐藏文件、index/预加载与 HTML 目录索引，限制扫描条目并处理热重载撤权。
+- 本地连续两轮幂等验证与固定目录打包；测试、缓存、报告、staging 和 ZIP 统一留在项目内。
+- 新增 config security/config performance：安全开关、默认值、中文建议和原生 socket 能力探测；CDN/FTP 支持保留参数的独立策略开关，修复单 IPv4 ACL，拒绝未实现的 MAC 黑名单配置。
+- Windows/macOS 保持已验证的运行时调度，增加独立 socket 适配，保留 TCP 自动调节、可选 keepalive 与共享 UDP 监听缓冲；上游 UDP 会话不强制扩容。macOS 可选 TCP_NOTSENT_LOWAT；Linux 保留原有发行版和 CPU 自适应。runtime.performance 变更需重启。
+- Docker 验证固定使用 proxysss-verify，运行前清理同名项目容器，结束或失败自动删除；系统探测、测试、场景检查和可选混合诊断复用一个容器。
+
 ## v1.3.7 - 2026-08-20
 
 - Added the production api.neko233.com AI gateway route for ai-router, including root/admin, health, OpenAI Responses, and Chat Completions paths while keeping the upstream listener loopback-only.

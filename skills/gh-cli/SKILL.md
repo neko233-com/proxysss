@@ -26,7 +26,7 @@ gh release list -R neko233-com/proxysss --limit 5
 
 | Workflow | File | Purpose |
 | --- | --- | --- |
-| `ci` | `.github/workflows/ci.yml` | actionlint, rustfmt, clippy, tests, multi-OS build |
+| `ci` | `.github/workflows/ci.yml` | six-platform release bundle packaging only; tests run locally |
 | `deploy` | `.github/workflows/deploy.yml` | package bundles |
 | `release` | `.github/workflows/release.yml` | tag builds + GitHub Release assets |
 

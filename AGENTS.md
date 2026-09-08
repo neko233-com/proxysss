@@ -89,7 +89,7 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 
 - **GitHub Actions / release work must use `skills/gh-cli/SKILL.md`.** Do not guess workflow status from memory or stale logs. Always confirm with `gh run list`, `gh run view`, `gh run watch`, and `gh release view` before reporting success or failure.
 - **Workflow JavaScript actions must target Node.js 24 LTS or newer.** Use `actions/upload-artifact@v6` and `actions/download-artifact@v6` (or later). Do not add `actions/*-artifact@v4` or other Node 20 actions without upgrading.
-- **Release tags require a matching changelog section, version, and green functional quality gate on the same commit.** Before pushing `vX.Y.Z`, ensure `CHANGELOG.md` contains `## vX.Y.Z`, `Cargo.toml` `version` matches, and `cargo fmt --all -- --check`, `cargo test --locked`, and `cargo clippy --all-targets --all-features --locked -- -D warnings` pass. Linux performance evidence is optional release material; when present, `performance-evidence/vX.Y.Z.json` is an auditable performance claim, not a hard blocker for a bug-free functional release. `release.yml` validates metadata, quality, and six-platform packaging during publish.
+- **Release tags require a matching changelog section and strict Linux evidence on the same commit.** Before pushing `vX.Y.Z`, ensure `CHANGELOG.md` contains `## vX.Y.Z`, `Cargo.toml` `version` matches, and `performance-evidence/vX.Y.Z.json` passes `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>`. Functional tests and benchmarks run locally; GitHub Actions only validates release metadata/evidence and packages six platforms. All release bundles include the binary, changelog, Chinese HTML documentation, configuration examples/templates, script declarations, and install scripts; `scripts/package-release.ps1` cleans fixed project-local staging and atomically replaces each archive.
 
 One-click bootstrap for autonomous agents:
 
@@ -154,3 +154,17 @@ The 20-second limit is an active client measurement budget accumulated from ever
 - Wildcard DNS-01 certificates are built into managed ACME via `http.tls.mode: acme_managed` + `http.tls.acme.challenge: dns01` and strategy-factory DNS providers (`cloudflare`, `aliyun_cn`, `aliyun_intl`, `tencent`, `volcengine`, `aws`, `azure`, `google`). Legacy `acme_dns_external` + `acme.sh` remains only for providers not yet implemented natively.
 
 These are tracked in `proxysss config nginx-parity` and should move toward `supported` with tests, not disappear from the matrix.
+
+## CDN 源站与本地产物约束
+
+- 静态站点 `security.origin_token`、`allowed_peers`、`signed_url` 必须在缓存、HEAD、Range 和条件响应之前校验；源站只信任 TCP 对端，不信任访客提交的转发 IP。配置展示必须脱敏 origin_token 和 signed_url.secret。
+- `autoindex` 默认 false，`hide_dotfiles` 默认 true；预加载、index 和目录浏览都必须遵守真实路径边界，索引扫描有界，URL 编码和 HTML 转义分开处理。签名站点不能开启目录索引。
+- 签名响应与静态错误响应使用 no-store；不要声称源站能约束已命中的 CDN 缓存。Referer 与客户端防逆向属于业务/边缘层。
+- 热重载/管理更新部署禁用连接免策略静态快路径，配置修改后重新预热；不可变无策略 H2 保留连接 OnceLock 与 ArcSwap payload。
+- 使用 `scripts/verify-local.ps1` 连续两轮幂等测试，`.tmp/tests` 完成或失败后清空；`.tmp/verification/latest` 覆盖报告，`.cache`/`target` 复用依赖/编译缓存，`dist/proxysss-local.zip` 为固定打包结果。清理必须验证项目绝对路径与链接边界，不得删除整棵共享历史 benchmark/cache。
+- 同步维护 `docs/CDN-ORIGIN.md` 与 `docs/cdn-origin.html`。
+
+
+## 安全开关与跨系统性能适配
+
+`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。

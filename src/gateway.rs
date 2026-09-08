@@ -94,7 +94,7 @@ use crate::config::{
     TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
-use crate::linux_tune::{self, TcpTuneProfile};
+use crate::linux_tune;
 use crate::script::{HttpContext, RouteDecision, ScriptPluginSpec, ScriptRuntime, StreamContext};
 use crate::security::{
     self, admin_loopback_only_allows, ip_access_is_denied, stream_access_is_denied,
@@ -1282,7 +1282,10 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tune_tcp_stream_for_linux(_stream: &TcpStream, _profile: TcpSocketTuneProfile) {}
+fn tune_tcp_stream_for_linux(_stream: &TcpStream, _profile: TcpSocketTuneProfile) {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::runtime_tuning::tune_tcp(_stream);
+}
 
 /// Enlarge UDP socket buffers so bursty game/KCP datagram floods are absorbed by
 /// the kernel instead of being dropped when a worker is momentarily busy. UDP has
@@ -1332,7 +1335,17 @@ fn tune_udp_socket_for_gateway(socket: &UdpSocket) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tune_udp_socket_for_gateway(_socket: &UdpSocket) {}
+fn tune_udp_socket_for_gateway(_socket: &UdpSocket) {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::runtime_tuning::tune_udp(_socket);
+}
+
+fn tune_udp_upstream_socket_for_gateway(_socket: &UdpSocket) {
+    // Desktop association counts can be very large: keep per-peer sockets on
+    // native defaults. Only the shared listener needs a configured burst queue.
+    #[cfg(target_os = "linux")]
+    tune_udp_socket_for_gateway(_socket);
+}
 
 #[cfg(target_os = "linux")]
 fn set_tcp_cork(stream: &TcpStream, enabled: bool) {
@@ -1563,6 +1576,7 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // HTTPS/realtime tail latency. Both remain bounded below Tokio's defaults.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
 const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK: usize = 256;
 const SHARDED_PLAIN_HTTP_EVENT_INTERVAL: u32 = 8;
 // HTTP/2 stream futures are deliberately driven inside their owning
 // connection to avoid one Tokio task allocation per small response. Yield
@@ -1681,7 +1695,7 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
             .thread_name("proxysss-tls")
             .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
             .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-            .max_io_events_per_tick(TLS_RUNTIME_MAX_IO_EVENTS_PER_TICK)
+            .max_io_events_per_tick(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK)
             .on_thread_start(move || set_current_thread_nice(scheduler_nice))
             .enable_all();
         vec![builder
@@ -1837,17 +1851,8 @@ fn spawn_http_connection<Connection>(
 }
 
 pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tune::RuntimeTunePlan {
-    let profile = match config.runtime.performance.profile {
-        crate::config::RuntimePerformanceProfile::Edge => TcpTuneProfile::Edge,
-        crate::config::RuntimePerformanceProfile::Bulk => TcpTuneProfile::Bulk,
-        crate::config::RuntimePerformanceProfile::Latency => TcpTuneProfile::Latency,
-    };
-    let plan = linux_tune::build_runtime_tune_plan(
-        config.runtime.performance.enabled,
-        config.runtime.performance.adaptive_system,
-        config.runtime.performance.socket_extreme,
-        profile,
-    );
+    let plan = crate::runtime_tuning::plan(&config.runtime.performance);
+    crate::runtime_tuning::configure(&config.runtime.performance);
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
@@ -2697,7 +2702,7 @@ impl Gateway {
     }
 
     async fn preload_static_fast_lane_cache(&self, config: &GatewayConfig) {
-        if !config.runtime.performance.enabled || !plain_static_fast_path_allowed(config) {
+        if !config.runtime.performance.enabled {
             return;
         }
 
@@ -4501,9 +4506,15 @@ impl Gateway {
 
     async fn reload_from_disk(&self) -> Result<()> {
         let new_config = GatewayConfig::load(&self.config_path)?;
+        if new_config.runtime.performance != self.bootstrap_config.runtime.performance {
+            anyhow::bail!("runtime.performance changed; restart required to replace startup workers/socket policy");
+        }
         prepare_tls_material(&new_config)?;
 
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
+        self.stats.warm.store(false, Ordering::Release);
+        self.static_route_cache.clear();
+        self.h2_static_route_cache.clear();
         self.dynamic.store(new_state);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
@@ -6221,8 +6232,10 @@ impl Gateway {
         let io = TokioIo::new(PrefixedIo::new(tls_stream, prefix));
         let result = if is_http2 {
             let gateway = self.clone();
+            let connection_cache = OnceLock::new();
             let service = service_fn(move |request| {
-                if let Some(response) = gateway.try_immutable_h2_static_success_fast_path(&request)
+                if let Some(response) = gateway
+                    .try_immutable_h2_static_success_fast_path(&request, Some(&connection_cache))
                 {
                     gateway.stats.record_http_request();
                     Either::Left(ready(Ok(response)))
@@ -6910,7 +6923,8 @@ impl Gateway {
         remote_addr: SocketAddr,
     ) -> Result<()> {
         let ftp_acl = crate::config::HttpAccessControlConfig {
-            enabled: !config.allow.is_empty() || !config.deny.is_empty(),
+            enabled: config.access_control_enabled
+                && (!config.allow.is_empty() || !config.deny.is_empty()),
             allow: config.allow.clone(),
             deny: config.deny.clone(),
             status: 421,
@@ -7489,7 +7503,7 @@ impl Gateway {
             .connect(upstream_addr)
             .await
             .with_context(|| format!("failed to connect direct udp upstream {upstream_addr}"))?;
-        tune_udp_socket_for_gateway(&socket);
+        tune_udp_upstream_socket_for_gateway(&socket);
 
         let upstream = upstream_addr.to_string();
         let lease = gateway.acquire_upstream_lease("udp", Some(listener_name), &upstream);
@@ -7641,7 +7655,7 @@ impl Gateway {
             match socket.connect(upstream_addr).await {
                 Ok(()) => {
                     gateway.on_upstream_success("udp", Some(listener_name), upstream);
-                    tune_udp_socket_for_gateway(&socket);
+                    tune_udp_upstream_socket_for_gateway(&socket);
                     let lease =
                         gateway.acquire_upstream_lease("udp", Some(listener_name), upstream);
                     selected = Some((socket, lease));
@@ -7975,6 +7989,9 @@ impl Gateway {
         h2_static_route_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Result<Option<GatewayResponse>> {
         let method = request.method();
+        if static_conditional_headers(request.headers()) {
+            return Ok(None);
+        }
         if method != Method::GET && method != Method::HEAD {
             return Ok(None);
         }
@@ -7982,7 +7999,9 @@ impl Gateway {
         // HTTP/2 cannot carry HTTP/1 Upgrade/Transfer-Encoding ambiguity. For
         // an already-ended GET stream, take the immutable precompiled static
         // lane before any HTTP/1-oriented header scans.
-        if let Some(response) = self.try_immutable_h2_static_success_fast_path(request) {
+        if let Some(response) =
+            self.try_immutable_h2_static_success_fast_path(request, h2_static_route_cache)
+        {
             return Ok(Some(response));
         }
 
@@ -8099,9 +8118,11 @@ impl Gateway {
     fn try_immutable_h2_static_success_fast_path(
         &self,
         request: &Request<Incoming>,
+        connection_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Option<GatewayResponse> {
         let method = request.method();
-        if request.version() != Version::HTTP_2
+        if static_conditional_headers(request.headers())
+            || request.version() != Version::HTTP_2
             || method != Method::GET
             || !request.body().is_end_stream()
             || request.headers().contains_key(RANGE)
@@ -8113,6 +8134,11 @@ impl Gateway {
             return None;
         }
 
+        if let Some(response) =
+            self.try_h2_cached_static_response(request.uri().path(), connection_cache)
+        {
+            return Some(response);
+        }
         let snapshots = self.h2_static_response_cache.load();
         if let Some(cached) = snapshots
             .get(request.uri().path())
@@ -8133,6 +8159,77 @@ impl Gateway {
         Some(cached.response)
     }
 
+    fn try_h2_cached_static_response(
+        &self,
+        path: &str,
+        connection_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
+    ) -> Option<GatewayResponse> {
+        let route = connection_cache
+            .and_then(OnceLock::get)
+            .filter(|cached| cached.path == path)
+            .map(|cached| cached.route.clone())
+            .or_else(|| {
+                let route = self
+                    .h2_static_route_cache
+                    .get(path)
+                    .map(|entry| entry.clone())?;
+                if let Some(connection_cache) = connection_cache {
+                    let _ = connection_cache.set(ConnectionH2StaticRouteCache {
+                        path: path.to_string(),
+                        route: route.clone(),
+                    });
+                }
+                Some(route)
+            })?;
+        let (response, revalidate) = cached_h2_static_response(&route);
+        if revalidate {
+            self.spawn_h2_static_cache_revalidation(route.clone());
+        }
+        Some(response)
+    }
+
+    fn spawn_h2_static_cache_revalidation(&self, route: Arc<CachedH2StaticRoute>) {
+        let static_file_cache = self.static_file_cache.clone();
+        let static_file_cache_bytes = self.static_file_cache_bytes.clone();
+        let static_file_load_locks = self.static_file_load_locks.clone();
+        std::mem::drop(tokio::spawn(async move {
+            let result: Result<()> = async {
+                if !tokio::fs::canonicalize(&route.target)
+                    .await
+                    .is_ok_and(|path| path == route.target)
+                {
+                    return Err(anyhow!("H2 static cache target changed its canonical path"));
+                }
+                let metadata = tokio::fs::metadata(&route.target)
+                    .await
+                    .context("failed reading H2 static cache metadata")?;
+                if !metadata.is_file() {
+                    return Err(anyhow!("H2 static cache target is no longer a file"));
+                }
+                let body = cached_static_file_body(
+                    &route.target,
+                    &metadata,
+                    &static_file_cache,
+                    &static_file_cache_bytes,
+                    &static_file_load_locks,
+                )
+                .await?;
+                route.payload.store(Arc::new(CachedH2StaticPayload {
+                    content_length: HeaderValue::from_str(&body.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    body,
+                    checked_at: Instant::now(),
+                }));
+                Ok(())
+            }
+            .await;
+            route.revalidating.store(false, Ordering::Release);
+            if let Err(error) = result {
+                tracing::debug!(?error, path = %route.target.display(), "H2 static cache revalidation failed");
+            }
+        }));
+    }
+
     fn spawn_static_cache_revalidation(&self, target: PathBuf) {
         let static_file_cache = self.static_file_cache.clone();
         let static_file_cache_bytes = self.static_file_cache_bytes.clone();
@@ -8146,7 +8243,15 @@ impl Gateway {
                 .get(&key)
                 .map(|entry| (entry.len, entry.modified));
             let mut refresh_h2_snapshot = false;
-            match tokio::fs::metadata(&target).await {
+            let canonical_unchanged = tokio::fs::canonicalize(&target)
+                .await
+                .is_ok_and(|resolved| resolved == target);
+            let metadata_result = if canonical_unchanged {
+                tokio::fs::metadata(&target).await
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            };
+            match metadata_result {
                 Ok(metadata) if metadata.is_file() => {
                     let current_identity = (metadata.len(), metadata.modified().ok());
                     refresh_h2_snapshot = previous_identity != Some(current_identity);
@@ -8400,14 +8505,28 @@ impl Gateway {
             .iter()
             .find(|site| static_site_path_matches(site, uri.path()))
         {
+            if !crate::static_security::site_peer_allowed(site, remote_addr.ip()) {
+                return Ok(static_denied());
+            }
             let _rate_limit_lease = match self.apply_http_rate_limit(
-                &state.config.services.rate_limit.http,
+                &merge_rate_limit_policy(&state.config.services.rate_limit.http, &site.rate_limit),
                 &host,
                 &headers,
                 remote_addr,
             ) {
                 Ok(lease) => lease,
-                Err(response) => return Ok(*response),
+                Err(response) => {
+                    let mut response = *response;
+                    response.headers.push((
+                        http::header::CACHE_CONTROL,
+                        HeaderValue::from_static("private, no-store"),
+                    ));
+                    response.headers.push((
+                        HeaderName::from_static("cdn-cache-control"),
+                        HeaderValue::from_static("no-store"),
+                    ));
+                    return Ok(response);
+                }
             };
             let response = dispatch_static_site(
                 site,
@@ -9548,11 +9667,10 @@ impl Gateway {
         }
 
         #[cfg(target_os = "linux")]
-        if config.runtime.performance.enabled
-            && native_stream_reactor_profile_enabled(config.runtime.performance.traffic_profile)
-            && plain_downstream_fd.is_some()
-        {
-            let downstream_fd = plain_downstream_fd.expect("plain downstream fd checked");
+        if let Some(downstream_fd) = plain_downstream_fd.filter(|_| {
+            config.runtime.performance.enabled
+                && native_stream_reactor_profile_enabled(config.runtime.performance.traffic_profile)
+        }) {
             match crate::stream_reactor::dispatch(
                 downstream_fd,
                 upstream_io.as_raw_fd(),
@@ -11645,14 +11763,27 @@ struct RawReverseFastLaneOptions<'a> {
     lane_upstream: &'a mut Option<RawReverseLaneUpstream>,
 }
 
+fn static_conditional_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(http::header::IF_NONE_MATCH)
+        || headers.contains_key(http::header::IF_MODIFIED_SINCE)
+        || headers.contains_key(http::header::IF_RANGE)
+}
+
 fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
-    !config.logging.access_log
+    !config.runtime.hot_reload.enabled
+        && !config.admin.enabled
+        && !config.logging.access_log
         && !config.security.ddos.enabled
         && !config.security.dynamic_blacklist.enabled
         && !config.services.access_control.http.enabled
         && !config.services.rate_limit.http.enabled
         && !config.services.response_policy.compression.enabled
         && !config.services.static_sites.is_empty()
+        && config
+            .services
+            .static_sites
+            .iter()
+            .all(crate::static_security::fast_lane_eligible)
 }
 
 fn static_sendfile_fast_path_threshold_bytes(config: &GatewayConfig) -> u64 {
@@ -11714,6 +11845,9 @@ fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest
         let (name, value) = line.split_once(':')?;
         let name = name.trim();
         if name.eq_ignore_ascii_case("range")
+            || name.eq_ignore_ascii_case("if-none-match")
+            || name.eq_ignore_ascii_case("if-modified-since")
+            || name.eq_ignore_ascii_case("if-range")
             || name.eq_ignore_ascii_case("transfer-encoding")
             || name.eq_ignore_ascii_case("upgrade")
         {
@@ -12104,6 +12238,11 @@ async fn resolve_large_static_fast_path_candidate(
         let Some(target) = static_site_filesystem_path(site, request.path)? else {
             return Ok(None);
         };
+        let Some(target) =
+            crate::static_security::confined_target(&site.root, &target, site.hide_dotfiles).await
+        else {
+            return Ok(None);
+        };
         matched_site = Some(site);
         target
     };
@@ -12117,18 +12256,35 @@ async fn resolve_large_static_fast_path_candidate(
         return Ok(Some(candidate));
     }
 
+    if !tokio::fs::canonicalize(&target)
+        .await
+        .is_ok_and(|resolved| resolved == target)
+    {
+        return Ok(None);
+    }
     let metadata = match tokio::fs::metadata(&target).await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("failed reading fast path static metadata"),
     };
     let metadata = if metadata.is_dir() {
+        if !request.path.ends_with('/') {
+            return Ok(None);
+        }
         let Some(site) = matched_site else {
             return Ok(None);
         };
         let mut found = None;
         for index in &site.index_files {
-            let candidate = target.join(index);
+            let Some(candidate) = crate::static_security::confined_target(
+                &site.root,
+                &target.join(index),
+                site.hide_dotfiles,
+            )
+            .await
+            else {
+                continue;
+            };
             if tokio::fs::metadata(&candidate)
                 .await
                 .map(|item| item.is_file())
@@ -12708,7 +12864,7 @@ fn tcp_stream_accept_worker_count_for(
 fn adaptive_data_plane_workers(min_workers: usize) -> usize {
     #[cfg(target_os = "linux")]
     {
-        return data_plane_cpu_ids().len().max(min_workers.max(1));
+        data_plane_cpu_ids().len().max(min_workers.max(1))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -13510,11 +13666,14 @@ fn decorate_error_response(
             config.http.error_pages.show_details,
         ) {
             let mut replacement = response;
-            replacement.headers = vec![(
+            replacement.headers.retain(|(name, _)| {
+                name != CONTENT_TYPE && name != CONTENT_LENGTH && name != CONTENT_ENCODING
+            });
+            replacement.headers.push((
                 CONTENT_TYPE,
                 HeaderValue::from_str(&page.content_type)
                     .unwrap_or_else(|_| HeaderValue::from_static("text/html; charset=utf-8")),
-            )];
+            ));
             replacement.body = Bytes::from(body);
             return replacement;
         }
@@ -13526,11 +13685,16 @@ fn decorate_error_response(
         } else {
             String::new()
         };
-        return GatewayHttpResponse::html_with_status(
-            response.status,
-            render_default_error_html(response.status, &detail),
-            response.upstream,
-        );
+        let mut replacement = response;
+        replacement.headers.retain(|(name, _)| {
+            name != CONTENT_TYPE && name != CONTENT_LENGTH && name != CONTENT_ENCODING
+        });
+        replacement.headers.push((
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        ));
+        replacement.body = Bytes::from(render_default_error_html(replacement.status, &detail));
+        return replacement;
     }
 
     response
@@ -15209,7 +15373,7 @@ fn ftp_user_policy<'a>(
     config: &'a crate::config::FtpConfig,
     user: &str,
 ) -> Option<&'a FtpUserPolicy> {
-    if user.is_empty() {
+    if user.is_empty() || !config.user_policy_enabled {
         return None;
     }
     config
@@ -15219,6 +15383,9 @@ fn ftp_user_policy<'a>(
 }
 
 fn ftp_command_allowed_for_user(config: &crate::config::FtpConfig, verb: &str, user: &str) -> bool {
+    if !config.command_policy_enabled {
+        return true;
+    }
     if let Some(policy) = ftp_user_policy(config, user) {
         if !policy.command_allow.is_empty()
             && !policy
@@ -15244,6 +15411,9 @@ fn ftp_transfer_allowed_for_user(
     verb: &str,
     user: &str,
 ) -> bool {
+    if !config.transfer_policy_enabled {
+        return true;
+    }
     if let Some(policy) = ftp_user_policy(config, user) {
         if !policy.transfer_allow.is_empty()
             && !policy
@@ -15276,6 +15446,9 @@ fn ftp_transfer_allowed_for_user(
 }
 
 fn ftp_command_allowed(config: &crate::config::FtpConfig, verb: &str) -> bool {
+    if !config.command_policy_enabled {
+        return true;
+    }
     if !config.command_allow.is_empty()
         && !config
             .command_allow
@@ -16499,6 +16672,20 @@ fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
         *password = serde_json::Value::String("***".to_string());
     }
 
+    if let Some(sites) = value
+        .get_mut("services")
+        .and_then(|v| v.get_mut("static_sites"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for site in sites {
+            if let Some(security) = site.get_mut("security") {
+                security["origin_token"] = serde_json::Value::String("***".into());
+                if let Some(signed) = security.get_mut("signed_url") {
+                    signed["secret"] = serde_json::Value::String("***".into());
+                }
+            }
+        }
+    }
     value
 }
 
@@ -17583,7 +17770,9 @@ fn http_static_success_fast_path_allowed(config: &GatewayConfig, scheme: &str, u
 }
 
 fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bool {
-    if config.logging.access_log
+    if config.runtime.hot_reload.enabled
+        || config.admin.enabled
+        || config.logging.access_log
         || config.security.ddos.enabled
         || config.security.dynamic_blacklist.enabled
         || config.services.access_control.http.enabled
@@ -17592,6 +17781,11 @@ fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bo
         || config.services.filecloud.enabled
         || config.services.webdav.enabled
         || config.services.static_sites.is_empty()
+        || !config
+            .services
+            .static_sites
+            .iter()
+            .all(crate::static_security::fast_lane_eligible)
     {
         return false;
     }
@@ -18640,7 +18834,73 @@ fn merge_rate_limit_policy<'a>(
     }
 }
 
+fn static_denied() -> GatewayHttpResponse {
+    let mut response = GatewayHttpResponse::error(StatusCode::FORBIDDEN, "static access denied");
+    response.headers.push((
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    ));
+    response.headers.push((
+        HeaderName::from_static("cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    ));
+    response
+}
+
 async fn dispatch_static_site(
+    site: &StaticSiteConfig,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
+) -> Result<GatewayHttpResponse> {
+    // This check precedes index resolution, Range, and every cached-body lookup.
+    if !crate::static_security::authorized(site, uri, headers, crate::static_security::now_secs()) {
+        return Ok(static_denied());
+    }
+    let mut response = dispatch_static_site_authorized(
+        site,
+        method,
+        uri,
+        headers,
+        static_file_cache,
+        static_file_cache_bytes,
+        static_file_load_locks,
+    )
+    .await?;
+    response.headers.push((
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    ));
+    if crate::static_security::signed_url_enabled(site)
+        || response.status.is_client_error()
+        || response.status.is_server_error()
+        || site.autoindex
+    {
+        response.headers.push((
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        ));
+        response.headers.push((
+            HeaderName::from_static("cdn-cache-control"),
+            HeaderValue::from_static("no-store"),
+        ));
+    } else if !site.cache_control.is_empty() {
+        response.headers.push((
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_str(&site.cache_control)?,
+        ));
+    }
+    if method == Method::HEAD {
+        response.body = Bytes::new();
+        response.stream_body = None;
+    }
+    Ok(response)
+}
+
+async fn dispatch_static_site_authorized(
     site: &StaticSiteConfig,
     method: &Method,
     uri: &Uri,
@@ -18658,13 +18918,21 @@ async fn dispatch_static_site(
         ));
     }
 
-    let Some(mut target) = static_site_filesystem_path(site, uri.path())? else {
+    let Some(target) = static_site_filesystem_path(site, uri.path())? else {
         return Ok(GatewayHttpResponse::error(
             StatusCode::NOT_FOUND,
             "static path not found",
         ));
     };
 
+    let Some(mut target) =
+        crate::static_security::confined_target(&site.root, &target, site.hide_dotfiles).await
+    else {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::NOT_FOUND,
+            "static path not found",
+        ));
+    };
     let metadata = match tokio::fs::metadata(&target).await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -18677,9 +18945,33 @@ async fn dispatch_static_site(
     };
 
     let metadata = if metadata.is_dir() {
+        if !uri.path().ends_with('/') && !crate::static_security::signed_url_enabled(site) {
+            let mut response = GatewayHttpResponse::bytes(
+                StatusCode::MOVED_PERMANENTLY,
+                "text/plain; charset=utf-8",
+                Bytes::new(),
+                "proxysss://static",
+            );
+            let location = match uri.query() {
+                Some(query) => format!("{}/?{query}", uri.path()),
+                None => format!("{}/", uri.path()),
+            };
+            response
+                .headers
+                .push((http::header::LOCATION, HeaderValue::from_str(&location)?));
+            return Ok(response);
+        }
         let mut found_index = None;
         for index in &site.index_files {
-            let candidate = target.join(index);
+            let Some(candidate) = crate::static_security::confined_target(
+                &site.root,
+                &target.join(index),
+                site.hide_dotfiles,
+            )
+            .await
+            else {
+                continue;
+            };
             if tokio::fs::metadata(&candidate)
                 .await
                 .map(|item| item.is_file())
@@ -18696,7 +18988,7 @@ async fn dispatch_static_site(
                 .await
                 .context("failed reading static index metadata")?
         } else if site.autoindex {
-            return static_autoindex(site, uri.path(), &target).await;
+            return static_autoindex(site, method, uri.path(), &target).await;
         } else {
             return Ok(GatewayHttpResponse::error(
                 StatusCode::FORBIDDEN,
@@ -18707,6 +18999,114 @@ async fn dispatch_static_site(
         metadata
     };
 
+    if !metadata.is_file() {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::NOT_FOUND,
+            "static path not found",
+        ));
+    }
+    let modified = metadata.modified().ok();
+    let etag = format!(
+        "W/\"{:x}-{:x}\"",
+        metadata.len(),
+        modified
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let unmodified_since = |value: &HeaderValue| -> bool {
+        value
+            .to_str()
+            .ok()
+            .and_then(|v| httpdate::parse_http_date(v).ok())
+            .zip(modified)
+            .is_some_and(|(date, time)| {
+                time.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    <= date
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+            })
+    };
+    let not_modified = if let Some(value) = headers.get(http::header::IF_NONE_MATCH) {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate.trim_start_matches("W/") == etag.trim_start_matches("W/")
+            })
+        })
+    } else {
+        headers
+            .get(http::header::IF_MODIFIED_SINCE)
+            .is_some_and(unmodified_since)
+    };
+    let mut response = if not_modified {
+        GatewayHttpResponse::bytes(
+            StatusCode::NOT_MODIFIED,
+            static_content_type(&target),
+            Bytes::new(),
+            "proxysss://static",
+        )
+    } else {
+        // If-Range requires an exact, strong validator, unlike If-Modified-Since.
+        // Metadata ETags are weak. Conservatively accept exact dates only after
+        // the file has been stable for a minute (HTTP dates have second precision).
+        let without_range;
+        let range_headers = if headers.get(http::header::IF_RANGE).is_some_and(|value| {
+            !value
+                .to_str()
+                .ok()
+                .and_then(|v| httpdate::parse_http_date(v).ok())
+                .zip(modified)
+                .is_some_and(|(date, time)| {
+                    httpdate::fmt_http_date(date) == httpdate::fmt_http_date(time)
+                        && time.elapsed().is_ok_and(|age| age.as_secs() >= 60)
+                })
+        }) {
+            without_range = {
+                let mut copy = headers.clone();
+                copy.remove(RANGE);
+                copy
+            };
+            &without_range
+        } else {
+            headers
+        };
+        dispatch_static_file_content(
+            &target,
+            &metadata,
+            method,
+            range_headers,
+            static_file_cache,
+            static_file_cache_bytes,
+            static_file_load_locks,
+        )
+        .await?
+    };
+    response
+        .headers
+        .push((http::header::ETAG, HeaderValue::from_str(&etag)?));
+    if let Some(modified) = modified {
+        response.headers.push((
+            http::header::LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified))?,
+        ));
+    }
+    Ok(response)
+}
+
+async fn dispatch_static_file_content(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+    method: &Method,
+    headers: &HeaderMap,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
+    static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
+) -> Result<GatewayHttpResponse> {
     match parse_static_range_header(headers, Some(metadata.len())) {
         StaticRangeDecision::NoRange => {}
         StaticRangeDecision::Invalid | StaticRangeDecision::Unsatisfiable => {
@@ -18727,26 +19127,28 @@ async fn dispatch_static_site(
             return Ok(response);
         }
         StaticRangeDecision::Range(range) => {
-            return static_range_response(&target, &metadata, method, range).await;
+            return static_range_response(target, metadata, method, range).await;
         }
     }
 
-    if let Some(response) = fresh_cached_static_file_response(&target, method, static_file_cache) {
+    if let Some(response) =
+        fresh_cached_static_file_response(target, metadata, method, static_file_cache)
+    {
         return Ok(response);
     }
 
     let (body, stream_body) = if method == Method::HEAD {
         (Bytes::new(), None)
     } else if metadata.len() >= STATIC_STREAM_THRESHOLD_BYTES {
-        let file = tokio::fs::File::open(&target)
+        let file = tokio::fs::File::open(target)
             .await
             .context("failed opening static file")?;
         (Bytes::new(), Some(file_streaming_body(file)))
     } else {
         (
             cached_static_file_body(
-                &target,
-                &metadata,
+                target,
+                metadata,
                 static_file_cache,
                 static_file_cache_bytes,
                 static_file_load_locks,
@@ -18757,7 +19159,7 @@ async fn dispatch_static_site(
     };
     let mut response = GatewayHttpResponse::bytes(
         StatusCode::OK,
-        static_content_type(&target),
+        static_content_type(target),
         body,
         "proxysss://static",
     );
@@ -19120,6 +19522,7 @@ fn cached_h2_static_response(route: &CachedH2StaticRoute) -> (GatewayResponse, b
 
 fn fresh_cached_static_file_response(
     target: &Path,
+    metadata: &std::fs::Metadata,
     method: &Method,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) -> Option<GatewayHttpResponse> {
@@ -19128,7 +19531,11 @@ fn fresh_cached_static_file_response(
     }
     let key = target.to_string_lossy();
     let entry = static_file_cache.get(key.as_ref())?;
-    if entry.body.len() as u64 != entry.len || entry.freshness.is_stale() {
+    if entry.len != metadata.len()
+        || entry.modified != metadata.modified().ok()
+        || entry.body.len() as u64 != entry.len
+        || entry.freshness.is_stale()
+    {
         return None;
     }
     let mut response = GatewayHttpResponse::bytes(
@@ -19340,6 +19747,7 @@ fn cached_static_sendfile(
     Ok(pool)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn preload_static_site_fast_lane_cache(
     site: &StaticSiteConfig,
     traffic_profile: RuntimePerformanceTrafficProfile,
@@ -19362,7 +19770,14 @@ async fn preload_static_site_fast_lane_cache(
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    candidates.insert(format!("{}/{}", prefix.trim_end_matches('/'), name), path);
+                    candidates.insert(
+                        format!(
+                            "{}/{}",
+                            prefix.trim_end_matches('/'),
+                            crate::static_security::encode_segment(name)
+                        ),
+                        path,
+                    );
                 }
             }
         }
@@ -19370,6 +19785,18 @@ async fn preload_static_site_fast_lane_cache(
 
     let mut preloaded = 0_usize;
     for (request_path, target) in candidates {
+        if target
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_none_or(|name| !crate::static_security::allowed_component(name, site.hide_dotfiles))
+        {
+            continue;
+        }
+        let Some(target) =
+            crate::static_security::confined_target(&site.root, &target, site.hide_dotfiles).await
+        else {
+            continue;
+        };
         let metadata = match tokio::fs::metadata(&target).await {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => continue,
@@ -19438,41 +19865,111 @@ async fn preload_static_site_fast_lane_cache(
 
 async fn static_autoindex(
     site: &StaticSiteConfig,
+    method: &Method,
     request_path: &str,
     target: &Path,
 ) -> Result<GatewayHttpResponse> {
     let mut entries = tokio::fs::read_dir(target)
         .await
         .context("failed reading static directory")?;
-    let mut links = Vec::new();
+    let mut rows = Vec::new();
+    let mut scanned = 0;
     while let Some(entry) = entries
         .next_entry()
         .await
         .context("failed reading static directory entry")?
     {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let href = join_static_href(&site.path_prefix, request_path, &name);
-        links.push(format!(
-            r#"<li><a href="{}">{}</a></li>"#,
+        scanned += 1;
+        if scanned > site.autoindex_max_entries {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "directory exceeds autoindex_max_entries",
+            ));
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !crate::static_security::allowed_component(&name, site.hide_dotfiles) {
+            continue;
+        }
+        let Some(path) =
+            crate::static_security::confined_target(&site.root, &entry.path(), site.hide_dotfiles)
+                .await
+        else {
+            continue;
+        };
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+        if !metadata.is_file() && !metadata.is_dir() {
+            continue;
+        }
+        let is_dir = metadata.is_dir();
+        let suffix = if is_dir { "/" } else { "" };
+        let href = format!(
+            "{}{suffix}",
+            join_static_href(&site.path_prefix, request_path, &name)
+        );
+        let size = if is_dir {
+            "—".to_string()
+        } else {
+            metadata.len().to_string()
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(httpdate::fmt_http_date)
+            .unwrap_or_else(|| "—".into());
+        let row = format!(
+            r#"<tr><td><a href="{}">{}{suffix}</a></td><td>{}</td><td>{}</td></tr>"#,
             xml_escape(&href),
-            xml_escape(&name)
-        ));
+            xml_escape(&name),
+            size,
+            modified
+        );
+        rows.push((!is_dir, name, row));
     }
-    links.sort();
-
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut links = String::new();
+    let prefix = normalize_webdav_prefix(&site.path_prefix);
+    let base = request_path.trim_end_matches('/');
+    if base != prefix.trim_end_matches('/') {
+        if let Some((parent, _)) = base.rsplit_once('/') {
+            links.push_str(&format!(
+                r#"<tr><td><a href="{}/">../</a></td><td>—</td><td>上级目录</td></tr>"#,
+                xml_escape(parent)
+            ));
+        }
+    }
+    for (_, _, row) in rows {
+        links.push_str(&row);
+    }
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of {}</title></head><body><h1>Index of {}</h1><ul>{}</ul></body></html>",
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Index of {0}</title><style>body{{font:15px system-ui,sans-serif;margin:48px auto;padding:0 24px;max-width:1000px;color:#202c3b;background:#f8fafc}}h1{{font-size:28px;overflow-wrap:anywhere}}table{{width:100%;border-collapse:collapse;background:white}}th,td{{padding:14px;text-align:left;border-bottom:1px solid #dfe5ec}}a{{color:#145ac4;text-decoration:none;overflow-wrap:anywhere}}a:hover{{text-decoration:underline}}p{{color:#526276}}td:nth-child(2){{font-variant-numeric:tabular-nums}}</style></head><body><p>proxysss · 文件目录</p><h1>Index of {0}</h1><table><thead><tr><th>名称</th><th>大小（字节）</th><th>修改时间（GMT）</th></tr></thead><tbody>{1}</tbody></table><p>仅展示当前目录中允许公开访问的文件。</p></body></html>"#,
         xml_escape(request_path),
-        xml_escape(request_path),
-        links.join("")
+        links
     );
-
-    Ok(GatewayHttpResponse::bytes(
+    let length = body.len();
+    let mut response = GatewayHttpResponse::bytes(
         StatusCode::OK,
         "text/html; charset=utf-8",
-        Bytes::from(body),
+        if method == Method::HEAD {
+            Bytes::new()
+        } else {
+            Bytes::from(body)
+        },
         "proxysss://static",
-    ))
+    );
+    response.headers.push((
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string())?,
+    ));
+    response.headers.push((HeaderName::from_static("content-security-policy"), HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")));
+    response.headers.push((
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    ));
+    Ok(response)
 }
 
 fn static_site_path_matches(site: &StaticSiteConfig, path: &str) -> bool {
@@ -19483,6 +19980,9 @@ fn static_site_filesystem_path(
     site: &StaticSiteConfig,
     request_path: &str,
 ) -> Result<Option<PathBuf>> {
+    if request_path.starts_with("//") {
+        return Ok(None);
+    }
     let prefix = normalize_webdav_prefix(&site.path_prefix);
     if !webdav_path_matches(&prefix, request_path) {
         return Ok(None);
@@ -19492,12 +19992,18 @@ fn static_site_filesystem_path(
         .strip_prefix(&prefix)
         .unwrap_or("")
         .trim_start_matches('/');
-    let decoded = percent_decode_path(relative)?;
+    let decoded = match percent_decode_path(relative) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
     let mut target = site.root.clone();
 
     for part in decoded.split('/') {
-        if part.is_empty() || part == "." {
+        if part.is_empty() {
             continue;
+        }
+        if !crate::static_security::allowed_component(part, site.hide_dotfiles) {
+            return Ok(None);
         }
         let component_path = Path::new(part);
         if component_path
@@ -19522,6 +20028,7 @@ fn join_static_href(prefix: &str, base_path: &str, child_name: &str) -> String {
             root: PathBuf::new(),
             index_files: Vec::new(),
             autoindex: false,
+            ..Default::default()
         },
         base_path,
     ) {
@@ -19529,7 +20036,10 @@ fn join_static_href(prefix: &str, base_path: &str, child_name: &str) -> String {
     } else {
         format!("{}/", normalize_webdav_prefix(prefix))
     };
-    format!("{base}{child_name}")
+    format!(
+        "{base}{}",
+        crate::static_security::encode_segment(child_name)
+    )
 }
 
 fn static_content_type(path: &Path) -> &'static str {
@@ -20640,7 +21150,8 @@ proxysss token show
       </section>
     </main>
   </div>
-</body>
+<div class="shell"><section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="https://neko233-com.github.io/proxysss/cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section></div>
+<div class="shell"><section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="https://neko233-com.github.io/proxysss/security-performance.html">查看完整配置、安全建议和验证边界</a></p></section></div></body>
 </html>"###
     .to_string();
 
@@ -23987,7 +24498,7 @@ mod tests {
 
     #[test]
     fn sendfile_revalidation_keeps_body_empty_and_clears_inflight_flag() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_support::temp_base().join(format!(
             "proxysss-sendfile-revalidate-{}.bin",
             Uuid::new_v4()
         ));
@@ -24031,8 +24542,8 @@ mod tests {
 
     #[test]
     fn static_sendfile_pool_prewarms_reuses_and_bounds_descriptors() {
-        let path =
-            std::env::temp_dir().join(format!("proxysss-sendfile-pool-{}.bin", std::process::id()));
+        let path = crate::test_support::temp_base()
+            .join(format!("proxysss-sendfile-pool-{}.bin", std::process::id()));
         std::fs::write(&path, b"sendfile-pool-data").expect("write sendfile pool fixture");
         let pool = StaticSendfilePool::with_capacity(
             std::fs::File::open(&path).expect("open initial sendfile pool fixture"),
@@ -24283,8 +24794,10 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.admin.enable_write_ops = true;
         config.admin.https.enabled = true;
-        config.http.tls.cert_path = std::env::temp_dir().join("proxysss-missing-admin-cert.pem");
-        config.http.tls.key_path = std::env::temp_dir().join("proxysss-missing-admin-key.pem");
+        config.http.tls.cert_path =
+            crate::test_support::temp_base().join("proxysss-missing-admin-cert.pem");
+        config.http.tls.key_path =
+            crate::test_support::temp_base().join("proxysss-missing-admin-key.pem");
         let denied = check_admin_mutation_access(
             &config,
             &AdminTransport::GatewayHttps {
@@ -24293,7 +24806,7 @@ mod tests {
         );
         assert!(denied.is_some());
 
-        let cert_dir = std::env::temp_dir().join(format!(
+        let cert_dir = crate::test_support::temp_base().join(format!(
             "proxysss-admin-tls-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -25562,7 +26075,8 @@ mod tests {
 
     #[tokio::test]
     async fn webdav_put_get_delete_roundtrip() {
-        let root = std::env::temp_dir().join(format!("proxysss-webdav-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-webdav-test-{}", Uuid::new_v4()));
         let config = WebDavConfig {
             enabled: true,
             path_prefix: "/dav".to_string(),
@@ -25599,8 +26113,8 @@ mod tests {
 
     #[tokio::test]
     async fn webdav_propfind_lists_collection() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-webdav-propfind-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-webdav-propfind-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root)
             .await
             .expect("create webdav root");
@@ -25640,11 +26154,12 @@ mod tests {
             root: PathBuf::from("/tmp/static-root"),
             index_files: vec!["index.html".to_string()],
             autoindex: false,
+            ..Default::default()
         };
 
-        let error = static_site_filesystem_path(&site, "/assets/%2e%2e/secret")
-            .expect_err("traversal must be rejected");
-        assert!(error.to_string().contains("escapes root"));
+        assert!(static_site_filesystem_path(&site, "/assets/%2e%2e/secret")
+            .unwrap()
+            .is_none());
     }
 
     async fn dispatch_static_site_for_test(
@@ -25670,7 +26185,8 @@ mod tests {
 
     #[tokio::test]
     async fn static_site_serves_index_file() {
-        let root = std::env::temp_dir().join(format!("proxysss-static-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-static-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root)
             .await
             .expect("create static root");
@@ -25684,8 +26200,9 @@ mod tests {
             root: root.clone(),
             index_files: vec!["index.html".to_string()],
             autoindex: false,
+            ..Default::default()
         };
-        let uri: Uri = "/assets".parse().expect("valid uri");
+        let uri: Uri = "/assets/".parse().expect("valid uri");
         let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
             .await
             .expect("static response");
@@ -25698,7 +26215,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_site_root_prefix_serves_child_files() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_support::temp_base().join(format!(
             "proxysss-static-root-prefix-test-{}",
             Uuid::new_v4()
         ));
@@ -25715,6 +26232,7 @@ mod tests {
             root: root.clone(),
             index_files: vec!["index.html".to_string()],
             autoindex: true,
+            ..Default::default()
         };
         let uri: Uri = "/test.txt".parse().expect("valid uri");
         let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
@@ -25729,8 +26247,8 @@ mod tests {
 
     #[tokio::test]
     async fn static_site_serves_byte_ranges() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-static-range-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-static-range-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root)
             .await
             .expect("create static root");
@@ -25744,6 +26262,7 @@ mod tests {
             root: root.clone(),
             index_files: vec!["index.html".to_string()],
             autoindex: false,
+            ..Default::default()
         };
         let uri: Uri = "/assets/video.bin".parse().expect("valid uri");
         let mut headers = HeaderMap::new();
@@ -25768,7 +26287,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_site_rejects_unsatisfiable_byte_range() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_support::temp_base().join(format!(
             "proxysss-static-range-unsat-test-{}",
             Uuid::new_v4()
         ));
@@ -25785,6 +26304,7 @@ mod tests {
             root: root.clone(),
             index_files: vec!["index.html".to_string()],
             autoindex: false,
+            ..Default::default()
         };
         let uri: Uri = "/assets/asset.bin".parse().expect("valid uri");
         let mut headers = HeaderMap::new();
@@ -25804,8 +26324,8 @@ mod tests {
 
     #[tokio::test]
     async fn static_site_autoindex_lists_directory() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-static-autoindex-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-static-autoindex-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root)
             .await
             .expect("create static root");
@@ -25819,8 +26339,9 @@ mod tests {
             root: root.clone(),
             index_files: vec!["index.html".to_string()],
             autoindex: true,
+            ..Default::default()
         };
-        let uri: Uri = "/assets".parse().expect("valid uri");
+        let uri: Uri = "/assets/".parse().expect("valid uri");
         let response = dispatch_static_site_for_test(&site, &Method::GET, &uri, &HeaderMap::new())
             .await
             .expect("static response");
@@ -25834,7 +26355,8 @@ mod tests {
 
     #[test]
     fn watched_script_paths_include_main_script_and_plugins() {
-        let root = std::env::temp_dir().join(format!("proxysss-watch-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-watch-test-{}", Uuid::new_v4()));
         let plugins = root.join("plugins");
         std::fs::create_dir_all(&plugins).expect("create plugin dir");
         std::fs::write(root.join("gateway.ts"), "// gateway").expect("write gateway");
@@ -25869,8 +26391,8 @@ mod tests {
 
     #[test]
     fn auto_load_plugin_spec_reads_sidecar_metadata() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-plugin-spec-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-plugin-spec-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create root");
         let plugin = root.join("geo-headers.ts");
         std::fs::write(&plugin, "// plugin").expect("write plugin");
@@ -26001,8 +26523,8 @@ mod tests {
 
     #[test]
     fn reload_fingerprint_changes_when_main_script_changes() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-fingerprint-test-{}", Uuid::new_v4()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-fingerprint-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create root");
         let config_path = root.join("proxysss.yaml");
         let script_path = root.join("gateway.ts");
@@ -26282,3 +26804,7 @@ mod tests {
         assert!(!apply_stream_rate_limit(&store, &config, addr));
     }
 }
+
+#[cfg(test)]
+#[path = "static_origin_tests.rs"]
+mod static_origin_tests;

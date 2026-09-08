@@ -1,87 +1,53 @@
-<#
-.SYNOPSIS
-    Docker Ubuntu 24 validation for the broad proxysss gateway scenario surface.
-
-.DESCRIPTION
-    This PowerShell wrapper mirrors scripts/verify-docker-scenarios.sh for
-    Windows operators. It validates the all-scenarios YAML, static Range
-    downloads, service discovery config, CLI capability output, and nginx-parity
-    declarations inside the Ubuntu 24 Docker image used by benchmark work.
-#>
 param(
-    [string]$Image = "proxysss-ubuntu24-scenarios",
-    [string]$Config = "examples/all-scenarios.example.yaml"
+    [string]$Image = 'proxysss-ubuntu24-amd64-bench:local',
+    [string]$Config = 'examples/all-scenarios.example.yaml',
+    [ValidateRange(1,10)][int]$Repeat = 2,
+    [switch]$Performance
 )
-
-$ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$repoRoot = Resolve-Path -LiteralPath $repoRoot
-
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+Initialize-ProjectArtifacts
+$repoRoot = $script:ProjectRoot
+$container = 'proxysss-verify'
+$owner = 'proxysss-project-verification'
+$lockPath = Get-ProjectArtifactPath '.tmp/docker-verify.lock'
+try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+catch { throw 'Another Docker verification is running.' }
 Push-Location $repoRoot
+$owned = $false
 try {
-    # Build the same Ubuntu 24 toolchain image used by the Linux benchmark
-    # helpers, so scenario validation runs in a production-like Linux family.
-    if ($env:REUSE_VERIFY_IMAGE -eq "1") {
-        docker image inspect $Image *> $null
-        if ($LASTEXITCODE -ne 0) {
-            throw "REUSE_VERIFY_IMAGE=1 but local image does not exist: $Image"
-        }
-        $probe = docker run --rm $Image bash -lc 'source /etc/os-release; printf "%s %s %s" "$ID" "$VERSION_ID" "$(uname -m)"'
-        if ($LASTEXITCODE -ne 0 -or $probe.Trim() -ne "ubuntu 24.04 x86_64") {
-            throw "cached scenario image must be Ubuntu 24.04 x86_64; detected: $probe"
-        }
-        Write-Host "reusing verified local Ubuntu 24 scenario image: $Image"
+    $configPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $Config))
+    if (-not $configPath.StartsWith($repoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $configPath)) { throw 'Verification config must exist inside this project' }
+    $configRelative = $configPath.Substring($repoRoot.Length + 1).Replace('\','/')
+    $exists = docker ps -aq --filter "name=^/${container}$"
+    if ($LASTEXITCODE -ne 0) { throw 'Docker is unavailable' }
+    if ($exists) {
+        $inspect = docker inspect $container | ConvertFrom-Json
+        $label = $inspect[0].Config.Labels.'com.proxysss.owner'
+        if ($label -ne $owner) { throw "Container name $container belongs to another task; refusing to delete it" }
+        docker rm -f $container | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Previous verification container cleanup failed' }
     }
-    else {
+    $owned = $true
+    Reset-ProjectArtifactDirectory '.tmp/docker-scenarios' | Out-Null
+    $imageId = docker image ls -q $Image
+    if (-not $imageId) {
         docker build -f docker/ubuntu24-bench.Dockerfile -t $Image .
-        if ($LASTEXITCODE -ne 0) {
-            throw "Docker scenario image build failed with exit code $LASTEXITCODE"
-        }
+        if ($LASTEXITCODE -ne 0) { throw 'Verification image build failed' }
     }
-
-    # Keep the command body in one bash script inside the container. That avoids
-    # PowerShell quoting differences changing the exact verification sequence.
-    $containerScript = @"
-set -euo pipefail
-
-cargo test --locked
-
-cargo build --locked
-proxysss_bin=/target/debug/proxysss
-`$proxysss_bin -config $Config check-config
-`$proxysss_bin -config $Config config explain | tee /tmp/proxysss-explain.txt
-`$proxysss_bin -config $Config config routes | tee /tmp/proxysss-routes.txt
-`$proxysss_bin config capabilities | tee /tmp/proxysss-capabilities.txt
-`$proxysss_bin config nginx-parity --format yaml | tee /tmp/proxysss-nginx-parity.yaml
-
-grep -q 'service discovery : enabled=true, registries=3, mappings=3' /tmp/proxysss-explain.txt
-grep -q 'large file range downloads' /tmp/proxysss-capabilities.txt
-grep -q 'service discovery registries' /tmp/proxysss-capabilities.txt
-grep -q 'waf hotlink crawler controls' /tmp/proxysss-capabilities.txt
-grep -q 'cdn origin and ipv6 edge' /tmp/proxysss-capabilities.txt
-grep -q 'api gateway policy chain' /tmp/proxysss-nginx-parity.yaml
-grep -q 'large file range downloads' /tmp/proxysss-nginx-parity.yaml
-grep -q 'mapping api-from-consul registry=consul-main service=spring-api' /tmp/proxysss-routes.txt
-"@
-    # Windows here-strings use CRLF. bash receives the script as an argument,
-    # so Git's checkout normalization cannot remove the carriage returns.
-    $containerScript = $containerScript.Replace("`r", "")
-
-    docker run --rm `
-        -e CARGO_HOME=/cargo `
-        -e CARGO_TARGET_DIR=/target `
-        -v proxysss-scenario-cargo:/cargo `
-        -v proxysss-scenario-target:/target `
-        -v "${repoRoot}:/work" `
-        -w /work `
-        $Image `
-        bash -lc $containerScript
-    if ($LASTEXITCODE -ne 0) {
-        throw "Docker scenario verification failed with exit code $LASTEXITCODE"
+    # OS probes, tests and mixed diagnostics share one fixed-name container.
+    $performanceValue = if ($Performance) { '1' } else { '0' }
+    docker run --name $container --label "com.proxysss.owner=$owner" --rm `
+        -e CARGO_HOME=/work/.cache/cargo -e CARGO_TARGET_DIR=/work/.benchmark/linux-target `
+        -e "VERIFY_CONFIG=$configRelative" -e "VERIFY_REPEAT=$Repeat" -e "VERIFY_PERFORMANCE=$performanceValue" `
+        -v "${repoRoot}:/work" -w /work $Image bash /work/scripts/verify-docker-container.sh
+    if ($LASTEXITCODE -ne 0) { throw "Docker verification failed with exit code $LASTEXITCODE" }
+    Write-Host 'proxysss Docker scenario verification passed'
+} finally {
+    if ($owned) {
+        $remaining = docker ps -aq --filter "name=^/${container}$"
+        if ($remaining) { docker rm -f $container | Out-Null }
     }
-
-    Write-Host "proxysss Docker scenario verification passed" -ForegroundColor Green
-}
-finally {
     Pop-Location
+    $lock.Dispose()
 }

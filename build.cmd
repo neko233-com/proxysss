@@ -1,5 +1,11 @@
 @echo off
 setlocal
+cd /d "%~dp0"
+set "TEMP=%~dp0.tmp\toolchain"
+set "TMP=%TEMP%"
+set "CARGO_HOME=%~dp0.cache\cargo"
+set "CARGO_TARGET_DIR=%~dp0target"
+if not exist "%TEMP%" mkdir "%TEMP%"
 
 set PROFILE=%1
 if "%PROFILE%"=="" set PROFILE=release-fast

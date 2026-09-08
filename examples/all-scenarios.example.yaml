@@ -158,6 +158,9 @@ services:
       root: ./public
       index_files: [index.html, index.htm]
       autoindex: false
+      hide_dotfiles: true
+      autoindex_max_entries: 1000
+      cache_control: public, max-age=60
 
   filecloud:
     enabled: true

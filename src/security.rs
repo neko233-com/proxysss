@@ -542,6 +542,12 @@ pub fn ip_matches_rule(ip: IpAddr, rule: &str) -> bool {
     let Some((base, prefix)) = parse_ip_rule(rule) else {
         return false;
     };
+    let ip = match (ip, base) {
+        // Accept IPv4 rules for dual-stack peers while preserving IPv6 CIDRs
+        // such as ::/0 and ::ffff:192.0.2.0/120 for the same mapped peer.
+        (IpAddr::V6(value), IpAddr::V4(_)) => value.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
     match (ip, base) {
         (IpAddr::V4(ip), IpAddr::V4(base)) => {
             let mask = if prefix == 0 {
@@ -575,9 +581,13 @@ fn parse_ip_rule(rule: &str) -> Option<(IpAddr, u8)> {
     if let Some((network, prefix)) = trimmed.split_once('/') {
         let base = network.parse::<IpAddr>().ok()?;
         let prefix = prefix.parse::<u8>().ok()?;
-        return Some((base, prefix));
+        let bits = if base.is_ipv4() { 32 } else { 128 };
+        return (prefix <= bits).then_some((base, prefix));
     }
-    trimmed.parse::<IpAddr>().ok().map(|ip| (ip, 128))
+    trimmed
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| (ip, if ip.is_ipv4() { 32 } else { 128 }))
 }
 
 pub fn apply_kubernetes_routes(
@@ -677,6 +687,24 @@ pub fn request_uri_is_safe(uri: &Uri) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_ipv4_acl_and_invalid_prefixes_do_not_shift_out_of_range() {
+        let mapped_peer = "::ffff:192.0.2.7".parse().unwrap();
+        assert!(ip_matches_rule(mapped_peer, "::/0"));
+        assert!(ip_matches_rule(mapped_peer, "::ffff:192.0.2.0/120"));
+        assert!(!ip_matches_rule(mapped_peer, "::ffff:192.0.3.0/120"));
+        let ip = "192.0.2.10".parse().unwrap();
+        assert!(super::ip_matches_rule(ip, "192.0.2.10"));
+        assert!(!super::ip_matches_rule(ip, "192.0.2.11"));
+        assert!(super::ip_matches_rule(
+            "::ffff:192.0.2.10".parse().unwrap(),
+            "192.0.2.10"
+        ));
+        for rule in ["192.0.2.0/33", "192.0.2.0/128", "::/129"] {
+            assert!(!super::ip_matches_rule(ip, rule));
+        }
+        assert!(super::ip_matches_rule(ip, "0.0.0.0/0"));
+    }
     use super::*;
 
     #[test]

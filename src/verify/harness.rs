@@ -34,10 +34,31 @@ pub async fn gateway_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 pub async fn reserve_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("failed to reserve ephemeral port")?;
-    Ok(listener.local_addr()?.port())
+    // A dropped ephemeral listener is not a reservation. Parallel fixtures may
+    // otherwise receive the same port before either gateway finishes TLS/cache
+    // initialization; Linux SO_REUSEPORT can then mix unrelated test gateways.
+    // Never reuse an assigned port within this test process, and check UDP too
+    // because callers use this helper for both protocols (Windows exclusions differ).
+    static ASSIGNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    for _ in 0..1024 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to reserve ephemeral port")?;
+        let port = listener.local_addr()?.port();
+        let Ok(_udp) = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).await else {
+            continue;
+        };
+        if ASSIGNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(port)
+        {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("could not select an unused TCP/UDP test port")
 }
 
 pub async fn wait_http_ok(url: &str) -> Result<()> {
@@ -353,7 +374,7 @@ pub fn cleanup(root: &Path) {
 }
 
 pub fn temp_root(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    crate::test_support::temp_base().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
 }
 
 pub async fn tcp_roundtrip(addr: &str, payload: &[u8]) -> Result<Vec<u8>> {

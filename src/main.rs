@@ -9,10 +9,13 @@ mod install;
 #[cfg(target_os = "linux")]
 mod linux_cpu;
 mod linux_tune;
+mod runtime_tuning;
 mod script;
 mod security;
+mod security_guidance;
 #[cfg(target_os = "linux")]
 mod sendfile_reactor;
+mod static_security;
 #[cfg(target_os = "linux")]
 mod stream_reactor;
 mod stream_routes;
@@ -22,6 +25,8 @@ mod ts_transpile;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod verify;
 
@@ -112,6 +117,15 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+    /// Generate an expiring relative URL for a protected static site.
+    StaticSign {
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value_t = 300)]
+        ttl_secs: u64,
+    },
     CertBootstrap {
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -177,6 +191,10 @@ enum ConfigOutputFormat {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
+    /// Inspect security switches, defaults and recommendations without secrets.
+    Security,
+    /// Inspect native OS socket capabilities and recommended performance settings.
+    Performance,
     Show {
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
         format: ConfigOutputFormat,
@@ -306,6 +324,22 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     (
         "static files",
         "built-in services.static_sites runtime for HTML/CSS/JS/images/fonts/audio/video, GET/HEAD, index files, optional autoindex, large-file streaming, and HTTP Range downloads",
+    ),
+    (
+        "static origin security",
+        "CDN 回源令牌、真实对端 CIDR、HMAC-SHA256 短期签名 URL、站点限流；先鉴权再处理缓存/HEAD/Range/304，私有签名响应 no-store",
+    ),
+    (
+        "safe directory index",
+        "autoindex 默认关闭；HTML 文件目录支持大小/GMT 时间/安全链接，默认隐藏点文件，限制扫描条目并验证真实路径边界",
+    ),
+    (
+        "security switch guidance",
+        "config security 输出安全开关、默认值和建议；CDN/FTP 策略支持独立停用，秘密保持脱敏",
+    ),
+    (
+        "native platform socket tuning",
+        "config performance 探测 Windows IOCP/macOS kqueue/Linux epoll；Windows/macOS 支持独立开关、keepalive、有界 UDP 缓冲，Linux 保留发行版与 CPU 自适应策略",
     ),
     (
         "large file range downloads",
@@ -630,7 +664,7 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     CaddyFeatureItem {
         capability: "file server",
         status: ParityStatus::Supported,
-        evidence: "services.static_sites handles file serving, index files, and autoindex",
+        evidence: "services.static_sites handles file serving, index files, bounded HTML autoindex, hidden-file/path confinement and origin authorization",
         next_gap: "",
     },
     CaddyFeatureItem {
@@ -671,9 +705,6 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
     },
 ];
 
-// Listener and connection hot paths own CPU-adaptive data runtimes. Keep the
-// supervisory/control-plane executor single-threaded so it cannot add a full
-// extra set of CFS competitors to a small production cpuset.
 #[tokio::main(worker_threads = 1)]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -683,7 +714,7 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Run { config: None }) {
         Commands::Run { config } => {
             let config_path =
-                install::resolve_run_config_path(merge_config_arg(global_config.clone(), config))?;
+                install::resolve_run_config_path(merge_config_arg(global_config, config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
             init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
@@ -759,6 +790,25 @@ async fn main() -> Result<()> {
         Commands::Init { dir, overwrite } => {
             init_cli_logging();
             install::init_layout(dir, overwrite)
+        }
+        Commands::StaticSign {
+            site,
+            path,
+            ttl_secs,
+        } => {
+            let config_path = install::resolve_run_config_path(global_config)?;
+            let config = GatewayConfig::load(&config_path)?;
+            let site = config
+                .services
+                .static_sites
+                .iter()
+                .find(|candidate| candidate.name == site)
+                .ok_or_else(|| anyhow::anyhow!("static site not found"))?;
+            println!(
+                "{}",
+                static_security::sign(site, &path, ttl_secs, static_security::now_secs())?
+            );
+            Ok(())
         }
         Commands::CertBootstrap { dir, overwrite } => {
             init_cli_logging();
@@ -859,6 +909,27 @@ async fn main() -> Result<()> {
                     let config_path = install::resolve_run_config_path(command_config.clone())?;
                     let gateway_config = GatewayConfig::load(&config_path)?;
                     print!("{}", render_route_topology(&gateway_config));
+                    Ok(())
+                }
+                ConfigCommands::Security | ConfigCommands::Performance => {
+                    let config_path = install::resolve_run_config_path(command_config.clone())?;
+                    let config = if config_path.exists() {
+                        GatewayConfig::load(&config_path)?
+                    } else if command_config.is_none() {
+                        GatewayConfig::default()
+                    } else {
+                        GatewayConfig::load(&config_path)?
+                    };
+                    if matches!(action, ConfigCommands::Security) {
+                        print!("{}", security_guidance::report(&config)?);
+                    } else {
+                        print!(
+                            "{}",
+                            serde_yaml::to_string(&runtime_tuning::report(
+                                &config.runtime.performance
+                            ))?
+                        );
+                    }
                     Ok(())
                 }
                 ConfigCommands::ReloadPlan => {
@@ -1134,6 +1205,25 @@ fn render_redacted_config_yaml(config: &GatewayConfig) -> Result<String> {
         .and_then(|item| item.get_mut("password"))
     {
         *password = serde_yaml::Value::String("***".to_string());
+    }
+    if let Some(sites) = value
+        .get_mut("services")
+        .and_then(|v| v.get_mut("static_sites"))
+        .and_then(|v| v.as_sequence_mut())
+    {
+        for site in sites {
+            if let Some(security) = site.get_mut("security") {
+                if let Some(token) = security.get_mut("origin_token") {
+                    *token = serde_yaml::Value::String("***".into());
+                }
+                if let Some(secret) = security
+                    .get_mut("signed_url")
+                    .and_then(|v| v.get_mut("secret"))
+                {
+                    *secret = serde_yaml::Value::String("***".into());
+                }
+            }
+        }
     }
     serde_yaml::to_string(&value).context("failed to render redacted config")
 }
@@ -1602,11 +1692,16 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     } else {
         for site in &config.services.static_sites {
             output.push_str(&format!(
-                "{} path={} root={} autoindex={}\n",
+                "{} path={} root={} autoindex={} hide_dotfiles={} origin_token_configured={} signed_url={} peer_rules={} rate_limit={}\n",
                 site.name,
                 site.path_prefix,
                 site.root.display(),
-                site.autoindex
+                site.autoindex,
+                site.hide_dotfiles,
+                !site.security.origin_token.is_empty(),
+                static_security::signed_url_enabled(site),
+                site.security.allowed_peers.len(),
+                site.rate_limit.enabled
             ));
         }
     }
@@ -1713,7 +1808,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("main extension script from script.entry\n");
     output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
     output.push_str("reverse_proxy routes\n");
-    output.push_str("static_sites\n");
+    output.push_str("static_sites (origin authorization, signed URL, safe autoindex, rate limit and cache policy)\n");
     output.push_str("webdav settings\n");
     output.push_str("ftp upstream when services.ftp listener identity is unchanged\n");
 
@@ -1724,6 +1819,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("udp listener name/bind set\n");
     output.push_str("services.ftp.enabled/services.ftp.bind\n");
     output.push_str("http.tls.mode\n");
+    output.push_str("runtime.performance (startup worker/socket policy)\n");
     output.push_str("logging.format/logging.filter/logging.level\n");
     output.push_str("logging.access_log_path/logging.error_log_path\n");
 
@@ -2441,6 +2537,7 @@ mod tests {
                 root: "public".into(),
                 index_files: vec!["index.html".to_string()],
                 autoindex: false,
+                ..Default::default()
             });
         config.services.webdav.enabled = true;
         config.services.ftp.enabled = true;
@@ -2595,8 +2692,8 @@ mod tests {
 
     #[test]
     fn open_log_writer_creates_parent_directory() {
-        let root =
-            std::env::temp_dir().join(format!("proxysss-log-writer-test-{}", std::process::id()));
+        let root = crate::test_support::temp_base()
+            .join(format!("proxysss-log-writer-test-{}", std::process::id()));
         let log_path = root.join("logs").join("access.log");
         let _ = std::fs::remove_dir_all(&root);
 

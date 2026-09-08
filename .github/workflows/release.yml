@@ -19,17 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
       - name: Verify release version and changelog
         shell: bash
         run: |
           set -euo pipefail
-          # workflow_dispatch remains useful for package rehearsals. A tag must
-          # match Cargo.toml and have a changelog section; performance evidence
-          # is optional and must not block a bug-free functional release.
+          # Tests and benchmarks run locally. Dispatch builds rehearse packaging;
+          # tags additionally validate the previously collected release evidence.
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             echo "not a tag build; release metadata check is a rehearsal"
             exit 0
@@ -38,24 +33,7 @@ jobs:
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "$cargo_version" = "${tag#v}"
           grep -Eq "^## ${tag}( |$)" CHANGELOG.md
-
-  quality:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Rust quality gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          cargo test --locked
-          cargo clippy --all-targets --all-features --locked -- -D warnings
+          go run scripts/verify-production-evidence.go --manifest "performance-evidence/${tag}.json" --tag "$tag" --commit "$GITHUB_SHA"
 
   build:
     strategy:
@@ -109,50 +87,20 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package bundle (tar.gz)
-        if: endsWith(matrix.asset, '.tar.gz')
-        shell: bash
-        run: |
-          mkdir -p bundle/scripts
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} bundle/
-          cp README.md bundle/
-          for doc in proxysss-script.d.ts ts-how-to-use.md nginx-to-proxysss.md caddy-to-proxysss.md benchmark-linux.md; do
-            if [ -f "$doc" ]; then cp "$doc" bundle/; fi
-          done
-          for script in install.sh install.ps1; do
-            if [ -f "scripts/$script" ]; then cp "scripts/$script" bundle/scripts/; fi
-          done
-          tar -czf ${{ matrix.asset }} -C bundle .
-
-      - name: Package bundle (zip)
-        if: endsWith(matrix.asset, '.zip')
+      - name: Package complete release bundle
         shell: pwsh
-        run: |
-          Remove-Item bundle -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path bundle -Force | Out-Null
-          New-Item -ItemType Directory -Path bundle/scripts -Force | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "bundle/" -Force
-          Copy-Item README.md "bundle/" -Force
-          foreach ($doc in @('proxysss-script.d.ts', 'ts-how-to-use.md', 'nginx-to-proxysss.md', 'caddy-to-proxysss.md', 'benchmark-linux.md')) {
-            if (Test-Path $doc) { Copy-Item $doc "bundle/" -Force }
-          }
-          foreach ($script in @('install.sh', 'install.ps1')) {
-            $source = Join-Path scripts $script
-            if (Test-Path $source) { Copy-Item $source "bundle/scripts/" -Force }
-          }
-          Remove-Item "${{ matrix.asset }}" -ErrorAction SilentlyContinue
-          tar.exe -a -cf "${{ matrix.asset }}" -C bundle .
+        run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}' -Asset '${{ matrix.asset }}'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           compression-level: 0
-          path: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, verify-release-metadata, quality]
+    needs: [build, verify-release-metadata]
     runs-on: ubuntu-latest
 
     steps:
@@ -175,8 +123,8 @@ jobs:
           fi
           awk -v tag="$tag" '
             $0 ~ "^## " tag "( |$)" { found=1 }
-            found { print }
             found && $0 ~ "^## " && $0 !~ "^## " tag "( |$)" { exit }
+            found { print }
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
 
