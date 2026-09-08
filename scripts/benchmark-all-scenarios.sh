@@ -13,6 +13,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "benchmark-all-scenarios.sh is a Linux-only production performance gate" >&2
@@ -125,7 +128,6 @@ if [[ "$REQUIRE_ZERO_ERRORS" != "1" && -z "$UDP_ERROR_TOLERANCE_SET" && ! -e /pr
   echo "==> /proc/sys/net/core/rmem_max is unavailable; using Docker/WSL UDP error tolerance +$UDP_ERROR_TOLERANCE" >&2
 fi
 
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 VENDOR_DIR="${VENDOR_DIR:-$BENCH_ROOT/vendors}"
 RUN_DIR="$BENCH_ROOT/runs/all-scenarios"
 WWW_DIR="$RUN_DIR/www"
@@ -143,7 +145,7 @@ BUILD_PROFILE="${BUILD_PROFILE:-release}"
 if [[ "$QUICK" == "1" && -z "$BUILD_PROFILE_WAS_SET" ]]; then
   BUILD_PROFILE="release-fast"
 fi
-DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}"
 PROXY_BIN="${PROXY_BIN:-$DEFAULT_TARGET_DIR/$BUILD_PROFILE/proxysss}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
 
@@ -183,7 +185,7 @@ require_cmd make
 require_cmd openssl
 
 if [[ "$FORCE_BUILD" == "1" || ! -x "$PROXY_BIN" ]]; then
-  cargo build --profile "$BUILD_PROFILE" --locked
+  CARGO_TARGET_DIR="$DEFAULT_TARGET_DIR" cargo build --profile "$BUILD_PROFILE" --locked
 fi
 
 stop_bench_processes
@@ -569,7 +571,7 @@ warm_udp_gateway() {
   "$PROXY_BIN" bench udp --addr "$addr" --connections 1 --duration-secs 1 --payload-bytes "$payload_bytes" --timeout-ms "$UDP_TIMEOUT_MS" >/dev/null 2>&1 || true
 }
 
-trap 'stop_bench_processes' EXIT
+trap 'stop_bench_processes; cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 "$PROXY_BIN" demo http-echo --listen 127.0.0.1:18190 >/dev/null 2>&1 &
 echo $! >>"$PID_FILE"

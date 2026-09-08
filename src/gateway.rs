@@ -1,8 +1,9 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
-use std::future::Future;
+use std::future::{ready, Future};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Cursor, IoSlice, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
@@ -18,12 +19,14 @@ use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use base64::Engine;
 use brotli::CompressorWriter;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use dashmap::{DashMap, DashSet};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::TryStreamExt;
+use futures::future::Either;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 use h3::server::Connection as H3Connection;
 use hmac::{Hmac, Mac};
 use http::header::{
@@ -45,11 +48,12 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use instant_acme::{
-    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, Order, OrderStatus,
+    RetryPolicy,
 };
 use memchr::memmem;
 use quinn::crypto::rustls::QuicServerConfig;
-use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
+use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair, PKCS_RSA_SHA256};
 use rustc_hash::FxHashMap;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
@@ -66,7 +70,7 @@ use tokio::io::{
     BufReader as TokioBufReader, ReadBuf,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::io::ReaderStream;
@@ -80,14 +84,14 @@ use std::sync::OnceLock;
 
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
-    on_demand_domain_allowed, AcmeChallengeType, ActiveHealthConfig, ActiveHealthOverrideConfig,
-    AdminConfig, CacheBehavior, CompressionAlgorithm, DomainRouteConfig, DomainTlsMode,
-    FileCloudConfig, FtpUserPolicy, GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig,
-    HttpRateLimitConfig, LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig,
-    RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig, ResponseCompressionConfig,
-    ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile, StaticSiteConfig,
-    StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig,
-    TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    on_demand_domain_allowed, AcmeChallengeType, AcmeKeyAlgorithm, ActiveHealthConfig,
+    ActiveHealthOverrideConfig, AdminConfig, CacheBehavior, CompressionAlgorithm,
+    DomainRouteConfig, DomainTlsMode, FileCloudConfig, FtpUserPolicy, GatewayConfig,
+    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
+    MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
+    ResponseCompressionConfig, ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile,
+    StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig,
+    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::linux_tune::{self, TcpTuneProfile};
@@ -105,7 +109,7 @@ pub struct Gateway {
     config_path: PathBuf,
     bootstrap_config: GatewayConfig,
     bootstrap_fast_lane: FastLaneState,
-    dynamic: Arc<RwLock<Arc<DynamicState>>>,
+    dynamic: Arc<ArcSwap<DynamicState>>,
     stats: Arc<GatewayStats>,
     sticky_affinity: Arc<DashMap<String, StickyEntry>>,
     round_robin_state: Arc<DashMap<String, u64>>,
@@ -118,6 +122,8 @@ pub struct Gateway {
     static_route_cache: Arc<DashMap<String, PathBuf>>,
     h2_static_route_cache: Arc<DashMap<String, Arc<CachedH2StaticRoute>>>,
     static_file_cache: Arc<DashMap<String, CachedStaticFile>>,
+    h2_static_response_cache: Arc<ArcSwap<FxHashMap<String, PrebuiltH2StaticResponse>>>,
+    h2_static_response_refresh_lock: Arc<TokioMutex<()>>,
     static_file_cache_bytes: Arc<AtomicU64>,
     static_file_load_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
     acme_http_challenges: Arc<DashMap<String, String>>,
@@ -170,14 +176,20 @@ impl FastLaneState {
 struct RawHttpUpstreamPool {
     host: String,
     port: u16,
+    socket_addr: Option<SocketAddr>,
     idle: ArrayQueue<TcpStream>,
 }
 
 impl RawHttpUpstreamPool {
     fn new(host: String, port: u16) -> Self {
+        let socket_addr = host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, port));
         Self {
             host,
             port,
+            socket_addr,
             idle: ArrayQueue::new(raw_http_pool_idle_capacity()),
         }
     }
@@ -189,16 +201,18 @@ impl RawHttpUpstreamPool {
             }
         }
 
-        let stream = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed connecting raw HTTP upstream {}:{}",
-                    self.host, self.port
-                )
-            })?;
+        let stream = match self.socket_addr {
+            Some(addr) => TcpStream::connect(addr).await,
+            None => TcpStream::connect((self.host.as_str(), self.port)).await,
+        }
+        .with_context(|| {
+            format!(
+                "failed connecting raw HTTP upstream {}:{}",
+                self.host, self.port
+            )
+        })?;
         let _ = stream.set_nodelay(true);
-        tune_tcp_stream_for_gateway(&stream);
+        tune_tcp_stream_for_latency(&stream);
         Ok(stream)
     }
 
@@ -218,6 +232,8 @@ fn raw_http_idle_stream_reusable(stream: &TcpStream) -> bool {
 fn raw_http_pool_idle_capacity() -> usize {
     adaptive_data_plane_workers(1).saturating_mul(64).max(64)
 }
+
+const RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL: usize = 2;
 
 /// Bounded, lock-free pool of reusable heap buffers for hot-path relay and
 /// streaming loops. Caps steady-state allocation churn under very high
@@ -564,12 +580,10 @@ where
 /// Keep each polling turn bounded so a continuously writable bulk connection
 /// cannot monopolize the runtime that also services game/WebSocket sessions.
 const MAX_POOLED_RELAY_POLL_STEPS: usize = 64;
-// A normal WebSocket echo frame needs one read and one write. A budget of two
-// forced a self-wake immediately after every frame, before the relay could poll
-// the next read and naturally park on Pending. Three removes that redundant
-// runnable task while still bounding a continuously readable peer to at most
-// two frame batches per runtime turn.
-const WEBSOCKET_RELAY_POLL_STEPS: usize = 3;
+// Socket readiness and Tokio's cooperative budget already bound a hot relay.
+// Reuse the normal relay budget so ready frame queues drain before parking
+// instead of creating periodic self-wakes on the shared small-profile runtime.
+const WEBSOCKET_RELAY_POLL_STEPS: usize = MAX_POOLED_RELAY_POLL_STEPS;
 
 struct PooledRelayCopyBuffer<
     const MAX_POLL_STEPS: usize,
@@ -812,11 +826,12 @@ async fn copy_tcp_bidirectional_adaptive(
     left: TcpStream,
     right: TcpStream,
     performance_enabled: bool,
+    _traffic_profile: RuntimePerformanceTrafficProfile,
     profile: TcpRelayProfile,
 ) -> Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
-    if LINUX_STREAM_REACTOR_ENABLED
-        && performance_enabled
+    if performance_enabled
+        && native_stream_reactor_profile_enabled(_traffic_profile)
         && matches!(profile, TcpRelayProfile::RealtimeSmall)
     {
         match crate::stream_reactor::dispatch_with_completion(
@@ -871,6 +886,7 @@ struct DirectTcpFastPath<'a> {
     first_payload: BytesMut,
     remote_addr: SocketAddr,
     worker_index: usize,
+    traffic_profile: RuntimePerformanceTrafficProfile,
 }
 
 async fn relay_direct_tcp_fast_path(
@@ -886,6 +902,7 @@ async fn relay_direct_tcp_fast_path(
         first_payload,
         remote_addr,
         worker_index,
+        traffic_profile,
     } = context;
 
     let mut outbound = tokio::time::timeout(
@@ -928,6 +945,7 @@ async fn relay_direct_tcp_fast_path(
         inbound,
         outbound,
         true,
+        traffic_profile,
         tcp_relay_profile(protocol, first_payload_len),
     )
     .await
@@ -1200,7 +1218,7 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
     }
 
     // Large request/response gateway sockets benefit from deep queues. Keep
-    // realtime game/MQTT/tool streams on Linux autotuning: forcing 1 MiB per
+    // realtime game/MQTT/tool streams on Linux autotuning: forcing deep queues per
     // direction wastes kernel memory at 100k connections and can add queueing
     // without helping one-frame-at-a-time traffic.
     if matches!(profile, TcpSocketTuneProfile::Gateway) {
@@ -1495,8 +1513,11 @@ impl HyperBody for GatewayBody {
 }
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -1504,11 +1525,12 @@ const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_QOS_DELAY: Duration = Duration::from_micros(125);
+const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 1024 * 1024;
 const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
-const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 1;
+const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
+const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 256;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
@@ -1516,12 +1538,16 @@ const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
 // explicit cooperative yield over a larger batch so tiny cached objects do not
 // pay scheduler overhead on every response. Raw reverse requests cross their
 // own upstream/downstream readiness points and need no extra periodic yield.
-const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 32;
-const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 8;
-const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS: usize = 300;
+const PLAIN_FAST_LANE_FAIRNESS_BATCH: usize = 128;
+const PLAIN_FAST_LANE_LOW_DENSITY_BATCH: usize = 256;
+const PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES: usize = 256 * 1024;
+// A shard with roughly one runnable connection per scheduler lane is still
+// low-density. Once dozens of keep-alive connections compete per worker, a
+// 256-response run lets hot static sockets queue unrelated HTTP, TLS and
+// realtime I/O for multiple milliseconds. Switch to the bounded batch before
+// that mixed-load knee while preserving the lower-overhead 1x path.
+const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "linux")]
-const LINUX_STREAM_REACTOR_ENABLED: bool = false;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
 // With the Linux fair scheduler enabled, a hot listen backlog can keep
 // `accept()` immediately ready long enough to queue hundreds of TLS tasks
@@ -1536,63 +1562,99 @@ const TLS_ELASTIC_CONNECTIONS_PER_BASE_SHARD: usize = 64;
 // three-second mixed sample does not exchange lower bookkeeping cost for
 // HTTPS/realtime tail latency. Both remain bounded below Tokio's defaults.
 const DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL: u32 = 31;
-const DATA_RUNTIME_EVENT_INTERVAL: u32 = 8;
-const DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK: usize = 128;
-const TLS_RUNTIME_MAX_IO_EVENTS_PER_TICK: usize = 256;
+const DATA_RUNTIME_EVENT_INTERVAL: u32 = 16;
+const SHARDED_PLAIN_HTTP_EVENT_INTERVAL: u32 = 8;
+// HTTP/2 stream futures are deliberately driven inside their owning
+// connection to avoid one Tokio task allocation per small response. Yield
+// after every completed stream even on the bounded balanced runtime: larger
+// ready batches make that continuously-runnable owner consume enough CFS time
+// to suppress HTTP/1/static/reverse throughput on the shared gateway cpuset.
+const H2_CONNECTION_TASK_FAIRNESS_BATCH: usize = 1;
+const DATA_PLANE_STATS_SHARDS: usize = 256;
+thread_local! {
+    static DATA_PLANE_STATS_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
+}
 #[cfg(target_os = "linux")]
 static RUNTIME_SOCKET_TUNE_LEVEL: OnceLock<linux_tune::RuntimeSocketTuneLevel> = OnceLock::new();
 static HTTP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static TLS_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
 static UDP_CONNECTION_RUNTIMES: OnceLock<Vec<tokio::runtime::Runtime>> = OnceLock::new();
-static SHARED_BALANCED_UDP_RUNTIMES: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_REVALIDATION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static DATA_RUNTIME_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
+static SHARDED_PLAIN_HTTP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static SHARED_TLS_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
+static SHARED_UDP_DATA_RUNTIMES: AtomicBool = AtomicBool::new(false);
 static PLAIN_HTTP_CONNECTIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+static ACTIVE_SENDFILE_TRANSFERS: AtomicUsize = AtomicUsize::new(0);
 static TLS_HTTP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static TLS_HTTP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 static UDP_RUNTIME_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 static UDP_RUNTIME_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
+static STATIC_REVALIDATION_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_QOS_ENABLED: AtomicBool = AtomicBool::new(true);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_ADAPTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
+#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
+#[cfg(target_os = "linux")]
+static STATIC_SENDFILE_SCOPED_SNDBUF_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(2);
 #[cfg(target_os = "linux")]
 static REALTIME_STREAM_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
-#[cfg(target_os = "linux")]
-static DATA_PLANE_CPU_IDS: OnceLock<Vec<usize>> = OnceLock::new();
-
 fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
     HTTP_CONNECTION_RUNTIMES.get_or_init(|| {
-        // Keep each SO_REUSEPORT accept shard and its ordinary HTTP sockets on
-        // one reactor thread. This avoids work-stealing and global-queue costs
-        // under sustained static/reverse-proxy load. TLS connections remain on
-        // the accepting shard so rustls sockets are never migrated mid-flight.
-        let shard_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        let worker_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
+        if SHARDED_PLAIN_HTTP_DATA_RUNTIMES.load(Ordering::Relaxed) {
+            let runtime_shards = plain_http_runtime_shard_count_for(worker_count, true);
+            tracing::info!(runtime_shards, "starting per-core plain HTTP data runtimes");
+            return (0..runtime_shards)
+                .map(|worker_index| {
+                    let mut builder = tokio::runtime::Builder::new_multi_thread();
+                    builder
+                        .worker_threads(1)
+                        .thread_name(format!("proxysss-http-{worker_index}"))
+                        .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+                        .event_interval(SHARDED_PLAIN_HTTP_EVENT_INTERVAL)
+                        .on_thread_start(move || pin_current_data_plane_thread(worker_index))
+                        .enable_all();
+                    builder
+                        .build()
+                        .expect("failed to build proxysss per-core HTTP data runtime")
+                })
+                .collect();
+        }
+
+        // Small keeps every protocol on one CPU-sized runtime. Work stealing
+        // absorbs sparse SO_REUSEPORT placement when H2, UDP, and streams share
+        // the same scheduler; balanced isolates those protocol owners first.
         tracing::info!(
-            runtime_shards = shard_count,
-            "starting sharded plain HTTP data runtimes"
+            runtime_workers = worker_count,
+            "starting unified work-stealing data runtime"
         );
-        (0..shard_count)
-            .map(|shard_index| {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder
-                    .worker_threads(1)
-                    .thread_name(format!("proxysss-http-{shard_index}"))
-                    .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
-                    .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
-                    .max_io_events_per_tick(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK)
-                    .on_thread_start(move || pin_current_data_plane_thread(shard_index))
-                    .enable_all();
-                builder
-                    .build()
-                    .expect("failed to build proxysss HTTP runtime shard")
-            })
-            .collect()
+        DATA_RUNTIME_THREAD_INDEX.store(0, Ordering::Relaxed);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(worker_count)
+            .thread_name("proxysss-data")
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .on_thread_start(register_current_data_plane_thread)
+            .enable_all();
+        vec![builder
+            .build()
+            .expect("failed to build proxysss unified data runtime")]
     })
 }
 
@@ -1629,8 +1691,19 @@ fn dedicated_tls_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_tls_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
+    if SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        return dedicated_http_connection_runtime(worker_index);
+    }
     let runtimes = dedicated_tls_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
+}
+
+fn initialize_tls_connection_runtimes() {
+    if SHARED_TLS_DATA_RUNTIMES.load(Ordering::Relaxed) {
+        let _ = dedicated_http_connection_runtimes();
+    } else {
+        let _ = dedicated_tls_connection_runtimes();
+    }
 }
 
 fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
@@ -1661,15 +1734,45 @@ fn dedicated_udp_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
 }
 
 fn dedicated_udp_connection_runtime(worker_index: usize) -> &'static tokio::runtime::Runtime {
-    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
         return dedicated_http_connection_runtime(worker_index);
     }
     let runtimes = dedicated_udp_connection_runtimes();
     &runtimes[worker_index % runtimes.len()]
 }
 
+#[cfg(target_os = "linux")]
+fn dedicated_static_revalidation_runtime() -> &'static tokio::runtime::Runtime {
+    STATIC_REVALIDATION_RUNTIME.get_or_init(|| {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(1)
+            .thread_name("proxysss-static-refresh")
+            .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
+            .event_interval(DATA_RUNTIME_EVENT_INTERVAL)
+            .on_thread_start(|| set_current_thread_nice(10))
+            .enable_all();
+        builder
+            .build()
+            .expect("failed to build proxysss static revalidation runtime")
+    })
+}
+
+fn spawn_static_revalidation_task<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    #[cfg(target_os = "linux")]
+    if STATIC_REVALIDATION_RUNTIME_ENABLED.load(Ordering::Relaxed) {
+        std::mem::drop(dedicated_static_revalidation_runtime().spawn(future));
+        return;
+    }
+
+    std::mem::drop(tokio::spawn(future));
+}
+
 fn initialize_udp_connection_runtimes() {
-    if SHARED_BALANCED_UDP_RUNTIMES.load(Ordering::Relaxed) {
+    if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
         let _ = dedicated_http_connection_runtimes();
     } else {
         let _ = dedicated_udp_connection_runtimes();
@@ -1678,32 +1781,12 @@ fn initialize_udp_connection_runtimes() {
 
 #[cfg(target_os = "linux")]
 fn data_plane_cpu_ids() -> &'static [usize] {
-    DATA_PLANE_CPU_IDS.get_or_init(|| {
-        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-        let result = unsafe {
-            libc::sched_getaffinity(
-                0,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &mut set as *mut libc::cpu_set_t,
-            )
-        };
-        let mut cpus = Vec::new();
-        if result == 0 {
-            for cpu in 0..libc::CPU_SETSIZE as usize {
-                if unsafe { libc::CPU_ISSET(cpu, &set) } {
-                    cpus.push(cpu);
-                }
-            }
-        }
-        if cpus.is_empty() {
-            cpus.push(0);
-        }
-        cpus
-    })
+    crate::linux_cpu::allowed_cpu_ids()
 }
 
 #[cfg(target_os = "linux")]
 fn pin_current_data_plane_thread(worker_index: usize) {
+    DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
     let cpus = data_plane_cpu_ids();
     let cpu = cpus[worker_index % cpus.len()];
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
@@ -1718,7 +1801,14 @@ fn pin_current_data_plane_thread(worker_index: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_current_data_plane_thread(_worker_index: usize) {}
+fn pin_current_data_plane_thread(worker_index: usize) {
+    DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
+}
+
+fn register_current_data_plane_thread() {
+    let worker_index = DATA_RUNTIME_THREAD_INDEX.fetch_add(1, Ordering::Relaxed);
+    pin_current_data_plane_thread(worker_index);
+}
 
 #[cfg(target_os = "linux")]
 fn set_current_thread_nice(nice: i32) {
@@ -1761,7 +1851,17 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     #[cfg(target_os = "linux")]
     {
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
-        SHARED_BALANCED_UDP_RUNTIMES.store(
+        SHARDED_PLAIN_HTTP_DATA_RUNTIMES.store(
+            config.runtime.performance.enabled
+                && sharded_plain_http_runtime_profile(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        SHARED_TLS_DATA_RUNTIMES.store(
+            config.runtime.performance.enabled
+                && shared_tls_runtime_profile(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        SHARED_UDP_DATA_RUNTIMES.store(
             config.runtime.performance.enabled
                 && shared_udp_runtime_profile(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -1782,6 +1882,11 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             udp_runtime_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
+        STATIC_REVALIDATION_RUNTIME_ENABLED
+            .store(config.runtime.performance.enabled, Ordering::Relaxed);
+        if config.runtime.performance.enabled {
+            let _ = dedicated_static_revalidation_runtime();
+        }
         STATIC_SENDFILE_QOS_ENABLED.store(
             config.runtime.performance.enabled
                 && matches!(
@@ -1793,6 +1898,17 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         STATIC_SENDFILE_REACTOR_ENABLED.store(
             config.runtime.performance.enabled
                 && sendfile_reactor_profile_enabled(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_REACTOR_ADAPTIVE.store(
+            matches!(
+                config.runtime.performance.traffic_profile,
+                RuntimePerformanceTrafficProfile::Balanced
+            ),
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_REACTOR_CPU_DIVISOR.store(
+            sendfile_reactor_cpu_divisor(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
         );
         let stream_reactor_divisor =
@@ -1808,7 +1924,33 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
-        STATIC_SENDFILE_REACTOR_NICE.store(0, Ordering::Relaxed);
+        STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.store(
+            if config.runtime.performance.enabled
+                && matches!(
+                    config.runtime.performance.traffic_profile,
+                    RuntimePerformanceTrafficProfile::Balanced
+                )
+            {
+                STATIC_SENDFILE_BALANCED_SNDBUF_BYTES
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        STATIC_SENDFILE_REACTOR_NICE.store(
+            sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
+            Ordering::Relaxed,
+        );
+        if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+            crate::sendfile_reactor::warm(
+                adaptive_data_plane_workers(1).div_ceil(
+                    STATIC_SENDFILE_REACTOR_CPU_DIVISOR
+                        .load(Ordering::Relaxed)
+                        .max(1),
+                ),
+                STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
+            );
+        }
     }
     plan
 }
@@ -1862,16 +2004,183 @@ struct CachedHttpEntry {
     upstream: String,
 }
 
-#[derive(Clone)]
+struct StaticCacheFreshness {
+    checked_at_unix_ms: AtomicU64,
+    revalidating: AtomicBool,
+}
+
+impl StaticCacheFreshness {
+    fn new() -> Self {
+        Self {
+            checked_at_unix_ms: AtomicU64::new(current_unix_millis()),
+            revalidating: AtomicBool::new(false),
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        current_unix_millis().saturating_sub(self.checked_at_unix_ms.load(Ordering::Acquire))
+            > STATIC_FILE_CACHE_REVALIDATE_SECS.saturating_mul(1000)
+    }
+
+    fn mark_checked(&self) {
+        self.checked_at_unix_ms
+            .store(current_unix_millis(), Ordering::Release);
+        self.revalidating.store(false, Ordering::Release);
+    }
+
+    fn claim_revalidation(&self) -> bool {
+        self.is_stale()
+            && self
+                .revalidating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+}
+
 struct CachedStaticFile {
     len: u64,
     modified: Option<SystemTime>,
     body: Bytes,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
     content_type: HeaderValue,
     content_length: HeaderValue,
-    checked_at: Instant,
-    revalidating: bool,
+    http1_keep_alive_response: Option<Bytes>,
+    freshness: Arc<StaticCacheFreshness>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct StaticSendfilePool {
+    idle: ArrayQueue<std::fs::File>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl StaticSendfilePool {
+    fn new(file: std::fs::File) -> Self {
+        let capacity = adaptive_data_plane_workers(1)
+            .saturating_mul(8)
+            .clamp(1, 256);
+        Self::with_capacity(file, capacity)
+    }
+
+    fn with_capacity(file: std::fs::File, capacity: usize) -> Self {
+        let idle = ArrayQueue::new(capacity);
+        idle.push(file)
+            .expect("new static sendfile descriptor pool has capacity");
+        Self { idle }
+    }
+
+    fn checkout(&self, path: &Path) -> Result<std::fs::File> {
+        self.idle.pop().map_or_else(
+            || {
+                std::fs::File::open(path).with_context(|| {
+                    format!("failed opening static file for sendfile {}", path.display())
+                })
+            },
+            Ok,
+        )
+    }
+
+    fn checkin(&self, file: std::fs::File) {
+        let _ = self.idle.push(file);
+    }
+
+    fn prewarm(&self, path: &Path) -> usize {
+        let mut opened = 0;
+        while self.idle.len() < self.idle.capacity() {
+            let Ok(file) = std::fs::File::open(path) else {
+                break;
+            };
+            if self.idle.push(file).is_err() {
+                break;
+            }
+            opened += 1;
+        }
+        opened
+    }
+}
+
+#[derive(Clone)]
+struct PrebuiltH2StaticResponse {
+    body: Bytes,
+    content_type: HeaderValue,
+    content_length: HeaderValue,
+    freshness: Arc<StaticCacheFreshness>,
+}
+
+type H2ConnectionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct H2ConnectionExecutor {
+    sender: tokio::sync::mpsc::UnboundedSender<H2ConnectionTask>,
+}
+
+impl<F> hyper::rt::Executor<F> for H2ConnectionExecutor
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let _ = self.sender.send(Box::pin(future));
+    }
+}
+
+fn h2_connection_executor() -> (
+    H2ConnectionExecutor,
+    tokio::sync::mpsc::UnboundedReceiver<H2ConnectionTask>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (H2ConnectionExecutor { sender }, receiver)
+}
+
+async fn drive_h2_connection_tasks(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<H2ConnectionTask>,
+) {
+    let mut tasks = FuturesUnordered::new();
+    let mut consecutive_ready = 0_usize;
+    loop {
+        if tasks.is_empty() {
+            consecutive_ready = 0;
+            match receiver.recv().await {
+                Some(task) => tasks.push(task),
+                None => break,
+            }
+            continue;
+        }
+
+        tokio::select! {
+            task = receiver.recv() => {
+                match task {
+                    Some(task) => tasks.push(task),
+                    None => {
+                        while tasks.next().await.is_some() {}
+                        break;
+                    }
+                }
+            }
+            _ = tasks.next() => {
+                consecutive_ready = consecutive_ready.saturating_add(1);
+                if consecutive_ready >= H2_CONNECTION_TASK_FAIRNESS_BATCH {
+                    consecutive_ready = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+}
+
+impl PrebuiltH2StaticResponse {
+    fn response(&self) -> GatewayResponse {
+        let mut response = Response::new(full_body(self.body.clone()));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, self.content_type.clone());
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, self.content_length.clone());
+        response
+            .headers_mut()
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        response
+    }
 }
 
 struct CachedH2StaticPayload {
@@ -1964,9 +2273,22 @@ struct SniResolver {
     on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
-#[derive(Default)]
+#[repr(align(128))]
+struct PaddedAtomicU64(AtomicU64);
+
+impl Default for PaddedAtomicU64 {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
 struct GatewayStats {
+    // Request counters are written by every HTTP data-plane shard. A single
+    // global atomic bounces one cache line across all gateway cores and makes
+    // metrics collection part of request latency. Each pinned shard owns one
+    // padded cell; control-plane threads use the fallback counter.
     http_requests: AtomicU64,
+    http_request_shards: [PaddedAtomicU64; DATA_PLANE_STATS_SHARDS],
     http_errors: AtomicU64,
     tcp_sessions_total: AtomicU64,
     tcp_sessions_active: AtomicU64,
@@ -1986,6 +2308,31 @@ struct GatewayStats {
     /// successful connection already implies a warm data plane.
     warm: AtomicBool,
     process_metrics: Mutex<ProcessMetricsSampler>,
+}
+
+impl Default for GatewayStats {
+    fn default() -> Self {
+        Self {
+            http_requests: AtomicU64::new(0),
+            http_request_shards: std::array::from_fn(|_| PaddedAtomicU64::default()),
+            http_errors: AtomicU64::new(0),
+            tcp_sessions_total: AtomicU64::new(0),
+            tcp_sessions_active: AtomicU64::new(0),
+            udp_packets_total: AtomicU64::new(0),
+            udp_bytes_total: AtomicU64::new(0),
+            reload_success_total: AtomicU64::new(0),
+            reload_failure_total: AtomicU64::new(0),
+            admin_requests_total: AtomicU64::new(0),
+            admin_auth_fail_total: AtomicU64::new(0),
+            script_fail_total: AtomicU64::new(0),
+            blocked_requests_total: AtomicU64::new(0),
+            ddos_bans_total: AtomicU64::new(0),
+            critical_task_failures_total: AtomicU64::new(0),
+            watchdog_heartbeat_total: AtomicU64::new(0),
+            warm: AtomicBool::new(false),
+            process_metrics: Mutex::new(ProcessMetricsSampler::default()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2036,6 +2383,29 @@ impl ActivePlainHttpConnectionGuard {
 impl Drop for ActivePlainHttpConnectionGuard {
     fn drop(&mut self) {
         PLAIN_HTTP_CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ActiveSendfileTransferGuard {
+    active: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl ActiveSendfileTransferGuard {
+    fn enter() -> Self {
+        Self {
+            active: ACTIVE_SENDFILE_TRANSFERS
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ActiveSendfileTransferGuard {
+    fn drop(&mut self) {
+        ACTIVE_SENDFILE_TRANSFERS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -2221,7 +2591,7 @@ impl Gateway {
             config_path,
             bootstrap_config: config,
             bootstrap_fast_lane,
-            dynamic: Arc::new(RwLock::new(dynamic)),
+            dynamic: Arc::new(ArcSwap::from(dynamic)),
             stats: Arc::new(GatewayStats::default()),
             sticky_affinity: Arc::new(DashMap::new()),
             round_robin_state: Arc::new(DashMap::new()),
@@ -2234,6 +2604,8 @@ impl Gateway {
             static_route_cache: Arc::new(DashMap::new()),
             h2_static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(ArcSwap::from_pointee(FxHashMap::default())),
+            h2_static_response_refresh_lock: Arc::new(TokioMutex::new(())),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges,
@@ -2260,6 +2632,7 @@ impl Gateway {
     async fn warm_up(&self, config: &GatewayConfig) {
         let started = Instant::now();
         self.preload_static_fast_lane_cache(config).await;
+        self.refresh_h2_static_response_cache().await;
         let predialed = self.prewarm_upstream_pools(config).await;
         self.stats.warm.store(true, Ordering::Release);
         tracing::info!(
@@ -2296,18 +2669,22 @@ impl Gateway {
             );
         }
 
+        let mut seen_pools = HashSet::new();
         let mut predialed = 0_usize;
         for upstream in upstreams {
             let Ok(Some((key, host, port))) = raw_http_pool_parts_from_upstream(&upstream) else {
                 continue;
             };
+            if !seen_pools.insert(key.clone()) {
+                continue;
+            }
             let pool = self.raw_http_pool_for_parts(key, host, port);
-            let mut warmed = Vec::with_capacity(2);
-            for _ in 0..2 {
+            let mut warmed = Vec::with_capacity(RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL);
+            for _ in 0..RAW_HTTP_PREWARM_CONNECTIONS_PER_POOL {
                 match tokio::time::timeout(Duration::from_millis(250), pool.checkout()).await {
                     Ok(Ok(stream)) => {
-                        warmed.push(stream);
                         predialed = predialed.saturating_add(1);
+                        warmed.push(stream);
                     }
                     _ => break,
                 }
@@ -2356,6 +2733,15 @@ impl Gateway {
                 "static fast lane cache preloaded"
             );
         }
+    }
+
+    async fn refresh_h2_static_response_cache(&self) {
+        let _refresh_guard = self.h2_static_response_refresh_lock.lock().await;
+        self.h2_static_response_cache
+            .store(Arc::new(build_prebuilt_h2_static_responses(
+                &self.static_route_cache,
+                &self.static_file_cache,
+            )));
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -2474,7 +2860,7 @@ impl Gateway {
                 .watchdog_heartbeat_total
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
-                http_requests = self.stats.http_requests.load(Ordering::Relaxed),
+                http_requests = self.stats.http_requests_total(),
                 tcp_sessions_active = self.stats.tcp_sessions_active.load(Ordering::Relaxed),
                 udp_packets_total = self.stats.udp_packets_total.load(Ordering::Relaxed),
                 critical_task_failures_total = self
@@ -4118,10 +4504,7 @@ impl Gateway {
         prepare_tls_material(&new_config)?;
 
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
-        {
-            let mut state = self.dynamic.write().await;
-            *state = new_state;
-        }
+        self.dynamic.store(new_state);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
         self.warm_up(&new_config).await;
@@ -4900,6 +5283,9 @@ impl Gateway {
             );
         let mut served_any = false;
         let mut served_since_yield = 0_usize;
+        let mut fairness_batch = plain_fast_lane_fairness_batch_for(
+            PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+        );
         let mut prefix = BytesMut::with_capacity(4096.max(initial_prefix.len()));
         prefix.extend_from_slice(&initial_prefix);
         let mut static_header = String::with_capacity(160);
@@ -4912,7 +5298,7 @@ impl Gateway {
         let mut balanced_sendfile_response_sequence =
             balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
-            let head_end = read_fast_lane_http_prefix(&mut stream, &mut prefix)
+            let head_end = read_plain_fast_lane_http_prefix(&stream, &mut prefix)
                 .await
                 .context("failed reading plain http fast-lane request")?;
             if prefix.is_empty() {
@@ -4928,10 +5314,13 @@ impl Gateway {
             };
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
-            if let Some(cached) = static_response_cache
-                .as_ref()
-                .filter(|cached| cached.raw_request_matches(request_head))
-            {
+            let static_cache_hit = static_response_cache
+                .as_mut()
+                .is_some_and(|cached| cached.raw_request_matches(request_head));
+            if static_cache_hit {
+                let cached = static_response_cache
+                    .as_ref()
+                    .expect("static cache hit checked");
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
@@ -4944,8 +5333,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5138,8 +5530,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5195,8 +5590,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5221,13 +5619,15 @@ impl Gateway {
                 && request.keep_alive
                 && (candidate.cached_body.is_some() || candidate.sendfile.is_some())
             {
-                let combined_response = candidate.cached_body.as_ref().and_then(|body| {
-                    (static_header.len() + body.len() <= POOL_BUFFER_BYTES).then(|| {
-                        small_static_response.clear();
-                        small_static_response.reserve(static_header.len() + body.len());
-                        small_static_response.extend_from_slice(static_header.as_bytes());
-                        small_static_response.extend_from_slice(body);
-                        Bytes::copy_from_slice(&small_static_response)
+                let combined_response = candidate.combined_response.clone().or_else(|| {
+                    candidate.cached_body.as_ref().and_then(|body| {
+                        (static_header.len() + body.len() <= POOL_BUFFER_BYTES).then(|| {
+                            small_static_response.clear();
+                            small_static_response.reserve(static_header.len() + body.len());
+                            small_static_response.extend_from_slice(static_header.as_bytes());
+                            small_static_response.extend_from_slice(body);
+                            Bytes::copy_from_slice(&small_static_response)
+                        })
                     })
                 });
                 let cached = ConnectionStaticFastPathCache {
@@ -5235,6 +5635,7 @@ impl Gateway {
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
                     checked_at: Instant::now(),
+                    hits_until_revalidation_check: STATIC_FILE_CONNECTION_REVALIDATE_HITS,
                     header: Bytes::copy_from_slice(static_header.as_bytes()),
                     combined_response,
                     body: candidate.cached_body.clone(),
@@ -5252,8 +5653,11 @@ impl Gateway {
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
-                if plain_fast_lane_should_yield(served_since_yield) {
+                if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                     served_since_yield = 0;
+                    fairness_batch = plain_fast_lane_fairness_batch_for(
+                        PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                    );
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -5276,8 +5680,7 @@ impl Gateway {
                 small_static_response.reserve(static_header.len() + body.len());
                 small_static_response.extend_from_slice(static_header.as_bytes());
                 small_static_response.extend_from_slice(body);
-                stream
-                    .write_all(&small_static_response)
+                write_all_plain_fast(&stream, &small_static_response)
                     .await
                     .context("failed writing combined static fast path response")
             } else {
@@ -5290,16 +5693,15 @@ impl Gateway {
                     set_tcp_cork(&stream, true);
                 }
 
-                let header_result = stream
-                    .write_all(static_header.as_bytes())
+                let header_result = write_all_plain_fast(&stream, static_header.as_bytes())
                     .await
                     .context("failed writing plain http fast path response head");
 
+                let mut body_uncorked = false;
                 let body_result =
                     if header_result.is_ok() && request.method == "GET" && candidate.len > 0 {
                         if let Some(body) = candidate.cached_body.as_ref() {
-                            stream
-                                .write_all(body)
+                            write_all_plain_fast(&stream, body)
                                 .await
                                 .context("failed writing cached static fast path body")
                         } else {
@@ -5311,13 +5713,15 @@ impl Gateway {
                                 false,
                             )
                             .await
-                            .map(|_| ())
+                            .map(|uncorked| {
+                                body_uncorked = uncorked;
+                            })
                         }
                     } else {
                         Ok(())
                     };
                 #[cfg(target_os = "linux")]
-                if cork_static {
+                if cork_static && !body_uncorked {
                     set_tcp_cork(&stream, false);
                 }
                 header_result.and(body_result)
@@ -5342,8 +5746,11 @@ impl Gateway {
             }
             discard_fast_lane_http_head(&mut prefix, head_end);
             served_since_yield = served_since_yield.saturating_add(1);
-            if plain_fast_lane_should_yield(served_since_yield) {
+            if plain_fast_lane_should_yield(served_since_yield, fairness_batch) {
                 served_since_yield = 0;
+                fairness_batch = plain_fast_lane_fairness_batch_for(
+                    PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
+                );
                 tokio::task::yield_now().await;
             }
         };
@@ -5505,8 +5912,8 @@ impl Gateway {
             };
             write_static_response_vectored(downstream, header.as_bytes(), response_body)
                 .await
-                .context("failed writing vectored TLS static fast-lane response")?;
-            self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+                .context("failed writing TLS static fast-lane response")?;
+            self.stats.record_http_request();
             if config.logging.access_log {
                 tracing::info!(
                     target: "access",
@@ -5525,7 +5932,7 @@ impl Gateway {
                 let _ = downstream.shutdown().await;
                 return Ok(TlsStaticFastLaneAttempt::Served);
             }
-            if served.is_multiple_of(PLAIN_FAST_LANE_FAIRNESS_BATCH) {
+            if served.is_multiple_of(PLAIN_FAST_LANE_LOW_DENSITY_BATCH) {
                 tokio::task::yield_now().await;
             }
         }
@@ -5539,7 +5946,7 @@ impl Gateway {
             self.acme_tls_alpn_certs.clone(),
             self.on_demand_certs.clone(),
             self.on_demand_trigger.clone(),
-            vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
+            default_tls_alpn_protocols(),
         )?));
         let base_worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
         let max_worker_count =
@@ -5549,7 +5956,7 @@ impl Gateway {
                 1
             };
         if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
-            let _ = dedicated_tls_connection_runtimes();
+            initialize_tls_connection_runtimes();
         }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = JoinSet::new();
@@ -5811,30 +6218,47 @@ impl Gateway {
             prefix
         };
 
-        let h2_static_route_cache = is_http2.then(|| Arc::new(OnceLock::new()));
-        let gateway = self.clone();
-        let service = service_fn(move |request| {
-            let gateway = gateway.clone();
-            let h2_static_route_cache = h2_static_route_cache.clone();
-            async move {
-                gateway
-                    .handle_hyper_request_with_h2_cache(
-                        request,
-                        remote_addr,
-                        "https",
-                        h2_static_route_cache.as_deref(),
-                    )
-                    .await
-            }
-        });
-
         let io = TokioIo::new(PrefixedIo::new(tls_stream, prefix));
         let result = if is_http2 {
-            optimized_http2_server_builder()
-                .serve_connection(io, service)
-                .await
-                .map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
+            let gateway = self.clone();
+            let service = service_fn(move |request| {
+                if let Some(response) = gateway.try_immutable_h2_static_success_fast_path(&request)
+                {
+                    gateway.stats.record_http_request();
+                    Either::Left(ready(Ok(response)))
+                } else {
+                    let gateway = gateway.clone();
+                    Either::Right(async move {
+                        gateway
+                            .handle_hyper_request(request, remote_addr, "https")
+                            .await
+                    })
+                }
+            });
+            let (executor, receiver) = h2_connection_executor();
+            let builder = optimized_http2_server_builder(executor);
+            let connection = builder.serve_connection(io, service);
+            let task_driver = drive_h2_connection_tasks(receiver);
+            tokio::pin!(connection);
+            tokio::pin!(task_driver);
+            tokio::select! {
+                result = &mut connection => {
+                    result.map_err(|error| anyhow!("HTTP/2 connection failed: {error}"))
+                }
+                _ = &mut task_driver => {
+                    Err(anyhow!("HTTP/2 connection task driver stopped early"))
+                }
+            }
         } else {
+            let gateway = self.clone();
+            let service = service_fn(move |request| {
+                let gateway = gateway.clone();
+                async move {
+                    gateway
+                        .handle_hyper_request(request, remote_addr, "https")
+                        .await
+                }
+            });
             optimized_http_server_builder()
                 .serve_connection_with_upgrades(io, service)
                 .await
@@ -6174,6 +6598,11 @@ impl Gateway {
                                     first_payload: BytesMut::new(),
                                     remote_addr,
                                     worker_index: connection_worker,
+                                    traffic_profile: state
+                                        .config
+                                        .runtime
+                                        .performance
+                                        .traffic_profile,
                                 },
                             )
                             .await?;
@@ -6312,6 +6741,11 @@ impl Gateway {
                                     first_payload,
                                     remote_addr,
                                     worker_index: connection_worker,
+                                    traffic_profile: state
+                                        .config
+                                        .runtime
+                                        .performance
+                                        .traffic_profile,
                                 },
                             )
                             .await?;
@@ -6438,6 +6872,7 @@ impl Gateway {
                         inbound,
                         outbound,
                         state.config.runtime.performance.enabled,
+                        state.config.runtime.performance.traffic_profile,
                         tcp_relay_profile(&listener_protocol, first_payload.len()),
                     )
                     .await
@@ -6741,14 +7176,17 @@ impl Gateway {
         let mut local_associations = FxHashMap::<SocketAddr, LocalUdpAssociation>::default();
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
+        let mut shared_udp_packets_since_yield = 0_usize;
+        let mut shared_udp_batch_started = Instant::now();
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
         let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
         let mut next_local_prune_epoch = cached_now_secs.saturating_add(local_prune_interval_secs);
         let mut direct_udp_cache = DirectUdpRouteCache::new();
         // A policy-free listener's upstream identity only changes after a
-        // control-plane reload. Do not acquire the dynamic config RwLock for
-        // every game datagram; refresh the worker-local snapshot once a second
+        // control-plane reload. Keep the ArcSwap snapshot outside the packet
+        // loop instead of reloading it for every game datagram; refresh the
+        // worker-local snapshot once a second
         // together with the association clock.
         let mut direct_udp_state = self.current_state().await;
         let mut direct_udp_state_refreshed = Instant::now();
@@ -6847,6 +7285,18 @@ impl Gateway {
                     existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
                     associations.remove(&client_addr);
+                } else if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
+                    shared_udp_packets_since_yield =
+                        shared_udp_packets_since_yield.saturating_add(1);
+                    if shared_udp_packets_since_yield >= BALANCED_UDP_FAIRNESS_PACKETS {
+                        let sustained =
+                            balanced_udp_batch_is_sustained(shared_udp_batch_started.elapsed());
+                        shared_udp_packets_since_yield = 0;
+                        shared_udp_batch_started = Instant::now();
+                        if sustained {
+                            tokio::task::yield_now().await;
+                        }
+                    }
                 }
                 continue;
             }
@@ -7259,7 +7709,7 @@ impl Gateway {
         scheme: &'static str,
         h2_static_route_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Result<GatewayResponse, Infallible> {
-        self.stats.http_requests.fetch_add(1, Ordering::Relaxed);
+        self.stats.record_http_request();
 
         match self
             .try_http_static_success_fast_path(&request, scheme, h2_static_route_cache)
@@ -7532,20 +7982,8 @@ impl Gateway {
         // HTTP/2 cannot carry HTTP/1 Upgrade/Transfer-Encoding ambiguity. For
         // an already-ended GET stream, take the immutable precompiled static
         // lane before any HTTP/1-oriented header scans.
-        if request.version() == Version::HTTP_2
-            && method == Method::GET
-            && request.body().is_end_stream()
-            && !request.headers().contains_key(RANGE)
-            && !self.bootstrap_config.runtime.hot_reload.enabled
-            && !self.bootstrap_config.admin.enabled
-            && self.bootstrap_fast_lane.hyper_static_success
-            && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
-        {
-            if let Some(response) =
-                self.try_h2_cached_static_response(request.uri().path(), h2_static_route_cache)
-            {
-                return Ok(Some(response));
-            }
+        if let Some(response) = self.try_immutable_h2_static_success_fast_path(request) {
+            return Ok(Some(response));
         }
 
         if !request_body_declared_empty(method, request.headers()) {
@@ -7658,79 +8096,60 @@ impl Gateway {
         }
     }
 
-    fn try_h2_cached_static_response(
+    fn try_immutable_h2_static_success_fast_path(
         &self,
-        path: &str,
-        connection_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
+        request: &Request<Incoming>,
     ) -> Option<GatewayResponse> {
-        let route = connection_cache
-            .and_then(OnceLock::get)
-            .filter(|cached| cached.path == path)
-            .map(|cached| cached.route.clone())
-            .or_else(|| {
-                let route = self
-                    .h2_static_route_cache
-                    .get(path)
-                    .map(|entry| entry.clone())?;
-                if let Some(connection_cache) = connection_cache {
-                    let _ = connection_cache.set(ConnectionH2StaticRouteCache {
-                        path: path.to_string(),
-                        route: route.clone(),
-                    });
-                }
-                Some(route)
-            })?;
-        let (response, revalidate) = cached_h2_static_response(&route);
-        if revalidate {
-            self.spawn_h2_static_cache_revalidation(route.clone());
+        let method = request.method();
+        if request.version() != Version::HTTP_2
+            || method != Method::GET
+            || !request.body().is_end_stream()
+            || request.headers().contains_key(RANGE)
+            || self.bootstrap_config.runtime.hot_reload.enabled
+            || self.bootstrap_config.admin.enabled
+            || !self.bootstrap_fast_lane.hyper_static_success
+            || monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
+        {
+            return None;
         }
-        Some(response)
-    }
 
-    fn spawn_h2_static_cache_revalidation(&self, route: Arc<CachedH2StaticRoute>) {
-        let static_file_cache = self.static_file_cache.clone();
-        let static_file_cache_bytes = self.static_file_cache_bytes.clone();
-        let static_file_load_locks = self.static_file_load_locks.clone();
-        std::mem::drop(tokio::spawn(async move {
-            let result: Result<()> = async {
-                let metadata = tokio::fs::metadata(&route.target)
-                    .await
-                    .context("failed reading H2 static cache metadata")?;
-                if !metadata.is_file() {
-                    return Err(anyhow!("H2 static cache target is no longer a file"));
-                }
-                let body = cached_static_file_body(
-                    &route.target,
-                    &metadata,
-                    &static_file_cache,
-                    &static_file_cache_bytes,
-                    &static_file_load_locks,
-                )
-                .await?;
-                route.payload.store(Arc::new(CachedH2StaticPayload {
-                    content_length: HeaderValue::from_str(&body.len().to_string())
-                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
-                    body,
-                    checked_at: Instant::now(),
-                }));
-                Ok(())
-            }
-            .await;
-            route.revalidating.store(false, Ordering::Release);
-            if let Err(error) = result {
-                tracing::debug!(?error, path = %route.target.display(), "H2 static cache revalidation failed");
-            }
-        }));
+        let snapshots = self.h2_static_response_cache.load();
+        if let Some(cached) = snapshots
+            .get(request.uri().path())
+            .filter(|cached| !cached.freshness.is_stale())
+        {
+            return Some(cached.response());
+        }
+
+        let target = self.static_route_cache.get(request.uri().path())?;
+        let cached = cached_static_file_response_stale_while_revalidate(
+            target.as_path(),
+            method,
+            &self.static_file_cache,
+        )?;
+        if cached.revalidate {
+            self.spawn_static_cache_revalidation(target.clone());
+        }
+        Some(cached.response)
     }
 
     fn spawn_static_cache_revalidation(&self, target: PathBuf) {
         let static_file_cache = self.static_file_cache.clone();
         let static_file_cache_bytes = self.static_file_cache_bytes.clone();
         let static_file_load_locks = self.static_file_load_locks.clone();
-        std::mem::drop(tokio::spawn(async move {
+        let static_route_cache = self.static_route_cache.clone();
+        let h2_static_response_cache = self.h2_static_response_cache.clone();
+        let h2_static_response_refresh_lock = self.h2_static_response_refresh_lock.clone();
+        spawn_static_revalidation_task(async move {
             let key = target.to_string_lossy().to_string();
+            let previous_identity = static_file_cache
+                .get(&key)
+                .map(|entry| (entry.len, entry.modified));
+            let mut refresh_h2_snapshot = false;
             match tokio::fs::metadata(&target).await {
                 Ok(metadata) if metadata.is_file() => {
+                    let current_identity = (metadata.len(), metadata.modified().ok());
+                    refresh_h2_snapshot = previous_identity != Some(current_identity);
                     let sendfile_entry = static_file_cache
                         .get(&key)
                         .is_some_and(|entry| entry.sendfile.is_some() && entry.body.is_empty());
@@ -7748,6 +8167,7 @@ impl Gateway {
                         .map(|_| ())
                     };
                     if let Err(error) = result {
+                        refresh_h2_snapshot = false;
                         tracing::debug!(?error, path = %target.display(), "background static cache revalidation failed");
                         finish_failed_static_revalidation(&key, &static_file_cache);
                     }
@@ -7756,12 +8176,14 @@ impl Gateway {
                     if let Some((_, stale)) = static_file_cache.remove(&key) {
                         static_file_cache_bytes
                             .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                        refresh_h2_snapshot = true;
                     }
                 }
                 Ok(_) => {
                     if let Some((_, stale)) = static_file_cache.remove(&key) {
                         static_file_cache_bytes
                             .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                        refresh_h2_snapshot = true;
                     }
                 }
                 Err(error) => {
@@ -7769,7 +8191,15 @@ impl Gateway {
                     finish_failed_static_revalidation(&key, &static_file_cache);
                 }
             }
-        }));
+
+            if refresh_h2_snapshot {
+                let _refresh_guard = h2_static_response_refresh_lock.lock().await;
+                h2_static_response_cache.store(Arc::new(build_prebuilt_h2_static_responses(
+                    &static_route_cache,
+                    &static_file_cache,
+                )));
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8696,7 +9126,7 @@ impl Gateway {
             )
         })?;
         let _ = upstream_io.set_nodelay(true);
-        tune_tcp_stream_for_gateway(&upstream_io);
+        tune_tcp_stream_for_latency(&upstream_io);
         let request_bytes = if route.emit_metadata_headers {
             let prefix = config
                 .services
@@ -8743,8 +9173,7 @@ impl Gateway {
                 },
             )
         };
-        upstream_io
-            .write_all(&request_bytes)
+        write_all_plain_fast(&upstream_io, &request_bytes)
             .await
             .with_context(|| {
                 format!("failed sending plain raw SSE request to {}", route.upstream)
@@ -8768,8 +9197,7 @@ impl Gateway {
             transfer_chunked,
         );
         if request.method == Method::HEAD || status_has_no_body(response_head.status) {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             if upstream_keep_alive {
@@ -8783,21 +9211,18 @@ impl Gateway {
                         Vec::with_capacity(response_head_bytes.len() + len as usize);
                     response_bytes.extend_from_slice(&response_head_bytes);
                     response_bytes.extend_from_slice(&leftover[..len as usize]);
-                    downstream
-                        .write_all(&response_bytes)
+                    write_all_plain_fast(downstream, &response_bytes)
                         .await
                         .context("failed writing raw SSE response head/body")?;
                     leftover_len == len
                 } else {
-                    downstream
-                        .write_all(&response_head_bytes)
+                    write_all_plain_fast(downstream, &response_head_bytes)
                         .await
                         .context("failed writing raw SSE response head")?;
                     relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
                 }
             } else {
-                downstream
-                    .write_all(&response_head_bytes)
+                write_all_plain_fast(downstream, &response_head_bytes)
                     .await
                     .context("failed writing raw SSE response head")?;
                 relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
@@ -8806,8 +9231,7 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else if transfer_chunked {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             let reusable = relay_passthrough_chunked_http_body(
@@ -8821,8 +9245,7 @@ impl Gateway {
                 pool.checkin(upstream_io);
             }
         } else {
-            downstream
-                .write_all(&response_head_bytes)
+            write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
@@ -8922,8 +9345,7 @@ impl Gateway {
                 .as_ref()
                 .expect("raw reverse request serialized")
         };
-        upstream_io
-            .write_all(request_bytes)
+        write_all_plain_fast(&upstream_io, request_bytes)
             .await
             .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
@@ -8937,8 +9359,7 @@ impl Gateway {
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
         if request.method == Method::HEAD || status_has_no_body(response.status) {
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             if upstream_keep_alive && buffered_body_len == 0 {
@@ -8951,13 +9372,12 @@ impl Gateway {
         } else if let Some(len) = response.content_length {
             let buffered_body_len_u64 = buffered_body_len as u64;
             let buffered_to_write = buffered_body_len_u64.min(len) as usize;
-            downstream
-                .write_all(
-                    &upstream_response_buffer
-                        [..response.head_end.saturating_add(buffered_to_write)],
-                )
-                .await
-                .context("failed writing raw HTTP response head/body")?;
+            write_all_plain_fast(
+                downstream,
+                &upstream_response_buffer[..response.head_end.saturating_add(buffered_to_write)],
+            )
+            .await
+            .context("failed writing raw HTTP response head/body")?;
             let reusable = if buffered_body_len_u64 > len {
                 false
             } else {
@@ -8979,8 +9399,7 @@ impl Gateway {
         } else if response.transfer_chunked {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             let reusable =
@@ -8995,8 +9414,7 @@ impl Gateway {
         } else {
             let leftover = (buffered_body_len > 0)
                 .then(|| Bytes::copy_from_slice(&upstream_response_buffer[response.head_end..]));
-            downstream
-                .write_all(&upstream_response_buffer[..response.head_end])
+            write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, leftover).await?;
@@ -9130,7 +9548,10 @@ impl Gateway {
         }
 
         #[cfg(target_os = "linux")]
-        if LINUX_STREAM_REACTOR_ENABLED && plain_downstream_fd.is_some() {
+        if config.runtime.performance.enabled
+            && native_stream_reactor_profile_enabled(config.runtime.performance.traffic_profile)
+            && plain_downstream_fd.is_some()
+        {
             let downstream_fd = plain_downstream_fd.expect("plain downstream fd checked");
             match crate::stream_reactor::dispatch(
                 downstream_fd,
@@ -9289,7 +9710,7 @@ impl Gateway {
     }
 
     async fn current_state(&self) -> Arc<DynamicState> {
-        self.dynamic.read().await.clone()
+        self.dynamic.load_full()
     }
 
     async fn plain_http_data_fast_lane_enabled(&self) -> bool {
@@ -10986,7 +11407,7 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
         .http2()
         .timer(timer)
-        .adaptive_window(true)
+        .adaptive_window(false)
         .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
         .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
         .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
@@ -10997,11 +11418,13 @@ fn optimized_http_server_builder() -> AutoBuilder<TokioExecutor> {
     builder
 }
 
-fn optimized_http2_server_builder() -> Http2ServerBuilder<TokioExecutor> {
-    let mut builder = Http2ServerBuilder::new(TokioExecutor::new());
+fn optimized_http2_server_builder(
+    executor: H2ConnectionExecutor,
+) -> Http2ServerBuilder<H2ConnectionExecutor> {
+    let mut builder = Http2ServerBuilder::new(executor);
     builder
         .timer(TokioTimer::new())
-        .adaptive_window(true)
+        .adaptive_window(false)
         .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW_SIZE_BYTES))
         .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW_SIZE_BYTES))
         .max_frame_size(Some(HTTP2_MAX_FRAME_SIZE_BYTES))
@@ -11025,7 +11448,8 @@ struct StaticFastPathCandidate {
     len: u64,
     content_type: &'static str,
     cached_body: Option<Bytes>,
-    sendfile: Option<Arc<std::fs::File>>,
+    combined_response: Option<Bytes>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
 }
 
 struct ConnectionStaticFastPathCache {
@@ -11033,18 +11457,26 @@ struct ConnectionStaticFastPathCache {
     target: String,
     host: Option<String>,
     checked_at: Instant,
+    hits_until_revalidation_check: u16,
     header: Bytes,
     combined_response: Option<Bytes>,
     body: Option<Bytes>,
     file_path: PathBuf,
     len: u64,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
 }
 
 impl ConnectionStaticFastPathCache {
-    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
+    fn raw_request_matches(&mut self, request_head: &[u8]) -> bool {
+        if self.request_head.as_ref() != request_head {
+            return false;
+        }
+        if self.hits_until_revalidation_check > 0 {
+            self.hits_until_revalidation_check -= 1;
+            return true;
+        }
+        self.hits_until_revalidation_check = STATIC_FILE_CONNECTION_REVALIDATE_HITS;
         self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && self.request_head.as_ref() == request_head
     }
 
     fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
@@ -11226,9 +11658,8 @@ fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
 fn static_sendfile_fast_path_threshold_bytes(config: &GatewayConfig) -> u64 {
     match config.runtime.performance.traffic_profile {
         RuntimePerformanceTrafficProfile::Bulk => 0,
-        RuntimePerformanceTrafficProfile::Small | RuntimePerformanceTrafficProfile::Balanced => {
-            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
-        }
+        RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES,
+        RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES,
     }
 }
 
@@ -11562,6 +11993,67 @@ where
     }
 }
 
+async fn read_plain_fast_lane_http_prefix(
+    stream: &TcpStream,
+    prefix: &mut BytesMut,
+) -> std::io::Result<Option<usize>> {
+    loop {
+        if let Some(index) = memmem::find(prefix, b"\r\n\r\n") {
+            return Ok(Some(index + 4));
+        }
+        if prefix.len() >= TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES {
+            return Ok(None);
+        }
+        let remaining = TLS_FAST_LANE_HTTP_HEAD_MAX_BYTES - prefix.len();
+        prefix.reserve(remaining.min(4096));
+        if read_plain_fast_buf(stream, prefix).await? == 0 {
+            return Ok(None);
+        }
+    }
+}
+
+async fn read_plain_fast_buf<B>(stream: &TcpStream, buffer: &mut B) -> std::io::Result<usize>
+where
+    B: BufMut,
+{
+    loop {
+        match stream.try_read_buf(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.readable().await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn write_all_plain_fast(stream: &TcpStream, mut bytes: &[u8]) -> std::io::Result<()> {
+    let mut written_since_yield = 0_usize;
+    while !bytes.is_empty() {
+        match stream.try_write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "plain fast-lane socket wrote zero bytes",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+                written_since_yield = written_since_yield.saturating_add(written);
+                if !bytes.is_empty() && written_since_yield >= PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES {
+                    written_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.writable().await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn discard_fast_lane_http_head(prefix: &mut BytesMut, head_end: usize) {
     debug_assert!(head_end <= prefix.len());
     let remaining = prefix.len().saturating_sub(head_end);
@@ -11691,11 +12183,15 @@ async fn resolve_large_static_fast_path_candidate(
         None
     };
 
+    let combined_response = cached_body.as_ref().and_then(|body| {
+        build_static_http1_keep_alive_response(static_content_type(&target), metadata.len(), body)
+    });
     Ok(Some(StaticFastPathCandidate {
         content_type: static_content_type(&target),
         len: metadata.len(),
         path: target,
         cached_body,
+        combined_response,
         sendfile,
     }))
 }
@@ -11706,8 +12202,7 @@ async fn send_connection_static_fast_path(
     cooperative_mid_yield: bool,
 ) -> Result<()> {
     if let Some(response) = cached.combined_response.as_ref() {
-        return stream
-            .write_all(response)
+        return write_all_plain_fast(stream, response)
             .await
             .context("failed writing cached combined static response");
     }
@@ -11719,14 +12214,13 @@ async fn send_connection_static_fast_path(
         set_tcp_cork(stream, true);
     }
 
-    let header_result = stream
-        .write_all(&cached.header)
+    let header_result = write_all_plain_fast(stream, &cached.header)
         .await
         .context("failed writing cached static response head");
+    let mut body_uncorked = false;
     let body_result = if header_result.is_ok() && cached.len > 0 {
         if let Some(body) = cached.body.as_ref() {
-            stream
-                .write_all(body)
+            write_all_plain_fast(stream, body)
                 .await
                 .context("failed writing cached static response body")
         } else {
@@ -11738,14 +12232,16 @@ async fn send_connection_static_fast_path(
                 cooperative_mid_yield,
             )
             .await
-            .map(|_| ())
+            .map(|uncorked| {
+                body_uncorked = uncorked;
+            })
         }
     } else {
         Ok(())
     };
 
     #[cfg(target_os = "linux")]
-    if cork_static {
+    if cork_static && !body_uncorked {
         set_tcp_cork(stream, false);
     }
     header_result.and(body_result)
@@ -11773,21 +12269,25 @@ async fn send_static_file_fast(
     stream: &mut TcpStream,
     path: &Path,
     _len: u64,
-    sendfile: Option<Arc<std::fs::File>>,
+    sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
-) -> Result<()> {
+) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        let file = match sendfile {
-            Some(file) => file,
-            None => Arc::new(
+        let (file, pool) = match sendfile {
+            Some(pool) => (pool.checkout(path)?, Some(pool)),
+            None => (
                 std::fs::File::open(path).context("failed opening static file for sendfile")?,
+                None,
             ),
         };
-        sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
+        let result = sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
             .await
-            .context("sendfile static response failed")?;
-        Ok(())
+            .context("sendfile static response failed");
+        if let Some(pool) = pool {
+            pool.checkin(file);
+        }
+        result.map(|(_, uncorked)| uncorked)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -11800,7 +12300,7 @@ async fn send_static_file_fast(
         tokio::io::copy(&mut file, stream)
             .await
             .context("failed copying static fast path file")?;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -11810,36 +12310,74 @@ async fn sendfile_all_async(
     in_fd: std::os::fd::RawFd,
     len: u64,
     cooperative_mid_yield: bool,
-) -> std::io::Result<u64> {
+) -> std::io::Result<(u64, bool)> {
     if len == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
+    let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
+    let data_plane_cores = adaptive_data_plane_workers(1);
+    let _send_buffer_guard =
+        sendfile_pressure_should_raise_buffer(transfer_guard.active, data_plane_cores)
+            .then(|| {
+                ScopedSendBuffer::apply(
+                    out_fd,
+                    STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
+                )
+            })
+            .flatten();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
-    let mut bytes_since_cooperative_yield = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
     let max_chunk_bytes = if cooperative_mid_yield {
         configured_chunk_bytes.min(STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES)
+    } else if transfer_guard.active <= data_plane_cores {
+        configured_chunk_bytes.max(STATIC_SENDFILE_LOW_CONCURRENCY_CHUNK_BYTES)
     } else {
         configured_chunk_bytes
     };
-    let data_plane_cores = adaptive_data_plane_workers(1);
+    let sendfile_reactor_workers = data_plane_cores.div_ceil(
+        STATIC_SENDFILE_REACTOR_CPU_DIVISOR
+            .load(Ordering::Relaxed)
+            .max(1),
+    );
+    let reactor_enabled = STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed);
+    let reactor_adaptive = STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed);
+    if reactor_enabled && reactor_adaptive && transfer_guard.active <= data_plane_cores {
+        // Let sibling large responses on the same pinned HTTP owners register
+        // before classifying pressure. Equal-load remains sparse after this
+        // one cooperative turn; saturation exposes its real transfer band.
+        tokio::task::yield_now().await;
+    }
+    let active_transfers = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed);
 
-    if STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed) {
+    if sendfile_reactor_should_dispatch(
+        reactor_enabled,
+        reactor_adaptive,
+        active_transfers,
+        data_plane_cores,
+    ) {
+        let active_reactor_workers = sendfile_reactor_active_workers(
+            reactor_adaptive,
+            active_transfers,
+            data_plane_cores,
+            sendfile_reactor_workers,
+        );
         match crate::sendfile_reactor::dispatch(
             out_fd,
             in_fd,
             0,
             len,
-            max_chunk_bytes,
-            data_plane_cores,
+            sendfile_reactor_job_chunk_bytes(reactor_adaptive, len, max_chunk_bytes),
+            sendfile_reactor_workers,
+            active_reactor_workers,
             STATIC_SENDFILE_REACTOR_NICE.load(Ordering::Relaxed),
         ) {
             Ok(completion) => {
-                return completion.await.map_err(|_| {
+                let completion = completion.await.map_err(|_| {
                     std::io::Error::other("sendfile reactor stopped before job completion")
-                })?;
+                })??;
+                return Ok((completion.bytes, completion.uncorked));
             }
             Err(error) => {
                 tracing::debug!(
@@ -11851,54 +12389,192 @@ async fn sendfile_all_async(
     }
 
     while sent < len {
-        let remaining = len - sent;
-        let count = remaining.min(max_chunk_bytes) as usize;
-        let written = stream
-            .async_io(tokio::io::Interest::WRITABLE, || {
-                let mut batch_written = 0_usize;
-                loop {
-                    let written = unsafe {
-                        libc::sendfile(out_fd, in_fd, &mut offset, count - batch_written)
-                    };
-                    if written > 0 {
-                        batch_written = batch_written.saturating_add(written as usize);
-                        if batch_written >= count {
-                            return Ok(batch_written);
-                        }
-                        continue;
-                    }
-                    if written == 0 {
-                        return Ok(batch_written);
-                    }
-
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if error.kind() == std::io::ErrorKind::WouldBlock && batch_written > 0 {
-                        return Ok(batch_written);
-                    }
-                    return Err(error);
-                }
-            })
-            .await?;
-        if written == 0 {
-            break;
+        let chunk_start = sent;
+        let chunk_end = sent.saturating_add(max_chunk_bytes).min(len);
+        match sendfile_until_blocked(out_fd, in_fd, &mut offset, &mut sent, chunk_end) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
-        sent = sent.saturating_add(written as u64);
-        bytes_since_cooperative_yield =
-            bytes_since_cooperative_yield.saturating_add(written as u64);
+        while sent < chunk_end {
+            stream.writable().await?;
+            match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                sendfile_until_blocked(out_fd, in_fd, &mut offset, &mut sent, chunk_end)
+            }) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
         if sent < len {
-            if STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed) {
-                tokio::time::sleep(STATIC_SENDFILE_QOS_DELAY).await;
-            } else if cooperative_mid_yield && bytes_since_cooperative_yield >= max_chunk_bytes {
-                bytes_since_cooperative_yield = 0;
+            let dense_transfer_pressure = ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed)
+                > data_plane_cores.saturating_mul(4);
+            if sendfile_should_cooperative_yield(
+                STATIC_SENDFILE_QOS_ENABLED.load(Ordering::Relaxed),
+                cooperative_mid_yield,
+                dense_transfer_pressure,
+                sent.saturating_sub(chunk_start),
+                max_chunk_bytes,
+            ) {
+                // Keep small-file and realtime tasks runnable without paying
+                // Linux timer-wheel granularity after every sendfile chunk.
+                // Dense waves already yield through EAGAIN/readiness.
                 tokio::task::yield_now().await;
             }
         }
     }
 
-    Ok(sent)
+    Ok((sent, false))
+}
+
+#[cfg(target_os = "linux")]
+fn sendfile_until_blocked(
+    out_fd: std::os::fd::RawFd,
+    in_fd: std::os::fd::RawFd,
+    offset: &mut libc::off_t,
+    sent: &mut u64,
+    chunk_end: u64,
+) -> std::io::Result<()> {
+    while *sent < chunk_end {
+        let count = (chunk_end - *sent) as usize;
+        let written = unsafe { libc::sendfile(out_fd, in_fd, offset, count) };
+        if written > 0 {
+            *sent = sent.saturating_add(written as u64);
+            continue;
+        }
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sendfile source ended before configured length",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cores: usize) -> bool {
+    active_transfers > data_plane_cores.max(1).div_ceil(2)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_should_cooperative_yield(
+    qos_enabled: bool,
+    cooperative_mid_yield: bool,
+    dense_transfer_pressure: bool,
+    chunk_progress: u64,
+    max_chunk_bytes: u64,
+) -> bool {
+    !dense_transfer_pressure
+        && (qos_enabled || (cooperative_mid_yield && chunk_progress >= max_chunk_bytes))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_should_dispatch(
+    enabled: bool,
+    adaptive: bool,
+    active_transfers: usize,
+    data_plane_cores: usize,
+) -> bool {
+    let cores = data_plane_cores.max(1);
+    enabled
+        && (!adaptive || (active_transfers > cores && active_transfers <= cores.saturating_mul(4)))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_job_chunk_bytes(adaptive: bool, len: u64, max_chunk_bytes: u64) -> u64 {
+    if adaptive {
+        len.max(1)
+    } else {
+        max_chunk_bytes.max(1)
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_active_workers(
+    adaptive: bool,
+    active_transfers: usize,
+    data_plane_cores: usize,
+    reactor_workers: usize,
+) -> usize {
+    if adaptive && active_transfers <= data_plane_cores.max(1).saturating_mul(2) {
+        reactor_workers.max(1).div_ceil(2)
+    } else {
+        reactor_workers.max(1)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ScopedSendBuffer {
+    fd: std::os::fd::RawFd,
+    restore_request_bytes: libc::c_int,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn scoped_send_buffer_should_raise(current_kernel_bytes: i32, request_bytes: i32) -> bool {
+    request_bytes > 0 && current_kernel_bytes < request_bytes.saturating_mul(2)
+}
+
+#[cfg(target_os = "linux")]
+impl ScopedSendBuffer {
+    fn apply(fd: std::os::fd::RawFd, request_bytes: usize) -> Option<Self> {
+        if request_bytes == 0 {
+            return None;
+        }
+        let mut current: libc::c_int = 0;
+        let mut current_len = std::mem::size_of_val(&current) as libc::socklen_t;
+        let read = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &mut current as *mut _ as *mut libc::c_void,
+                &mut current_len,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        let request = libc::c_int::try_from(request_bytes).ok()?;
+        if !scoped_send_buffer_should_raise(current, request) {
+            return None;
+        }
+        let changed = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &request as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&request) as libc::socklen_t,
+            )
+        };
+        (changed == 0).then_some(Self {
+            fd,
+            // Linux reports the doubled kernel value from SO_SNDBUF. Passing
+            // half restores the original requested queue target.
+            restore_request_bytes: (current / 2).max(1),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedSendBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &self.restore_request_bytes as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&self.restore_request_bytes) as libc::socklen_t,
+            );
+        }
+    }
 }
 
 async fn bind_tcp_listener(bind_addr: SocketAddr, label: &str) -> Result<TcpListener> {
@@ -12055,7 +12731,7 @@ fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usiz
 fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 2,
-        RuntimePerformanceTrafficProfile::Balanced => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -12064,10 +12740,10 @@ fn realtime_stream_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile
 fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        // One movable owner per four CPUs avoids a permanently-runnable CFS
-        // sibling on every HTTP shard. The count still scales with the full
-        // cpuset, and fd-indexed slots keep each owner's queue inexpensive.
-        RuntimePerformanceTrafficProfile::Balanced => 0,
+        // One soft-affinity owner per allowed CPU keeps pair queues shallow.
+        // nice 3 leaves HTTP the primary CFS consumer during saturation while
+        // fixed-rate realtime work stays prompt on otherwise-idle cores.
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12077,15 +12753,41 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+fn sharded_plain_http_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
+}
+
+fn plain_http_runtime_shard_count_for(cores: usize, sharded: bool) -> usize {
+    if sharded {
+        http_data_plane_workers_for(cores)
+    } else {
+        1
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn shared_tls_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Small)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn shared_udp_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(profile, RuntimePerformanceTrafficProfile::Small)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn native_stream_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn tls_http_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
-        RuntimePerformanceTrafficProfile::Balanced => 2,
+        RuntimePerformanceTrafficProfile::Small => 4,
+        RuntimePerformanceTrafficProfile::Balanced => 8,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
 }
@@ -12098,7 +12800,7 @@ fn tls_http_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 7,
+        RuntimePerformanceTrafficProfile::Balanced => 5,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -12106,7 +12808,7 @@ fn tls_http_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
 #[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
     match profile {
-        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Small => 2,
         RuntimePerformanceTrafficProfile::Balanced => 2,
         RuntimePerformanceTrafficProfile::Bulk => 4,
     }
@@ -12117,26 +12819,32 @@ fn udp_runtime_workers_for(cores: usize, cpu_divisor: usize) -> usize {
 }
 
 fn plain_fast_lane_fairness_batch_for(active_connections: usize) -> usize {
-    if active_connections < PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS {
+    plain_fast_lane_fairness_batch_for_workers(active_connections, adaptive_data_plane_workers(1))
+}
+
+fn plain_fast_lane_fairness_batch_for_workers(
+    active_connections: usize,
+    data_plane_workers: usize,
+) -> usize {
+    let high_density_connections = data_plane_workers
+        .max(1)
+        .saturating_mul(PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD);
+    if active_connections < high_density_connections {
         PLAIN_FAST_LANE_LOW_DENSITY_BATCH
     } else {
         PLAIN_FAST_LANE_FAIRNESS_BATCH
     }
 }
 
-fn plain_fast_lane_should_yield(served_since_yield: usize) -> bool {
-    served_since_yield >= PLAIN_FAST_LANE_LOW_DENSITY_BATCH
-        && served_since_yield
-            >= plain_fast_lane_fairness_batch_for(
-                PLAIN_HTTP_CONNECTIONS_ACTIVE.load(Ordering::Relaxed),
-            )
+fn plain_fast_lane_should_yield(served_since_yield: usize, fairness_batch: usize) -> bool {
+    served_since_yield >= fairness_batch
 }
 
 #[cfg(any(test, target_os = "linux"))]
 fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
-        RuntimePerformanceTrafficProfile::Balanced => 12,
+        RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
 }
@@ -12158,7 +12866,28 @@ fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
 
 #[cfg(any(test, target_os = "linux"))]
 fn sendfile_reactor_profile_enabled(profile: RuntimePerformanceTrafficProfile) -> bool {
-    matches!(profile, RuntimePerformanceTrafficProfile::Bulk)
+    matches!(
+        profile,
+        RuntimePerformanceTrafficProfile::Balanced | RuntimePerformanceTrafficProfile::Bulk
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_cpu_divisor(profile: RuntimePerformanceTrafficProfile) -> usize {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 1,
+        RuntimePerformanceTrafficProfile::Balanced => 1,
+        RuntimePerformanceTrafficProfile::Bulk => 1,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn sendfile_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
+    match profile {
+        RuntimePerformanceTrafficProfile::Small => 0,
+        RuntimePerformanceTrafficProfile::Balanced => 0,
+        RuntimePerformanceTrafficProfile::Bulk => 0,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -12314,10 +13043,32 @@ fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> Ga
 }
 
 impl GatewayStats {
+    fn record_http_request(&self) {
+        let recorded = DATA_PLANE_STATS_SHARD.with(|shard| {
+            let Some(index) = shard.get() else {
+                return false;
+            };
+            self.http_request_shards[index]
+                .0
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        if !recorded {
+            self.http_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn http_requests_total(&self) -> u64 {
+        self.http_request_shards.iter().fold(
+            self.http_requests.load(Ordering::Relaxed),
+            |total, shard| total.saturating_add(shard.0.load(Ordering::Relaxed)),
+        )
+    }
+
     fn snapshot_json(&self) -> serde_json::Value {
         let process = self.process_snapshot();
         serde_json::json!({
-            "http_requests": self.http_requests.load(Ordering::Relaxed),
+            "http_requests": self.http_requests_total(),
             "http_errors": self.http_errors.load(Ordering::Relaxed),
             "tcp_sessions_total": self.tcp_sessions_total.load(Ordering::Relaxed),
             "tcp_sessions_active": self.tcp_sessions_active.load(Ordering::Relaxed),
@@ -12348,7 +13099,7 @@ impl GatewayStats {
             (
                 "proxysss_http_requests_total",
                 "Total HTTP requests handled by the gateway",
-                self.http_requests.load(Ordering::Relaxed),
+                self.http_requests_total(),
             ),
             (
                 "proxysss_http_errors_total",
@@ -13233,6 +13984,13 @@ fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
     Ok(())
 }
 
+fn default_tls_alpn_protocols() -> Vec<Vec<u8>> {
+    // ACME TLS-ALPN must remain available for certificate automation. Normal
+    // clients do not offer it, so h2 is their first mutually supported
+    // protocol and HTTP/1.1 remains the compatibility fallback.
+    vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()]
+}
+
 fn build_rustls_server_config(
     config: &GatewayConfig,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
@@ -13500,10 +14258,9 @@ async fn issue_managed_acme_certificate(
             return Err(anyhow!("acme order ended in unexpected state {status:?}"));
         }
 
-        let private_key_pem = order
-            .finalize()
-            .await
-            .context("failed to finalize managed acme order")?;
+        let private_key_pem =
+            finalize_managed_acme_order(&mut order, &tls.acme.domains, tls.acme.key_algorithm)
+                .await?;
         let certificate_pem = order
             .poll_certificate(&retry)
             .await
@@ -13541,6 +14298,35 @@ async fn issue_managed_acme_certificate(
     }
 
     result
+}
+
+async fn finalize_managed_acme_order(
+    order: &mut Order,
+    domains: &[String],
+    key_algorithm: AcmeKeyAlgorithm,
+) -> Result<String> {
+    let mut params = CertificateParams::new(domains.to_vec())
+        .context("failed building managed acme certificate parameters")?;
+    params.distinguished_name = DistinguishedName::new();
+    let private_key = generate_managed_acme_key_pair(key_algorithm)?;
+    let csr = params
+        .serialize_request(&private_key)
+        .context("failed serializing managed acme CSR")?;
+    order
+        .finalize_csr(csr.der())
+        .await
+        .context("failed to finalize managed acme order")?;
+    Ok(private_key.serialize_pem())
+}
+
+fn generate_managed_acme_key_pair(key_algorithm: AcmeKeyAlgorithm) -> Result<KeyPair> {
+    match key_algorithm {
+        AcmeKeyAlgorithm::EcdsaP256 => {
+            KeyPair::generate().context("failed generating ECDSA P-256 certificate key")
+        }
+        AcmeKeyAlgorithm::Rsa2048 => KeyPair::generate_for(&PKCS_RSA_SHA256)
+            .context("failed generating RSA-2048 certificate key"),
+    }
 }
 
 async fn issue_on_demand_managed_certificate(
@@ -15165,6 +15951,12 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
 }
 
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
+const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
+const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
+
+fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
+    elapsed <= BALANCED_UDP_FAIRNESS_WINDOW
+}
 
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
@@ -15597,9 +16389,12 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
     let tls = &config.http.tls;
     let mode = serde_json::to_value(tls.mode).unwrap_or(serde_json::Value::Null);
     let challenge = serde_json::to_value(tls.acme.challenge).unwrap_or(serde_json::Value::Null);
+    let key_algorithm =
+        serde_json::to_value(tls.acme.key_algorithm).unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "mode": mode,
         "challenge": challenge,
+        "key_algorithm": key_algorithm,
         "server_name": tls.server_name,
         "cert_path": tls.cert_path.display().to_string(),
         "key_path": tls.key_path.display().to_string(),
@@ -15615,6 +16410,7 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
             "email": tls.acme.email,
             "domains": tls.acme.domains,
             "directory_production": tls.acme.directory_production,
+            "key_algorithm": key_algorithm,
             "dns_provider": tls.acme.dns.provider,
             "dns_credentials_configured": !tls.acme.dns.credentials.is_empty(),
         },
@@ -18119,6 +18915,29 @@ async fn static_range_response(
     Ok(response)
 }
 
+fn build_static_http1_keep_alive_response(
+    content_type: &'static str,
+    len: u64,
+    body: &Bytes,
+) -> Option<Bytes> {
+    let mut header = String::with_capacity(160);
+    std::fmt::Write::write_fmt(
+        &mut header,
+        format_args!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {len}\r\nconnection: keep-alive\r\n\r\n"
+        ),
+    )
+    .expect("writing static response header to String cannot fail");
+    if header.len().saturating_add(body.len()) > POOL_BUFFER_BYTES {
+        return None;
+    }
+
+    let mut response = Vec::with_capacity(header.len() + body.len());
+    response.extend_from_slice(header.as_bytes());
+    response.extend_from_slice(body);
+    Some(Bytes::from(response))
+}
+
 async fn cached_static_file_body(
     target: &Path,
     metadata: &std::fs::Metadata,
@@ -18187,6 +19006,12 @@ async fn cached_static_file_body(
     {
         let current = static_file_cache_bytes.load(Ordering::Relaxed);
         if current.saturating_add(body_len) <= STATIC_FILE_CACHE_MAX_BYTES {
+            let content_type_value = static_content_type(target);
+            let content_type = HeaderValue::from_static(content_type_value);
+            let content_length = HeaderValue::from_str(&metadata.len().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0"));
+            let http1_keep_alive_response =
+                build_static_http1_keep_alive_response(content_type_value, metadata.len(), &body);
             let sendfile = static_file_cache
                 .get(&key)
                 .and_then(|entry| entry.sendfile.clone());
@@ -18197,11 +19022,10 @@ async fn cached_static_file_body(
                     modified,
                     body: body.clone(),
                     sendfile,
-                    content_type: HeaderValue::from_static(static_content_type(target)),
-                    content_length: HeaderValue::from_str(&metadata.len().to_string())
-                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
-                    checked_at: Instant::now(),
-                    revalidating: false,
+                    content_type,
+                    content_length,
+                    http1_keep_alive_response,
+                    freshness: Arc::new(StaticCacheFreshness::new()),
                 },
             );
             static_file_cache_bytes.fetch_add(body_len, Ordering::Relaxed);
@@ -18231,13 +19055,12 @@ fn fresh_static_cache_body(
     modified: Option<SystemTime>,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) -> Option<Bytes> {
-    let mut entry = static_file_cache.get_mut(key)?;
+    let entry = static_file_cache.get(key)?;
     if entry.len == metadata.len()
         && entry.modified == modified
         && entry.body.len() as u64 == entry.len
     {
-        entry.checked_at = Instant::now();
-        entry.revalidating = false;
+        entry.freshness.mark_checked();
         return Some(entry.body.clone());
     }
     None
@@ -18305,9 +19128,7 @@ fn fresh_cached_static_file_response(
     }
     let key = target.to_string_lossy();
     let entry = static_file_cache.get(key.as_ref())?;
-    if entry.body.len() as u64 != entry.len
-        || entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-    {
+    if entry.body.len() as u64 != entry.len || entry.freshness.is_stale() {
         return None;
     }
     let mut response = GatewayHttpResponse::bytes(
@@ -18340,7 +19161,7 @@ fn cached_static_file_response_stale_while_revalidate(
     if entry.body.len() as u64 != entry.len {
         return None;
     }
-    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+    let revalidate = entry.freshness.claim_revalidation();
 
     let mut response = Response::new(full_body(entry.body.clone()));
     response
@@ -18352,21 +19173,6 @@ fn cached_static_file_response_stale_while_revalidate(
     response
         .headers_mut()
         .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    drop(entry);
-
-    let revalidate = if stale {
-        let mut entry = static_file_cache.get_mut(key.as_ref())?;
-        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && !entry.revalidating
-        {
-            entry.revalidating = true;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
     Some(CachedStaticResponse {
         response,
         revalidate,
@@ -18377,10 +19183,36 @@ fn finish_failed_static_revalidation(
     key: &str,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) {
-    if let Some(mut entry) = static_file_cache.get_mut(key) {
-        entry.checked_at = Instant::now();
-        entry.revalidating = false;
+    if let Some(entry) = static_file_cache.get(key) {
+        entry.freshness.mark_checked();
     }
+}
+
+fn build_prebuilt_h2_static_responses(
+    static_route_cache: &DashMap<String, PathBuf>,
+    static_file_cache: &DashMap<String, CachedStaticFile>,
+) -> FxHashMap<String, PrebuiltH2StaticResponse> {
+    let mut responses = FxHashMap::default();
+    responses.reserve(static_route_cache.len().min(STATIC_FILE_CACHE_MAX_ENTRIES));
+    for route in static_route_cache.iter() {
+        let cache_key = route.value().to_string_lossy();
+        let Some(cached) = static_file_cache.get(cache_key.as_ref()) else {
+            continue;
+        };
+        if cached.body.is_empty() {
+            continue;
+        }
+        responses.insert(
+            route.key().clone(),
+            PrebuiltH2StaticResponse {
+                body: cached.body.clone(),
+                content_type: cached.content_type.clone(),
+                content_length: cached.content_length.clone(),
+                freshness: cached.freshness.clone(),
+            },
+        );
+    }
+    responses
 }
 
 fn stale_cached_static_file_candidate(
@@ -18394,7 +19226,7 @@ fn stale_cached_static_file_candidate(
     }
     let key = target.to_string_lossy().to_string();
     let entry = static_file_cache.get(&key)?;
-    let stale = entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS);
+    let revalidate = entry.freshness.claim_revalidation();
     let sendfile = if cfg!(target_os = "linux") && entry.len >= sendfile_threshold {
         Some(entry.sendfile.as_ref()?.clone())
     } else {
@@ -18413,22 +19245,8 @@ fn stale_cached_static_file_candidate(
         len: entry.len,
         content_type: static_content_type(target),
         cached_body,
+        combined_response: entry.http1_keep_alive_response.clone(),
         sendfile,
-    };
-    drop(entry);
-
-    let revalidate = if stale {
-        let mut entry = static_file_cache.get_mut(&key)?;
-        if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
-            && !entry.revalidating
-        {
-            entry.revalidating = true;
-            true
-        } else {
-            false
-        }
-    } else {
-        false
     };
     Some((candidate, revalidate))
 }
@@ -18444,7 +19262,7 @@ fn fresh_cached_static_file_candidate(
     }
     let key = target.to_string_lossy().to_string();
     let entry = static_file_cache.get(&key)?;
-    if entry.checked_at.elapsed() > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS) {
+    if entry.freshness.is_stale() {
         return None;
     }
 
@@ -18467,6 +19285,7 @@ fn fresh_cached_static_file_candidate(
         len: entry.len,
         content_type: static_content_type(target),
         cached_body,
+        combined_response: entry.http1_keep_alive_response.clone(),
         sendfile,
     })
 }
@@ -18475,35 +19294,34 @@ fn cached_static_sendfile(
     target: &Path,
     metadata: &std::fs::Metadata,
     static_file_cache: &DashMap<String, CachedStaticFile>,
-) -> Result<Arc<std::fs::File>> {
+) -> Result<Arc<StaticSendfilePool>> {
     let key = target.to_string_lossy().to_string();
     let modified = metadata.modified().ok();
-    if let Some(mut entry) = static_file_cache.get_mut(&key) {
+    if let Some(entry) = static_file_cache.get(&key) {
         if entry.len == metadata.len() && entry.modified == modified {
-            entry.checked_at = Instant::now();
-            entry.revalidating = false;
-            if let Some(file) = &entry.sendfile {
-                return Ok(file.clone());
+            entry.freshness.mark_checked();
+            if let Some(pool) = &entry.sendfile {
+                return Ok(pool.clone());
             }
-            let file = Arc::new(std::fs::File::open(target).with_context(|| {
-                format!(
-                    "failed opening static file for sendfile {}",
-                    target.display()
-                )
-            })?);
-            entry.sendfile = Some(file.clone());
-            return Ok(file);
         }
     }
 
-    let file = Arc::new(std::fs::File::open(target).with_context(|| {
+    let file = std::fs::File::open(target).with_context(|| {
         format!(
             "failed opening static file for sendfile {}",
             target.display()
         )
-    })?);
+    })?;
+    let pool = Arc::new(StaticSendfilePool::new(file));
+    if let Some(mut entry) = static_file_cache.get_mut(&key) {
+        if entry.len == metadata.len() && entry.modified == modified {
+            entry.freshness.mark_checked();
+            entry.sendfile = Some(pool.clone());
+            return Ok(pool);
+        }
+    }
     if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
-        return Ok(file);
+        return Ok(pool);
     }
     static_file_cache.insert(
         key,
@@ -18511,15 +19329,15 @@ fn cached_static_sendfile(
             len: metadata.len(),
             modified,
             body: Bytes::new(),
-            sendfile: Some(file.clone()),
+            sendfile: Some(pool.clone()),
             content_type: HeaderValue::from_static(static_content_type(target)),
             content_length: HeaderValue::from_str(&metadata.len().to_string())
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
-            checked_at: Instant::now(),
-            revalidating: false,
+            http1_keep_alive_response: None,
+            freshness: Arc::new(StaticCacheFreshness::new()),
         },
     );
-    Ok(file)
+    Ok(pool)
 }
 
 async fn preload_static_site_fast_lane_cache(
@@ -18609,7 +19427,8 @@ async fn preload_static_site_fast_lane_cache(
                 preloaded = preloaded.saturating_add(1);
             }
         } else if should_cache_sendfile {
-            cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            let pool = cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            pool.prewarm(&target);
             preloaded = preloaded.saturating_add(1);
         }
     }
@@ -19613,7 +20432,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
     <header class="hero">
       <div class="eyebrow">proxysss docs / human first</div>
       <h1>先复制成功，再看完整能力面。</h1>
-      <p class="lead">这页内建文档同时服务两类人：新手要能在几分钟内跑起一个站点；高手要能立刻找到路由面、TLS、AI SSE、TCP/UDP、reload 和运维边界，不需要先看一屏宣传。</p>
+      <p class="lead">这页内建文档同时服务两类人：新手要能在几分钟内跑起一个站点；高手要能立刻找到路由面、TLS、AI SSE、TCP/UDP、reload 和运维边界，不需要先看一屏宣传。默认 `/` 是只含 GitHub 与 GitHub Docs 的零外部资源 fallback，用户路由优先；默认 443 普通客户端优先协商 HTTP/2。</p>
       <div class="meta">
         <div class="meta-item">
           <div class="meta-label">Default HTTP</div>
@@ -19655,7 +20474,7 @@ pub(crate) fn render_docs_html(_config: &GatewayConfig) -> String {
           <article class="path">
             <span class="tag beginner">正式上线</span>
             <h3>只填域名就给 WebSocket 加 WSS</h3>
-            <p class="subtle">单域名只填域名即可走正式 TLS-ALPN-01；无需证书脚本、DNS API 或邮箱，只需公网 443。显式 HTTP-01（需 80）继续兼容；泛域名使用 DNS-01。</p>
+            <p class="subtle">单域名只填域名即可免费走正式 TLS-ALPN-01 与默认 ECDSA P-256；无需证书脚本、DNS API 或邮箱，只需公网 443。极老旧客户端可选 RSA-2048；显式 HTTP-01（需 80）继续兼容，泛域名使用 DNS-01。</p>
             <pre><code>{{ACME_DNS}}</code></pre>
           </article>
         </div>
@@ -19873,7 +20692,7 @@ fn docs_template_ftp() -> &'static str {
 }
 
 fn docs_template_acme_dns() -> &'static str {
-    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用内建 ACME：正式 Let's Encrypt + TLS-ALPN-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
+    "http:\n  plain_bind: 0.0.0.0:80\n  tls_bind: 0.0.0.0:443\n  tls:\n    # domains 非空即自动启用免费内建 ACME：正式 Let's Encrypt + TLS-ALPN-01\n    auto_https:\n      domains: [wss.example.com]\n      # email: ops@example.com # 可选；仅用于到期/安全通知\n    acme:\n      key_algorithm: ecdsa_p256 # 推荐默认；极老旧客户端可改 rsa2048\nservices:\n  domain_routes:\n    - name: game-wss\n      domains: [wss.example.com]\n      path_prefix: /ws\n      upstream: ws://127.0.0.1:9000\n"
 }
 
 fn docs_template_health() -> &'static str {
@@ -20468,7 +21287,7 @@ fn render_admin_console_html(config: &GatewayConfig) -> String {
                 <div>
                     <div class="eyebrow">Built-in ACME</div>
                     <h2>TLS / Certificates</h2>
-                    <p class="hint">Fully embedded — no acme.sh, certbot, or cloud CLI. HTTP-01/TLS-ALPN-01 for normal domains; DNS-01 for wildcard via built-in cloud providers or manual TXT.</p>
+                    <p class="hint">Fully embedded and free — no acme.sh, certbot, or cloud CLI. ECDSA P-256 is the stable default; RSA-2048 is available for legacy clients. HTTP-01/TLS-ALPN-01 handles normal domains; DNS-01 handles wildcard domains.</p>
                 </div>
                 <div id="tls-state" class="status-dot">Loading TLS summary</div>
             </div>
@@ -21996,7 +22815,7 @@ async fn read_raw_reverse_http_response_into(
         }
 
         buffer.reserve(4096);
-        let read = upstream.read_buf(buffer).await?;
+        let read = read_plain_fast_buf(upstream, buffer).await?;
         if read == 0 {
             return Err(anyhow!("upstream closed during handshake"));
         }
@@ -22024,12 +22843,11 @@ async fn read_raw_fast_http_response_head(
             return Err(anyhow!("upstream response headers exceeded 64KiB"));
         }
 
-        let mut chunk = [0_u8; 4096];
-        let read = upstream.read(&mut chunk).await?;
+        buffer.reserve(4096);
+        let read = read_plain_fast_buf(upstream, &mut buffer).await?;
         if read == 0 {
             return Err(anyhow!("upstream closed during handshake"));
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -22716,6 +23534,51 @@ mod tests {
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_sendfile_preserves_progress_across_writable_waits() {
+        use std::ffi::CString;
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd;
+
+        let name = CString::new("proxysss-direct-sendfile-test").expect("memfd name");
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+        let expected = (0..8 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        file.write_all(&expected).expect("write sendfile fixture");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sendfile fixture");
+        let address = listener.local_addr().expect("sendfile fixture address");
+        let client = TcpStream::connect(address)
+            .await
+            .expect("connect sendfile fixture");
+        let (mut server, _) = listener.accept().await.expect("accept sendfile fixture");
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut received = Vec::new();
+            let mut client = client;
+            client
+                .read_to_end(&mut received)
+                .await
+                .expect("read sendfile fixture");
+            received
+        });
+
+        assert_eq!(
+            sendfile_all_async(&server, file.as_raw_fd(), expected.len() as u64, false)
+                .await
+                .expect("send direct file"),
+            (expected.len() as u64, false)
+        );
+        server.shutdown().await.expect("finish sendfile fixture");
+        assert_eq!(reader.await.expect("join sendfile reader"), expected);
+    }
+
     #[tokio::test]
     async fn raw_http_pool_discards_upstream_socket_closed_while_idle() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -22734,6 +23597,7 @@ mod tests {
             let _ = release_replacement_rx.await;
         });
         let pool = RawHttpUpstreamPool::new(address.ip().to_string(), address.port());
+        assert_eq!(pool.socket_addr, Some(address));
         let first = pool.checkout().await.expect("connect first raw socket");
         first.readable().await.expect("observe closed raw socket");
         pool.checkin(first);
@@ -22977,8 +23841,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_h2_static_response_keeps_range_and_length_headers() {
+    fn prebuilt_h2_static_response_keeps_range_and_length_headers() {
         let cache = DashMap::new();
+        let routes = DashMap::new();
+        routes.insert("/bench/asset.js".to_string(), PathBuf::from("asset.js"));
         cache.insert(
             "asset.js".to_string(),
             CachedStaticFile {
@@ -22988,32 +23854,48 @@ mod tests {
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
-                checked_at: Instant::now(),
-                revalidating: false,
+                http1_keep_alive_response: None,
+                freshness: Arc::new(StaticCacheFreshness::new()),
             },
         );
 
-        let response = cached_static_file_response_stale_while_revalidate(
-            Path::new("asset.js"),
-            &Method::GET,
-            &cache,
-        )
-        .expect("fresh cached response");
+        let snapshots = build_prebuilt_h2_static_responses(&routes, &cache);
+        let response = snapshots
+            .get("/bench/asset.js")
+            .expect("prebuilt H2 response")
+            .response();
 
-        assert!(!response.revalidate);
-        assert_eq!(response.response.status(), StatusCode::OK);
-        match response.response.body() {
+        assert_eq!(response.status(), StatusCode::OK);
+        match response.body() {
             GatewayBody::Full(Some(body)) => assert_eq!(body, &Bytes::from_static(b"test")),
             _ => panic!("cached H2 response must use a full body"),
         }
         assert_eq!(
-            response.response.headers().get(CONTENT_LENGTH),
+            response.headers().get(CONTENT_LENGTH),
             Some(&HeaderValue::from_static("4"))
         );
         assert_eq!(
-            response.response.headers().get(ACCEPT_RANGES),
+            response.headers().get(ACCEPT_RANGES),
             Some(&HeaderValue::from_static("bytes"))
         );
+        assert_ne!(
+            STATIC_FILE_CONNECTION_REVALIDATE_HITS as usize,
+            PLAIN_FAST_LANE_FAIRNESS_BATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_connection_executor_drives_streams_without_tokio_spawn_per_request() {
+        let (executor, receiver) = h2_connection_executor();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let task_completed = completed.clone();
+        hyper::rt::Executor::execute(&executor, async move {
+            task_completed.fetch_add(1, Ordering::Relaxed);
+        });
+        drop(executor);
+
+        drive_h2_connection_tasks(receiver).await;
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -23057,6 +23939,17 @@ mod tests {
     #[test]
     fn plain_static_stale_candidate_serves_body_and_coalesces_revalidation() {
         let cache = DashMap::new();
+        let prebuilt = build_static_http1_keep_alive_response(
+            "application/javascript; charset=utf-8",
+            4,
+            &Bytes::from_static(b"test"),
+        )
+        .expect("prebuilt HTTP/1 response");
+        let freshness = Arc::new(StaticCacheFreshness::new());
+        freshness.checked_at_unix_ms.store(
+            current_unix_millis().saturating_sub(3_000),
+            Ordering::Relaxed,
+        );
         cache.insert(
             "asset.js".to_string(),
             CachedStaticFile {
@@ -23066,8 +23959,8 @@ mod tests {
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
                 content_length: HeaderValue::from_static("4"),
-                checked_at: Instant::now() - Duration::from_secs(2),
-                revalidating: false,
+                http1_keep_alive_response: Some(prebuilt.clone()),
+                freshness,
             },
         );
 
@@ -23080,6 +23973,7 @@ mod tests {
         .expect("stale cached candidate");
         assert!(revalidate);
         assert_eq!(candidate.cached_body.as_deref(), Some(b"test".as_slice()));
+        assert_eq!(candidate.combined_response, Some(prebuilt));
 
         let (_, duplicate_revalidate) = stale_cached_static_file_candidate(
             Path::new("asset.js"),
@@ -23099,32 +23993,67 @@ mod tests {
         ));
         std::fs::write(&path, b"sendfile-data").expect("write sendfile fixture");
         let metadata = std::fs::metadata(&path).expect("sendfile metadata");
-        let file = Arc::new(std::fs::File::open(&path).expect("open sendfile fixture"));
+        let pool = Arc::new(StaticSendfilePool::new(
+            std::fs::File::open(&path).expect("open sendfile fixture"),
+        ));
         let key = path.to_string_lossy().to_string();
         let cache = DashMap::new();
+        let freshness = Arc::new(StaticCacheFreshness::new());
+        freshness.checked_at_unix_ms.store(
+            current_unix_millis().saturating_sub(2_000),
+            Ordering::Relaxed,
+        );
+        freshness.revalidating.store(true, Ordering::Relaxed);
         cache.insert(
             key.clone(),
             CachedStaticFile {
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
                 body: Bytes::new(),
-                sendfile: Some(file.clone()),
+                sendfile: Some(pool.clone()),
                 content_type: HeaderValue::from_static("application/octet-stream"),
                 content_length: HeaderValue::from_str(&metadata.len().to_string())
                     .expect("content length"),
-                checked_at: Instant::now() - Duration::from_secs(2),
-                revalidating: true,
+                http1_keep_alive_response: None,
+                freshness,
             },
         );
 
         let refreshed =
             cached_static_sendfile(&path, &metadata, &cache).expect("revalidate sendfile entry");
-        assert!(Arc::ptr_eq(&file, &refreshed));
+        assert!(Arc::ptr_eq(&pool, &refreshed));
         let entry = cache.get(&key).expect("cached sendfile entry");
         assert!(entry.body.is_empty());
-        assert!(!entry.revalidating);
+        assert!(!entry.freshness.revalidating.load(Ordering::Relaxed));
         drop(entry);
         std::fs::remove_file(path).expect("remove sendfile fixture");
+    }
+
+    #[test]
+    fn static_sendfile_pool_prewarms_reuses_and_bounds_descriptors() {
+        let path =
+            std::env::temp_dir().join(format!("proxysss-sendfile-pool-{}.bin", std::process::id()));
+        std::fs::write(&path, b"sendfile-pool-data").expect("write sendfile pool fixture");
+        let pool = StaticSendfilePool::with_capacity(
+            std::fs::File::open(&path).expect("open initial sendfile pool fixture"),
+            3,
+        );
+
+        assert_eq!(pool.prewarm(&path), 2);
+        assert_eq!(pool.idle.len(), 3);
+        let first = pool.checkout(&path).expect("checkout first descriptor");
+        let second = pool.checkout(&path).expect("checkout second descriptor");
+        let third = pool.checkout(&path).expect("checkout third descriptor");
+        assert_eq!(pool.idle.len(), 0);
+        let overflow = pool.checkout(&path).expect("open overflow descriptor");
+
+        pool.checkin(first);
+        pool.checkin(second);
+        pool.checkin(third);
+        pool.checkin(overflow);
+        assert_eq!(pool.idle.len(), 3);
+        drop(pool);
+        std::fs::remove_file(path).expect("remove sendfile pool fixture");
     }
 
     #[test]
@@ -23953,18 +24882,38 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert_eq!(
-            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Small),
+        assert!(scoped_send_buffer_should_raise(128 * 1024, 1024 * 1024));
+        assert!(!scoped_send_buffer_should_raise(
+            2 * 1024 * 1024,
             1024 * 1024
+        ));
+        assert!(!sendfile_pressure_should_raise_buffer(4, 8));
+        assert!(sendfile_pressure_should_raise_buffer(5, 8));
+        assert!(!sendfile_pressure_should_raise_buffer(1, 1));
+        assert!(sendfile_pressure_should_raise_buffer(2, 1));
+        assert!(sendfile_should_cooperative_yield(true, false, false, 1, 16));
+        assert!(sendfile_should_cooperative_yield(
+            false, true, false, 16, 16
+        ));
+        assert!(!sendfile_should_cooperative_yield(true, true, true, 16, 16));
+        assert!(!sendfile_reactor_should_dispatch(true, true, 8, 8));
+        assert!(sendfile_reactor_should_dispatch(true, true, 9, 8));
+        assert!(sendfile_reactor_should_dispatch(true, true, 32, 8));
+        assert!(!sendfile_reactor_should_dispatch(true, true, 33, 8));
+        assert!(sendfile_reactor_should_dispatch(true, false, usize::MAX, 8));
+        assert!(!sendfile_reactor_should_dispatch(false, false, 0, 8));
+        assert_eq!(
+            sendfile_reactor_job_chunk_bytes(true, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            32 * 1024 * 1024
         );
         assert_eq!(
-            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Balanced),
-            STATIC_STREAM_THRESHOLD_BYTES
+            sendfile_reactor_job_chunk_bytes(false, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            16 * 1024 * 1024
         );
-        assert_eq!(
-            static_preload_body_max_bytes(RuntimePerformanceTrafficProfile::Bulk),
-            0
-        );
+        assert_eq!(sendfile_reactor_active_workers(true, 16, 8, 8), 4);
+        assert_eq!(sendfile_reactor_active_workers(true, 17, 8, 8), 8);
+        assert_eq!(sendfile_reactor_active_workers(false, 1, 8, 8), 8);
+        assert_eq!(PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES, 256 * 1024);
         assert_eq!(realtime_stream_reactor_workers_for(1, 2), 1);
         assert_eq!(realtime_stream_reactor_workers_for(4, 2), 2);
         assert_eq!(realtime_stream_reactor_workers_for(96, 2), 48);
@@ -23978,7 +24927,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            4
+            1
         );
         assert_eq!(
             realtime_stream_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -23990,7 +24939,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            0
+            3
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
@@ -23998,24 +24947,40 @@ mod tests {
         );
         assert_eq!(http_data_plane_workers_for(4), 4);
         assert_eq!(http_data_plane_workers_for(96), 96);
-        assert_eq!(DATA_RUNTIME_MAX_IO_EVENTS_PER_TICK, 128);
-        assert_eq!(TLS_RUNTIME_MAX_IO_EVENTS_PER_TICK, 256);
-        assert!(!shared_udp_runtime_profile(
+        assert!(shared_tls_runtime_profile(
             RuntimePerformanceTrafficProfile::Small
         ));
+        assert!(!shared_tls_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!shared_tls_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
         assert!(shared_udp_runtime_profile(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(!shared_udp_runtime_profile(
             RuntimePerformanceTrafficProfile::Bulk
         ));
+        assert!(!native_stream_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(native_stream_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(native_stream_reactor_profile_enabled(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            1
+            4
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
-            2
+            8
         );
         assert_eq!(
             tls_http_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Bulk),
@@ -24026,21 +24991,35 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(96, 2), 48);
         assert_eq!(tls_http_runtime_workers_for(4, 4), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 4), 24);
+        assert_eq!(tls_http_runtime_workers_for(8, 8), 1);
+        assert_eq!(tls_http_runtime_workers_for(96, 8), 12);
+        assert!(!sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Small
+        ));
+        assert!(sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced
+        ));
+        assert!(!sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk
+        ));
+        assert_eq!(plain_http_runtime_shard_count_for(8, false), 1);
+        assert_eq!(plain_http_runtime_shard_count_for(8, true), 8);
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            7
+            5
         );
         assert_eq!(
             tls_http_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             5
         );
+        assert_eq!(H2_CONNECTION_TASK_FAIRNESS_BATCH, 1);
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Small),
-            1
+            2
         );
         assert_eq!(
             udp_runtime_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
@@ -24053,31 +25032,55 @@ mod tests {
         assert_eq!(udp_runtime_workers_for(1, 2), 1);
         assert_eq!(udp_runtime_workers_for(4, 2), 2);
         assert_eq!(udp_runtime_workers_for(96, 2), 48);
-        assert_eq!(plain_fast_lane_fairness_batch_for(1), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(299), 8);
-        assert_eq!(plain_fast_lane_fairness_batch_for(300), 32);
-        assert_eq!(plain_fast_lane_fairness_batch_for(30_000), 32);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(1, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(511, 8), 256);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(512, 8), 128);
+        assert_eq!(plain_fast_lane_fairness_batch_for_workers(30_000, 8), 128);
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Small),
             0
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            12
+            3
         );
         assert_eq!(
             udp_runtime_nice_for(RuntimePerformanceTrafficProfile::Bulk),
             12
         );
+        assert!(balanced_udp_batch_is_sustained(Duration::from_millis(8)));
+        assert!(!balanced_udp_batch_is_sustained(Duration::from_millis(9)));
         assert!(!sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Small
         ));
-        assert!(!sendfile_reactor_profile_enabled(
+        assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Balanced
         ));
         assert!(sendfile_reactor_profile_enabled(
             RuntimePerformanceTrafficProfile::Bulk
         ));
+        assert_eq!(
+            sendfile_reactor_cpu_divisor(RuntimePerformanceTrafficProfile::Balanced),
+            1
+        );
+        assert_eq!(SHARDED_PLAIN_HTTP_EVENT_INTERVAL, 8);
+        assert_eq!(
+            sendfile_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
+            0
+        );
+        let mut config = GatewayConfig::default();
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
+        assert_eq!(
+            static_sendfile_fast_path_threshold_bytes(&config),
+            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
+        );
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Balanced;
+        assert_eq!(
+            static_sendfile_fast_path_threshold_bytes(&config),
+            STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES
+        );
+        config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Bulk;
+        assert_eq!(static_sendfile_fast_path_threshold_bytes(&config), 0);
         let mut sendfile_sequence = 0;
         assert!(balanced_sendfile_mid_yield_for_next_response(
             &mut sendfile_sequence,
@@ -24338,12 +25341,23 @@ mod tests {
     }
 
     #[test]
+    fn http_request_stats_aggregate_fallback_and_data_shards() {
+        let stats = GatewayStats::default();
+        stats.http_requests.store(2, Ordering::Relaxed);
+        DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(7)));
+        stats.record_http_request();
+        stats.record_http_request();
+        DATA_PLANE_STATS_SHARD.with(|shard| shard.set(None));
+        assert_eq!(stats.http_requests_total(), 4);
+    }
+
+    #[test]
     fn weighted_plan_prefers_heavier_upstream() {
         let gateway = Gateway {
             config_path: PathBuf::from("proxysss.yaml"),
             bootstrap_config: GatewayConfig::default(),
             bootstrap_fast_lane: FastLaneState::compile(&GatewayConfig::default()),
-            dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
+            dynamic: Arc::new(ArcSwap::from(Arc::new(DynamicState {
                 config: GatewayConfig::default(),
                 fast_lane: FastLaneState::compile(&GatewayConfig::default()),
                 http_client: reqwest::Client::new(),
@@ -24363,6 +25377,8 @@ mod tests {
             static_route_cache: Arc::new(DashMap::new()),
             h2_static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(ArcSwap::from_pointee(FxHashMap::default())),
+            h2_static_response_refresh_lock: Arc::new(TokioMutex::new(())),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
@@ -24894,14 +25910,45 @@ mod tests {
         let config = GatewayConfig::default();
         let html = render_welcome_html(&config);
         assert!(html.contains("Welcome to proxysss"));
-        assert!(html.contains("<h1>Gateway ready.</h1>"));
-        assert!(html.contains("animation:"));
-        assert!(html.contains("@keyframes"));
+        assert!(html.contains("https://github.com/neko233-com/proxysss"));
+        assert!(html.contains("https://neko233-com.github.io/proxysss/"));
+        assert!(html.contains(">GitHub</a>"));
+        assert!(html.contains(">GitHub Docs</a>"));
         assert!(!html.contains("<script"));
-        assert!(html.contains("/docs.html"));
         assert!(!html.contains("127.0.0.1:7777"));
         assert!(!html.contains("Open Admin Console"));
-        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!html.contains("Gateway ready."));
+        assert!(!html.contains("general gateway"));
+        assert!(!html.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn builtin_docs_explain_free_acme_key_compatibility() {
+        let html = render_docs_html(&GatewayConfig::default());
+        assert!(html.contains("ECDSA P-256"));
+        assert!(html.contains("RSA-2048"));
+        assert!(html.contains("免费"));
+    }
+
+    #[test]
+    fn default_tls_alpn_prefers_http2_for_normal_clients() {
+        let protocols = default_tls_alpn_protocols();
+        assert_eq!(protocols[0], b"acme-tls/1");
+        assert_eq!(protocols[1], b"h2");
+        assert_eq!(protocols[2], b"http/1.1");
+    }
+
+    #[test]
+    fn managed_acme_supports_ecdsa_p256_and_rsa2048_keys() {
+        let ecdsa = generate_managed_acme_key_pair(AcmeKeyAlgorithm::EcdsaP256)
+            .expect("generate ECDSA P-256 key");
+        assert_eq!(ecdsa.algorithm(), &rcgen::PKCS_ECDSA_P256_SHA256);
+        assert!(ecdsa.serialize_pem().contains("PRIVATE KEY"));
+
+        let rsa = generate_managed_acme_key_pair(AcmeKeyAlgorithm::Rsa2048)
+            .expect("generate RSA-2048 key");
+        assert_eq!(rsa.algorithm(), &PKCS_RSA_SHA256);
+        assert!(rsa.serialize_pem().contains("PRIVATE KEY"));
     }
 
     #[test]

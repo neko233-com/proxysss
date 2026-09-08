@@ -132,7 +132,7 @@ curl -X POST http://127.0.0.1:7777/v1/tls/auto-https/upsert \
   }'
 ```
 
-`email`、`production` 与 `challenge` 都可省略：API 默认使用 Let's Encrypt 正式环境的 TLS-ALPN-01；不填邮箱不会阻塞签发或续期，但不会收到到期/安全通知。域名 A/AAAA 必须指向该网关，443 必须能从公网访问。旧部署可在 JSON 中显式传入 `"challenge":"http01"` 继续使用 HTTP-01（需开放 80）；成功响应会回显实际 `challenge`。DNS-01 泛域名仍使用下一节接口。
+`email`、`production` 与 `challenge` 都可省略：API 默认使用 Let's Encrypt 正式环境的 TLS-ALPN-01 与 ECDSA P-256；不填邮箱不会阻塞签发或续期，但不会收到到期/安全通知。极老旧客户端需要 RSA-2048 时，先在单一 YAML 中设置 `http.tls.acme.key_algorithm: rsa2048`，API 更新域名时会保留该选项。域名 A/AAAA 必须指向该网关，443 必须能从公网访问。旧部署可在 JSON 中显式传入 `"challenge":"http01"` 继续使用 HTTP-01（需开放 80）；成功响应会回显实际 `challenge`。DNS-01 泛域名仍使用下一节接口。
 
 ### Wildcard certificate via built-in DNS-01 (no external ACME client)
 

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Archive small, reviewable benchmark evidence while leaving multi-GiB build,
-# container, binary, and client scratch artifacts under ignored .benchmark/.
+# Archive small, reviewable benchmark evidence. Benchmark scripts clean their
+# default .benchmark/ output; set KEEP_BENCH_ARTIFACTS=1 or BENCH_ROOT first.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE="${1:-$ROOT/.benchmark/direct-ubuntu24-amd64}"
 DESTINATION="${2:-$ROOT/performance-evidence/development/local-docker}"
+
+if [[ -z "${BENCH_ROOT:-}" && "${KEEP_BENCH_ARTIFACTS:-0}" != "1" && "$SOURCE" == "$ROOT/.benchmark/direct-ubuntu24-amd64" ]]; then
+  echo "set KEEP_BENCH_ARTIFACTS=1 or pass explicit benchmark source before archiving" >&2
+  exit 1
+fi
 
 if [[ ! -d "$SOURCE" ]]; then
   echo "benchmark report source does not exist: $SOURCE" >&2

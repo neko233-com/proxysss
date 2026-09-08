@@ -29,6 +29,12 @@ const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
 // batch boundaries instead of relying on coarse CFS weighting.
 const ACTIVE_SPIN_POLLS: usize = 8;
 const ACTIVE_SPIN_MAX_PAIRS_PER_WORKER: usize = 4;
+const QUIET_REPLY_SPIN_LOW_POLLS: usize = 1;
+const QUIET_REPLY_SPIN_MID_POLLS: usize = 2;
+const QUIET_REPLY_SPIN_HIGH_POLLS: usize = 0;
+const QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER: usize = 16;
+const QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER: usize = 32;
+const QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const DENSE_SPIN_POLLS: usize = 0;
 const DENSE_SPIN_MAX_PAIRS_PER_WORKER: usize = 128;
 const CONTINUOUS_BATCH_YIELD_AFTER: usize = 8;
@@ -54,6 +60,7 @@ struct Reactors {
 struct SocketState {
     _stream: TcpStream,
     peer_fd: RawFd,
+    downstream: bool,
     read_enabled: bool,
     read_closed: bool,
     write_shutdown: bool,
@@ -114,6 +121,20 @@ enum RelayReadOutcome {
     Open,
     ReadClosed,
     Failed,
+}
+
+fn quiet_reply_spin_enabled(blocked_wait: bool, downstream: bool, pair_count: usize) -> bool {
+    blocked_wait && downstream && pair_count <= QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER
+}
+
+fn quiet_reply_spin_polls(pair_count: usize) -> usize {
+    if pair_count <= QUIET_REPLY_SPIN_LOW_PAIRS_PER_WORKER {
+        QUIET_REPLY_SPIN_LOW_POLLS
+    } else if pair_count <= QUIET_REPLY_SPIN_MID_PAIRS_PER_WORKER {
+        QUIET_REPLY_SPIN_MID_POLLS
+    } else {
+        QUIET_REPLY_SPIN_HIGH_POLLS
+    }
 }
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
@@ -200,7 +221,7 @@ fn dispatch_inner(
 impl Reactors {
     fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
         let worker_count = requested_workers.max(1);
-        let allowed_cpus = allowed_cpu_ids();
+        let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -213,7 +234,7 @@ impl Reactors {
             let cpu = reactor_worker_cpu(index, worker_count, &allowed_cpus);
             thread::Builder::new()
                 .name(format!("proxysss-ws-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
+                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice, allowed_cpus))
                 .expect("failed spawning WebSocket epoll reactor");
             workers.push(worker);
         }
@@ -225,12 +246,11 @@ impl Reactors {
 }
 
 fn reactor_worker_cpu(index: usize, worker_count: usize, allowed_cpus: &[usize]) -> Option<usize> {
-    if allowed_cpus.is_empty() || worker_count < allowed_cpus.len() {
-        // A sparse realtime pool must be able to follow whichever data-plane
-        // CPU has spare capacity. Hard-pinning its sole owner to the last CPU
-        // creates a hotspot beside that CPU's HTTP/UDP shard while another CPU
-        // remains idle. Linux will normally keep the thread cache-local and
-        // migrate it only when the runnable imbalance warrants doing so.
+    if allowed_cpus.is_empty() || worker_count <= allowed_cpus.len() {
+        // A realtime pool no larger than the cpuset must follow whichever
+        // data-plane CPU has spare capacity. Hard-pinning creates hotspots
+        // beside HTTP/UDP shards while another CPU remains idle. Linux keeps
+        // threads cache-local and migrates them only for runnable imbalance.
         return None;
     }
     allowed_cpus
@@ -253,10 +273,13 @@ fn wake(fd: RawFd) {
     let _ = unsafe { libc::write(fd, (&value as *const u64).cast(), mem::size_of::<u64>()) };
 }
 
-fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i32) {
-    if let Some(cpu) = cpu {
-        pin_current_thread(cpu);
-    }
+fn run_reactor(
+    worker: Arc<ReactorWorker>,
+    cpu: Option<usize>,
+    scheduler_nice: i32,
+    allowed_cpus: &[usize],
+) {
+    set_current_thread_affinity(cpu, allowed_cpus);
     set_current_thread_nice(scheduler_nice);
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     assert!(epoll_fd >= 0, "failed creating WebSocket epoll instance");
@@ -297,7 +320,9 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             std::hint::spin_loop();
             continue;
         }
-        if wait_started.elapsed() >= BLOCKED_WAIT_RESET {
+        active_spin_polls = 0;
+        let blocked_wait = wait_started.elapsed() >= BLOCKED_WAIT_RESET;
+        if blocked_wait {
             continuous_batches = 0;
         } else {
             continuous_batches = continuous_batches.saturating_add(1);
@@ -313,20 +338,25 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             }
 
             let fd = token as RawFd;
-            let Some((peer_fd, read_enabled)) = sockets
+            let Some((peer_fd, downstream, read_enabled)) = sockets
                 .get(&fd)
-                .map(|state| (state.peer_fd, state.read_enabled))
+                .map(|state| (state.peer_fd, state.downstream, state.read_enabled))
             else {
                 continue;
             };
             let pair_count = sockets.len() / 2;
-            active_spin_polls = if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
-                ACTIVE_SPIN_POLLS
+            if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
+                active_spin_polls = active_spin_polls.max(ACTIVE_SPIN_POLLS);
+            } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
+                // Fixed-rate game/WebSocket ticks commonly block before the
+                // client request arrives. Sparse owners use one/two immediate
+                // probes. Dense owners use eight: enough to cover the short
+                // backend scheduling gap without restoring the rejected
+                // 32-poll loop that starved sibling HTTP work.
+                active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
-                DENSE_SPIN_POLLS
-            } else {
-                0
-            };
+                active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
+            }
             let flags = event.events as i32;
             if flags & libc::EPOLLERR != 0 {
                 close_pair(epoll_fd, &mut sockets, fd);
@@ -400,6 +430,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
         SocketState {
             _stream: pair.downstream,
             peer_fd: upstream_fd,
+            downstream: true,
             read_enabled: true,
             read_closed: false,
             write_shutdown: false,
@@ -414,6 +445,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
         SocketState {
             _stream: pair.upstream,
             peer_fd: downstream_fd,
+            downstream: false,
             read_enabled: true,
             read_closed: false,
             write_shutdown: false,
@@ -664,34 +696,16 @@ fn drain_wake(fd: RawFd) {
     }
 }
 
-fn allowed_cpu_ids() -> Vec<usize> {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    let result = unsafe {
-        libc::sched_getaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &mut set as *mut libc::cpu_set_t,
-        )
-    };
-    if result != 0 {
-        return vec![0];
-    }
-    let mut cpus = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
-        if unsafe { libc::CPU_ISSET(cpu, &set) } {
-            cpus.push(cpu);
-        }
-    }
-    if cpus.is_empty() {
-        cpus.push(0);
-    }
-    cpus
-}
-
-fn pin_current_thread(cpu: usize) {
+fn set_current_thread_affinity(cpu: Option<usize>, allowed_cpus: &[usize]) {
     let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
     unsafe {
-        libc::CPU_SET(cpu, &mut set);
+        if let Some(cpu) = cpu {
+            libc::CPU_SET(cpu, &mut set);
+        } else {
+            for &allowed_cpu in allowed_cpus {
+                libc::CPU_SET(allowed_cpu, &mut set);
+            }
+        }
         let _ = libc::sched_setaffinity(
             0,
             mem::size_of::<libc::cpu_set_t>(),
@@ -715,13 +729,24 @@ mod tests {
 
     #[test]
     fn per_cpu_reactor_workers_pin_in_reverse_order() {
-        assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), Some(4));
-        assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), Some(2));
+        assert_eq!(reactor_worker_cpu(0, 2, &[2, 4]), None);
+        assert_eq!(reactor_worker_cpu(1, 2, &[2, 4]), None);
     }
 
     #[test]
     fn dense_spin_budget_is_bounded() {
         assert!(ACTIVE_SPIN_POLLS > DENSE_SPIN_POLLS);
+        assert_eq!(quiet_reply_spin_polls(16), 1);
+        assert_eq!(quiet_reply_spin_polls(17), 2);
+        assert_eq!(quiet_reply_spin_polls(32), 2);
+        assert_eq!(quiet_reply_spin_polls(33), 0);
+        assert_eq!(quiet_reply_spin_polls(48), 0);
+        assert_eq!(quiet_reply_spin_polls(128), 0);
+        assert_eq!(QUIET_REPLY_SPIN_MAX_PAIRS_PER_WORKER, 128);
+        assert!(quiet_reply_spin_enabled(true, true, 128));
+        assert!(!quiet_reply_spin_enabled(true, false, 128));
+        assert!(!quiet_reply_spin_enabled(false, true, 128));
+        assert!(!quiet_reply_spin_enabled(true, true, 129));
         assert_eq!(DENSE_SPIN_MAX_PAIRS_PER_WORKER, 128);
     }
 

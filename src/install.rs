@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use rcgen::generate_simple_self_signed;
@@ -329,13 +329,22 @@ fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> 
     let launcher_path = write_windows_hidden_launcher(executable, config_path)?;
     let task_command = format!("wscript.exe //B //Nologo \"{}\"", launcher_path.display());
 
-    if install_windows_run_key(&task_command).is_ok() {
-        let _ = run_command(
-            Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]),
-            "delete stale windows scheduled task",
-        );
-        return start_windows_command(executable, config_path);
-    }
+    let run_key_error = match install_windows_run_key(&task_command) {
+        Ok(()) => {
+            // Older releases registered a direct console executable in Task Scheduler.
+            // Leaving that task next to the hidden Run entry causes a cmd window and
+            // can start two gateway processes at the same logon.
+            if let Err(error) = remove_windows_scheduled_task() {
+                let _ = delete_windows_run_key();
+                return Err(error.context("remove stale windows scheduled task"));
+            }
+            return start_windows_command(executable, config_path);
+        }
+        Err(error) => error,
+    };
+
+    // Do not leave an old HKCU Run value behind when the fallback task is used.
+    let _ = delete_windows_run_key();
 
     let scheduled_task = run_command(
         Command::new("schtasks").args([
@@ -351,24 +360,20 @@ fn install_windows_service(executable: &Path, config_path: &Path) -> Result<()> 
         "create windows scheduled task",
     );
 
-    if scheduled_task.is_ok() {
-        return start_windows_service();
-    }
+    let scheduled_task_error = match scheduled_task {
+        Ok(()) => return start_windows_command(executable, config_path),
+        Err(error) => error,
+    };
 
     Err(anyhow!(
-        "failed to install windows auto-start entry using HKCU Run or Scheduled Tasks"
+        "failed to install windows auto-start entry: HKCU Run failed: {run_key_error}; Scheduled Task failed: {scheduled_task_error}"
     ))
 }
 
 fn uninstall_windows_service() -> Result<()> {
     let mut removed_any = false;
 
-    if run_command(
-        Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]),
-        "delete windows scheduled task",
-    )
-    .is_ok()
-    {
+    if remove_windows_scheduled_task()? {
         removed_any = true;
     }
 
@@ -390,37 +395,39 @@ fn start_windows_service() -> Result<()> {
 }
 
 fn windows_service_status() -> Result<()> {
-    if run_command(
-        Command::new("schtasks").args(["/Query", "/TN", SERVICE_NAME]),
-        "query windows scheduled task",
-    )
-    .is_ok()
-    {
-        return Ok(());
-    }
+    let scheduled_task = query_windows_scheduled_task()?;
+    let run_key = query_windows_run_key()?;
 
-    let output = Command::new("reg")
-        .args([
-            "query",
-            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            "/v",
-            SERVICE_NAME,
-        ])
-        .output()
-        .context("failed to query windows run registry entry")?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            println!("startup mode: HKCU Run");
-            println!("{stdout}");
+    match (scheduled_task, run_key) {
+        (Some(task), Some(run)) => {
+            println!("startup mode: duplicate Scheduled Task + HKCU Run");
+            println!("warning: run `proxysss service install` to remove the duplicate entry");
+            println!("scheduled task:\n{task}");
+            println!("HKCU Run:\n{run}");
         }
-        return Ok(());
+        (Some(task), None) => {
+            let lower = task.to_ascii_lowercase();
+            let hidden = lower.contains("wscript.exe") && lower.contains("//b");
+            if hidden {
+                println!("startup mode: hidden Scheduled Task");
+            } else {
+                println!("startup mode: legacy Scheduled Task (console window risk)");
+                println!("warning: run `proxysss service install` to repair it");
+            }
+            println!("{task}");
+        }
+        (None, Some(run)) => {
+            println!("startup mode: HKCU Run");
+            println!("{run}");
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "query windows auto-start failed: no scheduled task or HKCU Run entry found"
+            ));
+        }
     }
 
-    Err(anyhow!(
-        "query windows auto-start failed: no scheduled task or HKCU Run entry found"
-    ))
+    Ok(())
 }
 
 fn install_windows_run_key(task_command: &str) -> Result<()> {
@@ -451,6 +458,74 @@ fn delete_windows_run_key() -> Result<()> {
         ]),
         "delete windows HKCU run entry",
     )
+}
+
+fn remove_windows_scheduled_task() -> Result<bool> {
+    if query_windows_scheduled_task()?.is_none() {
+        return Ok(false);
+    }
+
+    run_command(
+        Command::new("schtasks").args(["/Delete", "/TN", SERVICE_NAME, "/F"]),
+        "delete windows scheduled task",
+    )?;
+    Ok(true)
+}
+
+fn query_windows_scheduled_task() -> Result<Option<String>> {
+    let output = Command::new("schtasks")
+        .args(["/Query", "/TN", SERVICE_NAME, "/V", "/FO", "LIST"])
+        .output()
+        .context("query windows scheduled task")?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    if command_output_indicates_missing(&output) {
+        return Ok(None);
+    }
+
+    Err(anyhow!(
+        "query windows scheduled task failed: {}",
+        command_output_text(&output)
+    ))
+}
+
+fn query_windows_run_key() -> Result<Option<String>> {
+    let output = Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            SERVICE_NAME,
+        ])
+        .output()
+        .context("query windows run registry entry")?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    if command_output_indicates_missing(&output) {
+        return Ok(None);
+    }
+
+    Err(anyhow!(
+        "query windows run registry entry failed: {}",
+        command_output_text(&output)
+    ))
+}
+
+fn command_output_text(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", error) => error.to_string(),
+        (result, "") => result.to_string(),
+        (result, error) => format!("{result}\n{error}"),
+    }
+}
+
+fn command_output_indicates_missing(output: &Output) -> bool {
+    let text = command_output_text(output).to_ascii_lowercase();
+    text.contains("cannot find") || text.contains("unable to find") || text.contains("not found")
 }
 
 fn stop_processes(config_path: Option<PathBuf>) -> Result<()> {
@@ -578,8 +653,13 @@ fn windows_proxysss_pids(current_pid: u32) -> Result<Vec<u32>> {
 
 fn start_windows_command(executable: &Path, config_path: &Path) -> Result<()> {
     let mut command = Command::new(executable);
-    command.args(["run", "--config", &config_path.display().to_string()]);
-    configure_hidden_windows_process(&mut command);
+    command
+        .args(["run", "--config", &config_path.display().to_string()])
+        .current_dir(config_path.parent().unwrap_or_else(|| Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_detached_process(&mut command);
     command
         .spawn()
         .with_context(|| format!("failed to start {}", executable.display()))?;
@@ -617,16 +697,6 @@ fn vbs_escape(value: &str) -> String {
 fn write_windows_hidden_launcher(_executable: &Path, _config_path: &Path) -> Result<PathBuf> {
     Err(anyhow!("windows launcher is only available on windows"))
 }
-
-#[cfg(windows)]
-fn configure_hidden_windows_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn configure_hidden_windows_process(_command: &mut Command) {}
 
 #[cfg(windows)]
 fn configure_detached_process(command: &mut Command) {

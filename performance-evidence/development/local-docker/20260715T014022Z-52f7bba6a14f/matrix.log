@@ -1,2 +1,0 @@
-scripts/benchmark-all-scenarios-isolated.sh: line 160: declare: -A: invalid option
-declare: usage: declare [-afFirtx] [-p] [name[=value] ...]

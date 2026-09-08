@@ -7,11 +7,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
-[[ "$(uname -s)" == "Linux" || "$(uname -s)" == "Darwin" ]] || {
-  echo "benchmark-all-scenarios-isolated.sh requires Linux or macOS with local Docker" >&2
-  exit 1
-}
+# Preserve Linux paths passed to containers under Git Bash/MSYS. Host paths
+# rooted in the checkout are converted explicitly for Docker Desktop.
+DOCKER_CLI_BIN="$(type -P docker || true)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    docker() {
+      local arg
+      local -a docker_args=()
+      for arg in "$@"; do
+        if [[ "$arg" == "$ROOT"* ]]; then
+          arg="$(cygpath -m "$ROOT")${arg#"$ROOT"}"
+        fi
+        docker_args+=("$arg")
+      done
+      MSYS2_ARG_CONV_EXCL='*' "$DOCKER_CLI_BIN" "${docker_args[@]}"
+    }
+    ;;
+esac
+
+case "$(uname -s)" in
+  Linux | Darwin | MINGW* | MSYS* | CYGWIN*) ;;
+  *)
+    echo "benchmark-all-scenarios-isolated.sh requires Linux, macOS, or Windows Git Bash with local Docker" >&2
+    exit 1
+    ;;
+esac
 for command in docker go openssl; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "missing required command: $command" >&2
@@ -27,13 +52,17 @@ BACKEND_CPUSET="${BACKEND_CPUSET:-4-7}"
 CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 # Each scenario already has its own client process. During fixed-rate equal
 # load, letting every process inherit the whole cpuset as Tokio's worker count
-# creates 11 * N runnable threads and makes generator timers skip ticks. One
-# I/O owner is enough there; static-large keeps two for response-body copying.
+# creates 11 * N runnable threads and makes generator timers skip ticks.
+# Realtime protocols keep one I/O owner. HTTP/SSE use two so fast responses do
+# not create a single-worker cooperative scheduling cliff; static-large also
+# keeps two for response-body copying.
 # Saturation continues using the whole client cpuset so it cannot cap a faster
 # gateway before the gateway's own CPU is full.
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
+EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 VALIDATION_TIMING_FILE="${VALIDATION_TIMING_FILE:-}"
+MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-0}"
 # CPU isolation is mandatory for fair throughput attribution. Memory is
 # measured in every run, but left uncapped by default so a synthetic cgroup
 # ceiling does not turn a safe memory-for-performance trade into a false fail.
@@ -43,6 +72,8 @@ BACKEND_MEMORY="${BACKEND_MEMORY:-}"
 CLIENT_MEMORY="${CLIENT_MEMORY:-}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-300000}"
 NGINX_WORKERS="${NGINX_WORKERS:-4}"
+GATEWAY_SOMAXCONN="${GATEWAY_SOMAXCONN:-65535}"
+GATEWAY_SYSCTL_ARGS=(--sysctl "net.core.somaxconn=${GATEWAY_SOMAXCONN}")
 TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-balanced}"
 BENCH_PLATFORM="${BENCH_PLATFORM:-linux/amd64}"
 HTTP_CONCURRENCY="${HTTP_CONCURRENCY:-64}"
@@ -51,15 +82,20 @@ STATIC_LARGE_CONCURRENCY="${STATIC_LARGE_CONCURRENCY:-4}"
 SSE_CONCURRENCY="${SSE_CONCURRENCY:-4}"
 STREAM_CONNECTIONS="${STREAM_CONNECTIONS:-16}"
 LOAD_SCALES="${LOAD_SCALES:-1}"
-DURATION_SECS="${DURATION_SECS:-3}"
+DURATION_SECS="${DURATION_SECS:-1}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-# The persistent controller still execs eleven amd64 client processes per
-# wave. Give QEMU enough time to start every process before the shared absolute
-# timestamp; otherwise late processes independently enter the 250 ms fallback
-# window and the workload is no longer concurrent.
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-750}"
+CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
+# The persistent controller execs eleven client processes per wave. A one-second
+# absolute lead lets plain HTTP clients preconnect their declared concurrency
+# while keeping all one-second measurement windows aligned. Only active windows
+# consume the 20-second measurement budget; orchestration is wall time.
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-2000}"
+GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-1000}"
+UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
+CLIENT_WAVE_GRACE_SECS="${CLIENT_WAVE_GRACE_SECS:-4}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
+LATENCY_REPETITIONS="${LATENCY_REPETITIONS:-2}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-1}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
@@ -72,11 +108,11 @@ RUN_MIXED_MATRIX="${RUN_MIXED_MATRIX:-1}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 ISOLATED_SCENARIOS="${ISOLATED_SCENARIOS:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 RUN_DIR="$BENCH_ROOT/runs/all-scenarios-isolated/$RUN_ID"
 BASE_RUN_DIR="$RUN_DIR"
 PROXY_BIN="${PROXY_BIN:-$ROOT/target/release/proxysss}"
 IMAGE="${IMAGE:-proxysss-isolated-all-bench:local}"
+register_benchmark_docker_image "$IMAGE"
 NETWORK="proxysss-all-isolated-$RUN_ID"
 PREFIX="proxysss-all-isolated-$RUN_ID"
 CLIENT_CONTAINER="$PREFIX-client"
@@ -90,7 +126,7 @@ CONTEXT_DIR="$BASE_RUN_DIR/image-context"
 WWW_DIR="$BASE_RUN_DIR/www"
 ROLE_MACHINE_ID_HASH="$(printf '%s' "$(docker info --format '{{.ID}}')" | sha256sum | awk '{print $1}')"
 
-[[ -x "$PROXY_BIN" ]] || {
+[[ -f "$PROXY_BIN" ]] || {
   echo "missing Linux proxysss binary: $PROXY_BIN" >&2
   exit 1
 }
@@ -106,14 +142,14 @@ ROLE_MACHINE_ID_HASH="$(printf '%s' "$(docker info --format '{{.ID}}')" | sha256
   echo "NGINX_WORKERS must be a positive integer" >&2
   exit 1
 }
-for value_name in BENCHMARK_REPETITIONS ISOLATED_REPETITIONS; do
+for value_name in BENCHMARK_REPETITIONS LATENCY_REPETITIONS ISOLATED_REPETITIONS; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$value_name must be a positive integer" >&2
     exit 1
   }
 done
-for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
+for value_name in EQUAL_LOAD_CLIENT_TOKIO_WORKERS EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$value_name must be a positive integer" >&2
@@ -124,6 +160,26 @@ done
   echo "CLIENT_START_LEAD_MS must be a positive integer" >&2
   exit 1
 }
+[[ "$GATEWAY_RESUME_SETTLE_MS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "GATEWAY_RESUME_SETTLE_MS must be a positive integer" >&2
+  exit 1
+}
+[[ "$UDP_CLIENT_TIMEOUT_MS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "UDP_CLIENT_TIMEOUT_MS must be a positive integer" >&2
+  exit 1
+}
+[[ "$MAX_VALIDATION_SECS" =~ ^[0-9]+$ ]] || {
+  echo "MAX_VALIDATION_SECS must be a non-negative integer" >&2
+  exit 1
+}
+[[ "$CLIENT_WAVE_GRACE_SECS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "CLIENT_WAVE_GRACE_SECS must be a positive integer" >&2
+  exit 1
+}
+command -v timeout >/dev/null 2>&1 || {
+  echo "GNU timeout is required for the hard validation deadline" >&2
+  exit 1
+}
 for scale in $LOAD_SCALES; do
   [[ "$scale" =~ ^[1-9][0-9]*$ ]] || {
     echo "LOAD_SCALES entries must be positive integers: $scale" >&2
@@ -132,6 +188,10 @@ for scale in $LOAD_SCALES; do
 done
 [[ "$CAPTURE_DOCKER_STATS" == "0" || "$CAPTURE_DOCKER_STATS" == "1" ]] || {
   echo "CAPTURE_DOCKER_STATS must be 0 or 1" >&2
+  exit 1
+}
+[[ "$CAPTURE_THREAD_STATS" == "0" || "$CAPTURE_THREAD_STATS" == "1" ]] || {
+  echo "CAPTURE_THREAD_STATS must be 0 or 1" >&2
   exit 1
 }
 
@@ -199,13 +259,63 @@ CLIENT_CPU_CORES="$(cpuset_cpu_ids "$CLIENT_CPUSET" | wc -l | tr -d '[:space:]')
   echo "cannot determine client CPU count from $CLIENT_CPUSET" >&2
   exit 1
 }
+ALL_SCENARIOS=(
+  static-small static-large cdn-hot-update https-static-small reverse-proxy
+  generic-sse websocket-long-connection game-long-connection tcp-stream udp-stream
+  qcp-transparent
+)
+
+mapfile -t BACKEND_CPU_IDS < <(cpuset_cpu_ids "$BACKEND_CPUSET")
+if (( ${#BACKEND_CPU_IDS[@]} < 6 )); then
+  echo "strict mixed benchmark needs at least 6 backend CPUs for protocol isolation" >&2
+  exit 1
+fi
+BACKEND_HTTP_CPUSET="${BACKEND_CPU_IDS[0]}"; BACKEND_HTTP_CPU_COUNT=1
+BACKEND_SSE_CPUSET="${BACKEND_CPU_IDS[1]}"; BACKEND_SSE_CPU_COUNT=1
+BACKEND_WS_CPUSET="${BACKEND_CPU_IDS[2]}"; BACKEND_WS_CPU_COUNT=1
+BACKEND_TCP_CPUSET="${BACKEND_CPU_IDS[3]}"; BACKEND_TCP_CPU_COUNT=1
+BACKEND_UDP_CPUSET="${BACKEND_CPU_IDS[4]}"; BACKEND_UDP_CPU_COUNT=1
+BACKEND_QCP_CPUSET="${BACKEND_CPU_IDS[5]}"; BACKEND_QCP_CPU_COUNT=1
+for ((cpu_index = 6; cpu_index < ${#BACKEND_CPU_IDS[@]}; cpu_index++)); do
+  cpu="${BACKEND_CPU_IDS[$cpu_index]}"
+  if (( (cpu_index - 6) % 2 == 0 )); then
+    BACKEND_HTTP_CPUSET+=",$cpu"
+    BACKEND_HTTP_CPU_COUNT=$((BACKEND_HTTP_CPU_COUNT + 1))
+  else
+    BACKEND_TCP_CPUSET+=",$cpu"
+    BACKEND_TCP_CPU_COUNT=$((BACKEND_TCP_CPU_COUNT + 1))
+  fi
+done
+
+mapfile -t CLIENT_CPU_IDS < <(cpuset_cpu_ids "$CLIENT_CPUSET")
+if (( ${#CLIENT_CPU_IDS[@]} < ${#ALL_SCENARIOS[@]} )); then
+  echo "strict mixed benchmark needs at least ${#ALL_SCENARIOS[@]} client CPUs for per-scenario isolation" >&2
+  exit 1
+fi
+declare -A CLIENT_SCENARIO_CPUSET=()
+declare -A CLIENT_SCENARIO_CPU_COUNT=()
+for scenario_index in "${!ALL_SCENARIOS[@]}"; do
+  scenario="${ALL_SCENARIOS[$scenario_index]}"
+  CLIENT_SCENARIO_CPUSET["$scenario"]="${CLIENT_CPU_IDS[$scenario_index]}"
+  CLIENT_SCENARIO_CPU_COUNT["$scenario"]=1
+done
+CLIENT_EXTRA_CPU_PRIORITY=(
+  static-small static-large cdn-hot-update https-static-small reverse-proxy
+)
+for ((cpu_index = ${#ALL_SCENARIOS[@]}; cpu_index < ${#CLIENT_CPU_IDS[@]}; cpu_index++)); do
+  priority_index=$(((cpu_index - ${#ALL_SCENARIOS[@]}) % ${#CLIENT_EXTRA_CPU_PRIORITY[@]}))
+  scenario="${CLIENT_EXTRA_CPU_PRIORITY[$priority_index]}"
+  CLIENT_SCENARIO_CPUSET["$scenario"]+=",${CLIENT_CPU_IDS[$cpu_index]}"
+  CLIENT_SCENARIO_CPU_COUNT["$scenario"]=$((CLIENT_SCENARIO_CPU_COUNT["$scenario"] + 1))
+done
 case "$TRAFFIC_PROFILE" in
   small|balanced|bulk) ;;
   *) echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2; exit 1 ;;
 esac
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]] \
-  && (( BENCHMARK_REPETITIONS < 4 || BENCHMARK_REPETITIONS % 2 != 0 )); then
-  echo "BENCHMARK_REPETITIONS must be an even number >= 4 for balanced gateway order" >&2
+  && (( BENCHMARK_REPETITIONS < 4 || BENCHMARK_REPETITIONS % 2 != 0 \
+    || LATENCY_REPETITIONS < 4 || LATENCY_REPETITIONS % 2 != 0 )); then
+  echo "BENCHMARK_REPETITIONS and LATENCY_REPETITIONS must be even numbers >= 4 for balanced gateway order" >&2
   exit 1
 fi
 
@@ -226,6 +336,8 @@ cleanup() {
   set +e
   docker ps -aq --filter "name=^/${PREFIX}" | xargs -r docker rm -f >/dev/null 2>&1
   docker network rm "$NETWORK" >/dev/null 2>&1
+  cleanup_benchmark_docker_images
+  cleanup_benchmark_artifacts
 }
 trap cleanup EXIT
 docker network create --driver bridge --subnet "$SUBNET" "$NETWORK" >/dev/null
@@ -302,7 +414,7 @@ udp:
       max_associations: 65536
     - name: qcp-transparent
       bind: 0.0.0.0:18310
-      upstream: ${BACKEND_IP}:18301
+      upstream: ${BACKEND_IP}:18311
       protocol: qcp
       session_ttl_secs: 30
       max_associations: 65536
@@ -345,14 +457,52 @@ stream {
   upstream tcp_echo { server ${BACKEND_IP}:18201; }
   server { listen 0.0.0.0:18200 backlog=65536 reuseport; proxy_pass tcp_echo; proxy_connect_timeout 1s; proxy_timeout 30s; tcp_nodelay on; }
   upstream udp_echo { server ${BACKEND_IP}:18301; }
+  upstream qcp_echo { server ${BACKEND_IP}:18311; }
   server { listen 0.0.0.0:18300 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
-  server { listen 0.0.0.0:18310 udp reuseport; proxy_pass udp_echo; proxy_responses 1; proxy_timeout 30s; }
+  server { listen 0.0.0.0:18310 udp reuseport; proxy_pass qcp_echo; proxy_responses 1; proxy_timeout 30s; }
 }
 NGINX
 }
 
 write_proxy_config
 write_nginx_config
+
+write_fairness_manifest() {
+  grep -Fq 'plain_bind: 0.0.0.0:18080' "$RUN_DIR/proxysss.yaml"
+  grep -Fq 'tls_bind: 0.0.0.0:18443' "$RUN_DIR/proxysss.yaml"
+  grep -Fq 'listen 0.0.0.0:18080 backlog=65536 reuseport;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'listen 0.0.0.0:18443 ssl backlog=65536 reuseport;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'http2 on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'events { use epoll; worker_connections 65535; multi_accept on; }' "$RUN_DIR/nginx.conf"
+  grep -Fq 'sendfile on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'tcp_nodelay on;' "$RUN_DIR/nginx.conf"
+  grep -Fq 'socket_extreme: true' "$RUN_DIR/proxysss.yaml"
+  {
+    echo 'comparison=equivalent-protocol-and-routing-surface'
+    echo "gateway_cpuset=$GATEWAY_CPUSET"
+    echo "gateway_nofile=$NOFILE_LIMIT"
+    echo "gateway_somaxconn=$GATEWAY_SOMAXCONN"
+    echo "nginx_workers=$NGINX_WORKERS"
+    echo 'shared_kernel=true'
+    echo 'shared_container_sysctls=true'
+    echo 'shared_ports=http:18080,https-h2:18443,tcp:18200,udp:18300,qcp-transparent:18310'
+    echo 'nginx_optimizations=epoll,multi_accept,reuseport,sendfile,tcp_nopush,tcp_nodelay,upstream_keepalive,tls_session_cache'
+    echo 'proxysss_optimizations=adaptive_system,socket_extreme,reuseport,preload,pools,h2'
+    echo "backend_partition_http=$BACKEND_HTTP_CPUSET"
+    echo "backend_partition_sse=$BACKEND_SSE_CPUSET"
+    echo "backend_partition_websocket=$BACKEND_WS_CPUSET"
+    echo "backend_partition_tcp=$BACKEND_TCP_CPUSET"
+    echo "backend_partition_udp=$BACKEND_UDP_CPUSET"
+    echo "backend_partition_qcp=$BACKEND_QCP_CPUSET"
+    for scenario in "${ALL_SCENARIOS[@]}"; do
+      echo "client_partition_${scenario}=${CLIENT_SCENARIO_CPUSET[$scenario]}"
+    done
+    echo "proxysss_config_sha256=$(sha256sum "$RUN_DIR/proxysss.yaml" | awk '{print $1}')"
+    echo "nginx_config_sha256=$(sha256sum "$RUN_DIR/nginx.conf" | awk '{print $1}')"
+  } >"$RUN_DIR/fairness-config.txt"
+}
+
+write_fairness_manifest
 
 memory_limit_enabled() {
   [[ -n "$1" && "$1" != "0" && "$1" != "infinity" && "$1" != "unlimited" ]]
@@ -366,14 +516,15 @@ start_backend() {
     --platform "$BENCH_PLATFORM" \
     --cpuset-cpus "$BACKEND_CPUSET" ${memory_arg:+"$memory_arg"} \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-    "$IMAGE" bash -ec '
-      proxysss demo http-echo --listen 0.0.0.0:18190 &
-      proxysss demo ws-echo --listen 0.0.0.0:18192 &
-      proxysss demo tcp-echo --listen 0.0.0.0:18201 &
-      proxysss demo udp-echo --listen 0.0.0.0:18301 &
-      /usr/local/bin/benchmark-helper serve-sse --listen 0.0.0.0:18191 --chunks 1 &
+    "$IMAGE" bash -ec "
+      taskset -c '$BACKEND_HTTP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_HTTP_CPU_COUNT' proxysss demo http-echo --listen 0.0.0.0:18190 &
+      taskset -c '$BACKEND_WS_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_WS_CPU_COUNT' proxysss demo ws-echo --listen 0.0.0.0:18192 &
+      taskset -c '$BACKEND_TCP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_TCP_CPU_COUNT' proxysss demo tcp-echo --listen 0.0.0.0:18201 &
+      taskset -c '$BACKEND_UDP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_UDP_CPU_COUNT' proxysss demo udp-echo --listen 0.0.0.0:18301 &
+      taskset -c '$BACKEND_QCP_CPUSET' env TOKIO_WORKER_THREADS='$BACKEND_QCP_CPU_COUNT' proxysss demo udp-echo --listen 0.0.0.0:18311 &
+      taskset -c '$BACKEND_SSE_CPUSET' env GOMAXPROCS='$BACKEND_SSE_CPU_COUNT' /usr/local/bin/benchmark-helper serve-sse --listen 0.0.0.0:18191 --chunks 1 &
       wait -n
-    ' >/dev/null
+    " >/dev/null
   docker cp "$LINUX_HELPER" "$name:/usr/local/bin/benchmark-helper"
   docker start "$name" >/dev/null
 }
@@ -398,7 +549,7 @@ start_gateway() {
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" ${memory_arg:+"$memory_arg"} \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-      --sysctl net.core.somaxconn=65535 \
+      "${GATEWAY_SYSCTL_ARGS[@]}" \
       "$IMAGE" bash -ec '
         mkdir -p /run/proxysss
         openssl ecparam -name prime256v1 -genkey -noout -out /run/proxysss/bench.key
@@ -412,7 +563,7 @@ start_gateway() {
       --platform "$BENCH_PLATFORM" \
       --cpuset-cpus "$GATEWAY_CPUSET" ${memory_arg:+"$memory_arg"} \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
-      --sysctl net.core.somaxconn=65535 \
+      "${GATEWAY_SYSCTL_ARGS[@]}" \
       "$IMAGE" bash -ec '
         mkdir -p /run/nginx
         openssl ecparam -name prime256v1 -genkey -noout -out /run/nginx/bench.key
@@ -456,14 +607,17 @@ activate_gateway() {
   docker pause "$PREFIX-gateway-$other" >/dev/null 2>&1 || true
 }
 
+settle_resumed_gateway() {
+  local seconds
+  printf -v seconds '%d.%03d' \
+    "$((GATEWAY_RESUME_SETTLE_MS / 1000))" \
+    "$((GATEWAY_RESUME_SETTLE_MS % 1000))"
+  sleep "$seconds"
+}
+
 declare -a SATURATION_ROWS=()
 declare -a ISOLATED_ROWS=()
 declare -a LATENCY_ROWS=()
-ALL_SCENARIOS=(
-  static-small static-large cdn-hot-update https-static-small reverse-proxy
-  generic-sse websocket-long-connection game-long-connection tcp-stream udp-stream
-  qcp-transparent
-)
 SCENARIOS=("${ALL_SCENARIOS[@]}")
 if [[ -n "$ISOLATED_SCENARIOS" ]]; then
   read -r -a SCENARIOS <<<"$ISOLATED_SCENARIOS"
@@ -483,6 +637,22 @@ if [[ -n "$MIXED_SCENARIOS" ]]; then
       exit 1
     fi
   done
+fi
+
+scale_count=0
+for _scale in $LOAD_SCALES; do
+  scale_count=$((scale_count + 1))
+done
+required_active_measurement_secs=0
+if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
+  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * (BENCHMARK_REPETITIONS * 2 + LATENCY_REPETITIONS * 2) * DURATION_SECS))
+fi
+if [[ "$RUN_ISOLATED_SATURATION" == "1" ]]; then
+  required_active_measurement_secs=$((required_active_measurement_secs + scale_count * ${#SCENARIOS[@]} * ISOLATED_REPETITIONS * 2 * DURATION_SECS))
+fi
+if (( MAX_VALIDATION_SECS > 0 && required_active_measurement_secs > MAX_VALIDATION_SECS )); then
+  echo "matrix needs ${required_active_measurement_secs}s active measurement, exceeding MAX_VALIDATION_SECS=${MAX_VALIDATION_SECS}" >&2
+  exit 1
 fi
 
 scenario_requested() {
@@ -524,18 +694,34 @@ start_client_controller() {
 launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
-  # Saturation must be able to drive the faster gateway to full capacity, so
-  # it may use the whole client cpuset. Fixed-rate latency needs fewer runnable
-  # timer owners: one normally and two for static-large response copying.
-  local runtime_workers="$CLIENT_CPU_CORES"
+  # Mixed waves pin each generator to a disjoint CPU partition. Otherwise a
+  # faster TCP/UDP/WebSocket candidate consumes more client CPU and can make
+  # its own HTTP sibling look slower. Serial isolated waves keep the full set.
+  local client_affinity="${CLIENT_SCENARIO_CPUSET[$scenario]}"
+  local client_cpu_cores="${CLIENT_SCENARIO_CPU_COUNT[$scenario]}"
+  if [[ "$phase" == "isolated-saturation" ]]; then
+    client_affinity="$CLIENT_CPUSET"
+    client_cpu_cores="$CLIENT_CPU_CORES"
+  fi
+  local runtime_workers="$client_cpu_cores"
   if [[ "$phase" == "equal-load" ]]; then
     runtime_workers="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
+    if [[ "$protocol" == "http" || "$protocol" == "sse" ]]; then
+      runtime_workers="$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS"
+    fi
     if [[ "$scenario" == "static-large" ]]; then
       runtime_workers="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
     fi
   fi
-  if (( runtime_workers > CLIENT_CPU_CORES )); then
-    runtime_workers="$CLIENT_CPU_CORES"
+  # HTTP/SSE may use two workers on a one-CPU partition. Both candidates get
+  # identical bounded generator resources, while timers and I/O can progress
+  # independently. Realtime stays capped to its assigned CPU partition.
+  if [[ "$phase" == "equal-load" && ( "$protocol" == "http" || "$protocol" == "sse" ) ]]; then
+    if (( runtime_workers > CLIENT_CPU_CORES )); then
+      runtime_workers="$CLIENT_CPU_CORES"
+    fi
+  elif (( runtime_workers > client_cpu_cores )); then
+    runtime_workers="$client_cpu_cores"
   fi
   if [[ "$phase" == "equal-load" ]]; then
     local interval
@@ -551,19 +737,25 @@ launch_client() {
     fi
   fi
   {
-    printf 'TOKIO_WORKER_THREADS=%q proxysss bench' "$runtime_workers"
+    printf 'taskset -c %q env TOKIO_WORKER_THREADS=%q proxysss bench' \
+      "$client_affinity" "$runtime_workers"
     printf ' %q' "$@"
     # shellcheck disable=SC2016
     printf ' --start-at-unix-ms "$start_at" > %q 2>&1 &\n' "/tmp/proxysss-bench-results/$scenario.txt"
     printf 'pids+=("$!")\n'
   } >>"$WAVE_SCRIPT"
-  printf '%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" >>"$RUN_DIR/clients.meta"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" "$runtime_workers" >>"$RUN_DIR/clients.meta"
 }
 
 run_candidate() {
   local phase="$1" kind="$2" only_scenario="${3:-}"
   : >"$RUN_DIR/clients.meta"
   activate_gateway "$kind"
+  # A paused async gateway resumes with cold CPU caches and overdue timer/I/O
+  # bookkeeping. Starting a one-second sample immediately after unpause creates
+  # candidate-wide p99 spikes unrelated to the steady data path. Apply the same
+  # excluded settle window to both gateways before scheduling the future start.
+  settle_resumed_gateway
 
   local gateway_ip
   gateway_ip="$(gateway_ip_for "$kind")"
@@ -593,8 +785,8 @@ CLIENT_WAVE
   scenario_requested "$only_scenario" websocket-long-connection && launch_client "$phase" "$kind" websocket-long-connection websocket "ws://${gateway_ip}:18080/ws/" "$STREAM_CONNECTIONS" websocket --url "ws://${gateway_ip}:18080/ws/" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
   scenario_requested "$only_scenario" game-long-connection && launch_client "$phase" "$kind" game-long-connection tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256
   scenario_requested "$only_scenario" tcp-stream && launch_client "$phase" "$kind" tcp-stream tcp "${gateway_ip}:18200" "$STREAM_CONNECTIONS" tcp --addr "${gateway_ip}:18200" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024
-  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${gateway_ip}:18300" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms 7000
-  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${gateway_ip}:18310" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms 7000
+  scenario_requested "$only_scenario" udp-stream && launch_client "$phase" "$kind" udp-stream udp "${gateway_ip}:18300" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18300" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 512 --timeout-ms "$UDP_CLIENT_TIMEOUT_MS"
+  scenario_requested "$only_scenario" qcp-transparent && launch_client "$phase" "$kind" qcp-transparent udp "${gateway_ip}:18310" "$STREAM_CONNECTIONS" udp --addr "${gateway_ip}:18310" --connections "$STREAM_CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 1024 --timeout-ms "$UDP_CLIENT_TIMEOUT_MS"
   cat >>"$WAVE_SCRIPT" <<'CLIENT_WAVE'
 status=0
 for pid in "${pids[@]}"; do
@@ -605,10 +797,19 @@ CLIENT_WAVE
 
   WAVE_START_AT_UNIX_MS=$(( $("$HELPER" now-unix-ms) + CLIENT_START_LEAD_MS ))
   local client_exec_log="$RUN_DIR/$phase-$kind-client-exec.log"
-  docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
+  local wave_timeout_secs=2147483647
+  if (( MAX_VALIDATION_SECS > 0 )); then
+    if (( MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS > MAX_VALIDATION_SECS )); then
+      echo "active measurement budget exhausted before $WAVE_CLIENT_NAME" >&2
+      return 124
+    fi
+    wave_timeout_secs=$((DURATION_SECS + CLIENT_WAVE_GRACE_SECS))
+  fi
+  timeout --foreground --signal=TERM --kill-after=0.1s "${wave_timeout_secs}s" \
+    docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
-  local name row_scenario protocol target concurrency gateway result_phase
+  local name row_scenario protocol target concurrency gateway result_phase runtime_workers
   local stats_name="$phase-$kind"
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
   if [[ "$CAPTURE_DOCKER_STATS" == "1" ]]; then
@@ -622,6 +823,19 @@ CLIENT_WAVE
     local stat_targets=("$PREFIX-gateway-$kind" "$PREFIX-backend" "$CLIENT_CONTAINER")
     docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
       "${stat_targets[@]}" | tee "$RUN_DIR/$stats_name-stats.txt"
+    if [[ "$CAPTURE_THREAD_STATS" == "1" && "$kind" == "proxysss" ]]; then
+      # Git for Windows may check this controller out with CRLF. Normalize the
+      # diagnostic heredoc before the container shell parses it.
+      docker exec -i "$PREFIX-gateway-$kind" bash -c 'tr -d "\r" | bash -s' \
+        >"$RUN_DIR/$stats_name-thread-ticks.txt" <<'THREAD_TICKS'
+set -euo pipefail
+awk '{ print ($14 + $15) "|" $39 "|" $1 "|" $2 }' /proc/1/task/*/stat
+THREAD_TICKS
+      if [[ ! -s "$RUN_DIR/$stats_name-thread-ticks.txt" ]]; then
+        echo "proxysss thread tick sample was empty for $stats_name" >&2
+        return 1
+      fi
+    fi
   else
     printf 'disabled_for_one_minute_feedback=true\n' >"$RUN_DIR/$stats_name-stats.txt"
   fi
@@ -630,15 +844,25 @@ CLIENT_WAVE
   wait "$client_exec_pid"
   exit_code=$?
   set -e
+  MATRIX_MEASUREMENT_USED_SECS=$((MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS))
+  if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
+    docker exec "$CLIENT_CONTAINER" sh -c 'pkill -TERM -x proxysss 2>/dev/null || true' >/dev/null 2>&1 || true
+    echo "client wave $WAVE_CLIENT_NAME exceeded its ${wave_timeout_secs}s process deadline" >&2
+    return 124
+  fi
   docker cp "$CLIENT_CONTAINER:/tmp/proxysss-bench-results/." "$WAVE_RESULTS_DIR"
   if [[ "$exit_code" != "0" ]]; then
     cat "$client_exec_log" >&2 || true
     echo "client wave $WAVE_CLIENT_NAME failed with exit $exit_code" >&2
     return 1
   fi
-  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase; do
+  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase runtime_workers; do
     local output
     output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
+    if ! grep -qx "runtime workers : $runtime_workers" "$WAVE_RESULTS_DIR/$row_scenario.txt"; then
+      echo "client runtime worker mismatch for $row_scenario: expected $runtime_workers" >&2
+      return 1
+    fi
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
     local row planned_target="-1"
     if [[ "$result_phase" == "equal-load" ]]; then
@@ -753,7 +977,7 @@ write_scale_reports() {
       --require-latency-percentiles=true --require-zero-errors=true \
       --gate-ops=false --gate-latency=true --min-target-achievement="$MIN_TARGET_ACHIEVEMENT" --phase=equal-offered-load \
       --strict-superiority="$strict" --mixed-matrix=true --cpu-cores "$GATEWAY_CPU_CORES" \
-      --traffic-profile "$TRAFFIC_PROFILE" --samples-per-gateway "$BENCHMARK_REPETITIONS" \
+      --traffic-profile "$TRAFFIC_PROFILE" --samples-per-gateway "$LATENCY_REPETITIONS" \
       --http-concurrency "$HTTP_CONCURRENCY" --https-concurrency "$HTTPS_CONCURRENCY" \
       --static-large-concurrency "$STATIC_LARGE_CONCURRENCY" \
       --sse-concurrency "$SSE_CONCURRENCY" --stream-connections "$STREAM_CONNECTIONS"
@@ -767,10 +991,12 @@ load_scale=$scale
 run_order=$RUN_ORDER
 latency_run_order=$LATENCY_RUN_ORDER
 benchmark_repetitions=$BENCHMARK_REPETITIONS
+latency_repetitions=$LATENCY_REPETITIONS
 isolated_repetitions=$ISOLATED_REPETITIONS
 equal_load_fraction=$EQUAL_LOAD_FRACTION
 min_target_achievement=$MIN_TARGET_ACHIEVEMENT
 capture_docker_stats=$CAPTURE_DOCKER_STATS
+capture_thread_stats=$CAPTURE_THREAD_STATS
 run_isolated_saturation=$RUN_ISOLATED_SATURATION
 run_mixed_matrix=$RUN_MIXED_MATRIX
 mixed_scenarios=${MIXED_SCENARIOS:-all}
@@ -784,11 +1010,17 @@ backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
 saturation_client_tokio_workers=$CLIENT_CPU_CORES
 equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS
+equal_load_http_client_tokio_workers=$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS
 equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS
 nginx_workers=$NGINX_WORKERS
 traffic_profile=$TRAFFIC_PROFILE
 bench_platform=$BENCH_PLATFORM
 client_start_lead_ms=$CLIENT_START_LEAD_MS
+gateway_resume_settle_ms=$GATEWAY_RESUME_SETTLE_MS
+udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS
+max_validation_secs=$MAX_VALIDATION_SECS
+required_active_measurement_secs=$required_active_measurement_secs
+client_wave_grace_secs=$CLIENT_WAVE_GRACE_SECS
 role_isolation=docker-cgroup-cpuset-network-namespace
 role_machine_id_hashes=client:$ROLE_MACHINE_ID_HASH,gateway:$ROLE_MACHINE_ID_HASH,backend:$ROLE_MACHINE_ID_HASH
 gateway_memory_samples=cgroup-v2-current-and-peak
@@ -814,15 +1046,15 @@ run_scale() {
   if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate saturation "$kind"; done
+      for kind in $repetition_order; do run_candidate saturation "$kind" || return $?; done
     done
     printf '%s\n' "${SATURATION_ROWS[@]}" >"$SATURATION_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$SATURATION_RESULTS_JSONL" --out "$SATURATION_RESULTS_JSON"
     "$HELPER" write-equal-load-plan --results "$SATURATION_RESULTS_JSON" --out "$EQUAL_LOAD_PLAN" \
       --fraction "$EQUAL_LOAD_FRACTION" --duration-secs "$DURATION_SECS"
-    for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+    for repetition in $(seq 1 "$LATENCY_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$LATENCY_RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate equal-load "$kind"; done
+      for kind in $repetition_order; do run_candidate equal-load "$kind" || return $?; done
     done
     printf '%s\n' "${LATENCY_ROWS[@]}" >"$LATENCY_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$LATENCY_RESULTS_JSONL" --out "$LATENCY_RESULTS_JSON"
@@ -834,7 +1066,7 @@ run_scale() {
       for repetition in $(seq 1 "$ISOLATED_REPETITIONS"); do
         order_repetition=$((scenario_index + repetition))
         scenario_order="$(order_for_repetition "$RUN_ORDER" "$order_repetition")"
-        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario"; done
+        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario" || return $?; done
       done
       scenario_index=$((scenario_index + 1))
     done
@@ -859,15 +1091,18 @@ start_gateway proxysss
 wait_gateway proxysss
 
 matrix_validation_start_secs="$(date +%s)"
+MATRIX_MEASUREMENT_USED_SECS=0
 overall_status=0
 for scale in $LOAD_SCALES; do
   if ! run_scale "$scale"; then overall_status=1; fi
 done
-matrix_validation_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))
+matrix_validation_wall_elapsed_secs=$(( $(date +%s) - matrix_validation_start_secs ))
+matrix_validation_elapsed_secs=$MATRIX_MEASUREMENT_USED_SECS
 if [[ -n "$VALIDATION_TIMING_FILE" ]]; then
   {
     echo "validation_start_secs=$matrix_validation_start_secs"
     echo "validation_elapsed_secs=$matrix_validation_elapsed_secs"
+    echo "validation_wall_elapsed_secs=$matrix_validation_wall_elapsed_secs"
   } >"$VALIDATION_TIMING_FILE"
 fi
 

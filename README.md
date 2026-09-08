@@ -41,6 +41,18 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1 | iex
 ```
 
+To pin the installer to a specific release instead of following `latest`:
+
+```powershell
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action update -Version 1.3.7
+```
+
+On Windows, `proxysss service install` registers a hidden HKCU Run launcher (`wscript //B //Nologo`) and removes legacy direct-console scheduled tasks. If an old task was created with elevated privileges, run the command once from an elevated PowerShell window. Check the result with:
+
+```powershell
+proxysss service status
+```
+
 Create a starter workspace:
 
 ```bash
@@ -77,11 +89,13 @@ services:
 What each part means:
 
 - `plain_bind` exposes public HTTP on port `80`.
-- `tls_bind` exposes HTTPS and HTTP/2 on port `443`.
+- `tls_bind` exposes HTTPS and default-preferred HTTP/2 on port `443`; a fresh default config bootstraps a self-signed certificate until production TLS is configured.
 - `h3_bind` exposes HTTP/3 on port `443/udp`.
 - `domain_routes` is the recommended HTTP routing model when you care about hostnames.
 - `domains` is the host list this route should answer for.
 - `upstream` is the backend app that will receive the request.
+
+When no user route owns `/`, the Rust gateway returns a zero-asset `Welcome to proxysss` page with only GitHub and GitHub Docs links.
 
 Check the file before you run it:
 
@@ -118,7 +132,7 @@ services:
 
 How to think about it:
 
-- `auto_https.domains` 非空就自动启用内建 managed ACME。生产默认使用 TLS-ALPN-01，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。原有显式 `challenge: http01` 仍完整兼容（需开放 80）。
+- `auto_https.domains` 非空就自动启用免费的内建 managed ACME。生产默认使用 TLS-ALPN-01 与 ECDSA P-256 证书密钥，因此只需域名 A/AAAA 指向网关并开放 443，即可得到 `wss://`；不需要 `certbot`、`acme.sh`、DNS API 或账号邮箱。极老旧客户端可显式设置 `http.tls.acme.key_algorithm: rsa2048`；原有 `challenge: http01` 仍完整兼容（需开放 80）。
 - The domain's public A/AAAA record must reach this host and ports 80 and 443 must be reachable. `email` is optional; adding it enables certificate-expiry/security notices.
 - The route still lives in `domain_routes`; TLS automation does not change how you declare backends.
 
@@ -344,6 +358,7 @@ http:
     acme:
       email: admin@example.com
       challenge: dns01
+      key_algorithm: ecdsa_p256 # 推荐默认；老旧客户端可改 rsa2048
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12
@@ -454,7 +469,9 @@ PROXY_BIN=target/release/proxysss \
   scripts/benchmark-production-scale-matrix.sh
 ```
 
-`benchmark-ubuntu24-amd64-docker.sh` accepts either a native amd64 Docker daemon or a local arm64 daemon with `linux/amd64` emulation, but hard-checks the controller and benchmark images as Ubuntu 24.04 x86_64. It builds the current checkout there, records `native-amd64` versus `emulated-amd64`, then pins gateway, backend, and load-client containers to disjoint CPU sets before running strict 1x/2x/4x mixed and equal-offered-load waves. Each wave creates one client container containing 11 independent protocol processes; every process waits on a shared-volume release file and receives the same absolute `--start-at-unix-ms`. Per scale, one backend plus both gateway containers stay ready; the inactive gateway is paused on the shared cpuset, so only the measured candidate runs. Container creation and emulated startup therefore cannot shorten or stagger the measurement window. proxysss is AOT compiled and does not perform JIT warm-up; deterministic config-load cache preparation and container readiness precede the strict validation timer. Every scale expands HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP and transparent QCP together. The default feedback gate takes one synchronized 3-second sample per phase; build, image/container setup, and readiness are excluded, while the strict 1x/2x/4x matrix itself must finish within 60 seconds. It requires zero errors and per-scenario superiority, and retains raw evidence under `.benchmark/direct-ubuntu24-amd64/`. This isolation prevents a faster closed-loop stream path from consuming extra client/backend CPU and falsely starving sibling gateway paths. Emulated local results compare both gateways under the same cost but must not be presented as physical-x86 evidence. On an arm64 Docker host the wrapper requires Zig, cargo-zigbuild, and the Rust x86_64-unknown-linux-gnu target; it compiles the release ELF at native host speed, then hard-verifies that exact binary inside Ubuntu 24 amd64 before measuring, instead of spending minutes compiling under QEMU. nginx is mainline 1.31.2 built with `-O3 -fno-plt` and receives the same gateway cpuset. Equal-load defaults to 25% of the slower gateway's measured saturation rate, leaving real latency headroom while all 11 isolated generators run. Saturation generators retain the full client cpuset so they can drive the faster gateway; fixed-rate equal-load uses one Tokio I/O worker per small-message generator and two for static-large, preventing 11 processes from each multiplying by the full cpuset; fixed-load rows must still complete at least 98% of target and beat every latency percentile. Optional serial per-scenario saturation is disabled by default and uses one sample when explicitly enabled. Memory is observed and reported by default; set a Docker or systemd memory limit only for a real declared production envelope.
+The default matrix uses 18 seconds of active client measurement under a hard 20-second limit: one saturation sample and two reversed-order equal-load samples per gateway at each 1x/2x/4x scale. Process startup, connection/resource/session warm-up, result copying, and report parsing are excluded and reported separately as wall time. Each wave still has a four-second process grace that terminates stuck in-container generators and fails the run. `proxysss bench` and fixture `demo` commands create a child Tokio runtime from `TOKIO_WORKER_THREADS`, so the recorded saturation/equal-load client and backend CPU budgets are the workers that actually execute I/O rather than metadata-only settings hidden by the single-thread gateway supervisor. The synchronized future-start lead is 2000 ms so the 4x wave can finish all 11 process-local connection pools and protocol warm-ups before the shared timestamp; before it, both candidates preconnect plain HTTP/1 pools at the declared concurrency while HTTPS/H2 preconnects its multiplexed session, execute two real GET/SSE requests, and complete one WebSocket/TCP/UDP/QCP echo per connection. Static/reverse cache fill, stale-while-revalidate, stream relay activation, and UDP association creation therefore stay outside the active window for both gateways. The UDP/QCP response timeout remains 500 ms outside active measurement.
+
+`benchmark-ubuntu24-amd64-docker.sh` accepts either a native amd64 Docker daemon or a local arm64 daemon with `linux/amd64` emulation, but hard-checks the controller and benchmark images as Ubuntu 24.04 x86_64. Windows Docker Desktop is supported from Git Bash through its local `npipe://` endpoint; Linux/macOS use the local Unix socket. It builds the current checkout there, records `native-amd64` versus `emulated-amd64`, then pins gateway, backend, and load-client containers to disjoint CPU sets before running strict 1x/2x/4x mixed and equal-offered-load waves. When registry metadata is temporarily unavailable, `REUSE_BENCH_IMAGE=1` reuses the local controller image without skipping the Ubuntu 24.04/amd64 probe. `TRAFFIC_PROFILE=small|balanced|bulk`, `RUN_ORDER`, `LATENCY_RUN_ORDER`, `BENCH_SUBNET` and explicit role IPs are forwarded and written to the run fingerprint for reproducible default/profile and order checks. The full mixed gate requires at least 24 Docker CPUs. Each wave creates one client container containing 11 independent protocol processes; every process waits on the same absolute `--start-at-unix-ms`, but `taskset` gives every scenario a disjoint CPU partition. Backend HTTP, SSE, WebSocket, TCP, UDP, and QCP echo processes are likewise partitioned, with UDP and QCP using separate upstream listeners. Per scale, one backend plus both gateway containers stay warm; the inactive gateway is paused on the shared cpuset, so only the measured candidate runs. Container creation and emulated startup therefore cannot shorten or stagger the measurement window. Every scale expands HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP and transparent QCP together. The default feedback gate takes one synchronized one-second saturation sample plus two reversed-order equal-load samples per gateway/scale, reports the equal-load median, and uses 18 seconds of active client measurement under a hard 20-second cap; build, image setup, container preparation, warm-up, process startup, result collection, and parsing are excluded from `validation_elapsed_secs`, while `validation_wall_elapsed_secs` records orchestration time. It requires zero errors. Benchmark artifacts under `.benchmark/` are disposable and removed by default; set `KEEP_BENCH_ARTIFACTS=1` or `BENCH_ROOT` to retain raw evidence. Per-scenario and per-service CPU partitions prevent a faster closed-loop stream path from consuming extra client/backend CPU and falsely starving sibling gateway paths. Emulated local results compare both gateways under the same cost but must not be presented as physical-x86 evidence. On an arm64 Docker host the wrapper requires Zig, cargo-zigbuild, and the Rust x86_64-unknown-linux-gnu target; it compiles the release ELF at native host speed, then hard-verifies that exact binary inside Ubuntu 24 amd64 before measuring, instead of spending minutes compiling under QEMU. nginx is mainline 1.31.2 built with `-O3 -fno-plt` and receives the same gateway cpuset. Equal-load defaults to 25% of the slower gateway's measured saturation rate, leaving real latency headroom while all 11 isolated generators run; fixed-load rows must still complete at least 98% of target and beat every latency percentile. Optional serial per-scenario saturation is disabled by default and uses the full client cpuset when explicitly enabled. Memory is observed and reported by default; set a Docker or systemd memory limit only for a real declared production envelope.
 
 For physical-network WSS evidence, run the additional strict replay from an independent Linux client host. It stages one hashed proxysss binary to separate gateway and backend hosts, then uses a remote systemd cgroup to enforce `AllowedCPUs=0-3` and `LimitNOFILE=300000` for both nginx and proxysss. It records cgroup current/peak memory plus per-connection cost, host/`nginx -V` fingerprints and raw samples, and refuses equality for throughput or p50/p95/p99. `GATEWAY_MEMORY_MAX` is optional (default `infinity`); set it to `8G` only when that is the declared production envelope. Set the addresses reachable between roles; do not set `BUILD_NATIVE=1` unless all three hosts have compatible CPUs.
 
@@ -474,7 +491,7 @@ GATEWAY_ADDR=10.0.0.10 BACKEND_ADDR=10.0.0.20 \
 
 When a stale Docker benchmark network occupies the default subnet, set an unused `/16` such as `BENCH_SUBNET=172.31.0.0/16`; the WSS scripts derive every role address from it. A restricted Linux controller may use a trusted, same-architecture Go-native helper with `PREBUILT_BENCH_HELPER=/opt/benchmark-helper`; build it from this repository with `GOOS=linux GOARCH=amd64 go build -o /opt/benchmark-helper scripts/benchmark-helper.go`.
 
-Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles. Tests, smoke benchmarks, and performance gates must not run in GitHub Actions, including manual workflows; performance evidence is collected by running local Ubuntu 24 x86_64 Docker containers or dedicated Linux hosts directly. A release tag additionally requires `performance-evidence/vX.Y.Z.json`: strict 1x/2x/4x role-isolated plus cross-host evidence, raw-artifact hashes, role fingerprints, and memory observations. The v2 manifest records direct per-scenario ops/s, p50/p95/p99, errors, WSS capacity metrics, and proxysss/nginx current/peak/per-connection memory; the release validator rejects a missing scenario, non-zero error, equality/regression in any metric, proxysss memory above 2x nginx, or a synthetic 100k capacity claim. The release workflow validates and publishes that manifest with the assets.
+Default GitHub Actions CI is packaging-only: it builds and uploads the six release bundles. Functional release quality is checked by the release workflow with rustfmt, tests, and Clippy; performance benchmarks remain operator-run on local Ubuntu 24 x86_64 Docker containers or dedicated Linux hosts. A release tag does not require a performance manifest: `performance-evidence/vX.Y.Z.json` is optional evidence for performance claims. When present, the v2 manifest records direct per-scenario ops/s, p50/p95/p99, errors, WSS capacity metrics, and proxysss/nginx current/peak/per-connection memory; the release validator rejects a missing scenario, non-zero error, equality/regression in any metric, proxysss memory above 2x nginx, or a synthetic 100k capacity claim.
 
 Current UDP fast-path evidence for v1.3.5:
 

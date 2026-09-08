@@ -13,6 +13,7 @@ http:
     acme:
       email: ops@example.com
       challenge: dns01
+      key_algorithm: ecdsa_p256
       domains: [example.com, "*.example.com"]
       directory_production: false
       dns:

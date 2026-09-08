@@ -209,8 +209,8 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	results := filepath.Join(dir, "saturation.json")
 	plan := filepath.Join(dir, "plan.txt")
 	writeBenchRows(t, results, []BenchRow{
-		{Scenario: "websocket", Gateway: "nginx", Concurrency: 8, OpsPerSec: 800},
-		{Scenario: "websocket", Gateway: "proxysss", Concurrency: 8, OpsPerSec: 1200},
+		{Scenario: "websocket", Gateway: "nginx", Protocol: "websocket", Concurrency: 8, OpsPerSec: 800},
+		{Scenario: "websocket", Gateway: "proxysss", Protocol: "websocket", Concurrency: 8, OpsPerSec: 1200},
 	})
 	if err := runWriteEqualLoadPlan([]string{
 		"--results", results,
@@ -229,13 +229,13 @@ func TestEqualLoadPlanUsesSlowerGatewayAndConcurrency(t *testing.T) {
 	}
 }
 
-func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
+func TestEqualLoadPlanReservesRealtimeCompletionGuard(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "saturation.json")
 	plan := filepath.Join(dir, "plan.txt")
 	writeBenchRows(t, results, []BenchRow{
-		{Scenario: "static-large", Gateway: "nginx", Concurrency: 4, OpsPerSec: 83.5},
-		{Scenario: "static-large", Gateway: "proxysss", Concurrency: 4, OpsPerSec: 90},
+		{Scenario: "qcp-transparent", Gateway: "nginx", Protocol: "udp", Concurrency: 64, OpsPerSec: 8964},
+		{Scenario: "qcp-transparent", Gateway: "proxysss", Protocol: "udp", Concurrency: 64, OpsPerSec: 12000},
 	})
 	if err := runWriteEqualLoadPlan([]string{
 		"--results", results,
@@ -249,8 +249,108 @@ func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(string(raw), "|20.000000\n") {
-		t.Fatalf("one-second target must match the 20 executable operations: %s", raw)
+	if !strings.HasSuffix(string(raw), "|2176.000000\n") {
+		t.Fatalf("realtime target must leave one millisecond for final completion: %s", raw)
+	}
+}
+
+func TestEqualLoadPlanReservesWebSocketCompletionGuard(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "websocket-long-connection", Gateway: "nginx", Protocol: "websocket", Concurrency: 128, OpsPerSec: 8211},
+		{Scenario: "websocket-long-connection", Gateway: "proxysss", Protocol: "websocket", Concurrency: 128, OpsPerSec: 10381},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|1920.000000\n") {
+		t.Fatalf("websocket target must leave five milliseconds for final framing and completion: %s", raw)
+	}
+}
+
+func TestEqualLoadPlanReservesTCPCompletionGuard(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "tcp-stream", Gateway: "nginx", Protocol: "tcp", Concurrency: 64, OpsPerSec: 9226},
+		{Scenario: "tcp-stream", Gateway: "proxysss", Protocol: "tcp", Concurrency: 64, OpsPerSec: 14468},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|2240.000000\n") {
+		t.Fatalf("tcp target must leave two milliseconds for final relay completion: %s", raw)
+	}
+}
+
+func TestEqualLoadPlanQuantizesShortWindowTarget(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "static-large", Gateway: "nginx", Protocol: "http", Concurrency: 4, OpsPerSec: 83.5},
+		{Scenario: "static-large", Gateway: "proxysss", Protocol: "http", Concurrency: 4, OpsPerSec: 90},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|21.000000\n") {
+		t.Fatalf("one-second target must match the 21 phase-spread operations: %s", raw)
+	}
+}
+
+func TestEqualLoadPlanAllowsTargetBelowConnectionCount(t *testing.T) {
+	dir := t.TempDir()
+	results := filepath.Join(dir, "saturation.json")
+	plan := filepath.Join(dir, "plan.txt")
+	writeBenchRows(t, results, []BenchRow{
+		{Scenario: "static-large", Gateway: "nginx", Protocol: "http", Concurrency: 32, OpsPerSec: 64},
+		{Scenario: "static-large", Gateway: "proxysss", Protocol: "http", Concurrency: 32, OpsPerSec: 96},
+	})
+	if err := runWriteEqualLoadPlan([]string{
+		"--results", results,
+		"--out", plan,
+		"--fraction", "0.25",
+		"--duration-secs", "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "|16.000000\n") {
+		t.Fatalf("low-rate target must not force all 32 connections to run: %s", raw)
 	}
 }
 

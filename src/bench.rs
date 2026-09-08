@@ -317,7 +317,8 @@ impl BenchmarkSchedule {
             // and WebSocket schedules stay synchronized to model game ticks.
             let first_offset = if self.stagger_operations {
                 interval.mul_f64(
-                    (worker_index.min(self.participants - 1) + 1) as f64 / self.participants as f64,
+                    (worker_index.min(self.participants - 1) as f64 + 0.5)
+                        / self.participants as f64,
                 )
             } else {
                 interval
@@ -357,7 +358,10 @@ async fn wait_for_operation_slot(
     deadline: tokio::time::Instant,
 ) -> bool {
     if let Some(ticker) = ticker.as_mut() {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => return false,
+        }
     }
     tokio::time::Instant::now() < deadline
 }
@@ -405,6 +409,15 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     let client = builder.build().context("failed to build reqwest client")?;
     let url = Arc::new(args.url);
 
+    // Plain HTTP/1 measurements use many pooled connections, unlike HTTPS/H2
+    // which multiplexes on one preconnected session below. Open the same
+    // connection count for both gateways before the absolute measurement
+    // timestamp so one-second p99 represents steady gateway work instead of
+    // whichever candidate completed the initial TCP ramp first.
+    if url.starts_with("http://") {
+        preconnect_http1_pool(&client, url.clone(), concurrency).await?;
+    }
+
     // HTTPS saturation measures steady HTTP/2/TLS request processing, not a
     // race between the first QEMU-scheduled client handshake and the shared
     // measurement timestamp. A HEAD request creates the same pooled TLS/H2
@@ -419,6 +432,17 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
             .bytes()
             .await
             .context("failed to drain HTTPS preconnect response")?;
+    }
+
+    // HEAD establishes transport capacity but intentionally skips the static
+    // GET cache and reverse-proxy response path. Exercise one real GET, allow
+    // stale-while-revalidate work to finish outside the active window, then
+    // confirm the refreshed path. This keeps one-second p99 from measuring a
+    // synchronized cache-expiry wave while applying the same warm-up to nginx.
+    if method == Method::GET {
+        prewarm_http_resource(&client, url.as_str()).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        prewarm_http_resource(&client, url.as_str()).await?;
     }
 
     let mut tasks = JoinSet::new();
@@ -463,6 +487,51 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     Ok(())
 }
 
+async fn prewarm_http_resource(client: &reqwest::Client, url: &str) -> Result<()> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("failed to warm HTTP benchmark resource")?;
+    response
+        .bytes()
+        .await
+        .context("failed to drain HTTP benchmark resource warm-up")?;
+    Ok(())
+}
+
+async fn preconnect_http1_pool(
+    client: &reqwest::Client,
+    url: Arc<String>,
+    connections: usize,
+) -> Result<()> {
+    let barrier = Arc::new(Barrier::new(connections.saturating_add(1)));
+    let mut tasks = JoinSet::new();
+    for _ in 0..connections {
+        let client = client.clone();
+        let url = url.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let response = client
+                .head(url.as_str())
+                .send()
+                .await
+                .context("failed to preconnect HTTP/1 benchmark client")?;
+            response
+                .bytes()
+                .await
+                .context("failed to drain HTTP/1 preconnect response")?;
+            Result::<()>::Ok(())
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = tasks.join_next().await {
+        result.context("HTTP/1 preconnect task failed")??;
+    }
+    Ok(())
+}
+
 async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
     let concurrency = args.concurrency.max(1);
@@ -492,6 +561,10 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     let client = builder.build().context("failed to build reqwest client")?;
     let url = Arc::new(args.url);
     let max_chunks = args.max_chunks.max(1);
+
+    prewarm_sse_resource(&client, url.as_str()).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    prewarm_sse_resource(&client, url.as_str()).await?;
 
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
@@ -568,6 +641,27 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     Ok(())
 }
 
+async fn prewarm_sse_resource(client: &reqwest::Client, url: &str) -> Result<()> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .context("failed to warm SSE benchmark resource")?;
+    if !response.status().is_success() {
+        anyhow::bail!("SSE benchmark warm-up returned {}", response.status());
+    }
+    let mut stream = response.bytes_stream();
+    match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        Ok(Some(Ok(_))) => Ok(()),
+        Ok(Some(Err(error))) => {
+            Err(anyhow::Error::new(error).context("failed reading SSE benchmark warm-up"))
+        }
+        Ok(None) => anyhow::bail!("SSE benchmark warm-up ended before the first chunk"),
+        Err(_) => anyhow::bail!("SSE benchmark warm-up timed out"),
+    }
+}
+
 async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     if args.hold_connections {
         return run_websocket_connection_capacity(args).await;
@@ -637,6 +731,38 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 stats.add_task(&local);
                 return local.latencies_us;
             };
+            let warmup = async {
+                websocket
+                    .send(Message::Binary(payload.as_ref().clone().into()))
+                    .await?;
+                loop {
+                    match websocket.next().await {
+                        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Text(_))) => {
+                            return Ok::<(), tokio_tungstenite::tungstenite::Error>(());
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            websocket.send(Message::Pong(payload)).await?;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            return Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(error),
+                    }
+                }
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_millis(500), warmup).await,
+                Ok(Ok(()))
+            ) {
+                match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
+                    Ok((stream, _)) => websocket = stream,
+                    Err(_) => {
+                        stats.add_task(&local);
+                        return local.latencies_us;
+                    }
+                }
+            }
             let measurement_start = *scheduled_start
                 .get()
                 .expect("websocket benchmark start time initialized");
@@ -866,15 +992,35 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
             let stream =
                 tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr.as_str()))
                     .await;
+            let mut stream = match stream {
+                Ok(Ok(stream)) => Some(stream),
+                Ok(Err(_)) | Err(_) => None,
+            };
+            if let Some(warm_stream) = stream.as_mut() {
+                let _ = warm_stream.set_nodelay(true);
+                let mut warm_buffer = vec![0_u8; payload.len()];
+                let warmup = async {
+                    warm_stream.write_all(&payload).await?;
+                    warm_stream.read_exact(&mut warm_buffer).await?;
+                    Ok::<(), std::io::Error>(())
+                };
+                if !matches!(
+                    tokio::time::timeout(Duration::from_millis(500), warmup).await,
+                    Ok(Ok(()))
+                ) {
+                    stream = TcpStream::connect(addr.as_str()).await.ok();
+                }
+            }
             let (deadline, mut ticker) = schedule.begin(worker_index).await;
             let mut stream = match stream {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(_)) | Err(_) => {
+                Some(stream) => stream,
+                None => {
                     local.record_error();
                     stats.add_task(&local);
                     return local.latencies_us;
                 }
             };
+            let _ = stream.set_nodelay(true);
 
             let mut buffer = vec![0_u8; payload.len()];
             while wait_for_operation_slot(&mut ticker, deadline).await {
@@ -944,10 +1090,11 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
                 Ok(socket) if socket.connect(addr.as_str()).await.is_ok() => Some(socket),
                 Ok(_) | Err(_) => None,
             };
-            let (deadline, mut ticker) = schedule.begin(worker_index).await;
             let socket = match socket {
                 Some(socket) => socket,
                 None => {
+                    let (deadline, _) = schedule.begin(worker_index).await;
+                    let _ = deadline;
                     local.record_error();
                     stats.add_task(&local);
                     return local.latencies_us;
@@ -955,6 +1102,31 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
             };
 
             let mut buffer = vec![0_u8; payload.len().max(65_536)];
+            let warmup = async {
+                socket.send(&payload).await?;
+                match tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    socket.recv(&mut buffer),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "udp warm-up timeout",
+                    )),
+                }
+            };
+            let warmup_ok = warmup.await.is_ok();
+            let (deadline, mut ticker) = schedule.begin(worker_index).await;
+            if !warmup_ok {
+                local.record_error();
+                stats.add_task(&local);
+                return local.latencies_us;
+            }
             while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let result = async {
@@ -1076,4 +1248,28 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
     let last = values.len().saturating_sub(1);
     let index = ((last as f64) * quantile).round() as usize;
     values[index.min(last)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixed_rate_wait_stops_at_measurement_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut ticker = Some(tokio::time::interval_at(
+            now + Duration::from_secs(4),
+            Duration::from_secs(4),
+        ));
+        let deadline = now + Duration::from_millis(10);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_operation_slot(&mut ticker, deadline),
+        )
+        .await
+        .expect("deadline must wake before the distant ticker");
+
+        assert!(!result);
+    }
 }

@@ -33,6 +33,9 @@ plugins:
 admin:
   enabled: false
 runtime:
+  performance:
+    enabled: true
+    traffic_profile: balanced
   hot_reload:
     enabled: false
 load_balance:

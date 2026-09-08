@@ -10,6 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
 [[ "$(uname -s)" == "Linux" ]] || {
   echo "benchmark-cross-host-wss.sh must run from a Linux client host" >&2
@@ -47,8 +50,8 @@ NGINX_WORKERS="${NGINX_WORKERS:-4}"
 NGINX_BIN="${NGINX_BIN:-/usr/local/nginx/sbin/nginx}"
 BUILD_PROFILE="${BUILD_PROFILE:-release-fast}"
 BUILD_NATIVE="${BUILD_NATIVE:-0}"
-PROXY_BIN="${PROXY_BIN:-$ROOT/target/$BUILD_PROFILE/proxysss}"
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
+DEFAULT_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}"
+PROXY_BIN="${PROXY_BIN:-$DEFAULT_TARGET_DIR/$BUILD_PROFILE/proxysss}"
 RUN_DIR="$BENCH_ROOT/runs/cross-host-wss/$RUN_ID"
 REMOTE_ROOT="${REMOTE_ROOT:-/tmp/proxysss-cross-host-$RUN_ID}"
 GATEWAY_PORT="${GATEWAY_PORT:-18443}"
@@ -128,13 +131,15 @@ ulimit -n "$NOFILE_LIMIT" 2>/dev/null || true
 }
 
 if [[ "$BUILD_NATIVE" == "1" ]]; then
-  [[ "$PROXY_BIN" == "$ROOT/target/$BUILD_PROFILE/proxysss" ]] || {
+  [[ "$PROXY_BIN" == "$DEFAULT_TARGET_DIR/$BUILD_PROFILE/proxysss" ]] || {
     echo "BUILD_NATIVE=1 requires the default PROXY_BIN; prebuild and pass an explicit binary otherwise" >&2
     exit 1
   }
-  RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" cargo build --profile "$BUILD_PROFILE" --locked
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}" \
+    RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" cargo build --profile "$BUILD_PROFILE" --locked
 elif [[ ! -x "$PROXY_BIN" ]]; then
-  cargo build --profile "$BUILD_PROFILE" --locked
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}" \
+    cargo build --profile "$BUILD_PROFILE" --locked
 fi
 
 mkdir -p "$RUN_DIR"
@@ -222,7 +227,7 @@ stop_processes() {
   if [[ -n "$gateway_unit" ]]; then ssh_run "$GATEWAY_HOST" "systemctl stop '$gateway_unit' 2>/dev/null || true" || true; fi
   if [[ -n "$backend_pid" ]]; then ssh_run "$BACKEND_HOST" "kill '$backend_pid' 2>/dev/null || true" || true; fi
 }
-trap stop_processes EXIT
+trap 'stop_processes; cleanup_benchmark_artifacts' EXIT
 
 start_backend() {
   backend_pid="$(ssh_run "$BACKEND_HOST" "cd '$REMOTE_ROOT' && ulimit -n '$NOFILE_LIMIT' && nohup ./proxysss demo ws-echo --listen 0.0.0.0:$BACKEND_PORT >backend.log 2>&1 & echo \$!")"

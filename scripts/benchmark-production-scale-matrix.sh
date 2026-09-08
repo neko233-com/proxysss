@@ -7,6 +7,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap cleanup_benchmark_artifacts EXIT
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "benchmark-production-scale-matrix.sh is Linux-only" >&2
@@ -22,7 +25,7 @@ BASE_STREAM_CONNECTIONS="${BASE_STREAM_CONNECTIONS:-16}"
 DURATION_SECS="${DURATION_SECS:-30}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-4}"
 ISOLATED_REPETITIONS="${ISOLATED_REPETITIONS:-3}"
-RUN_ROOT="${BENCH_ROOT:-$ROOT/.benchmark/runs/production-scale-matrix/$(date +%Y%m%d-%H%M%S)}"
+RUN_ROOT="$BENCH_ROOT/runs/production-scale-matrix/$(date +%Y%m%d-%H%M%S)"
 
 mkdir -p "$RUN_ROOT"
 

@@ -10,9 +10,6 @@ on:
         description: Deployment profile name
         required: true
         default: production
-  push:
-    branches:
-      - main
 
 jobs:
   package:

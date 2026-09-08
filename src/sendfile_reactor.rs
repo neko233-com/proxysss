@@ -16,7 +16,6 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
-use rustc_hash::FxHashMap;
 use tokio::sync::oneshot;
 
 // Per-worker handoff bursts are bounded independently of active jobs. A full
@@ -26,23 +25,69 @@ const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const WAKE_TOKEN: u64 = u64::MAX;
 
+pub(crate) struct SendfileCompletion {
+    pub(crate) bytes: u64,
+    pub(crate) uncorked: bool,
+}
+
 struct SendfileJob {
     socket: TcpStream,
     file: File,
     offset: u64,
     len: u64,
     max_chunk_bytes: u64,
-    completion: oneshot::Sender<io::Result<u64>>,
+    completion: oneshot::Sender<io::Result<SendfileCompletion>>,
 }
 
 struct SendfileState {
-    _socket: TcpStream,
+    socket: TcpStream,
     file: File,
     offset: libc::off_t,
     sent: u64,
     len: u64,
     max_chunk_bytes: u64,
-    completion: Option<oneshot::Sender<io::Result<u64>>>,
+    completion: Option<oneshot::Sender<io::Result<SendfileCompletion>>>,
+}
+
+#[derive(Default)]
+struct SendfileTable {
+    slots: Vec<Option<SendfileState>>,
+}
+
+impl SendfileTable {
+    fn contains(&self, fd: RawFd) -> bool {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|index| self.slots.get(index))
+            .is_some_and(Option::is_some)
+    }
+
+    fn get_mut(&mut self, fd: RawFd) -> Option<&mut SendfileState> {
+        let index = usize::try_from(fd).ok()?;
+        self.slots.get_mut(index)?.as_mut()
+    }
+
+    fn insert(&mut self, fd: RawFd, state: SendfileState) {
+        let index = usize::try_from(fd).expect("sendfile fd must be non-negative");
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        debug_assert!(self.slots[index].is_none());
+        self.slots[index] = Some(state);
+    }
+
+    fn remove(&mut self, fd: RawFd) -> Option<SendfileState> {
+        let index = usize::try_from(fd).ok()?;
+        self.slots.get_mut(index)?.take()
+    }
+
+    fn active_fds(&self) -> Vec<RawFd> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, state)| state.as_ref().map(|_| fd as RawFd))
+            .collect()
+    }
 }
 
 struct ReactorWorker {
@@ -52,6 +97,7 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
+    worker_cpus: Vec<Option<usize>>,
     next: AtomicUsize,
 }
 
@@ -62,6 +108,10 @@ enum DriveResult {
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
+pub(crate) fn warm(requested_workers: usize, scheduler_nice: i32) {
+    let _ = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+}
+
 pub(crate) fn dispatch(
     socket_fd: RawFd,
     file_fd: RawFd,
@@ -69,11 +119,15 @@ pub(crate) fn dispatch(
     len: u64,
     max_chunk_bytes: u64,
     requested_workers: usize,
+    active_workers: usize,
     scheduler_nice: i32,
-) -> io::Result<oneshot::Receiver<io::Result<u64>>> {
+) -> io::Result<oneshot::Receiver<io::Result<SendfileCompletion>>> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
-        let _ = sender.send(Ok(0));
+        let _ = sender.send(Ok(SendfileCompletion {
+            bytes: 0,
+            uncorked: false,
+        }));
         return Ok(receiver);
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
@@ -88,7 +142,14 @@ pub(crate) fn dispatch(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
-    let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
+    let current_cpu = current_cpu();
+    let index = preferred_worker_index_limited(
+        &reactors.worker_cpus,
+        current_cpu,
+        fallback,
+        active_workers,
+    );
     let worker = &reactors.workers[index];
     worker
         .registrations
@@ -101,8 +162,9 @@ pub(crate) fn dispatch(
 impl Reactors {
     fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
         let worker_count = requested_workers.max(1);
-        let allowed_cpus = allowed_cpu_ids();
+        let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
+        let mut worker_cpus = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
@@ -117,12 +179,55 @@ impl Reactors {
                 .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
                 .expect("failed spawning sendfile epoll reactor");
             workers.push(worker);
+            worker_cpus.push(cpu);
         }
         Self {
             workers,
+            worker_cpus,
             next: AtomicUsize::new(0),
         }
     }
+}
+
+fn current_cpu() -> Option<usize> {
+    let cpu = unsafe { libc::sched_getcpu() };
+    (cpu >= 0).then_some(cpu as usize)
+}
+
+fn preferred_worker_index(
+    worker_cpus: &[Option<usize>],
+    current_cpu: Option<usize>,
+    fallback: usize,
+) -> usize {
+    current_cpu
+        .and_then(|cpu| {
+            worker_cpus
+                .iter()
+                .position(|worker_cpu| *worker_cpu == Some(cpu))
+        })
+        .unwrap_or(fallback % worker_cpus.len().max(1))
+}
+
+fn preferred_worker_index_limited(
+    worker_cpus: &[Option<usize>],
+    current_cpu: Option<usize>,
+    fallback: usize,
+    active_workers: usize,
+) -> usize {
+    let active_workers = active_workers.clamp(1, worker_cpus.len().max(1));
+    if active_workers >= worker_cpus.len() {
+        return preferred_worker_index(worker_cpus, current_cpu, fallback);
+    }
+    let candidate = |slot: usize| slot.saturating_mul(worker_cpus.len()) / active_workers;
+    if let Some(cpu) = current_cpu {
+        for slot in 0..active_workers {
+            let index = candidate(slot);
+            if worker_cpus.get(index).copied().flatten() == Some(cpu) {
+                return index;
+            }
+        }
+    }
+    candidate(fallback % active_workers)
 }
 
 fn duplicate_stream(fd: RawFd) -> io::Result<TcpStream> {
@@ -172,7 +277,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     };
     assert_eq!(add_wake, 0, "failed registering sendfile reactor eventfd");
 
-    let mut jobs = FxHashMap::<RawFd, SendfileState>::default();
+    let mut jobs = SendfileTable::default();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     loop {
         let ready =
@@ -201,7 +306,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             }
 
             let fd = token as RawFd;
-            if !jobs.contains_key(&fd) {
+            if !jobs.contains(fd) {
                 continue;
             }
             let flags = event.events as i32;
@@ -226,20 +331,12 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
     }
 }
 
-fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job: SendfileJob) {
+fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
     let fd = job.socket.as_raw_fd();
-    let mut event = libc::epoll_event {
-        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
-        u64: fd as u64,
-    };
-    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-        let _ = job.completion.send(Err(io::Error::last_os_error()));
-        return;
-    }
     jobs.insert(
         fd,
         SendfileState {
-            _socket: job.socket,
+            socket: job.socket,
             file: job.file,
             offset: job.offset as libc::off_t,
             sent: 0,
@@ -248,10 +345,32 @@ fn register_job(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, job
             completion: Some(job.completion),
         },
     );
+    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
+        finish_unregistered_job(jobs, fd, result);
+        return;
+    }
+
+    let mut event = libc::epoll_event {
+        events: (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+        u64: fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+        finish_unregistered_job(jobs, fd, Err(io::Error::last_os_error()));
+        return;
+    }
 }
 
-fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResult {
-    let Some(state) = jobs.get_mut(&fd) else {
+fn finish_unregistered_job(jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
+    if let Some(mut state) = jobs.remove(fd) {
+        let result = finish_sendfile_result(&state.socket, result);
+        if let Some(completion) = state.completion.take() {
+            let _ = completion.send(result);
+        }
+    }
+}
+
+fn drive_job(jobs: &mut SendfileTable, fd: RawFd) -> DriveResult {
+    let Some(state) = jobs.get_mut(fd) else {
         return DriveResult::Complete(Err(io::Error::new(
             io::ErrorKind::NotFound,
             "sendfile reactor job disappeared",
@@ -291,24 +410,20 @@ fn drive_job(jobs: &mut FxHashMap<RawFd, SendfileState>, fd: RawFd) -> DriveResu
     DriveResult::Pending
 }
 
-fn complete_job(
-    epoll_fd: RawFd,
-    jobs: &mut FxHashMap<RawFd, SendfileState>,
-    fd: RawFd,
-    result: io::Result<u64>,
-) {
+fn complete_job(epoll_fd: RawFd, jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
     unsafe {
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
     }
-    if let Some(mut state) = jobs.remove(&fd) {
+    if let Some(mut state) = jobs.remove(fd) {
+        let result = finish_sendfile_result(&state.socket, result);
         if let Some(completion) = state.completion.take() {
             let _ = completion.send(result);
         }
     }
 }
 
-fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut FxHashMap<RawFd, SendfileState>, message: &str) {
-    let fds = jobs.keys().copied().collect::<Vec<_>>();
+fn fail_all_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, message: &str) {
+    let fds = jobs.active_fds();
     for fd in fds {
         complete_job(
             epoll_fd,
@@ -328,30 +443,6 @@ fn drain_wake(fd: RawFd) {
         }
         break;
     }
-}
-
-fn allowed_cpu_ids() -> Vec<usize> {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    let result = unsafe {
-        libc::sched_getaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &mut set as *mut libc::cpu_set_t,
-        )
-    };
-    if result != 0 {
-        return vec![0];
-    }
-    let mut cpus = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
-        if unsafe { libc::CPU_ISSET(cpu, &set) } {
-            cpus.push(cpu);
-        }
-    }
-    if cpus.is_empty() {
-        cpus.push(0);
-    }
-    cpus
 }
 
 fn pin_current_thread(cpu: usize) {
@@ -412,6 +503,7 @@ mod tests {
             (expected.len() - start) as u64,
             16 * 1024,
             1,
+            1,
             0,
         )
         .unwrap();
@@ -423,11 +515,79 @@ mod tests {
             client.read_exact(&mut received).unwrap();
             (received, expected[start..].to_vec())
         });
-        assert_eq!(
-            completion.blocking_recv().unwrap().unwrap(),
-            (64 * 1024 - start) as u64
-        );
+        let completion = completion.blocking_recv().unwrap().unwrap();
+        assert_eq!(completion.bytes, (64 * 1024 - start) as u64);
+        assert!(completion.uncorked);
         let (received, expected) = reader.join().unwrap();
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn sendfile_handoff_prefers_current_cpu_owner() {
+        let worker_cpus = vec![Some(2), Some(4), Some(6), Some(8)];
+        assert_eq!(preferred_worker_index(&worker_cpus, Some(6), 0), 2);
+        assert_eq!(preferred_worker_index(&worker_cpus, Some(7), 3), 3);
+        assert_eq!(preferred_worker_index(&worker_cpus, None, 5), 1);
+        assert_eq!(
+            preferred_worker_index_limited(&worker_cpus, Some(6), 0, 2),
+            2
+        );
+        assert_eq!(
+            preferred_worker_index_limited(&worker_cpus, Some(4), 1, 2),
+            2
+        );
+        assert_eq!(preferred_worker_index_limited(&worker_cpus, None, 1, 2), 2);
+    }
+
+    #[test]
+    fn sendfile_table_indexes_jobs_by_fd_without_hashing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let file = File::open("/dev/null").unwrap();
+        let fd = server.as_raw_fd();
+        let (completion, _receiver) = oneshot::channel();
+        let mut jobs = SendfileTable::default();
+        jobs.insert(
+            fd,
+            SendfileState {
+                socket: server,
+                file,
+                offset: 0,
+                sent: 0,
+                len: 1,
+                max_chunk_bytes: 1,
+                completion: Some(completion),
+            },
+        );
+        assert!(jobs.contains(fd));
+        assert_eq!(jobs.active_fds(), vec![fd]);
+        assert!(jobs.get_mut(fd).is_some());
+        assert!(jobs.remove(fd).is_some());
+        assert!(!jobs.contains(fd));
+        drop(client);
+    }
+}
+
+fn finish_sendfile_result(
+    socket: &TcpStream,
+    result: io::Result<u64>,
+) -> io::Result<SendfileCompletion> {
+    result.map(|bytes| SendfileCompletion {
+        bytes,
+        uncorked: uncork_sendfile_socket(socket),
+    })
+}
+
+fn uncork_sendfile_socket(socket: &TcpStream) -> bool {
+    let disabled: libc::c_int = 0;
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            (&disabled as *const libc::c_int).cast(),
+            mem::size_of_val(&disabled) as libc::socklen_t,
+        ) == 0
     }
 }

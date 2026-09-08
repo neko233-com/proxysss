@@ -241,7 +241,7 @@
             <div class="kicker">Migration mindset</div>
             <h2>先记住该把配置写在哪里</h2>
           </div>
-          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 `reverse_proxy`、`domain_routes`、`static_sites` 还是 `tcp/udp listeners`。</p>
+          <p class="subtle">你不用先记所有字段，只要先判断这条能力属于 `reverse_proxy`、`domain_routes`、`static_sites` 还是 `tcp/udp listeners`。没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；业务首页应显式声明 route/static site。</p>
         </div>
 
         <table>
@@ -336,7 +336,7 @@
   tls:
     auto_https:
       domains: [wss.example.com]</code></pre>
-            <p class="subtle">只给域名就会启用内建 managed ACME，默认正式环境 TLS-ALPN-01；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。邮箱只是到期/安全通知的可选项；显式 HTTP-01（需 80）、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
+            <p class="subtle">只给域名就会启用免费的内建 managed ACME，默认正式环境 TLS-ALPN-01 与 ECDSA P-256；无需 certbot、acme.sh、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`；显式 HTTP-01（需 80）、TLS-ALPN-01 和 DNS-01 配置仍完全兼容。</p>
           </article>
         </div>
       </section>

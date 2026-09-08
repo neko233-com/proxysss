@@ -13,6 +13,8 @@ proxysss 的配置目标不是“把 nginx 指令重新拼一遍”，而是让�
 - 公网 HTTPS / HTTP2 / HTTP3 默认端口 `443`
 - 管理面默认 `127.0.0.1:7777`
 - 默认配置文件 `proxysss.yaml`
+- 未配置用户根路由时，`/` 返回只含 GitHub 与 GitHub Docs 链接的 `Welcome to proxysss` 页面
+- 默认 443 TLS 会生成缺省自签证书，普通客户端 ALPN 优先协商 HTTP/2；生产环境应改为 managed ACME 或显式证书
 
 ## 1. 新手先从这里开始
 
@@ -70,7 +72,7 @@ services:
 
 这段配置做了什么：
 
-- 只要 `auto_https.domains` 非空，proxysss 就自动切到内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 TLS-ALPN-01：A/AAAA 指向网关且公网 443 可达即可，不需要额外证书工具、DNS API 或邮箱。显式 `challenge: http01` 仍完整兼容（需要公网 80），`tls_alpn01` 与 DNS-01 入口也保持不变。
+- 只要 `auto_https.domains` 非空，proxysss 就自动切到免费的内建 `acme_managed`，默认在 Let's Encrypt 正式环境使用 TLS-ALPN-01 与 ECDSA P-256 证书密钥：A/AAAA 指向网关且公网 443 可达即可，不需要额外证书工具、DNS API 或邮箱。ECDSA P-256 握手开销更小，是推荐稳定默认；只有兼容极老旧客户端时才设置 `http.tls.acme.key_algorithm: rsa2048`。显式 `challenge: http01` 仍完整兼容（需要公网 80），`tls_alpn01` 与 DNS-01 入口也保持不变。
 - 不用额外跑 `certbot`、`acme.sh` 或云厂商 CLI，也不必填写邮箱。邮箱是可选项：填写 `http.tls.auto_https.email` 才会收到到期和安全通知。
 - WebSocket upgrade 路由照常声明；签证完成后同一条 `/ws` 自动同时支持 `ws://` 与 `wss://`。
 
@@ -450,6 +452,7 @@ http:
       enabled: true
       email: "ops@example.com"
       challenge: dns01
+      key_algorithm: ecdsa_p256 # 推荐默认；兼容极老旧客户端时改 rsa2048
       dns:
         provider: cloudflare
         credentials:
@@ -553,6 +556,19 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - TCP / UDP listener bind 集合
 - `http.tls.mode`
 - 日志路径和级别核心设置
+
+### 4.3 Windows 后台自启动
+
+Windows 下执行 `service install` 会优先写入当前用户的 HKCU Run，并通过 `wscript //B //Nologo` 隐藏启动 proxysss；这样登录时不会弹出 cmd。安装时还会清理旧版本留下的直接执行型计划任务，避免两个入口重复启动。
+
+```powershell
+proxysss service install
+proxysss service status
+proxysss service start
+proxysss service stop
+```
+
+如果旧计划任务曾经以 `HighestAvailable` 权限创建，普通 PowerShell 可能无法删除它；只需用“以管理员身份运行”的 PowerShell 执行一次 `proxysss service install`，之后保持 HKCU Run 单一入口即可。`service status` 会提示重复入口或仍有弹窗风险的旧任务。
 
 ## 5. 性能建议要这样理解
 

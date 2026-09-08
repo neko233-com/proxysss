@@ -28,6 +28,7 @@ if (Test-Path $ReportDir) {
 New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
 
 $results = [System.Collections.Generic.List[object]]::new()
+$benchRoot = Join-Path $repoRoot ".benchmark\verify-deep\benchmark-run"
 
 function Add-Result {
     param(
@@ -83,16 +84,29 @@ try {
 
     if (-not $SkipBench) {
         Write-Step "7/7 benchmark-gateways + HTML/MD reports"
-        if ($QuickBench) {
-            & (Join-Path $repoRoot "scripts/benchmark-gateways.ps1") -Quick
-        } else {
-            & (Join-Path $repoRoot "scripts/benchmark-gateways.ps1")
+        $previousBenchRoot = $env:BENCH_ROOT
+        $previousKeepBenchArtifacts = $env:KEEP_BENCH_ARTIFACTS
+        $benchSucceeded = $false
+        try {
+            $env:BENCH_ROOT = $benchRoot
+            $env:KEEP_BENCH_ARTIFACTS = "1"
+            if ($QuickBench) {
+                & (Join-Path $repoRoot "scripts/benchmark-gateways.ps1") -Quick
+            } else {
+                & (Join-Path $repoRoot "scripts/benchmark-gateways.ps1")
+            }
+            $benchSucceeded = $true
+        } finally {
+            if ($null -eq $previousBenchRoot) { Remove-Item Env:BENCH_ROOT -ErrorAction SilentlyContinue } else { $env:BENCH_ROOT = $previousBenchRoot }
+            if ($null -eq $previousKeepBenchArtifacts) { Remove-Item Env:KEEP_BENCH_ARTIFACTS -ErrorAction SilentlyContinue } else { $env:KEEP_BENCH_ARTIFACTS = $previousKeepBenchArtifacts }
+            if (-not $benchSucceeded -and (Test-Path $benchRoot)) { Remove-Item -LiteralPath $benchRoot -Recurse -Force }
         }
-        $benchRun = Join-Path $repoRoot ".benchmark\runs\latest"
+        $benchRun = Join-Path $benchRoot "runs\latest"
         Copy-Item (Join-Path $benchRun "results.json") (Join-Path $ReportDir "benchmark-results.json") -Force
         Copy-Item (Join-Path $benchRun "report.md") (Join-Path $ReportDir "benchmark-report.md") -Force
         Copy-Item (Join-Path $benchRun "report.html") (Join-Path $ReportDir "benchmark-report.html") -Force
         Add-Result "benchmark" "throughput gate" $true (Get-Content (Join-Path $benchRun "report.md") -TotalCount 8 -Raw)
+        if (Test-Path $benchRoot) { Remove-Item -LiteralPath $benchRoot -Recurse -Force }
     } else {
         Write-Host "==> 7/7 benchmark skipped (-SkipBench)"
         Add-Result "benchmark" "throughput" $true "skipped"

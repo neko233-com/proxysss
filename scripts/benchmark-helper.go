@@ -21,6 +21,12 @@ import (
 	"time"
 )
 
+const (
+	realtimeCompletionGuardMicros  int64 = 1_000
+	tcpCompletionGuardMicros       int64 = 2_000
+	websocketCompletionGuardMicros int64 = 5_000
+)
+
 type BenchRow struct {
 	Scenario        string   `json:"scenario,omitempty"`
 	Gateway         string   `json:"gateway,omitempty"`
@@ -904,15 +910,43 @@ func runWriteEqualLoadPlan(args []string) error {
 		if intervalMicros < 1 {
 			intervalMicros = 1
 		}
-		// A short fixed-rate run can only schedule a whole number of operations
-		// per connection. Gate against that executable rate instead of an
-		// asymptotic fractional target that is mathematically unreachable in a
-		// one-second feedback window.
-		scheduledPerConnection := int64(*durationSecs) * 1_000_000 / intervalMicros
-		if scheduledPerConnection < 1 {
-			scheduledPerConnection = 1
+		durationMicros := int64(*durationSecs) * 1_000_000
+		var scheduledTotal int64
+		if proxy.Protocol == "http" || proxy.Protocol == "sse" {
+			// HTTP/SSE workers use centered uniform phase offsets. Across all
+			// workers that produces one aggregate slot every interval/concurrency
+			// without a request exactly at the measurement boundary.
+			scheduledTotal = (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
+		} else {
+			// Realtime workers intentionally tick together. Their first operation
+			// is one full interval after measurement_start. Reserve one
+			// millisecond for the final bounded round trip: a slot 200-900 us
+			// before the hard deadline is schedulable but cannot reliably finish
+			// inside a one-second sample on either gateway.
+			completionGuardMicros := realtimeCompletionGuardMicros
+			if proxy.Protocol == "tcp" || nginx.Protocol == "tcp" {
+				// A raw TCP echo still crosses two userspace relays. At the
+				// high-density 64-connection slot, one millisecond was below
+				// the measured 1.1-1.3 ms p99 and made the final whole tick
+				// mathematically impossible.
+				completionGuardMicros = tcpCompletionGuardMicros
+			} else if proxy.Protocol == "websocket" || nginx.Protocol == "websocket" {
+				// A WebSocket echo includes framing plus two user-space protocol
+				// transitions. One millisecond is enough for raw TCP/UDP but
+				// makes the final synchronized WebSocket tick client-limited at
+				// 128 connections even when both gateways have spare capacity.
+				completionGuardMicros = websocketCompletionGuardMicros
+			}
+			executableMicros := durationMicros - completionGuardMicros
+			if executableMicros < 1 {
+				executableMicros = 1
+			}
+			scheduledTotal = ((executableMicros - 1) / intervalMicros) * int64(concurrency)
 		}
-		actualTarget := float64(scheduledPerConnection*int64(concurrency)) / float64(*durationSecs)
+		if scheduledTotal < 1 {
+			scheduledTotal = 1
+		}
+		actualTarget := float64(scheduledTotal) / float64(*durationSecs)
 		lines = append(lines, fmt.Sprintf("%s|%d|%.6f", scenario, intervalMicros, actualTarget))
 	}
 	if len(lines) == 0 {

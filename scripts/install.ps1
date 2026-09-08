@@ -142,25 +142,38 @@ function Compare-VersionNullable([string]$Left, [string]$Right) {
     return ([version]$Left).CompareTo([version]$Right)
 }
 
-function Test-ServiceTaskExists {
+function Test-ServiceEntryExists {
+    $taskFound = $false
     $getScheduledTask = Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue
     if ($null -ne $getScheduledTask) {
         try {
             $task = Get-ScheduledTask -TaskName $BinaryName -ErrorAction SilentlyContinue
-            return ($null -ne $task)
+            $taskFound = ($null -ne $task)
         } catch {
         }
     }
 
-    cmd /c "schtasks /Query /TN \"$BinaryName\" >nul 2>&1"
-    return ($LASTEXITCODE -eq 0)
+    if (-not $taskFound) {
+        cmd /c "schtasks /Query /TN \"$BinaryName\" >nul 2>&1"
+        $taskFound = ($LASTEXITCODE -eq 0)
+    }
+    if ($taskFound) {
+        return $true
+    }
+
+    try {
+        $runValue = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $BinaryName -ErrorAction Stop).$BinaryName
+        return (-not [string]::IsNullOrWhiteSpace([string]$runValue))
+    } catch {
+        return $false
+    }
 }
 
 function Stop-ServiceIfPresent([string]$ExePath) {
     if ($NoServiceRestart) {
         return
     }
-    if (!(Test-ServiceTaskExists)) {
+    if (!(Test-ServiceEntryExists)) {
         return
     }
     if (!(Test-Path $ExePath)) {
@@ -184,7 +197,7 @@ function Start-ServiceIfPresent([string]$ExePath) {
     if ($NoServiceRestart) {
         return
     }
-    if (!(Test-ServiceTaskExists)) {
+    if (!(Test-ServiceEntryExists)) {
         return
     }
 
@@ -330,7 +343,6 @@ if ($DryRun) {
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Stop-ServiceIfPresent $Dest
 
 $tmpRoot = Join-Path $InstallDir "bundle-tmp"
 $archivePath = Join-Path $InstallDir $asset
@@ -346,6 +358,9 @@ if (!(Test-Path $bundleExe)) {
     throw "release bundle is missing $BinaryName.exe"
 }
 
+# Download/extract first. Failed updates must not leave an existing gateway
+# stopped. Stop only after the replacement bundle has passed validation.
+Stop-ServiceIfPresent $Dest
 Move-Item -Force $bundleExe $Dest
 
 Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
@@ -385,7 +400,7 @@ if (!$SkipInit) {
     & $Dest check-config
 }
 
-if (Test-ServiceTaskExists) {
+if (Test-ServiceEntryExists) {
     Start-ServiceIfPresent $Dest
 } else {
     try {

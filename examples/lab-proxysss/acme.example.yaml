@@ -11,6 +11,7 @@ http:
       domains:
         - gateway.example.com
       # Uses production TLS-ALPN-01 by default: DNS + public 443 only.
+      # Certificate key defaults to ECDSA P-256; set tls.acme.key_algorithm: rsa2048 only for legacy clients.
       # Email is optional and is used only for renewal/security notices.
       # email: ops@example.com
 # HTTP-01 compatibility override example: this explicit form remains supported.
@@ -19,6 +20,7 @@ http:
 #      email: ops@example.com
 #      domains: [gateway.example.com]
 #      challenge: http01
+#      key_algorithm: ecdsa_p256
 #      directory_production: true
 
 # Wildcard (*.example.com) — built-in DNS-01 (configure via admin console or YAML):
@@ -32,6 +34,7 @@ http:
 #     acme:
 #       email: ops@example.com
 #       challenge: dns01
+#       key_algorithm: ecdsa_p256
 #       domains: [example.com, "*.example.com"]
 #       directory_production: true
 #       dns:

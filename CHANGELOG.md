@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.3.7 - 2026-08-20
+
+- Added the production api.neko233.com AI gateway route for ai-router, including root/admin, health, OpenAI Responses, and Chat Completions paths while keeping the upstream listener loopback-only.
+- Removed admin-token forwarding at the edge and kept the AI route on the low-allocation streaming path with hot-reloadable configuration.
+
+- Hardened Windows auto-start repair: HKCU Run is now the single preferred hidden entry, legacy direct-console scheduled tasks are detected and removed, status reports duplicate or unsafe startup entries, and installer errors preserve the underlying permission failure.
+- Bounded local benchmark disk usage: default Rust targets and reports are disposable, and proxysss-owned Docker benchmark images are removed after a run unless artifact retention is explicitly enabled.
+- Rebuilt the default public `/` page as a zero-asset, responsive `Welcome to proxysss` screen containing only GitHub and GitHub Docs links.
+- Locked the default TLS ALPN order so ordinary clients prefer HTTP/2 on port 443 while ACME TLS-ALPN-01 remains available, and added default-config coverage for self-signed TLS bootstrap.
+- Hardened the Ubuntu 24 Docker benchmark entrypoints for Windows Docker Desktop path handling and emitted a same-run fairness manifest proving matching ports, CPU/FD/sysctl limits, protocol surfaces, and nginx/proxysss optimizations. Strict measured validation remains capped at 60 seconds.
+- Added explicit `REUSE_BENCH_IMAGE=1` support for offline/transient-registry validation; the wrapper still probes the cached image for amd64 and Ubuntu 24.04 before building or measuring the checkout.
+- Fixed `verify-docker-scenarios.sh` on Windows Git Bash by preserving container `/work` paths and explicitly converting only the host checkout mount.
+- Added `REUSE_VERIFY_IMAGE=1` for registry-independent scenario validation while retaining an explicit Ubuntu 24.04 x86_64 image probe.
+- Made the Ubuntu 24 wrapper record and forward explicit `TRAFFIC_PROFILE`, saturation/latency run orders, and benchmark subnet/role addresses so default-small and balanced experiments remain reproducible without editing scripts.
+- Enforced that 60-second cap inside every client wave, shortened synchronized startup and UDP/QCP tail waits, kept balanced UDP on the proven per-core fast path, and reduced TLS/sendfile/realtime owner contention under mixed load.
+- Replaced the hot-path async configuration `RwLock` with atomically published ArcSwap snapshots, so HTTP/H2/stream requests remain reload-safe without lock acquisition or wakeups per state read.
+- Added bounded UDP cooperative fairness, lower-weight realtime owners, a cache-local TLS owner profile, and fat-LTO release builds to preserve per-protocol latency under saturated mixed traffic.
+- Partitioned every mixed-wave client scenario and backend protocol service onto disjoint CPUs, including separate UDP/QCP echo listeners, so faster stream paths cannot steal generator/backend time from HTTP; the full strict matrix now requires at least 24 Docker CPUs.
+- Fixed lazy native-reactor CPU discovery to use the cgroup effective cpuset instead of an already pinned caller thread; sparse WebSocket/TCP owners explicitly regain the full mask for soft CFS ownership, while dense relay and sendfile owners retain deliberate per-CPU placement.
+- Made balanced UDP/QCP fairness burst-aware: the shared per-core runtime yields after eight packets only when they arrive within eight milliseconds, avoiding scheduler tax on latency-sensitive low-rate traffic while preserving saturated mixed-load fairness.
+- Bounded the default-small TLS crypto runtime to one owner per four detected CPUs and its UDP/QCP runtime to one owner per two CPUs, preserving full-CPU `SO_REUSEPORT` listener fanout and adaptive scaling while reducing mixed-traffic scheduler contention.
+- Consolidated default-small HTTP/1.1, HTTP/2/TLS, WebSocket, TCP, UDP, and transparent QCP work onto the same CPU-adaptive per-core data shards, halving I/O-driver polling intervals for latency, using cooperative sendfile yields instead of timer sleeps, and keeping tiny reverse/SSE upstream sockets on Linux autotuning rather than forced bulk buffers.
+- Replaced isolated one-thread default-small data runtimes with one CPU-sized work-stealing Tokio runtime. HTTP/H2/TLS/WebSocket/TCP/UDP/QCP still share one worker per allowed core, but ready connections can escape SO_REUSEPORT hash skew instead of leaving sibling cores idle during mixed load.
+- Disabled Tokio's non-stealable LIFO slot on the unified data runtime, ensuring echo-style WebSocket/TCP/UDP/QCP wake chains return to stealable worker queues instead of creating cross-protocol p99 stalls.
+- Removed sub-p99 self-wake boundaries from low-density HTTP/TLS/WebSocket lanes: the data runtime now polls injection/I/O twice as often, WebSocket tunnels use the normal bounded relay budget, and explicit HTTP yields occur every 256 responses until connections exceed 256 per data worker. Saturated high-density traffic retains the proven 32-response fairness boundary.
+- Restored Tokio's connection-local LIFO wake slot and the throughput-proven 31/16 injection/I/O cadence after strict mixed evidence showed that queueing every fresh I/O wake behind the stealable local queue created a common ~2 ms p99 step and that the 15/8 cadence reduced static/HTTPS throughput. The short-period HTTP/WebSocket self-wakes remain removed, preventing the monopolization risk that originally motivated disabling LIFO.
+- Restored the UDP/QCP benchmark response timeout to 500 ms and expanded only the non-measured process grace to four seconds; a 50 ms timeout produced false packet errors at higher scales while active measurement remains capped at 20 seconds.
+- Reduced the official Ubuntu 24 strict matrix to a 20-second active-measurement budget with synchronized one-second samples. All 1x/2x/4x saturation and equal-load windows count toward that budget; orchestration wall time is reported separately, and every wave retains a hard stuck-process timeout.
+- Added free managed-ACME certificate key selection: stable, efficient ECDSA P-256 remains the default, while `http.tls.acme.key_algorithm: rsa2048` provides explicit legacy-client compatibility without external certificate tooling.
+- Removed the shared HTTP request-counter cache-line bounce with per-data-shard padded counters, restored a throughput/latency-balanced 16-poll I/O driver cadence, and made immutable HTTP/2 static hits complete synchronously inside the connection service without per-request gateway Arc contention. Plain static connections now refresh the global fairness threshold only at yield boundaries and amortize the one-second revalidation clock check over 32 exact hits. Kept the proven 2 MiB sendfile fairness slice after a 16 MiB experiment starved mixed HTTP siblings.
+- Fixed the mmap static-cache threshold being Linux-only at compile time even though the portable cache path uses it, restoring Windows/macOS build parity for large cached assets.
+
 ## v1.3.5 - 2026-07-01
 
 - Added independent QCP UDP listener coverage for neko233-com/QCP alongside existing KCP-style UDP examples, templates, capability output, nginx-parity output, and Chinese-first docs. KCP and QCP remain separate listener modes; proxysss forwards datagrams transparently and leaves protocol framing/reliability semantics to upstream services.

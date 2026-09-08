@@ -6,6 +6,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap cleanup_benchmark_artifacts EXIT
 
 [[ "$(uname -s)" == "Linux" ]] || {
   echo "benchmark-cross-host-scale-matrix.sh must run from a Linux client host" >&2
@@ -16,7 +19,6 @@ SCALE_FACTORS="${SCALE_FACTORS:-1 2 4}"
 BASE_CONNECTIONS="${BASE_CONNECTIONS:-4096}"
 CAPACITY_CONNECTIONS="${CAPACITY_CONNECTIONS:-20000}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
-BENCH_ROOT="${BENCH_ROOT:-$ROOT/.benchmark}"
 RUN_ROOT="$BENCH_ROOT/runs/cross-host-wss-scale-matrix/$RUN_ID"
 
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || {

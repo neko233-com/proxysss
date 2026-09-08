@@ -85,9 +85,9 @@ KCP 和 QCP 仍然是两套独立 UDP listener 能力。协议终止语义不拿
 
 ### 4.1 三阶段公平判定，不能混用吞吐与延迟口径
 
-`scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。默认是 4+4+8 CPU，也允许本机 wrapper 按 Docker 可用核数等比例切分；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。每个 wave 只创建 1 个 client 容器，内部 11 个独立协议进程共享 client cpuset 与同一个 `--start-at-unix-ms`；每尺度只启动 1 个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause，切换时 resume 并等待 readiness 稳定，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。saturation client 保留完整 client cpuset，确保能把更快的 gateway 压满；fixed-rate equal-load 的小包 client 每进程只启动 1 个 Tokio I/O worker，static-large 启动 2 个，避免 11 个进程各自按整个 cpuset 扩张后让 timer 因发生器自身过载而跳 tick。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
+`scripts/benchmark-all-scenarios-isolated.sh` 把 gateway、backend、client 固定到互不重叠的 CPU set/cgroup，并用同一 Docker bridge 上的独立网络命名空间传输。完整 mixed gate 至少需要 24 个 Docker CPU；报告中的 `cpu_cores` 来自实际 gateway cpuset，不能硬编码。每个 wave 只创建 1 个 client 容器，内部 11 个独立协议进程使用同一个 `--start-at-unix-ms`，但每场景通过 `taskset` 获得互不重叠的 CPU 分区。backend 的 HTTP、SSE、WebSocket、TCP、UDP、QCP echo 进程同样分区，UDP 与 QCP 使用独立 upstream listener。同步 WebSocket/TCP/UDP/QCP 的 mandatory target 只统计 hard deadline 前至少保留 1 ms completion guard 的完整 tick，避免双方都无法可靠完成的最后亚毫秒 slot 制造假失败。每尺度只启动 1 个 backend 与两边 gateway，非被测 gateway 在共同 cpuset 上 pause，切换时 resume 并等待 readiness 稳定，短时 emulated-amd64 诊断也不会把容器启动耗时误算成 mixed wave。serial isolated saturation 显式启用时仍使用完整 client cpuset。默认记录 cgroup current/peak、容器资源快照和每连接成本；只有声明真实生产预算时才传 Docker/systemd 内存上限。对照 nginx 固定为当前 mainline `1.31.2`，以 `-O3 -fno-plt` 构建并启用 HTTP SSL/H2/stream；proxysss 必须使用 Linux release binary。透明 QCP 使用独立 `protocol: qcp` UDP listener，并与 nginx 等价 UDP listener 接受同一负载；这只证明 edge forwarding，不代表 QCP frame termination。
 
-它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度对每个 gateway/phase 采 1 个同步 3 秒样本，关闭额外 serial isolated；proxysss 是 AOT binary，不做 JIT warm-up，构建、镜像/容器准备、确定性的配置加载缓存准备与 readiness 都在严格计时之前完成，完整 matrix 自身必须不超过 60 秒。仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 `BENCHMARK_REPETITIONS` 与 `DURATION_SECS`，多轮再取中位数、错误取最大值：
+它分三阶段输出 JSON、Markdown、HTML 与百分比表。默认反馈门槛在每个 1x/2x/4x 尺度运行 1 次 saturation 和 2 次反向 candidate order 的 equal-load 1 秒样本，关闭额外 serial isolated；完整矩阵使用 18 秒 active client measurement，并硬限制在 20 秒内。`validation_elapsed_secs` 累加真实采样窗口，排除 build/setup/warm-up、客户端连接/资源/session 预热、进程启动、结果复制与报告解析；`validation_wall_elapsed_secs` 单独记录编排耗时。每个 wave 仍有 4 秒独立 process grace，卡死会停止容器内发生器并失败。默认 future-start lead 为 2000 ms，确保 4x 下 11 个独立发生器完成连接池和协议预热后再进入共享时间戳；plain HTTP/1 双方在 active window 前并发建立与场景 concurrency 相同的连接池，HTTPS/H2 预连单个 multiplexed session，GET/SSE 执行两次真实请求，每条 WebSocket/TCP/UDP/QCP 连接完成一次 echo。static/reverse cache、stale-while-revalidate、stream relay 与 UDP association 均在双方 active window 外就绪。UDP/QCP response timeout 为 500 ms；预热和尾部等待不计入 active measurement。仍逐场景严格判定且任一错误立即失败。需要根因审计时可显式提高 repetitions 与 `DURATION_SECS`，多轮取中位数、错误取最大值：
 
 1. `mixed saturation`：十一个场景（含透明 QCP）同时跑，只判逐场景/聚合吞吐和错误，不拿两边不同实际吞吐下的饱和延迟硬比。
 2. `isolated saturation`：每次只跑一个场景并交替先后顺序，判单场景最大吞吐/容量。
@@ -99,7 +99,7 @@ STRICT_SUPERIORITY=1 DURATION_SECS=30 \
 bash scripts/benchmark-all-scenarios-isolated.sh
 ```
 
-Docker role isolation 解决的是同进程、同 cgroup、同 CPU 抢占混淆，不等于三台物理机。脚本会先拒绝角色 cpuset 重叠或默认 16 核包络之外的机器；公网 RTT、NIC/IRQ/RSS、跨机丢包结论仍要在独立 gateway/backend/client 主机复跑。
+Docker role isolation 解决的是同进程、同 cgroup、同 CPU 抢占混淆，不等于三台物理机。脚本会先拒绝角色 cpuset 重叠或少于 24 个 Docker CPU 的机器；公网 RTT、NIC/IRQ/RSS、跨机丢包结论仍要在独立 gateway/backend/client 主机复跑。
 
 ### 4.2 WebSocket 容量与延迟要分开验证
 
@@ -175,14 +175,14 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 - `scripts/benchmark-ubuntu24-amd64-docker.sh`：本机或原生 Docker 入口；硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64，在容器内构建当前 checkout，并把 gateway/backend/client 分配到互不重叠的 cpuset。默认把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大，逐档同时跑 mixed saturation 与 equal-offered-load，要求零错误、逐场景吞吐和延迟严格胜出。arm64 daemon 会记录 `execution_mode=emulated-amd64`，不能冒充物理 x86 证据
 
-这个本机 wrapper 在 amd64 daemon 复用 `.benchmark/ubuntu24-amd64-target`；arm64 daemon 必须安装 Zig、cargo-zigbuild 与 Rust `x86_64-unknown-linux-gnu` target，并复用 `.benchmark/ubuntu24-amd64-cross-target` 做本机原生速度交叉编译，再把同一个 ELF 放进 Ubuntu 24 amd64 容器执行校验，禁止回退到数分钟的 QEMU 编译。优化 nginx 镜像由 Docker layer cache 复用；每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；默认 1 分钟反馈必须清空 filter 并保留全部场景；只有显式长时根因审计才提高到四轮交错顺序。
+这个本机 wrapper 在 amd64 daemon 复用 `.benchmark/ubuntu24-amd64-target`；arm64 daemon 必须安装 Zig、cargo-zigbuild 与 Rust `x86_64-unknown-linux-gnu` target，并复用 `.benchmark/ubuntu24-amd64-cross-target` 做本机原生速度交叉编译，再把同一个 ELF 放进 Ubuntu 24 amd64 容器执行校验，禁止回退到数分钟的 QEMU 编译。默认 benchmark 结束自动删除 target、报告和本次创建的 proxysss benchmark 镜像；需审计时设置 `KEEP_BENCH_ARTIFACTS=1`，或设置 `BENCH_ROOT` 指向保留目录。优化 nginx 镜像由 Docker layer cache 复用；registry 元数据暂时不可用时可显式设置 `REUSE_BENCH_IMAGE=1`，wrapper 仍会硬校验缓存镜像是 Ubuntu 24.04 amd64，不能跳过平台探针。每个 run 的配置、日志、原始样本和 summary 仍按 `BENCH_RUN_ID` 隔离。`MIXED_SCENARIOS='static-small static-large ...'` 可做不改变场景负载定义的根因诊断，`RUN_ORDER='proxysss nginx'` 可检查执行顺序偏差；默认 1 分钟反馈必须清空 filter 并保留全部场景；只有显式长时根因审计才提高到四轮交错顺序。
 - `scripts/benchmark-all-scenarios.sh`：正式 Linux mixed-load 入口
 - `scripts/benchmark-all-scenarios-isolated.sh`：4c role-isolated saturation + equal-offered-load 严格对照入口，内存默认观测
 - `scripts/benchmark-websocket-production-gate.sh`：4c 单网关多尺度 WSS active latency + 20k idle 容量角色隔离入口，内存默认观测
 - `scripts/benchmark-cross-host-wss.sh`：三台独立 Linux 主机 WSS 严格吞吐、p50/p95/p99 与 20k 容量证据入口
 - `scripts/benchmark-cross-host-scale-matrix.sh`：三机 WSS 1x/2x/4x 严格复跑入口，默认只扩 active 负载
 - `SCENARIO_FILTER=udp-stream`：定位 UDP fast path 的专项入口
-- `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 输出
+- `.benchmark/runs/all-scenarios/results.json` / `summary.md` / `summary.html`：手动 benchmark 运行期间输出；默认结束清理，需保留时设置 `KEEP_BENCH_ARTIFACTS=1` 或 `BENCH_ROOT`
 
 ## 6. Windows benchmark 还要不要留
 

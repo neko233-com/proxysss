@@ -14,6 +14,29 @@ FEEDBACK_START_SECS="$(date +%s)"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/benchmark-artifact-policy.sh"
+init_benchmark_artifacts
+trap 'cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
+
+# Git Bash/MSYS rewrites Linux container paths such as /work into paths under
+# its own installation directory. Disable that implicit conversion at Docker
+# boundaries, while explicitly translating checkout-owned host paths.
+DOCKER_CLI_BIN="$(type -P docker || true)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*)
+    docker() {
+      local arg
+      local -a docker_args=()
+      for arg in "$@"; do
+        if [[ "$arg" == "$ROOT"* ]]; then
+          arg="$(cygpath -m "$ROOT")${arg#"$ROOT"}"
+        fi
+        docker_args+=("$arg")
+      done
+      MSYS2_ARG_CONV_EXCL='*' "$DOCKER_CLI_BIN" "${docker_args[@]}"
+    }
+    ;;
+esac
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -42,49 +65,93 @@ fi
 
 docker version >/dev/null
 DOCKER_SOCKET="${DOCKER_SOCKET:-$(docker context inspect --format '{{.Endpoints.docker.Host}}')}"
-DOCKER_SOCKET="${DOCKER_SOCKET#unix://}"
 DOCKER_DAEMON_SOCKET="${DOCKER_DAEMON_SOCKET:-/var/run/docker.sock}"
-if [[ ! -S "$DOCKER_SOCKET" ]]; then
-  echo "role-isolated controller requires a local Unix Docker socket, found: $DOCKER_SOCKET" >&2
-  exit 1
-fi
+case "$DOCKER_SOCKET" in
+  unix://*)
+    DOCKER_SOCKET="${DOCKER_SOCKET#unix://}"
+    if [[ ! -S "$DOCKER_SOCKET" ]]; then
+      echo "role-isolated controller requires a local Unix Docker socket, found: $DOCKER_SOCKET" >&2
+      exit 1
+    fi
+    ;;
+  npipe://*)
+    case "$(uname -s)" in
+      MINGW* | MSYS* | CYGWIN*) ;;
+      *)
+        echo "Docker named-pipe endpoints are supported only from Windows Git Bash/MSYS/Cygwin: $DOCKER_SOCKET" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    if [[ ! -S "$DOCKER_SOCKET" ]]; then
+      echo "unsupported local Docker endpoint: $DOCKER_SOCKET" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 TOTAL_CPUS="${TOTAL_CPUS:-}"
 CPU_CORES="${CPU_CORES:-}"
-DURATION_SECS="${DURATION_SECS:-3}"
+DURATION_SECS="${DURATION_SECS:-1}"
 BENCHMARK_REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
+LATENCY_REPETITIONS="${LATENCY_REPETITIONS:-2}"
 LOAD_SCALES="${LOAD_SCALES:-1 2 4}"
 ALLOW_UNBALANCED_REPETITIONS="${ALLOW_UNBALANCED_REPETITIONS:-1}"
 RUN_SERIAL_ISOLATED="${RUN_SERIAL_ISOLATED:-0}"
 SAMPLE_AFTER_SECS="${SAMPLE_AFTER_SECS:-1}"
 CAPTURE_DOCKER_STATS="${CAPTURE_DOCKER_STATS:-0}"
-CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-750}"
-MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-60}}"
+CAPTURE_THREAD_STATS="${CAPTURE_THREAD_STATS:-0}"
+REUSE_BENCH_IMAGE="${REUSE_BENCH_IMAGE:-0}"
+CLIENT_START_LEAD_MS="${CLIENT_START_LEAD_MS:-2000}"
+GATEWAY_RESUME_SETTLE_MS="${GATEWAY_RESUME_SETTLE_MS:-1000}"
+UDP_CLIENT_TIMEOUT_MS="${UDP_CLIENT_TIMEOUT_MS:-500}"
+MAX_VALIDATION_SECS="${MAX_VALIDATION_SECS:-${MAX_FEEDBACK_SECS:-20}}"
 MIXED_SCENARIOS="${MIXED_SCENARIOS:-}"
 RUN_ORDER="${RUN_ORDER:-nginx proxysss}"
+LATENCY_RUN_ORDER="${LATENCY_RUN_ORDER:-proxysss nginx}"
+TRAFFIC_PROFILE="${TRAFFIC_PROFILE:-balanced}"
+BENCH_SUBNET="${BENCH_SUBNET:-172.31.0.0/16}"
+BACKEND_IP="${BACKEND_IP:-172.31.10.10}"
+GATEWAY_IP="${GATEWAY_IP:-172.31.20.20}"
+PROXYSSS_GATEWAY_IP="${PROXYSSS_GATEWAY_IP:-172.31.20.21}"
 EQUAL_LOAD_FRACTION="${EQUAL_LOAD_FRACTION:-0.25}"
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
+EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"
 IMAGE="${PROXYSSS_BENCH_IMAGE:-proxysss-ubuntu24-amd64-bench:local}"
+register_benchmark_docker_image "$IMAGE" "$REUSE_BENCH_IMAGE"
 COMMIT="$(git rev-parse HEAD)"
 RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${COMMIT:0:12}}"
 if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "BENCH_RUN_ID contains unsupported characters: $RUN_ID" >&2
   exit 1
 fi
-OUTPUT_REL=".benchmark/direct-ubuntu24-amd64/$RUN_ID"
+BENCH_ROOT_REL="${BENCH_ROOT#"$ROOT"/}"
+[[ "$BENCH_ROOT" == "$ROOT"/* && "$BENCH_ROOT_REL" != "$BENCH_ROOT" ]] || {
+  echo "BENCH_ROOT must be inside checkout so Docker can mount benchmark artifacts: $BENCH_ROOT" >&2
+  exit 1
+}
+OUTPUT_REL="$BENCH_ROOT_REL/direct-ubuntu24-amd64/$RUN_ID"
+register_benchmark_docker_image "proxysss-isolated-ubuntu24-amd64:$RUN_ID"
 OUTPUT_ROOT="$ROOT/$OUTPUT_REL"
 CURRENT_BENCH_ROOT="$OUTPUT_ROOT/current"
-TARGET_DIR="/work/.benchmark/ubuntu24-amd64-target"
-CROSS_TARGET_REL=".benchmark/ubuntu24-amd64-cross-target"
+TARGET_REL="$BENCH_ROOT_REL/ubuntu24-amd64-target"
+TARGET_DIR="/work/$TARGET_REL"
+CROSS_TARGET_REL="$BENCH_ROOT_REL/ubuntu24-amd64-cross-target"
 CROSS_TARGET_DIR="$ROOT/$CROSS_TARGET_REL"
-CARGO_HOME_DIR="/work/.benchmark/ubuntu24-amd64-cargo-home"
+CARGO_HOME_REL="$BENCH_ROOT_REL/ubuntu24-amd64-cargo-home"
+CARGO_HOME_DIR="/work/$CARGO_HOME_REL"
 
 require_positive_integer DURATION_SECS "$DURATION_SECS"
 require_positive_integer BENCHMARK_REPETITIONS "$BENCHMARK_REPETITIONS"
+require_positive_integer LATENCY_REPETITIONS "$LATENCY_REPETITIONS"
 require_positive_integer EQUAL_LOAD_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
+require_positive_integer EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS"
 require_positive_integer EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS "$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
 require_positive_integer CLIENT_START_LEAD_MS "$CLIENT_START_LEAD_MS"
+require_positive_integer GATEWAY_RESUME_SETTLE_MS "$GATEWAY_RESUME_SETTLE_MS"
+require_positive_integer UDP_CLIENT_TIMEOUT_MS "$UDP_CLIENT_TIMEOUT_MS"
 require_positive_integer MAX_VALIDATION_SECS "$MAX_VALIDATION_SECS"
 if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "0" && "$ALLOW_UNBALANCED_REPETITIONS" != "1" ]]; then
   echo "ALLOW_UNBALANCED_REPETITIONS must be 0 or 1" >&2
@@ -92,6 +159,14 @@ if [[ "$ALLOW_UNBALANCED_REPETITIONS" != "0" && "$ALLOW_UNBALANCED_REPETITIONS" 
 fi
 if [[ "$CAPTURE_DOCKER_STATS" != "0" && "$CAPTURE_DOCKER_STATS" != "1" ]]; then
   echo "CAPTURE_DOCKER_STATS must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$CAPTURE_THREAD_STATS" != "0" && "$CAPTURE_THREAD_STATS" != "1" ]]; then
+  echo "CAPTURE_THREAD_STATS must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$REUSE_BENCH_IMAGE" != "0" && "$REUSE_BENCH_IMAGE" != "1" ]]; then
+  echo "REUSE_BENCH_IMAGE must be 0 or 1" >&2
   exit 1
 fi
 if [[ "$RUN_SERIAL_ISOLATED" != "0" && "$RUN_SERIAL_ISOLATED" != "1" ]]; then
@@ -102,6 +177,14 @@ if [[ "$RUN_ORDER" != "nginx proxysss" && "$RUN_ORDER" != "proxysss nginx" ]]; t
   echo "RUN_ORDER must be 'nginx proxysss' or 'proxysss nginx'" >&2
   exit 1
 fi
+if [[ "$LATENCY_RUN_ORDER" != "nginx proxysss" && "$LATENCY_RUN_ORDER" != "proxysss nginx" ]]; then
+  echo "LATENCY_RUN_ORDER must be 'nginx proxysss' or 'proxysss nginx'" >&2
+  exit 1
+fi
+case "$TRAFFIC_PROFILE" in
+  small|balanced|bulk) ;;
+  *) echo "TRAFFIC_PROFILE must be small, balanced, or bulk" >&2; exit 1 ;;
+esac
 for scale in $LOAD_SCALES; do
   require_positive_integer LOAD_SCALE "$scale"
 done
@@ -117,13 +200,18 @@ restore_ownership() {
     -v "$ROOT:/work" \
     "$IMAGE" \
     chown -R "$(id -u):$(id -g)" "/work/$OUTPUT_REL" \
-      /work/.benchmark/ubuntu24-amd64-target \
-      /work/.benchmark/ubuntu24-amd64-cargo-home >/dev/null 2>&1 || true
+      "/work/$TARGET_REL" \
+      "/work/$CARGO_HOME_REL" >/dev/null 2>&1 || true
 }
-trap restore_ownership EXIT
+trap 'restore_ownership; cleanup_benchmark_docker_images; cleanup_benchmark_artifacts' EXIT
 
-echo "==> building Ubuntu 24 benchmark image: $IMAGE"
-docker build --platform linux/amd64 -f docker/ubuntu24-bench.Dockerfile -t "$IMAGE" .
+if [[ "$REUSE_BENCH_IMAGE" == "1" ]]; then
+  echo "==> reusing locally cached Ubuntu 24 benchmark image: $IMAGE"
+  docker image inspect "$IMAGE" >/dev/null
+else
+  echo "==> building Ubuntu 24 benchmark image: $IMAGE"
+  docker build --platform linux/amd64 -f docker/ubuntu24-bench.Dockerfile -t "$IMAGE" .
+fi
 image_ready=1
 
 image_arch="$(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
@@ -147,8 +235,8 @@ if [[ -z "$TOTAL_CPUS" ]]; then
   TOTAL_CPUS="$(printf '%s\n' "$container_probe" | sed -n 's/^detected_nproc=//p')"
 fi
 require_positive_integer TOTAL_CPUS "$TOTAL_CPUS"
-if (( TOTAL_CPUS < 4 )); then
-  echo "role-isolated benchmark requires at least 4 Docker CPUs, found $TOTAL_CPUS" >&2
+if (( TOTAL_CPUS < 24 )); then
+  echo "strict mixed benchmark requires at least 24 Docker CPUs for gateway/backend/client protocol isolation, found $TOTAL_CPUS" >&2
   exit 1
 fi
 if [[ -z "$CPU_CORES" ]]; then
@@ -193,14 +281,22 @@ fi
   echo "load_scales=$LOAD_SCALES"
   echo "duration_secs=$DURATION_SECS"
   echo "repetitions=$BENCHMARK_REPETITIONS"
+  echo "latency_repetitions=$LATENCY_REPETITIONS"
   echo "mixed_scenarios=${MIXED_SCENARIOS:-all}"
   echo "run_serial_isolated=$RUN_SERIAL_ISOLATED"
   echo "client_start_lead_ms=$CLIENT_START_LEAD_MS"
+  echo "gateway_resume_settle_ms=$GATEWAY_RESUME_SETTLE_MS"
+  echo "udp_client_timeout_ms=$UDP_CLIENT_TIMEOUT_MS"
   echo "max_validation_secs=$MAX_VALIDATION_SECS"
   echo "run_order=$RUN_ORDER"
+  echo "latency_run_order=$LATENCY_RUN_ORDER"
+  echo "traffic_profile=$TRAFFIC_PROFILE"
+  echo "bench_subnet=$BENCH_SUBNET"
   echo "equal_load_fraction=$EQUAL_LOAD_FRACTION"
   echo "capture_docker_stats=$CAPTURE_DOCKER_STATS"
+  echo "capture_thread_stats=$CAPTURE_THREAD_STATS"
   echo "equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS"
+  echo "equal_load_http_client_tokio_workers=$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS"
   echo "equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS"
   docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
   printf '%s\n' "$container_probe" | grep -v '^detected_nproc='
@@ -232,7 +328,7 @@ else
     -e CARGO_TARGET_DIR="$TARGET_DIR" \
     "$IMAGE" \
     cargo build --locked --release
-  PROXY_BIN_HOST_PATH="$ROOT/.benchmark/ubuntu24-amd64-target/release/proxysss"
+  PROXY_BIN_HOST_PATH="$ROOT/$TARGET_REL/release/proxysss"
   PROXY_BIN_PATH="$TARGET_DIR/release/proxysss"
 fi
 
@@ -262,14 +358,19 @@ GATEWAY_CPUSET="$GATEWAY_CPUSET" \
 BACKEND_CPUSET="$BACKEND_CPUSET" \
 CLIENT_CPUSET="$CLIENT_CPUSET" \
 NGINX_WORKERS="$CPU_CORES" \
-TRAFFIC_PROFILE=balanced \
+TRAFFIC_PROFILE="$TRAFFIC_PROFILE" \
 BENCHMARK_REPETITIONS="$BENCHMARK_REPETITIONS" \
+LATENCY_REPETITIONS="$LATENCY_REPETITIONS" \
 ALLOW_UNBALANCED_REPETITIONS="$ALLOW_UNBALANCED_REPETITIONS" \
 LOAD_SCALES="$LOAD_SCALES" \
 DURATION_SECS="$DURATION_SECS" \
 SAMPLE_AFTER_SECS="$SAMPLE_AFTER_SECS" \
 CAPTURE_DOCKER_STATS="$CAPTURE_DOCKER_STATS" \
+CAPTURE_THREAD_STATS="$CAPTURE_THREAD_STATS" \
 CLIENT_START_LEAD_MS="$CLIENT_START_LEAD_MS" \
+GATEWAY_RESUME_SETTLE_MS="$GATEWAY_RESUME_SETTLE_MS" \
+UDP_CLIENT_TIMEOUT_MS="$UDP_CLIENT_TIMEOUT_MS" \
+MAX_VALIDATION_SECS="$MAX_VALIDATION_SECS" \
 HTTP_CONCURRENCY="$http_concurrency" \
 HTTPS_CONCURRENCY="$https_concurrency" \
 STATIC_LARGE_CONCURRENCY="$static_large_concurrency" \
@@ -277,8 +378,14 @@ SSE_CONCURRENCY="$sse_concurrency" \
 STREAM_CONNECTIONS="$stream_connections" \
 MIXED_SCENARIOS="$MIXED_SCENARIOS" \
 RUN_ORDER="$RUN_ORDER" \
+LATENCY_RUN_ORDER="$LATENCY_RUN_ORDER" \
+BENCH_SUBNET="$BENCH_SUBNET" \
+BACKEND_IP="$BACKEND_IP" \
+GATEWAY_IP="$GATEWAY_IP" \
+PROXYSSS_GATEWAY_IP="$PROXYSSS_GATEWAY_IP" \
 EQUAL_LOAD_FRACTION="$EQUAL_LOAD_FRACTION" \
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="$EQUAL_LOAD_CLIENT_TOKIO_WORKERS" \
+EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS" \
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS" \
 VALIDATION_TIMING_FILE="$OUTPUT_ROOT/validation-timing.txt" \
 RUN_MIXED_MATRIX=1 \
@@ -292,14 +399,20 @@ set -e
 for scale in $LOAD_SCALES; do
   source_dir="$OUTPUT_ROOT/current/runs/all-scenarios-isolated/matrix/scale-$scale"
   archive_dir="$OUTPUT_ROOT/scale-$scale"
-  test -d "$source_dir"
+  if [[ ! -d "$source_dir" ]]; then
+    echo "scale $scale did not finish before the hard deadline" >&2
+    benchmark_status=1
+    continue
+  fi
   rm -rf "$archive_dir"
   cp -a "$source_dir" "$archive_dir"
 done
 
 validation_elapsed_secs=""
+validation_wall_elapsed_secs=""
 if [[ -f "$OUTPUT_ROOT/validation-timing.txt" ]]; then
   validation_elapsed_secs="$(sed -n 's/^validation_elapsed_secs=//p' "$OUTPUT_ROOT/validation-timing.txt" | tail -1)"
+  validation_wall_elapsed_secs="$(sed -n 's/^validation_wall_elapsed_secs=//p' "$OUTPUT_ROOT/validation-timing.txt" | tail -1)"
 fi
 if ! [[ "$validation_elapsed_secs" =~ ^[0-9]+$ ]]; then
   validation_elapsed_secs=$(( $(date +%s) - VALIDATION_WALL_START_SECS ))
@@ -307,6 +420,7 @@ fi
 total_elapsed_secs=$(( $(date +%s) - FEEDBACK_START_SECS ))
 {
   echo "validation_elapsed_secs=$validation_elapsed_secs"
+  echo "validation_wall_elapsed_secs=${validation_wall_elapsed_secs:-unknown}"
   echo "total_elapsed_secs=$total_elapsed_secs"
 } | tee -a "$OUTPUT_ROOT/host-fingerprint.txt"
 if (( validation_elapsed_secs > MAX_VALIDATION_SECS )); then
@@ -318,7 +432,7 @@ if [[ "$benchmark_status" != "0" ]]; then
   exit "$benchmark_status"
 fi
 
-echo "==> all strict Ubuntu 24 x86_64 Docker scales passed in ${validation_elapsed_secs}s (build/setup total ${total_elapsed_secs}s)"
+echo "==> all strict Ubuntu 24 x86_64 Docker scales passed with ${validation_elapsed_secs}s of active measurement (matrix wall ${validation_wall_elapsed_secs:-unknown}s, build/setup total ${total_elapsed_secs}s)"
 for scale in $LOAD_SCALES; do
   echo "$OUTPUT_ROOT/scale-$scale/saturation-summary.md"
   echo "$OUTPUT_ROOT/scale-$scale/equal-load-summary.md"

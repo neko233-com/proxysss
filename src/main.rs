@@ -6,6 +6,8 @@ mod demo;
 mod filecloud;
 mod gateway;
 mod install;
+#[cfg(target_os = "linux")]
+mod linux_cpu;
 mod linux_tune;
 mod script;
 mod security;
@@ -25,6 +27,7 @@ mod verify;
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -346,7 +349,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "auto https",
-        "proxysss YAML style http.tls.auto_https expands to managed ACME HTTP-01/TLS-ALPN-01; wildcard DNS-01 uses built-in http.tls.mode=acme_managed + http.tls.acme.challenge=dns01 provider strategies",
+        "proxysss YAML style http.tls.auto_https expands to free managed ACME HTTP-01/TLS-ALPN-01 with ECDSA P-256 by default and optional RSA-2048 compatibility; wildcard DNS-01 uses built-in http.tls.mode=acme_managed + http.tls.acme.challenge=dns01 provider strategies",
     ),
     (
         "multi-cert sni",
@@ -785,11 +788,11 @@ async fn main() -> Result<()> {
         },
         Commands::Bench { protocol } => {
             init_cli_logging();
-            bench::run(protocol).await
+            run_configured_command_runtime("benchmark", bench::run(protocol)).await
         }
         Commands::Demo { kind } => {
             init_cli_logging();
-            demo::run(kind).await
+            run_configured_command_runtime("demo", demo::run(kind)).await
         }
         Commands::PrintDefaultConfig { format } => {
             match format {
@@ -990,6 +993,66 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn parse_command_runtime_workers(value: Option<&str>) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(1);
+    };
+    let workers = value.parse::<usize>().with_context(|| {
+        format!("TOKIO_WORKER_THREADS must be a positive integer, got {value:?}")
+    })?;
+    anyhow::ensure!(
+        workers > 0,
+        "TOKIO_WORKER_THREADS must be a positive integer"
+    );
+    Ok(workers)
+}
+
+async fn run_configured_command_runtime<F>(label: &'static str, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let configured = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let workers = parse_command_runtime_workers(configured.as_deref())?;
+    run_command_runtime(label, workers, future).await
+}
+
+async fn run_command_runtime<F>(label: &'static str, workers: usize, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tracing::info!(
+        runtime = label,
+        runtime_workers = workers,
+        "starting command runtime"
+    );
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name_fn(move || {
+                static COMMAND_RUNTIME_THREAD: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let index =
+                    COMMAND_RUNTIME_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("proxysss-{label}-{index}")
+            })
+            .enable_all()
+            .build()
+            .with_context(|| format!("failed building {label} runtime with {workers} workers"))?;
+        let actual_workers = runtime.metrics().num_workers();
+        anyhow::ensure!(
+            actual_workers == workers,
+            "{label} runtime worker mismatch: requested {workers}, actual {actual_workers}"
+        );
+        println!("runtime workers : {actual_workers}");
+        let task = runtime.spawn(future);
+        runtime
+            .block_on(task)
+            .with_context(|| format!("{label} runtime future panicked"))?
+    })
+    .await
+    .with_context(|| format!("{label} runtime task panicked"))?
 }
 
 fn merge_config_arg(
@@ -1282,7 +1345,7 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         config.logging.error_log_path.display()
     );
     println!(
-        "auto https        : enabled={}, mode={:?}, domains={}, production={}",
+        "auto https        : enabled={}, mode={:?}, domains={}, production={}, key_algorithm={:?}",
         config.http.tls.auto_https.enabled,
         config.http.tls.mode,
         if config.http.tls.auto_https.domains.is_empty() {
@@ -1290,7 +1353,8 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
         } else {
             config.http.tls.auto_https.domains.join(",")
         },
-        config.http.tls.auto_https.production
+        config.http.tls.auto_https.production,
+        config.http.tls.acme.key_algorithm
     );
     println!(
         "reverse proxy     : routes={}",
@@ -2444,7 +2508,70 @@ mod tests {
     fn capability_matrix_mentions_auto_https() {
         assert!(CAPABILITY_MATRIX
             .iter()
-            .any(|(name, status)| *name == "auto https" && status.contains("auto_https")));
+            .any(|(name, status)| *name == "auto https"
+                && status.contains("auto_https")
+                && status.contains("ECDSA P-256")
+                && status.contains("RSA-2048")));
+    }
+
+    #[test]
+    fn ubuntu_benchmark_uses_twenty_second_active_measurement_budget() {
+        let wrapper = include_str!("../scripts/benchmark-ubuntu24-amd64-docker.sh");
+        let runner = include_str!("../scripts/benchmark-all-scenarios-isolated.sh");
+        assert!(wrapper.contains("DURATION_SECS=\"${DURATION_SECS:-1}\""));
+        assert!(wrapper.contains("LATENCY_REPETITIONS=\"${LATENCY_REPETITIONS:-2}\""));
+        assert!(wrapper.contains("MAX_FEEDBACK_SECS:-20"));
+        assert!(wrapper.contains("UDP_CLIENT_TIMEOUT_MS=\"${UDP_CLIENT_TIMEOUT_MS:-500}\""));
+        assert!(wrapper.contains("GATEWAY_RESUME_SETTLE_MS=\"${GATEWAY_RESUME_SETTLE_MS:-1000}\""));
+        assert!(wrapper.contains("CLIENT_START_LEAD_MS=\"${CLIENT_START_LEAD_MS:-2000}\""));
+        assert!(wrapper.contains(
+            "EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}\""
+        ));
+        assert!(runner
+            .contains("EQUAL_LOAD_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}\""));
+        assert!(runner.contains(
+            "EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS=\"${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}\""
+        ));
+        assert!(include_str!("bench.rs").contains("preconnect_http1_pool"));
+        assert!(include_str!("bench.rs").contains("prewarm_http_resource"));
+        assert!(include_str!("bench.rs").contains("prewarm_sse_resource"));
+        assert!(include_str!("bench.rs").contains("udp warm-up timeout"));
+        assert!(wrapper.contains("validation_wall_elapsed_secs"));
+        assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
+        assert!(runner.contains("required_active_measurement_secs"));
+        assert!(runner.contains("BENCHMARK_REPETITIONS * 2 + LATENCY_REPETITIONS * 2"));
+        assert!(runner.contains("CLIENT_WAVE_GRACE_SECS"));
+        assert!(runner.contains("settle_resumed_gateway"));
+        assert!(runner.contains("runtime workers : $runtime_workers"));
+        assert!(!runner.contains("MATRIX_VALIDATION_DEADLINE_SECS"));
+    }
+
+    #[test]
+    fn command_runtime_worker_count_honors_benchmark_environment() {
+        assert_eq!(parse_command_runtime_workers(None).expect("default"), 1);
+        assert_eq!(
+            parse_command_runtime_workers(Some("16")).expect("configured"),
+            16
+        );
+        assert!(parse_command_runtime_workers(Some("0")).is_err());
+        assert!(parse_command_runtime_workers(Some("many")).is_err());
+    }
+
+    #[tokio::test]
+    async fn command_runtime_executes_on_named_child_runtime() {
+        run_command_runtime("bench-test", 2, async {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            anyhow::ensure!(
+                name.starts_with("proxysss-bench-test-"),
+                "unexpected runtime thread: {name}"
+            );
+            Ok(())
+        })
+        .await
+        .expect("child runtime");
     }
 
     #[test]

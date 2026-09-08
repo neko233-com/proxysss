@@ -1,2 +1,0 @@
-validation_start_secs=1784082842
-validation_elapsed_secs=49

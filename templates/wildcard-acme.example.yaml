@@ -14,6 +14,7 @@ http:
     acme:
       email: admin@example.com
       challenge: dns01
+      key_algorithm: ecdsa_p256 # Recommended; use rsa2048 only for legacy clients.
       domains: [example.com, "*.example.com"]
       directory_production: true
       renew_interval_hours: 12

@@ -1,4 +1,9 @@
 /**
+ * The built-in `Welcome to proxysss` root page is a Rust fallback, not a script API;
+ * configured user routes take precedence. / 内建欢迎页属于 Rust fallback，不属于脚本 API；用户路由优先。
+ */
+
+/**
  * JSON primitive value supported by proxysss script payloads.
  * proxysss 脚本载荷里允许出现的 JSON 基础值。
  */
