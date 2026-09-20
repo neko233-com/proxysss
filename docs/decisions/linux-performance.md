@@ -2,6 +2,16 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：大文件客户端 CPU 栈与混合资源记录
+
+采样沿用固定 f4d10e6 二进制、Ubuntu 24 amd64 Docker 和 0–5/6–11/12–23 三角色 CPU。18 波完整混合矩阵只对双方 static-large 客户端启用 perf cpu-clock 499 Hz，按共同一秒窗口过滤，全部窗口零 lost samples。观察器也消耗 client CPU，不作为网关吞吐收益或发布证据。
+
+1×/2×/4× 饱和客户端调用栈包含 net_rx_action 的采样比例，proxysss 为 31.5%/40.0%/38.9%，nginx 为 18.9%/19.2%/24.1%；recvfrom 调用链约占 90%–95%，用户态叶采样约 3%–6%。可见调用链包含读取后的 TCP ACK、veth/bridge、netfilter 与 softirq；等负载 net_rx_action 比例双方多在 25%–33%，客户端估计 CPU 时间也接近。包含关系可以重叠，不能相加或等同墙钟延迟；这些数据不能证明包数、GSO/GRO、特定连接或某个网关参数就是根因。下一步先核对每条下载连接的 TCP 计数，不能直接据此恢复已拒绝的调度/队列参数，也不能移除防火墙来制造成绩。
+
+本轮 198 个原始场景零错误，132 个等负载样本最低完成率 0.982143；大文件吞吐比 0.927/0.615/0.697，多个 HTTP/实时延迟门槛仍失败。18 秒活跃、174 秒矩阵 wall。4× cgroup current/peak：proxysss 88358912/286932992、nginx 209506304/371494912 bytes。原始 perf、kallsyms、时间窗口、CPU 栈汇总、诊断 runner 与 manifest 位于 `.benchmark/goal-client-perf-final/`。
+
+资源记录修复 010d04d 已通过 372 项 Linux 测试连续两轮及真实 taskset 检查；本轮另核对全部 198 份实际 affinity/worker 记录。大文件饱和发生器实际为 CPU 13、1 worker，旧 run-metadata 中的统一 12 worker 字段不准确。修复独立保留每波计划和执行记录，不改变负载目标、CPU 分配或网关数据路径。完整功能工件为 `.benchmark/client-resources-functional/`；功能通过与诊断采样不等于严格性能通过。
+
 ## 2026-09-21：客户端接收分块诊断，排除单一碎片化解释
 
 固定 f4d10e6 release（SHA256 `f725fed1bc646994da42cb83e85e09cbbc6241a71d7411906eaeaf6257009432`），Ubuntu 24 amd64 Docker，gateway/backend/client CPU 为 0–5/6–11/12–23。双方所有发生器通过同一 LD_PRELOAD 采集器记录共同一秒窗口内 socket 接收的长度直方图，不记录正文。采集器先通过真实 stream/datagram、EAGAIN、EOF、fd 复用与非 socket 排除检查；128 线程槽有界，198 份结果均无 overflow 或接收错误。
