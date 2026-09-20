@@ -690,6 +690,9 @@ start_client_controller() {
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" sleep infinity >/dev/null
   docker cp "$LINUX_HELPER" "$CLIENT_CONTAINER:/usr/local/bin/benchmark-helper"
+  # Normalize Windows checkout line endings before the Linux shell reads it.
+  tr -d '\r' <"$ROOT/scripts/benchmark-client-exec.sh" >"$RUN_DIR/benchmark-client-exec.sh"
+  docker cp "$RUN_DIR/benchmark-client-exec.sh" "$CLIENT_CONTAINER:/usr/local/bin/benchmark-client-exec.sh"
   docker start "$CLIENT_CONTAINER" >/dev/null
 }
 
@@ -767,14 +770,14 @@ launch_client() {
     fi
   fi
   {
-    printf 'taskset -c %q env TOKIO_WORKER_THREADS=%q proxysss bench' \
-      "$client_affinity" "$runtime_workers"
+    printf 'taskset -c %q env TOKIO_WORKER_THREADS=%q bash /usr/local/bin/benchmark-client-exec.sh %q proxysss bench' \
+      "$client_affinity" "$runtime_workers" "/tmp/proxysss-bench-results/$scenario-resources.txt"
     printf ' %q' "$@"
     # shellcheck disable=SC2016
     printf ' --start-at-unix-ms "$start_at" > %q 2>&1 &\n' "/tmp/proxysss-bench-results/$scenario.txt"
     printf 'pids+=("$!")\n'
   } >>"$WAVE_SCRIPT"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" "$runtime_workers" >>"$RUN_DIR/clients.meta"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$WAVE_CLIENT_NAME" "$scenario" "$protocol" "$target" "$concurrency" "$kind" "$phase" "$runtime_workers" "$client_affinity" >>"$RUN_DIR/clients.meta"
 }
 
 run_candidate() {
@@ -827,6 +830,7 @@ for pid in "${pids[@]}"; do
 done
 exit "$status"
 CLIENT_WAVE
+  cp "$RUN_DIR/clients.meta" "$WAVE_RESULTS_DIR/clients.meta"
 
   local role container
   for role in gateway backend client; do
@@ -852,7 +856,7 @@ CLIENT_WAVE
     docker exec -i "$CLIENT_CONTAINER" bash -s -- "$WAVE_START_AT_UNIX_MS" \
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
-  local name row_scenario protocol target concurrency gateway result_phase runtime_workers
+  local name row_scenario protocol target concurrency gateway result_phase runtime_workers client_affinity
   local stats_name="$phase-$kind-r$sample"
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
   if [[ "$CAPTURE_DOCKER_STATS" == "1" ]]; then
@@ -911,11 +915,14 @@ THREAD_TICKS
     echo "client wave $WAVE_CLIENT_NAME failed with exit $exit_code" >&2
     return 1
   fi
-  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase runtime_workers; do
+  while IFS='|' read -r name row_scenario protocol target concurrency gateway result_phase runtime_workers client_affinity; do
     local output
     output="$(<"$WAVE_RESULTS_DIR/$row_scenario.txt")"
-    if ! grep -qx "runtime workers : $runtime_workers" "$WAVE_RESULTS_DIR/$row_scenario.txt"; then
-      echo "client runtime worker mismatch for $row_scenario: expected $runtime_workers" >&2
+    if ! "$HELPER" verify-client-resources \
+      --expected-cpuset "$client_affinity" --expected-workers "$runtime_workers" \
+      --resources "$WAVE_RESULTS_DIR/$row_scenario-resources.txt" \
+      --output "$WAVE_RESULTS_DIR/$row_scenario.txt"; then
+      echo "client resource mismatch for $row_scenario" >&2
       return 1
     fi
     printf '%s\n' "$output" >"$RUN_DIR/$result_phase-$gateway-$row_scenario.txt"
@@ -1064,7 +1071,10 @@ proxysss_gateway_ip=$PROXYSSS_GATEWAY_IP
 gateway_memory=${GATEWAY_MEMORY:-unlimited}
 backend_cpuset=$BACKEND_CPUSET
 client_cpuset=$CLIENT_CPUSET
-saturation_client_tokio_workers=$CLIENT_CPU_CORES
+mixed_client_cpu_policy=disjoint-scenario-partitions
+mixed_saturation_client_tokio_workers=per-scenario-cpu-count
+isolated_saturation_client_tokio_workers=$CLIENT_CPU_CORES
+client_resource_records=per-wave-results/clients.meta-and-scenario-resources.txt
 equal_load_client_tokio_workers=$EQUAL_LOAD_CLIENT_TOKIO_WORKERS
 equal_load_http_client_tokio_workers=$EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS
 equal_load_static_large_client_tokio_workers=$EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS

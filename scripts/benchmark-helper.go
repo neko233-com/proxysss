@@ -89,6 +89,8 @@ func main() {
 		err = runServeSSE(os.Args[2:])
 	case "parse-bench":
 		err = runParseBench(os.Args[2:])
+	case "verify-client-resources":
+		err = runVerifyClientResources(os.Args[2:])
 	case "write-json-array":
 		err = runWriteJSONArray(os.Args[2:])
 	case "aggregate-bench-medians":
@@ -725,6 +727,91 @@ func renderIsolatedWSSMarkdown(summary IsolatedWSSSummary, active bool, capacity
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: benchmark-helper <subcommand> [flags]")
+}
+
+func runVerifyClientResources(args []string) error {
+	fs := flag.NewFlagSet("verify-client-resources", flag.ContinueOnError)
+	cpuset := fs.String("expected-cpuset", "", "planned generator CPU list")
+	workers := fs.Int("expected-workers", 0, "planned Tokio workers")
+	resources := fs.String("resources", "", "pre-exec kernel affinity and worker record")
+	output := fs.String("output", "", "actual generator stdout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *workers <= 0 || *resources == "" || *output == "" {
+		return errors.New("verify-client-resources requires positive workers, resources and output")
+	}
+	want, err := canonicalClientCPUSet(*cpuset)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(*resources)
+	if err != nil {
+		return err
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || (key != "allowed_cpus" && key != "runtime_workers") || fields[key] != "" || value == "" {
+			return fmt.Errorf("invalid or duplicate client resource field: %q", line)
+		}
+		fields[key] = value
+	}
+	got, err := canonicalClientCPUSet(fields["allowed_cpus"])
+	if err != nil {
+		return err
+	}
+	if got != want || fields["runtime_workers"] != strconv.Itoa(*workers) {
+		return fmt.Errorf("client resources differ: CPUs %s vs %s; workers %s vs %d", got, want, fields["runtime_workers"], *workers)
+	}
+	raw, err = os.ReadFile(*output)
+	if err != nil {
+		return err
+	}
+	matches := regexp.MustCompile(`(?m)^runtime workers\s+:\s+(\d+)\r?$`).FindAllStringSubmatch(string(raw), -1)
+	if len(matches) != 1 || matches[0][1] != strconv.Itoa(*workers) {
+		return errors.New("actual generator runtime worker count differs or is missing/duplicated")
+	}
+	return nil
+}
+
+// CPU IDs are sparse and Linux may canonicalize 12,13 as 12-13. Compare sets,
+// while bounding malformed ranges before expansion and rejecting duplicates.
+func canonicalClientCPUSet(value string) (string, error) {
+	seen := map[int]bool{}
+	for _, part := range strings.Split(value, ",") {
+		bounds := strings.Split(part, "-")
+		if len(bounds) > 2 {
+			return "", fmt.Errorf("invalid client CPU list %q", value)
+		}
+		first, err := strconv.Atoi(bounds[0])
+		if err != nil || first < 0 || first > 1_048_575 {
+			return "", fmt.Errorf("invalid client CPU list %q", value)
+		}
+		last := first
+		if len(bounds) == 2 {
+			last, err = strconv.Atoi(bounds[1])
+		}
+		if err != nil || last < first || last > 1_048_575 || last-first >= 65_536 {
+			return "", fmt.Errorf("invalid client CPU range %q", part)
+		}
+		for cpu := first; cpu <= last; cpu++ {
+			if seen[cpu] || len(seen) >= 65_536 {
+				return "", fmt.Errorf("duplicate or excessive client CPUs in %q", value)
+			}
+			seen[cpu] = true
+		}
+	}
+	ids := make([]int, 0, len(seen))
+	for cpu := range seen {
+		ids = append(ids, cpu)
+	}
+	sort.Ints(ids)
+	parts := make([]string, len(ids))
+	for i, cpu := range ids {
+		parts[i] = strconv.Itoa(cpu)
+	}
+	return strings.Join(parts, ","), nil
 }
 
 func runWriteLargeFile(args []string) error {

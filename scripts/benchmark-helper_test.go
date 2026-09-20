@@ -1,16 +1,96 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+func TestClientResourcesRejectFalseMetadata(t *testing.T) {
+	dir := t.TempDir()
+	resource, output := filepath.Join(dir, "resources.txt"), filepath.Join(dir, "output.txt")
+	for _, tc := range []struct {
+		name, planned, actual, environment, stdout string
+		valid                                      bool
+	}{
+		{"canonical-range", "12,13,23", "12-13,23", "2", "runtime workers : 2\n", true},
+		{"sparse-high-ids", "2048,4096", "4096,2048", "2", "runtime workers : 2\n", true},
+		{"container-instead-of-task", "13", "12-23", "2", "runtime workers : 2\n", false},
+		{"environment-wrong", "13", "13", "12", "runtime workers : 2\n", false},
+		{"runtime-wrong", "13", "13", "2", "runtime workers : 12\n", false},
+		{"runtime-missing", "13", "13", "2", "success : 100\n", false},
+		{"runtime-duplicate", "13", "13", "2", "runtime workers : 2\nruntime workers : 2\n", false},
+		{"resource-duplicate", "13", "13\nallowed_cpus=13", "2", "runtime workers : 2\n", false},
+		{"missing-cpus", "13", "", "2", "runtime workers : 2\n", false},
+		{"reversed", "13-12", "13", "2", "runtime workers : 2\n", false},
+		{"excessive", "0-999999999", "13", "2", "runtime workers : 2\n", false},
+		{"duplicate-cpus", "12-13,13", "12-13", "2", "runtime workers : 2\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(resource, []byte("allowed_cpus="+tc.actual+"\nruntime_workers="+tc.environment+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(output, []byte(tc.stdout), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := runVerifyClientResources([]string{"--expected-cpuset", tc.planned, "--expected-workers", "2", "--resources", resource, "--output", output})
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestClientExecRecordsActualTasksetAffinity(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux /proc and taskset required")
+	}
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allowed string
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "Cpus_allowed_list:") {
+			allowed = strings.TrimSpace(strings.TrimPrefix(line, "Cpus_allowed_list:"))
+		}
+	}
+	canonical, err := canonicalClientCPUSet(allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oneCPU := strings.Split(canonical, ",")[0]
+	_, thisFile, _, _ := runtime.Caller(0)
+	wrapper, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "benchmark-client-exec.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	script, resource, output := filepath.Join(dir, "exec.sh"), filepath.Join(dir, "resources.txt"), filepath.Join(dir, "stdout.txt")
+	if err := os.WriteFile(script, bytes.ReplaceAll(wrapper, []byte("\r\n"), []byte("\n")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("taskset", "-c", oneCPU, "env", "TOKIO_WORKER_THREADS=2", "bash", script, resource, "sh", "-c", `printf 'runtime workers : %s\n' "$TOKIO_WORKER_THREADS"`)
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper: %v: %s", err, raw)
+	}
+	if err := os.WriteFile(output, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runVerifyClientResources([]string{"--expected-cpuset", oneCPU, "--expected-workers", "2", "--resources", resource, "--output", output}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestVerifyHTTPBodyRequiresPublishedBytesAndSuccess(t *testing.T) {
 	var attempts atomic.Int32

@@ -2675,7 +2675,9 @@ mod tests {
         assert!(runner.contains("BENCHMARK_REPETITIONS * 2 + LATENCY_REPETITIONS * 2"));
         assert!(runner.contains("CLIENT_WAVE_GRACE_SECS"));
         assert!(runner.contains("settle_resumed_gateway"));
-        assert!(runner.contains("runtime workers : $runtime_workers"));
+        assert!(runner.contains("verify-client-resources"));
+        assert!(runner.contains("--expected-workers \"$runtime_workers\""));
+        assert!(runner.contains("--expected-cpuset \"$client_affinity\""));
         assert!(!runner.contains("MATRIX_VALIDATION_DEADLINE_SECS"));
     }
 

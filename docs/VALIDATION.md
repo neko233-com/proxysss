@@ -35,6 +35,8 @@ KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
 
 预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 `TOKIO_WORKER_THREADS`，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；混合负载按场景划分互不重叠的 client CPU，饱和时 worker 数等于该场景 CPU 数；只有串行 isolated-saturation 诊断使用全部 client cpuset。单场景 CPU 满载时只能说明当前发生器资源下的比较，不能断言网关容量上限。官方 fixture、解析和验收工具使用 Go 或原生编译工具。
 
+每波结果目录独立保留 `clients.meta`（最后两列为计划 worker 数与 CPU 列表）和各场景的 `*-resources.txt`。发生器在 taskset 后、exec/预热前读取真实 `/proc/self/status` affinity 与 worker 环境值；汇总还核对实际 `bench` 输出的 runtime worker 数。缺失、重复或不一致会使该波失败。`run-metadata.txt` 区分混合场景分区与串行诊断的全 client CPU，不能把容器的 12 核配额写成每个混合发生器的 12 个 worker。此记录不等于整个采样窗口的线程调度追踪。
+
 HTTP/1 每个并发 worker 使用独立、最多一个空闲连接的 client，并先完成 HEAD，确保声明的连接数真实建立且随后复用；HTTPS/H2 仍共享一个多路复用 client。HTTP 下载逐块消费并计数，不把完整大文件收进发生器内存。`bench http` 默认仅接受 2xx；`--expected-status` 可指定精确状态，`--expected-body-bytes` 校验正文长度。正式 HTTP 夹具要求 200，静态夹具还要求实际文件长度；错误页、短正文和意外长正文不能算吞吐成功。
 
 预热错过 `--start-at-unix-ms` 时整波失败，不能自行延后开始而把异步运行当作同时混合负载。双方每轮都必须完成至少 98% 的可执行目标，参考 nginx 不达标同样使比较无效。CDN 预检在测量前依次确认 v1 正文、原子发布 v2、确认双方确实返回 v2；其后测量的是更新生效后的读取吞吐，不声称是一秒内连续发布的性能。

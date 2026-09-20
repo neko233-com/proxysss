@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 修正混合压测的发生器资源元数据：每波保留实际 taskset affinity、计划与真实 Tokio worker 数并严格核对，避免把整个 client 容器配额误报为单场景资源；不改变负载目标或 CPU 分配。
+
 - 修复 UDP 新会话绕过 stream allow/deny、连接限流、DDoS 与动态黑名单；连接配额按 association 扣取，与 TCP 共享 zone，既有数据报不重复扣取。统一流拒绝统计，修复 TCP DDoS 拒绝重复计数。listener supervisor 及 HTTP/TLS/TCP 跨 runtime 包装任务增加取消所有权，防止重载撤销监听后旧 accept 任务继续持有端口。
 
 - 修复 UDP 并发建会话突破 max_associations 的问题：先预留容量，再复制首包、运行脚本或 DNS，失败和取消自动释放。退休会话唤醒等待任务，弱引用缓存不保留旧 socket；listener 停止会取消独立运行时 worker 和在途创建。满额保留活跃会话，清理扫描限频；同名同 bind 的容量/TTL/protocol 更新供新会话使用，既有会话保留原 TTL。
