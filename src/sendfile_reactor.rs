@@ -28,8 +28,6 @@ const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const REGISTRATION_BATCH: usize = 256;
 const WAKE_TOKEN: u64 = u64::MAX;
-pub(crate) const SHARED_SEND_BYTES: u64 = 1024 * 1024;
-const SHARED_ADMISSION_BATCH: usize = 32;
 
 pub(crate) struct SendfileCompletion {
     pub(crate) bytes: u64,
@@ -85,17 +83,11 @@ struct SendfileState {
     len: u64,
     max_chunk_bytes: u64,
     completion: Option<oneshot::Sender<io::Result<SendfileCompletion>>>,
-    ready: bool,
-    ready_flags: i32,
-    ready_prev: Option<RawFd>,
-    ready_next: Option<RawFd>,
 }
 
 #[derive(Default)]
 struct SendfileTable {
     slots: Vec<Option<SendfileState>>,
-    ready_head: Option<RawFd>,
-    ready_tail: Option<RawFd>,
 }
 
 impl SendfileTable {
@@ -121,61 +113,8 @@ impl SendfileTable {
     }
 
     fn remove(&mut self, fd: RawFd) -> Option<SendfileState> {
-        self.unlink_ready(fd);
         let index = usize::try_from(fd).ok()?;
         self.slots.get_mut(index)?.take()
-    }
-
-    fn enqueue_ready(&mut self, fd: RawFd, flags: i32) {
-        let tail = self.ready_tail;
-        let Some(state) = self.get_mut(fd) else {
-            return;
-        };
-        state.ready_flags |= flags;
-        if state.ready {
-            return;
-        }
-        state.ready = true;
-        state.ready_prev = tail;
-        state.ready_next = None;
-        if let Some(tail) = tail {
-            self.get_mut(tail).expect("ready tail exists").ready_next = Some(fd);
-        } else {
-            self.ready_head = Some(fd);
-        }
-        self.ready_tail = Some(fd);
-    }
-
-    fn unlink_ready(&mut self, fd: RawFd) {
-        let Some(state) = self.get_mut(fd) else {
-            return;
-        };
-        if !state.ready {
-            return;
-        }
-        let (prev, next) = (state.ready_prev.take(), state.ready_next.take());
-        state.ready = false;
-        if let Some(prev) = prev {
-            self.get_mut(prev)
-                .expect("ready predecessor exists")
-                .ready_next = next;
-        } else {
-            self.ready_head = next;
-        }
-        if let Some(next) = next {
-            self.get_mut(next)
-                .expect("ready successor exists")
-                .ready_prev = prev;
-        } else {
-            self.ready_tail = prev;
-        }
-    }
-
-    fn pop_ready(&mut self) -> Option<(RawFd, i32)> {
-        let fd = self.ready_head?;
-        self.unlink_ready(fd);
-        let flags = mem::take(&mut self.get_mut(fd).expect("ready job exists").ready_flags);
-        Some((fd, flags))
     }
 
     fn active_fds(&self) -> Vec<RawFd> {
@@ -187,98 +126,11 @@ impl SendfileTable {
     }
 }
 
-pub(crate) struct ReactorWorker {
+struct ReactorWorker {
     registrations: ArrayQueue<SendfileJob>,
     cancellations: ArrayQueue<RawFd>,
     sweep_cancelled: AtomicBool,
     wake_fd: RawFd,
-}
-
-impl ReactorWorker {
-    pub(crate) fn shared(wake_fd: RawFd) -> Arc<Self> {
-        Arc::new(Self {
-            registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
-            cancellations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
-            sweep_cancelled: AtomicBool::new(false),
-            wake_fd,
-        })
-    }
-}
-
-/// Single-owner download state driven by the realtime epoll loop. Ready jobs
-/// form an intrusive FIFO: at most one node per live job, removed in O(1) on
-/// completion/cancellation, so fd reuse cannot leave stale queue entries.
-#[derive(Default)]
-pub(crate) struct SharedDownloads {
-    jobs: SendfileTable,
-}
-
-impl SharedDownloads {
-    pub(crate) fn has_ready(&self) -> bool {
-        self.jobs.ready_head.is_some()
-    }
-
-    pub(crate) fn observe(&mut self, events: &[libc::epoll_event]) {
-        for event in events {
-            if event.u64 != WAKE_TOKEN {
-                self.jobs
-                    .enqueue_ready(event.u64 as RawFd, event.events as i32);
-            }
-        }
-    }
-
-    // Call only after the entire cached epoll batch has been consumed.
-    pub(crate) fn on_wake(&mut self, epoll_fd: RawFd, worker: &ReactorWorker) {
-        cancel_abandoned_jobs(epoll_fd, &mut self.jobs, worker);
-        for _ in 0..SHARED_ADMISSION_BATCH {
-            let Some(mut job) = worker.registrations.pop() else {
-                break;
-            };
-            job.max_chunk_bytes = SHARED_SEND_BYTES;
-            register_job_inner(epoll_fd, &mut self.jobs, job, false);
-        }
-        if !worker.registrations.is_empty() {
-            wake(worker.wake_fd);
-        }
-    }
-
-    pub(crate) fn drive_one(&mut self, epoll_fd: RawFd) {
-        let Some((fd, flags)) = self.jobs.pop_ready() else {
-            return;
-        };
-        if flags & (libc::EPOLLERR | libc::EPOLLHUP) != 0 {
-            complete_job(
-                epoll_fd,
-                &mut self.jobs,
-                fd,
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "sendfile client socket closed",
-                )),
-            );
-            return;
-        }
-        let before = self.jobs.get_mut(fd).expect("ready job exists").sent;
-        match drive_job(&mut self.jobs, fd) {
-            DriveResult::Complete(result) => complete_job(epoll_fd, &mut self.jobs, fd, result),
-            DriveResult::Pending => {
-                let state = self.jobs.get_mut(fd).expect("pending job exists");
-                // Full quantum remains runnable; real EAGAIN waits for epoll.
-                if state.sent - before >= state.max_chunk_bytes {
-                    self.jobs.enqueue_ready(fd, libc::EPOLLOUT);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn fail(&mut self, epoll_fd: RawFd, worker: &ReactorWorker) {
-        fail_all_jobs(epoll_fd, &mut self.jobs, "shared realtime epoll failed");
-        while let Some(job) = worker.registrations.pop() {
-            let _ = job
-                .completion
-                .send(Err(io::Error::other("shared realtime epoll failed")));
-        }
-    }
 }
 
 struct Reactors {
@@ -309,32 +161,6 @@ pub(crate) fn dispatch(
     active_workers: usize,
     scheduler_nice: i32,
 ) -> io::Result<PendingSendfile> {
-    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
-    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
-    let index = preferred_worker_index_limited(
-        &reactors.worker_cpus,
-        current_cpu(),
-        fallback,
-        active_workers,
-    );
-    dispatch_to_worker(
-        &reactors.workers[index],
-        socket_fd,
-        file_fd,
-        offset,
-        len,
-        max_chunk_bytes,
-    )
-}
-
-pub(crate) fn dispatch_to_worker(
-    worker: &Arc<ReactorWorker>,
-    socket_fd: RawFd,
-    file_fd: RawFd,
-    offset: u64,
-    len: u64,
-    max_chunk_bytes: u64,
-) -> io::Result<PendingSendfile> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
         let _ = sender.send(Ok(SendfileCompletion {
@@ -346,6 +172,7 @@ pub(crate) fn dispatch_to_worker(
             cancellation: None,
         });
     }
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
     let socket = duplicate_stream(socket_fd)?;
     let reactor_fd = socket.as_raw_fd();
     let file = duplicate_file(file_fd)?;
@@ -358,6 +185,15 @@ pub(crate) fn dispatch_to_worker(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
+    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
+    let current_cpu = current_cpu();
+    let index = preferred_worker_index_limited(
+        &reactors.worker_cpus,
+        current_cpu,
+        fallback,
+        active_workers,
+    );
+    let worker = &reactors.workers[index];
     worker
         .registrations
         .push(job)
@@ -570,15 +406,6 @@ fn register_pending_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &Rea
 }
 
 fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
-    register_job_inner(epoll_fd, jobs, job, true);
-}
-
-fn register_job_inner(
-    epoll_fd: RawFd,
-    jobs: &mut SendfileTable,
-    job: SendfileJob,
-    immediate: bool,
-) {
     if job.completion.is_closed() {
         return;
     }
@@ -593,17 +420,11 @@ fn register_job_inner(
             len: job.len,
             max_chunk_bytes: job.max_chunk_bytes,
             completion: Some(job.completion),
-            ready: false,
-            ready_flags: 0,
-            ready_prev: None,
-            ready_next: None,
         },
     );
-    if immediate {
-        if let DriveResult::Complete(result) = drive_job(jobs, fd) {
-            finish_unregistered_job(jobs, fd, result);
-            return;
-        }
+    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
+        finish_unregistered_job(jobs, fd, result);
+        return;
     }
 
     let mut event = libc::epoll_event {
@@ -612,8 +433,6 @@ fn register_job_inner(
     };
     if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
         finish_unregistered_job(jobs, fd, Err(io::Error::last_os_error()));
-    } else if !immediate {
-        jobs.enqueue_ready(fd, libc::EPOLLOUT);
     }
 }
 
@@ -679,14 +498,8 @@ fn cancelled_download() -> io::Error {
 }
 
 fn cancel_abandoned_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &ReactorWorker) {
-    for _ in 0..REGISTRATION_BATCH {
-        let Some(fd) = worker.cancellations.pop() else {
-            break;
-        };
+    while let Some(fd) = worker.cancellations.pop() {
         cancel_abandoned_job(epoll_fd, jobs, fd);
-    }
-    if !worker.cancellations.is_empty() {
-        wake(worker.wake_fd);
     }
     // A cancellation burst cannot grow the queue indefinitely. Only overflow
     // triggers this scan; normal completions and cancellation use indexed slots.
@@ -795,91 +608,6 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::OwnedFd;
     use std::time::Duration;
-
-    #[test]
-    fn shared_download_turns_rotate_and_cancellation_removes_ready_nodes() {
-        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        assert!(wake_fd >= 0);
-        let _wake = unsafe { OwnedFd::from_raw_fd(wake_fd) };
-        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(epoll_fd >= 0);
-        let _epoll = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
-        let worker = ReactorWorker::shared(wake_fd);
-        let mut downloads = SharedDownloads::default();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let name = CString::new("proxysss-shared-ready-test").unwrap();
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0);
-        let file = unsafe { File::from_raw_fd(fd) };
-        file.set_len(4 * SHARED_SEND_BYTES).unwrap();
-        let mut clients = Vec::new();
-        let mut pending = Vec::new();
-        let mut fds = Vec::new();
-        for _ in 0..3 {
-            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (server, _) = listener.accept().unwrap();
-            let future = dispatch_to_worker(
-                &worker,
-                server.as_raw_fd(),
-                file.as_raw_fd(),
-                0,
-                4 * SHARED_SEND_BYTES,
-                4 * SHARED_SEND_BYTES,
-            )
-            .unwrap();
-            fds.push(future.cancellation.as_ref().unwrap().1);
-            pending.push(future);
-            clients.push(client);
-        }
-        // Old HUP entries must be consumed before registering new jobs.
-        downloads.observe(&[libc::epoll_event {
-            events: libc::EPOLLHUP as u32,
-            u64: fds[0] as u64,
-        }]);
-        downloads.on_wake(epoll_fd, &worker);
-        for _ in 0..8 {
-            downloads.observe(
-                &fds.iter()
-                    .map(|&fd| libc::epoll_event {
-                        events: libc::EPOLLOUT as u32,
-                        u64: fd as u64,
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        }
-        downloads.drive_one(epoll_fd);
-        let first = downloads.jobs.get_mut(fds[0]).unwrap().sent;
-        assert!(first > 0 && first <= SHARED_SEND_BYTES);
-        assert_eq!(downloads.jobs.get_mut(fds[1]).unwrap().sent, 0);
-        downloads.drive_one(epoll_fd);
-        assert!(downloads.jobs.get_mut(fds[1]).unwrap().sent > 0);
-        assert_eq!(downloads.jobs.get_mut(fds[0]).unwrap().sent, first);
-        // Remove middle/head/tail nodes while readiness is duplicated/queued.
-        drop(pending.remove(1));
-        downloads.on_wake(epoll_fd, &worker);
-        assert!(!downloads.jobs.contains(fds[1]));
-        let mut queued = Vec::new();
-        while let Some((fd, _)) = downloads.jobs.pop_ready() {
-            queued.push(fd);
-        }
-        let unique: std::collections::HashSet<_> = queued.iter().copied().collect();
-        assert_eq!(unique.len(), queued.len());
-        assert!(!unique.contains(&fds[1]));
-        for fd in [fds[0], fds[2]] {
-            downloads.jobs.enqueue_ready(fd, libc::EPOLLOUT);
-        }
-        let mut state = downloads.jobs.remove(fds[0]).unwrap();
-        state.ready_flags = 0;
-        downloads.jobs.insert(fds[0], state);
-        downloads.jobs.enqueue_ready(fds[0], libc::EPOLLOUT);
-        assert_eq!(downloads.jobs.pop_ready().unwrap().0, fds[2]);
-        assert_eq!(downloads.jobs.pop_ready().unwrap().0, fds[0]);
-        assert!(downloads.jobs.pop_ready().is_none());
-        drop(pending);
-        downloads.on_wake(epoll_fd, &worker);
-        assert!(downloads.jobs.active_fds().is_empty());
-        assert!(!downloads.has_ready());
-    }
 
     #[test]
     fn admission_ignores_cached_hup_for_reused_descriptor_and_bounds_queued_work() {
@@ -1046,10 +774,6 @@ mod tests {
                     len: 1,
                     max_chunk_bytes: 1,
                     completion: Some(completion),
-                    ready: false,
-                    ready_flags: 0,
-                    ready_prev: None,
-                    ready_next: None,
                 },
             );
             pending.push(PendingSendfile {
@@ -1214,10 +938,6 @@ mod tests {
                 len: 1,
                 max_chunk_bytes: 1,
                 completion: Some(completion),
-                ready: false,
-                ready_flags: 0,
-                ready_prev: None,
-                ready_next: None,
             },
         );
         assert!(jobs.contains(fd));

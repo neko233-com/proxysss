@@ -218,7 +218,7 @@ func run() (runErr error) {
 			return fmt.Errorf("%s relay corrupted payload", pair[0])
 		}
 	}
-	// Balanced native owners are prewarmed for both realtime and downloads.
+	// Native owners start lazily after the first successful TCP exchange.
 	maskSet := map[int]bool{}
 	for _, cpu := range launch {
 		maskSet[cpu] = true
@@ -264,11 +264,11 @@ func run() (runErr error) {
 				sendfile++
 			}
 		}
-		if len(httpShards) == workers && realtime == workers && sendfile == 0 {
+		if len(httpShards) == workers && realtime == workers && sendfile == workers {
 			break
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("owner count expected=%d HTTP=%d shared-realtime-download=%d standalone-sendfile=%d", workers, len(httpShards), realtime, sendfile)
+			return fmt.Errorf("owner count expected=%d HTTP=%d realtime=%d sendfile=%d", workers, len(httpShards), realtime, sendfile)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -277,7 +277,7 @@ func run() (runErr error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	fmt.Printf("Linux CPU confinement passed: taskset=%s base_workers=%d HTTP=%v shared-realtime-download=%d standalone-sendfile=%d checked_threads=%d; HTTP/TCP/UDP payloads passed\n", mask, workers, names, realtime, sendfile, checked)
+	fmt.Printf("Linux CPU confinement passed: taskset=%s base_workers=%d HTTP=%v realtime=%d sendfile=%d checked_threads=%d; HTTP/TCP/UDP payloads passed\n", mask, workers, names, realtime, sendfile, checked)
 	fmt.Printf("%s", report)
 	return nil
 }

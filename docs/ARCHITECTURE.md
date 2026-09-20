@@ -89,14 +89,12 @@ MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
 | small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
-| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 按数据核预算建立 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 大文件 sendfile 与实时流共用预热的 native owner，HTTP 等待完成 |
+| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 按数据核预算建立 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
 balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
 
-balanced 大于等于 8 MiB 的完整明文静态响应交给共享 TCP/WebSocket 的 native owner，不另建 sendfile 线程池。监听前预热 owner；下载轮询分配到各 owner，每轮先处理已返回的实时事件，再推进一个下载、最多发送 1 MiB。就绪下载使用作业内嵌链表轮转，每个活跃作业最多一个节点；重复 readiness 不追加节点，取消或完成立即摘除，fd 复用不会留下旧队列项。预算用完仍可写的作业排到队尾；EAGAIN 保存进度并等待内核就绪。接收队列满时退回 HTTP Tokio readiness，每 1 MiB 主动让出。
-
-独立文件描述符从有界池借还；静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 HTTP owner，避免重复 syscall。small 保留直接发送和压力切片，bulk 保留独立 sendfile reactor。共享 owner 的字节预算约束单轮发送量，不承诺磁盘 page fault 的最长阻塞时间；生产资源应按实际工作集预热并完成混合验证。
+balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 
 明文 HTTP I/O event interval 为 8，shared-small 为 16，global queue interval 为 31。H2 每连接用本地 FuturesUnordered 驱动流，每个完成流后让出。静态 freshness 为 2 秒，nice-10 控制运行时重验证并原子发布快照。改变策略前阅读 [性能决策](decisions/linux-performance.md)，验证方法见 [验证流程](VALIDATION.md)。
 
@@ -134,7 +132,7 @@ HTTP 上游等待采用连接/响应头期限与逐帧正文空闲期限，持�
 
 HTTP/2 的快速路径仅处理已经结束的入站正文，不能仅凭 GET 或缺少 Content-Length 推断无正文。HTTP/3 每个请求流独立驱动，慢上传/下载不会串行阻塞同连接其他请求；逐帧发送保持 QUIC 背压并保留响应 trailers，正文生产失败会重置流而非发送正常 FIN。HTTP/3 使用与其他 HTTP 路径相同的访问日志和错误装饰。入站正文具有单请求大小与空闲期限，失败正文不会进入业务分发；当前入站正文仍按请求缓冲，不宣称已实现大上传零拷贝。
 
-Linux native TCP/WebSocket 与 sendfile owner 先消费完整个 epoll_wait 返回批次，再安装待接收的连接/下载，避免当前批次中的旧 ERR/HUP 作用于复用 fd 的新任务。实时连接和独立 sendfile 每轮最多安装 256 个，共享 owner 每轮最多安装 32 个下载；剩余队列通过 eventfd 唤醒下一轮。取消队列每轮最多消费 256 项，溢出时才扫描已放弃作业。这些边界不减少 CPU 自适应 owner 数，下载发送遵守上述轮转和背压。依据 [Linux epoll 事件缓存说明](https://www.man7.org/linux/man-pages/man7/epoll.7.html)；不能仅因 EPOLL_CTL_DEL 已调用，就假定用户态已取回的事件也被删除。
+Linux native TCP/WebSocket 与 sendfile owner 先消费完整个 epoll_wait 返回批次，再安装待接收的连接/下载，避免当前批次中的旧 ERR/HUP 作用于复用 fd 的新任务。每轮最多安装 256 个任务，有剩余则通过 eventfd 唤醒下一轮，已有流量先获得 I/O 处理机会；该边界只限制接收队列，不减少 CPU 自适应 owner 数，也不改变既有数据发送预算或背压。依据 [Linux epoll 事件缓存说明](https://www.man7.org/linux/man-pages/man7/epoll.7.html)；不能仅因 EPOLL_CTL_DEL 已调用，就假定用户态已取回的事件也被删除。
 
 原始 HTTP 上游空闲池给每个 Tokio socket 记录所属 runtime ID。checkout 在同一 runtime 内保持直接复用；跨 runtime（包括控制面预热转入数据面、不同 HTTP shard 之间复用）时先解除旧 reactor 注册，使用非阻塞 peek 排除已关闭或带残留数据的连接，再把同一 TCP 连接注册到当前 reactor。避免 socket 移动后仍依赖旧运行时唤醒；不额外预拨连接、不改变池容量，也不把每次普通转发变成重连。
 
