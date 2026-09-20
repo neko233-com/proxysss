@@ -513,8 +513,8 @@ func TestAllScenariosEqualLoadGateRequiresTargetCompletion(t *testing.T) {
 	nginxP50, nginxP95, nginxP99 := 2.0, 4.0, 8.0
 	proxyP50, proxyP95, proxyP99 := 1.0, 3.0, 7.0
 	rows := []BenchRow{
-		{Scenario: "tcp", Gateway: "nginx", Protocol: "tcp", OpsPerSec: 99, TargetOpsPerSec: &target, LatencyP50MS: &nginxP50, LatencyP95MS: &nginxP95, LatencyP99MS: &nginxP99},
-		{Scenario: "tcp", Gateway: "proxysss", Protocol: "tcp", OpsPerSec: 99, TargetOpsPerSec: &target, LatencyP50MS: &proxyP50, LatencyP95MS: &proxyP95, LatencyP99MS: &proxyP99},
+		{Scenario: "tcp", Gateway: "nginx", Protocol: "tcp", DurationSecs: 1, Concurrency: 1, Success: 99, OpsPerSec: 99, TargetOpsPerSec: &target, LatencyP50MS: &nginxP50, LatencyP95MS: &nginxP95, LatencyP99MS: &nginxP99},
+		{Scenario: "tcp", Gateway: "proxysss", Protocol: "tcp", DurationSecs: 1, Concurrency: 1, Success: 99, OpsPerSec: 99, TargetOpsPerSec: &target, LatencyP50MS: &proxyP50, LatencyP95MS: &proxyP95, LatencyP99MS: &proxyP99},
 	}
 	writeBenchRows(t, results, rows)
 	args := []string{
@@ -532,12 +532,15 @@ func TestAllScenariosEqualLoadGateRequiresTargetCompletion(t *testing.T) {
 		t.Fatalf("99%% fixed-load completion should pass: %v", err)
 	}
 	rows[0].OpsPerSec = 97
+	rows[0].Success = 97
 	writeBenchRows(t, results, rows)
 	if err := runWriteAllScenariosSummary(args); err == nil || !strings.Contains(err.Error(), "nginx target achievement") {
 		t.Fatalf("reference under-completion invalidates the equal-load comparison: %v", err)
 	}
 	rows[0].OpsPerSec = 99
 	rows[1].OpsPerSec = 97
+	rows[0].Success = 99
+	rows[1].Success = 97
 	writeBenchRows(t, results, rows)
 	if err := runWriteAllScenariosSummary(args); err == nil || !strings.Contains(err.Error(), "target achievement") {
 		t.Fatalf("97%% fixed-load completion should fail, got %v", err)
@@ -553,6 +556,145 @@ func TestStrictOpsGateRequiresRatioAboveFloor(t *testing.T) {
 	}
 	if ratioGateFailed(1.0, 1.0, false) {
 		t.Fatal("non-strict gate keeps legacy equality behavior")
+	}
+}
+
+func equalLoadRepeatedRows() []BenchRow {
+	var rows []BenchRow
+	// Reverse candidate order in the second wave, as the real matrix does.
+	for _, gateway := range []string{"nginx", "proxysss", "proxysss", "nginx"} {
+		rows = append(rows, BenchRow{Scenario: "qcp-transparent", Gateway: gateway,
+			Protocol: "udp", Concurrency: 24, DurationSecs: 1, Success: 1056,
+			OpsPerSec: 1056, TargetOpsPerSec: floatPointer(1056),
+			LatencyP50MS: floatPointer(1), LatencyP95MS: floatPointer(2), LatencyP99MS: floatPointer(3)})
+	}
+	return rows
+}
+
+func TestRepeatedCompletionSurvivesSerializationAndMedianAggregation(t *testing.T) {
+	for _, failedIndex := range []int{-1, 0, 1, 2, 3} {
+		t.Run(fmt.Sprint(failedIndex), func(t *testing.T) {
+			dir := t.TempDir()
+			rows := equalLoadRepeatedRows()
+			if failedIndex >= 0 {
+				// The real failing sample: 1032/1056=.97727; averaging with
+				// 1056/1056 used to produce .98864 and falsely pass the gate.
+				rows[failedIndex].Success, rows[failedIndex].OpsPerSec = 1032, 1032
+			}
+			raw := filepath.Join(dir, "raw.jsonl")
+			var input strings.Builder
+			for _, row := range rows {
+				data, err := json.Marshal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				input.Write(data)
+				input.WriteByte('\n')
+			}
+			if err := os.WriteFile(raw, []byte(input.String()), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			results := filepath.Join(dir, "results.json")
+			if err := runAggregateBenchMedians([]string{"--in", raw, "--out", results}); err != nil {
+				t.Fatal(err)
+			}
+			aggregated, err := loadResults(results)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range aggregated {
+				if row.SampleCount != 2 || row.WorstTargetAchievement == nil {
+					t.Fatalf("missing per-sample evidence: %+v", row)
+				}
+				if failedIndex >= 0 && row.Gateway == rows[failedIndex].Gateway {
+					if row.OpsPerSec != 1044 || row.LatencyP99MS == nil || *row.LatencyP99MS != 3 || *row.WorstTargetAchievement != 1032.0/1056 || row.WorstTargetSample != 1+failedIndex/2 {
+						t.Fatalf("median or worst-sample evidence changed: %+v", row)
+					}
+				}
+			}
+			md, html := filepath.Join(dir, "report.md"), filepath.Join(dir, "report.html")
+			err = runWriteAllScenariosSummary([]string{"--results", results, "--md", md, "--html", html,
+				"--gate-ops=false", "--gate-latency=false", "--min-target-achievement=.98", "--samples-per-gateway=2"})
+			if failedIndex < 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), rows[failedIndex].Gateway+" target achievement") || !strings.Contains(err.Error(), fmt.Sprintf("worst sample=%d/2", 1+failedIndex/2)) {
+				t.Fatalf("single failed repetition must fail: %v", err)
+			}
+			for _, path := range []string{md, html} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(data), "0.977x") {
+					t.Fatalf("%s concealed worst completion: %s", path, data)
+				}
+			}
+		})
+	}
+}
+
+func TestFixedLoadEvidenceRejectsMissingSamplesAndUnequalTargets(t *testing.T) {
+	for _, name := range []string{"missing repetition", "unequal gateways", "missing worst completion", "invalid worst sample", "empty report"} {
+		t.Run(name, func(t *testing.T) {
+			rows := equalLoadRepeatedRows()
+			if name == "missing repetition" {
+				rows = rows[:3]
+			}
+			if name == "unequal gateways" {
+				rows[0].TargetOpsPerSec = floatPointer(1057)
+				rows[3].TargetOpsPerSec = floatPointer(1057)
+			}
+			aggregated, err := aggregateBenchRowMedians(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "missing worst completion" {
+				aggregated[0].WorstTargetAchievement = nil
+			}
+			if name == "invalid worst sample" {
+				aggregated[0].WorstTargetSample = 3
+			}
+			if name == "empty report" {
+				aggregated = nil
+			}
+			dir := t.TempDir()
+			results := filepath.Join(dir, "results.json")
+			writeBenchRows(t, results, aggregated)
+			if err := runWriteAllScenariosSummary([]string{"--results", results, "--md", filepath.Join(dir, "report.md"), "--html", filepath.Join(dir, "report.html"), "--gate-ops=false", "--gate-latency=false", "--min-target-achievement=.98", "--samples-per-gateway=2"}); err == nil {
+				t.Fatal("invalid evidence passed")
+			}
+		})
+	}
+}
+
+func TestAggregationRejectsIncompatibleOrReaggregatedSamples(t *testing.T) {
+	for _, field := range []string{"target", "partial target", "protocol", "concurrency", "duration", "ops", "sample count"} {
+		t.Run(field, func(t *testing.T) {
+			rows := equalLoadRepeatedRows()
+			switch field {
+			case "target":
+				rows[3].TargetOpsPerSec = floatPointer(1057)
+			case "partial target":
+				rows[3].TargetOpsPerSec = nil
+			case "protocol":
+				rows[3].Protocol = "tcp"
+			case "concurrency":
+				rows[3].Concurrency = 25
+			case "duration":
+				rows[3].DurationSecs = 2
+			case "ops":
+				rows[3].OpsPerSec = 1057
+			case "sample count":
+				rows[3].SampleCount = 2
+			}
+			if _, err := aggregateBenchRowMedians(rows); err == nil {
+				t.Fatal("inconsistent raw samples accepted")
+			}
+		})
 	}
 }
 

@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 修复混合性能报告用中位吞吐掩盖单轮完成率不足的问题：保留最低完成率及轮次，检查样本数量、参数与双方目标一致性；吞吐和延迟仍取中位数。HTML/Markdown 显示最低完成率，Go 报告器回归纳入本地 Ubuntu 功能入口。
+
 - 修复缓存静态/sendfile、原始反代、SSE、WS/WSS 快速路径漏记 HTTP 请求，以及分发异常重复累加错误的问题；握手在长连接存活期间即可观测，消息不计作 HTTP 请求。JSON/Prometheus 统一对网关生成和上游返回的 4xx/5xx 响应计数，真实 HTTP/1、TLS/H2/H3、WebSocket 收发与回退纳入回归。
 
 - Linux 数据面统一记录启动 affinity 与 quota 预算，不再用 cgroup CPU 列表覆盖 taskset 限制；HTTP/TCP/UDP、TLS 与 native owner 共享预算。动态亲和位图支持 CPU ID 超过 1023，诊断输出区分控制运行时和数据核预算；真实受限进程的 HTTP/TCP/UDP 收发、线程范围与 owner 数量纳入 Docker 功能验证。

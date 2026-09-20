@@ -14,6 +14,8 @@ Linux/macOS 使用 `scripts/verify-docker-scenarios.sh`。脚本探测 Ubuntu 24
 
 CPU 功能探针 `scripts/verify-linux-cpu/main.go` 随 Docker 功能检查运行：用 taskset 收窄真实网关的 CPU 范围，验证 HTTP/TCP/UDP 正文、所有线程 affinity，以及 HTTP/native relay/sendfile owner 数量。单独在带 CPU quota 的容器中可使用 `go run scripts/verify-linux-cpu/main.go --binary <Linux二进制> --expected-workers <预算>` 断言 quota 生效；这是功能检查，不是性能胜出证据。检查结果保存为 cpu-confinement.txt。
 
+同一入口也运行 `scripts/benchmark-helper_test.go`，保护性能报告、原始样本汇总和门槛判定；这些 Go 验证只在本地执行，不加入 GitHub Actions。
+
 下载验收包括 GET/HEAD、单段/多段 Range、后缀与开放区间、重叠合并、越界、条件响应、鉴权顺序、超大文件局部读取和截断错误。协议测试应穿过真实监听器，覆盖 HTTP/1.1、HTTP/2 与 TLS。长连接检查双向背压、半关闭、断连清理、超时、重载和 UDP association 上限。现有套件不等于任意第三方客户端、真实云 DNS/ACME 或所有故障组合已验收。
 
 ## 2. Linux 混合性能
@@ -44,6 +46,8 @@ HTTP/1 每个并发 worker 使用独立、最多一个空闲连接的 client，�
 ARM Docker 上的 amd64 模拟必须记为 `emulated-amd64`；通过原生 Zig 交叉构建、在目标容器执行后测量。Docker Desktop 的 native-amd64 代表 Linux VM 中原生指令执行，不代表独立物理机。
 
 WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websocket --hold-connections 输出 hold ready 后，控制器才开始等待并采集连接存活期间的 cgroup current/peak；结束时逐条真实 echo，要求 retained 等于 requested 且 hold failures 为 0。只统计曾经 opened、只持有 socket 句柄或在客户端退出后采样，均不能证明容量。nginx 测试 idle timeout 必须长于持有期；活跃 WSS 的共同开始时间只能在所有连接完成 warm-up echo 后发布。Docker 客户端和后端显式按声明 CPU 配额设置 TOKIO_WORKER_THREADS；汇总拒绝缺少存活/内存字段的旧报告，且逐轮限制 current、peak、每连接成本不超过 nginx 的 2 倍。WSS 等负载目标只统计测量窗口内、距结束至少 5 ms 的完整 tick；例如 4096 连接、5 秒、300000 us 间隔的目标是 65536 次，而非无限时长速率乘窗口。CLI 显示可执行 target ops/sec，汇总要求双方目标相同且每轮完成至少 98%；没有完整 tick 的计划不能作为延迟证据。等待 tick、收发及重连都在测量截止时间停止，不把超时后的完成计入吞吐。容量矩阵默认在持有期一半时采在线内存。
+
+重复样本的吞吐和延迟取中位数，错误取最大值，**完成率取最差单轮**。汇总 JSON 保留 `sample_count`、`worst_target_achievement` 与 `worst_target_sample`；Markdown/HTML 显示最低完成率，错误指出最差轮次。完成率由该轮成功次数、测量时长和可执行目标计算，不用四舍五入后的中位吞吐替代。样本数量须符合声明，重复中的协议/并发/时长/目标一致，两边目标也须一致；缺失轮次、缺失最低完成率或已汇总数据再次聚合均不能作为通过证据。例：1032/1056 与 1056/1056 必须按 97.73% 失败，不能按两轮平均的 98.86% 通过。修复报告后重算保留的原始样本不等于重新运行性能测试。
 
 ## 3. Windows 功能验收
 

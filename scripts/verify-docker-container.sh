@@ -20,6 +20,7 @@ printf 'verification container OS: %s %s %s\n' "$ID" "$VERSION_ID" "$(uname -m)"
 bash -n /work/scripts/verify-docker-scenarios.sh /work/scripts/verify-docker-container.sh
 go run /work/scripts/verify-docs.go
 go test /work/scripts/verify-docs.go /work/scripts/verify-docs_test.go
+go test /work/scripts/benchmark-helper.go /work/scripts/benchmark-helper_test.go
 # The reused benchmark image has a minimal Rust toolchain. Install only missing
 # check components in this disposable container; no extra containers or images.
 if ! cargo fmt --version >/dev/null 2>&1 || ! cargo clippy --version >/dev/null 2>&1; then

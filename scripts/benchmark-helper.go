@@ -29,22 +29,25 @@ const (
 )
 
 type BenchRow struct {
-	Scenario        string   `json:"scenario,omitempty"`
-	Gateway         string   `json:"gateway,omitempty"`
-	Name            string   `json:"name"`
-	Protocol        string   `json:"protocol,omitempty"`
-	Target          string   `json:"target,omitempty"`
-	URL             string   `json:"url,omitempty"`
-	Concurrency     int      `json:"concurrency"`
-	DurationSecs    int      `json:"duration_secs"`
-	Success         int      `json:"success"`
-	Errors          int      `json:"errors"`
-	OpsPerSec       float64  `json:"ops_per_sec"`
-	ThroughputMiBS  float64  `json:"throughput_mib_s"`
-	TargetOpsPerSec *float64 `json:"target_ops_per_sec,omitempty"`
-	LatencyP50MS    *float64 `json:"latency_p50_ms"`
-	LatencyP95MS    *float64 `json:"latency_p95_ms"`
-	LatencyP99MS    *float64 `json:"latency_p99_ms"`
+	Scenario               string   `json:"scenario,omitempty"`
+	Gateway                string   `json:"gateway,omitempty"`
+	Name                   string   `json:"name"`
+	Protocol               string   `json:"protocol,omitempty"`
+	Target                 string   `json:"target,omitempty"`
+	URL                    string   `json:"url,omitempty"`
+	Concurrency            int      `json:"concurrency"`
+	DurationSecs           int      `json:"duration_secs"`
+	Success                int      `json:"success"`
+	Errors                 int      `json:"errors"`
+	OpsPerSec              float64  `json:"ops_per_sec"`
+	ThroughputMiBS         float64  `json:"throughput_mib_s"`
+	TargetOpsPerSec        *float64 `json:"target_ops_per_sec,omitempty"`
+	LatencyP50MS           *float64 `json:"latency_p50_ms"`
+	LatencyP95MS           *float64 `json:"latency_p95_ms"`
+	LatencyP99MS           *float64 `json:"latency_p99_ms"`
+	SampleCount            int      `json:"sample_count,omitempty"`
+	WorstTargetAchievement *float64 `json:"worst_target_achievement,omitempty"`
+	WorstTargetSample      int      `json:"worst_target_sample,omitempty"`
 }
 
 type SimpleBaseline struct {
@@ -950,7 +953,8 @@ func runWriteJSONArray(args []string) error {
 // runAggregateBenchMedians turns repeated, interleaved samples into one row
 // per scenario/gateway. Throughput and percentiles use medians so a one-off
 // scheduler tick cannot decide a release; errors use the maximum so a flaky
-// repetition can never be hidden by aggregation.
+// repetition can never be hidden by aggregation. Fixed-load completion keeps
+// the minimum individual completion, never the ratio of median throughput.
 func runAggregateBenchMedians(args []string) error {
 	fs := flag.NewFlagSet("aggregate-bench-medians", flag.ContinueOnError)
 	inPath := fs.String("in", "", "repeated jsonl input path")
@@ -985,6 +989,9 @@ func aggregateBenchRowMedians(rows []BenchRow) ([]BenchRow, error) {
 		if row.Scenario == "" || row.Gateway == "" {
 			return nil, errors.New("median aggregation requires scenario and gateway on every row")
 		}
+		if row.SampleCount != 0 || row.WorstTargetAchievement != nil || row.WorstTargetSample != 0 {
+			return nil, errors.New("median aggregation requires raw samples, not already aggregated rows")
+		}
 		k := key{row.Scenario, row.Gateway}
 		groups[k] = append(groups[k], row)
 	}
@@ -1005,12 +1012,32 @@ func aggregateBenchRowMedians(rows []BenchRow) ([]BenchRow, error) {
 	for _, k := range keys {
 		samples := groups[k]
 		row := samples[0]
+		row.SampleCount = len(samples)
+		row.WorstTargetAchievement = nil
+		row.WorstTargetSample = 0
 		ops := make([]float64, 0, len(samples))
 		throughput := make([]float64, 0, len(samples))
 		success := make([]float64, 0, len(samples))
 		var targets, p50s, p95s, p99s []float64
 		row.Errors = 0
-		for _, sample := range samples {
+		for index, sample := range samples {
+			if sample.Protocol != row.Protocol || sample.Concurrency != row.Concurrency || sample.DurationSecs != row.DurationSecs {
+				return nil, fmt.Errorf("%s %s sample %d has inconsistent protocol/concurrency/duration", k.scenario, k.gateway, index+1)
+			}
+			if (sample.TargetOpsPerSec == nil) != (row.TargetOpsPerSec == nil) ||
+				(sample.TargetOpsPerSec != nil && *sample.TargetOpsPerSec != *row.TargetOpsPerSec) {
+				return nil, fmt.Errorf("%s %s sample %d has a different fixed offered-load target", k.scenario, k.gateway, index+1)
+			}
+			if sample.TargetOpsPerSec != nil {
+				achievement, err := fixedLoadAchievement(sample)
+				if err != nil {
+					return nil, fmt.Errorf("%s %s sample %d: %w", k.scenario, k.gateway, index+1, err)
+				}
+				if row.WorstTargetAchievement == nil || achievement < *row.WorstTargetAchievement {
+					row.WorstTargetAchievement = &achievement
+					row.WorstTargetSample = index + 1
+				}
+			}
 			ops = append(ops, sample.OpsPerSec)
 			throughput = append(throughput, sample.ThroughputMiBS)
 			success = append(success, float64(sample.Success))
@@ -1233,10 +1260,19 @@ func runWriteAllScenariosSummary(args []string) error {
 	}
 	criticalSet := makeSet(*criticalScenarios)
 	diagnosticSet := makeSet(*diagnosticScenarios)
+	if len(rows) == 0 || *samplesPerGateway < 1 {
+		return errors.New("scenario summary requires rows and a positive sample count")
+	}
 	byScenario := map[string]map[string]BenchRow{}
 	for _, row := range rows {
+		if row.Scenario == "" || (row.Gateway != "proxysss" && row.Gateway != "nginx") {
+			return errors.New("scenario summary requires named scenarios and known gateways")
+		}
 		if byScenario[row.Scenario] == nil {
 			byScenario[row.Scenario] = map[string]BenchRow{}
+		}
+		if _, exists := byScenario[row.Scenario][row.Gateway]; exists {
+			return errors.New("scenario summary requires one aggregated row per scenario/gateway")
 		}
 		byScenario[row.Scenario][row.Gateway] = row
 	}
@@ -1250,6 +1286,16 @@ func runWriteAllScenariosSummary(args []string) error {
 		protocol := proxy.Protocol
 		if protocol == "" {
 			protocol = nginx.Protocol
+		}
+		for _, gateway := range []string{"proxysss", "nginx"} {
+			row, exists := gateways[gateway]
+			count := row.SampleCount
+			if count == 0 {
+				count = 1
+			}
+			if !exists || count != *samplesPerGateway || *samplesPerGateway < 1 {
+				errorFailures = append(errorFailures, fmt.Sprintf("%s %s sample count %d != declared %d or gateway missing", scenario, gateway, count, *samplesPerGateway))
+			}
 		}
 		if *requireZeroErrors {
 			if proxy.Errors > 0 || nginx.Errors > 0 {
@@ -1276,17 +1322,24 @@ func runWriteAllScenariosSummary(args []string) error {
 			}
 		}
 		if *minTargetAchievement > 0 {
+			if proxy.TargetOpsPerSec != nil && nginx.TargetOpsPerSec != nil && *proxy.TargetOpsPerSec != *nginx.TargetOpsPerSec {
+				targetFailures = append(targetFailures, fmt.Sprintf("%s gateways have different fixed offered-load targets", scenario))
+			}
 			for _, gateway := range []string{"proxysss", "nginx"} {
 				row := gateways[gateway]
-				if row.TargetOpsPerSec == nil || *row.TargetOpsPerSec <= 0 {
-					targetFailures = append(targetFailures, fmt.Sprintf("%s %s missing fixed offered-load target", scenario, gateway))
+				count := row.SampleCount
+				if count == 0 {
+					count = 1
+				}
+				achievement, err := fixedLoadAchievement(row)
+				if err != nil {
+					targetFailures = append(targetFailures, fmt.Sprintf("%s %s: %v", scenario, gateway, err))
 					continue
 				}
-				achievement := row.OpsPerSec / *row.TargetOpsPerSec
 				if achievement < *minTargetAchievement {
 					message := fmt.Sprintf(
-						"%s %s target achievement %.3f < %.3f (actual=%.2f target=%.2f)",
-						scenario, gateway, achievement, *minTargetAchievement, row.OpsPerSec, *row.TargetOpsPerSec,
+						"%s %s target achievement %.6f < %.3f (worst sample=%d/%d target=%.2f)",
+						scenario, gateway, achievement, *minTargetAchievement, max(row.WorstTargetSample, 1), count, *row.TargetOpsPerSec,
 					)
 					targetFailures = append(targetFailures, message)
 				}
@@ -1300,7 +1353,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		"",
 		fmt.Sprintf("- Matrix mode: `%s`", ternary(*mixedMatrix, "mixed concurrent", "serial diagnostic")),
 		fmt.Sprintf("- Measurement phase: `%s`", *phase),
-		fmt.Sprintf("- Interleaved samples per gateway: `%d` (median metrics, maximum observed errors)", *samplesPerGateway),
+		fmt.Sprintf("- Interleaved samples per gateway: `%d` (median throughput/latency, maximum errors, minimum per-sample completion)", *samplesPerGateway),
 		fmt.Sprintf("- Detected CPU cores: `%s`", *cpuCores),
 		fmt.Sprintf("- Runtime traffic profile: `%s`", *trafficProfile),
 		fmt.Sprintf("- Auto concurrency: HTTP `%s`, HTTPS `%s`, static-large `%s`, SSE `%s`, TCP/UDP/WebSocket `%s`", *httpConcurrency, *httpsConcurrency, *staticLargeConcurrency, *sseConcurrency, *streamConnections),
@@ -1318,7 +1371,7 @@ func runWriteAllScenariosSummary(args []string) error {
 		fmt.Sprintf("- Zero-error gate: `%t`", *requireZeroErrors),
 		fmt.Sprintf("- Result file: `%s`", *resultsPath),
 		"",
-		"| Scenario | proxysss ops/s | nginx ops/s | Ops ratio | Ops improvement | Target ops/s | proxy completion | nginx completion | p50 ratio | p50 improvement | p95 ratio | p95 improvement | p99 ratio | p99 improvement | Errors |",
+		"| Scenario | proxysss ops/s | nginx ops/s | Ops ratio | Ops improvement | Target ops/s | proxy min completion | nginx min completion | p50 ratio | p50 improvement | p95 ratio | p95 improvement | p99 ratio | p99 improvement | Errors |",
 		"| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
 	)
 
@@ -1433,6 +1486,8 @@ func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []s
 		bodyRows.WriteString(fmt.Sprintf("<td>%.2f</td>", nginx.OpsPerSec))
 		bodyRows.WriteString(fmt.Sprintf("<td>%.3fx</td>", item.Ratio))
 		bodyRows.WriteString(fmt.Sprintf("<td>%s</td>", opsImprovementPercent(item.Ratio)))
+		target, proxyCompletion, nginxCompletion := fixedLoadColumns(proxy, nginx)
+		bodyRows.WriteString(fmt.Sprintf("<td>%s</td><td>%s</td><td>%s</td>", target, proxyCompletion, nginxCompletion))
 		bodyRows.WriteString(fmt.Sprintf("<td>%.3fx</td>", latencyRatio(proxy.LatencyP50MS, nginx.LatencyP50MS)))
 		bodyRows.WriteString(fmt.Sprintf("<td>%s</td>", latencyImprovementPercent(proxy.LatencyP50MS, nginx.LatencyP50MS)))
 		bodyRows.WriteString(fmt.Sprintf("<td>%.3fx</td>", latencyRatio(proxy.LatencyP95MS, nginx.LatencyP95MS)))
@@ -1442,7 +1497,7 @@ func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []s
 		bodyRows.WriteString("</tr>")
 	}
 	return fmt.Sprintf(`<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <title>proxysss all-scenarios benchmark</title>
@@ -1457,12 +1512,13 @@ func buildAllScenariosHTML(byScenario map[string]map[string]BenchRow, ratios []s
 </head>
 <body>
   <main>
-    <h1>proxysss all-scenarios benchmark</h1>
-    <p>Runtime traffic profile: <strong>%s</strong></p>
-    <p>Aggregate proxysss/nginx ratio: <strong>%.3fx</strong></p>
+    <h1>proxysss 全场景混合性能报告</h1>
+    <p>流量 profile：<strong>%s</strong></p>
+    <p>总吞吐 proxysss/nginx 比值：<strong>%.3fx</strong></p>
+    <p>吞吐和延迟使用重复样本中位数，完成率显示最差单轮；双方每轮均须达到门槛，不能用中位数掩盖未完成的请求。</p>
     <table>
       <thead>
-		<tr><th>Scenario</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>ops ratio</th><th>ops improvement</th><th>p50 ratio</th><th>p50 improvement</th><th>p95 ratio</th><th>p95 improvement</th><th>p99 ratio</th><th>p99 improvement</th></tr>
+		<tr><th>场景</th><th>proxysss ops/s</th><th>nginx ops/s</th><th>吞吐比</th><th>吞吐改善</th><th>目标 ops/s</th><th>proxysss 最低完成率</th><th>nginx 最低完成率</th><th>p50 比值</th><th>p50 改善</th><th>p95 比值</th><th>p95 改善</th><th>p99 比值</th><th>p99 改善</th></tr>
       </thead>
       <tbody>%s</tbody>
     </table>
@@ -1851,10 +1907,40 @@ func fixedLoadColumns(proxy, nginx BenchRow) (string, string, string) {
 		*proxy.TargetOpsPerSec <= 0 || *nginx.TargetOpsPerSec <= 0 {
 		return "-", "-", "-"
 	}
-	target := math.Min(*proxy.TargetOpsPerSec, *nginx.TargetOpsPerSec)
-	return fmt.Sprintf("%.2f", target),
-		fmt.Sprintf("%.3fx", proxy.OpsPerSec / *proxy.TargetOpsPerSec),
-		fmt.Sprintf("%.3fx", nginx.OpsPerSec / *nginx.TargetOpsPerSec)
+	target := fmt.Sprintf("%.2f", *proxy.TargetOpsPerSec)
+	if *proxy.TargetOpsPerSec != *nginx.TargetOpsPerSec {
+		target = "mismatch"
+	}
+	completion := func(row BenchRow) string {
+		value, err := fixedLoadAchievement(row)
+		if err != nil {
+			return "-"
+		}
+		return fmt.Sprintf("%.3fx", value)
+	}
+	return target, completion(proxy), completion(nginx)
+}
+
+// Counts, duration and the executable target define completion. Rounded ops/s
+// is display data; the median of it cannot prove every repetition completed.
+func fixedLoadAchievement(row BenchRow) (float64, error) {
+	if row.TargetOpsPerSec == nil || *row.TargetOpsPerSec <= 0 || math.IsNaN(*row.TargetOpsPerSec) || math.IsInf(*row.TargetOpsPerSec, 0) {
+		return 0, errors.New("missing or invalid fixed offered-load target")
+	}
+	if row.SampleCount > 0 {
+		if row.WorstTargetAchievement == nil || *row.WorstTargetAchievement < 0 || math.IsNaN(*row.WorstTargetAchievement) || math.IsInf(*row.WorstTargetAchievement, 0) || row.WorstTargetSample < 1 || row.WorstTargetSample > row.SampleCount {
+			return 0, errors.New("aggregated row missing valid worst-sample completion")
+		}
+		return *row.WorstTargetAchievement, nil
+	}
+	if row.SampleCount < 0 || row.DurationSecs <= 0 || row.Concurrency <= 0 || row.Success < 0 {
+		return 0, errors.New("invalid fixed-load sample count, duration, concurrency or success count")
+	}
+	actual := float64(row.Success) / float64(row.DurationSecs)
+	if math.IsNaN(row.OpsPerSec) || math.IsInf(row.OpsPerSec, 0) || math.Abs(row.OpsPerSec-actual) > 0.011 {
+		return 0, errors.New("fixed-load ops/sec disagrees with success count and duration")
+	}
+	return actual / *row.TargetOpsPerSec, nil
 }
 
 func ratioGateFailed(ratio, floor float64, strict bool) bool {

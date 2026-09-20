@@ -857,6 +857,7 @@ plugins:
             </div>
             <p class="subtle">这是 proxysss 架构设计里非常核心的一条线：热路径避免全局锁、尽量使用分片或原子结构、静态和流式都要参与 warm-up、结论必须靠 mixed-load 压测证明。</p>
           </div>
+          <p>Go 报告器对原始重复样本的吞吐和延迟取中位数、错误取最大值、完成率保留最差单轮与序号。样本数量和固定负载参数必须一致，不能用中位吞吐证明每轮完成；该数据流由本地 Docker 功能入口的 Go 回归保护。字段与门槛见<a href="validation.html">验证流程</a>。</p>
 
           <div class="cards">
             <article class="card">
