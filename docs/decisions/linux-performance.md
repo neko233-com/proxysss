@@ -2,6 +2,18 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：下载收包入口归属，未证明 backlog 根因
+
+固定 11ba450 二进制，在标准 Ubuntu 24.04 native-amd64 Docker Desktop VM、6/6/12 核完整混合矩阵中，按实际内核 PID、网络命名空间及 TCP_INFO 端口区分接收入口。原先的入口/返回配对采集出现残留栈帧、深度 12 和 4 次溢出，报告器拒绝整组诊断；该无效采集完整保存在 `.benchmark/goal-rx-flow/`，不得引用其时间或流量比例，也不能据此认定网关错误。
+
+替换为只计入口次数、skb 字节和大小分布的探针，不再配对返回。真实双 TCP 下载及同一 UDP 流的窗口前/中/后三包自检通过，只有窗口中的 UDP 包被计入；空采集被拒绝。完整采集中 18 次 PID 注册、504 条充分预热的连接、1008 个连接端点记录均通过核对，无 helper 错误，直方图合计一致；TCP_INFO 最大边界滞后 4.810 ms。内核 PID 由目标进程内 uprobe 获取，不能直接套用 Docker namespace PID。
+
+在下载客户端进程上下文和测量窗口内，未观测到无关 TCP 或 UDP 入口。1×/2×/4× 饱和时下载 skb 平均大小，nginx 为 58.24/57.33/55.79 KiB，proxysss 为 56.88/56.37/56.78 KiB，接近而非明显碎片化。该上下文中的下载 skb 字节相对 TCP_INFO 接收增量约为 nginx 46.02%/28.02%/28.49%、proxysss 65.15%/69.08%/73.22%；另有同一连接网关端的 ACK 大小入口。该近似比例包含协议头和窗口边界差异，只说明处理上下文分配有差别，不是 CPU 占比、物理帧大小或整个内核网络处理量。
+
+下一步检查 socket 用户持有状态和 backlog 调用路径。实际 Docker 内核对应的 [tcp_ipv4.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp_ipv4.c) 在 socket 由用户线程持有时将接收包交给 backlog，[tcp.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp.c) 的读取路径可排空它；这是待验证假设，现有入口计数不能证明此路径导致吞吐差距。
+
+探针、共享 client CPU 的观察器和持有 socket 副本会影响时序，本轮仅作诊断。198 个原始样本零错误，132 个等负载样本最低完成率 0.996269；大文件吞吐比 0.770/0.623/0.602，三个尺度延迟门槛仍失败。18 秒活跃、165 秒矩阵 wall；4× current/peak bytes 为 proxysss 91545600/300101632、nginx 208453632/411656192。源码、自检、原始数据、报告和摘要在 `.benchmark/goal-rx-entry/`。生产代码保持不变，最近完整功能验证仍是两轮各 378 项 Rust 测试及 Go/Clippy/文档/CLI 检查；未执行 Windows、push 或发布。
+
 ## 2026-09-21：完整连接预热与截止修复保留，重新建立混合基线
 
 提交 11ba450 修复全部 HTTP/1 worker 的真实资源预热、有限 SSE 正文读取与连接复用，以及 HTTP/SSE 截止后的等待和成功计数。Ubuntu 24.04 x86_64 两轮各 378 项 Rust 测试、Go、Clippy/格式、文档、真实 CPU 约束和 CLI 检查通过。真实发生器测试覆盖每条连接两次预热、后续复用、空正文/截断/错误状态、首块延迟与完整响应的区别，以及卡住响应头或尾部时按测量截止取消。功能工件 `.benchmark/full-pool-warm-functional/`。
