@@ -4121,10 +4121,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configuration_guide_examples_are_executable_and_keep_every_field() {
-        let markdown = include_str!("../docs/CONFIGURATION.md");
-        let html = include_str!("../docs/configuration.html");
+    fn assert_documented_example_pair(
+        markdown: &str,
+        html: &str,
+        markdown_name: &str,
+        html_name: &str,
+        minimum_examples: usize,
+    ) {
         let markdown_examples = markdown
             .split("```yaml")
             .skip(1)
@@ -4139,6 +4142,8 @@ mod tests {
                 "tcp:",
                 "udp:",
                 "load_balance:",
+                "script:",
+                "plugins:",
             ]
             .iter()
             .any(|root| code.starts_with(root))
@@ -4150,12 +4155,15 @@ mod tests {
             })
         });
         let documents = [
-            ("CONFIGURATION.md", markdown_examples.collect::<Vec<_>>()),
-            ("configuration.html", html_examples.collect::<Vec<_>>()),
+            (markdown_name, markdown_examples.collect::<Vec<_>>()),
+            (html_name, html_examples.collect::<Vec<_>>()),
         ];
         let mut parsed_examples = [Vec::new(), Vec::new()];
         for (document_index, (document, examples)) in documents.iter().enumerate() {
-            assert!(examples.len() >= 9, "missing examples in {document}");
+            assert!(
+                examples.len() >= minimum_examples,
+                "missing examples in {document}"
+            );
             for (index, yaml) in examples.iter().enumerate() {
                 let label = format!("{document} YAML #{}", index + 1);
                 let config: GatewayConfig =
@@ -4180,6 +4188,28 @@ mod tests {
                 "MD example missing or different in HTML: {example:?}"
             );
         }
+    }
+
+    #[test]
+    fn configuration_guide_examples_are_executable_and_keep_every_field() {
+        assert_documented_example_pair(
+            include_str!("../docs/CONFIGURATION.md"),
+            include_str!("../docs/configuration.html"),
+            "CONFIGURATION.md",
+            "configuration.html",
+            9,
+        );
+    }
+
+    #[test]
+    fn architecture_examples_are_executable_and_keep_every_field() {
+        assert_documented_example_pair(
+            include_str!("../docs/ARCHITECTURE.md"),
+            include_str!("../docs/architecture.html"),
+            "ARCHITECTURE.md",
+            "architecture.html",
+            6,
+        );
     }
 
     #[test]

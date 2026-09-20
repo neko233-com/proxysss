@@ -682,7 +682,7 @@ services:
       bind: 0.0.0.0:5432
       nodelay: true
       connect_timeout_ms: 2000
-      upstream: 10.0.0.12:5432</code></pre></article>
+      upstream: 10.0.0.12:5432</code></pre><p>nodelay 默认 true，同时控制网关接入与上游 socket；显式 false 启用 Nagle 合并，Linux 自动调优不会覆盖它。同名同 bind 的 listener 热更新 nodelay、connect_timeout_ms、protocol 后，新连接读取当前值，已有长连接保持原选项与上游。</p></article>
 <article class="card"><h3>KCP 与 QCP 透明 UDP 转发</h3><p>两个 listener 分别转发到对应服务。session_ttl_secs 控制空闲关联寿命，max_associations 限制关联数量；帧语义与可靠性由上游负责。</p><pre><code>udp:
   listeners:
     - name: kcp-gateway

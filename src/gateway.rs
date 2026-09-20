@@ -1016,12 +1016,8 @@ async fn relay_direct_tcp_fast_path(
     })?
     .with_context(|| format!("failed to connect direct tcp upstream {upstream}"))?;
 
-    if nodelay {
-        outbound
-            .set_nodelay(true)
-            .with_context(|| format!("failed setting TCP_NODELAY for upstream {upstream}"))?;
-    }
-    tune_tcp_stream_for_latency(&outbound);
+    configure_tcp_listener_stream(&outbound, nodelay)
+        .with_context(|| format!("failed configuring direct tcp upstream {upstream}"))?;
 
     if !protocol.trim().is_empty() {
         tracing::debug!(
@@ -1276,6 +1272,30 @@ fn tune_tcp_stream_for_latency(stream: &TcpStream) {
     tune_tcp_stream_for_linux(stream, TcpSocketTuneProfile::Realtime);
 }
 
+fn configure_tcp_listener_stream(stream: &TcpStream, nodelay: bool) -> std::io::Result<()> {
+    tune_tcp_stream_for_latency(stream);
+    // Explicit listener policy applies to both accepted and upstream sockets,
+    // including false. Automatic OS tuning must never override this choice.
+    stream.set_nodelay(nodelay)
+}
+
+fn configure_tcp_listener_accept<'a>(
+    stream: &TcpStream,
+    config: &'a GatewayConfig,
+    bootstrap: &'a TcpListenerConfig,
+) -> std::io::Result<&'a TcpListenerConfig> {
+    // Identity owns the listening socket; mutable connection policy belongs to
+    // the current config. Generated FTP/SNI listeners use their native defaults.
+    let listener = config
+        .tcp
+        .listeners
+        .iter()
+        .find(|listener| listener.name == bootstrap.name && listener.bind == bootstrap.bind)
+        .unwrap_or(bootstrap);
+    configure_tcp_listener_stream(stream, listener.nodelay)?;
+    Ok(listener)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpSocketTuneProfile {
     Gateway,
@@ -1287,6 +1307,15 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
     let level = *RUNTIME_SOCKET_TUNE_LEVEL
         .get()
         .unwrap_or(&linux_tune::RuntimeSocketTuneLevel::PortableLinux);
+    tune_tcp_stream_for_linux_at_level(stream, profile, level);
+}
+
+#[cfg(target_os = "linux")]
+fn tune_tcp_stream_for_linux_at_level(
+    stream: &TcpStream,
+    profile: TcpSocketTuneProfile,
+    level: linux_tune::RuntimeSocketTuneLevel,
+) {
     if matches!(level, linux_tune::RuntimeSocketTuneLevel::Disabled) {
         return;
     }
@@ -1302,19 +1331,6 @@ fn tune_tcp_stream_for_linux(stream: &TcpStream, profile: TcpSocketTuneProfile) 
             libc::TCP_QUICKACK,
             &quickack as *const _ as *const libc::c_void,
             std::mem::size_of_val(&quickack) as libc::socklen_t,
-        );
-    }
-
-    // TCP_NODELAY: disable Nagle algorithm for immediate packet dispatch.
-    // Critical for game-long-connection and tcp-stream latency.
-    let nodelay: libc::c_int = 1;
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            &nodelay as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&nodelay) as libc::socklen_t,
         );
     }
 
@@ -6906,20 +6922,19 @@ impl Gateway {
         loop {
             let (inbound, remote_addr) = listener.accept().await.context("tcp accept failed")?;
             let connection_worker = worker_index;
-            if listener_config.nodelay {
-                inbound
-                    .set_nodelay(true)
-                    .with_context(|| format!("failed setting TCP_NODELAY for {remote_addr}"))?;
-            }
-            tune_tcp_stream_for_latency(&inbound);
-            let gateway = self.clone();
-            let listener_name = listener_config.name.clone();
-            let listener_bind = listener_config.bind.clone();
-            let listener_default_upstream = listener_config.upstream.clone();
-            let listener_protocol = listener_config.protocol.clone();
-            let listener_nodelay = listener_config.nodelay;
-            let listener_connect_timeout_ms = listener_config.connect_timeout_ms;
             let accept_state = self.current_state().await;
+            let accepted_listener =
+                configure_tcp_listener_accept(&inbound, &accept_state.config, &listener_config)
+                    .with_context(|| {
+                        format!("failed configuring tcp connection for {remote_addr}")
+                    })?;
+            let gateway = self.clone();
+            let listener_name = accepted_listener.name.clone();
+            let listener_bind = accepted_listener.bind.clone();
+            let listener_default_upstream = accepted_listener.upstream.clone();
+            let listener_protocol = accepted_listener.protocol.clone();
+            let listener_nodelay = accepted_listener.nodelay;
+            let listener_connect_timeout_ms = accepted_listener.connect_timeout_ms;
             if !apply_stream_rate_limit(
                 &self.stream_rate_limits,
                 &accept_state.config.services.rate_limit.stream,
@@ -7188,12 +7203,10 @@ impl Gateway {
                         .await
                         {
                             Ok(Ok(stream)) => {
-                                if listener_nodelay {
-                                    stream.set_nodelay(true).with_context(|| {
-                                        format!("failed setting TCP_NODELAY for upstream {upstream}")
+                                configure_tcp_listener_stream(&stream, listener_nodelay)
+                                    .with_context(|| {
+                                        format!("failed configuring tcp upstream {upstream}")
                                     })?;
-                                }
-                                tune_tcp_stream_for_latency(&stream);
                                 if !listener_protocol.trim().is_empty() {
                                     tracing::debug!(
                                         protocol = %listener_protocol,
@@ -22664,6 +22677,93 @@ mod tests {
         AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
+
+    #[tokio::test]
+    async fn tcp_listener_nodelay_applies_to_accepted_and_connected_sockets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut connected = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        for nodelay in [false, true, false] {
+            for socket in [&accepted, &connected] {
+                socket.set_nodelay(!nodelay).unwrap();
+                configure_tcp_listener_stream(socket, nodelay).unwrap();
+                assert_eq!(socket.nodelay().unwrap(), nodelay);
+            }
+            connected.write_all(b"policy").await.unwrap();
+            let mut payload = [0; 6];
+            accepted.read_exact(&mut payload).await.unwrap();
+            accepted.write_all(&payload).await.unwrap();
+            connected.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"policy");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_socket_tuning_preserves_explicit_nodelay_at_every_level() {
+        use linux_tune::RuntimeSocketTuneLevel;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connected = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        for level in [
+            RuntimeSocketTuneLevel::Disabled,
+            RuntimeSocketTuneLevel::PortableLinux,
+            RuntimeSocketTuneLevel::Ubuntu24Extreme,
+            RuntimeSocketTuneLevel::FutureLinuxExtreme,
+        ] {
+            for profile in [
+                TcpSocketTuneProfile::Gateway,
+                TcpSocketTuneProfile::Realtime,
+            ] {
+                for nodelay in [false, true] {
+                    for socket in [&connected, &accepted] {
+                        socket.set_nodelay(nodelay).unwrap();
+                        tune_tcp_stream_for_linux_at_level(socket, profile, level);
+                        assert_eq!(socket.nodelay().unwrap(), nodelay, "{level:?} {profile:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_accept_uses_reloaded_policy_without_changing_existing_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let bootstrap: TcpListenerConfig = serde_yaml::from_str(&format!(
+            "name: game\nbind: {address}\nupstream: 127.0.0.1:9000\nprotocol: game_tcp\n"
+        ))
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        config.tcp.listeners.push(bootstrap.clone());
+        let mut original_client = TcpStream::connect(address).await.unwrap();
+        let (mut original, _) = listener.accept().await.unwrap();
+        configure_tcp_listener_accept(&original, &config, &bootstrap).unwrap();
+        assert!(original.nodelay().unwrap());
+
+        let current = &mut config.tcp.listeners[0];
+        current.nodelay = false;
+        current.connect_timeout_ms = 700;
+        current.protocol = "mqtt".into();
+        current.upstream = "127.0.0.1:9001".into();
+        let _next_client = TcpStream::connect(address).await.unwrap();
+        let (next, _) = listener.accept().await.unwrap();
+        let selected = configure_tcp_listener_accept(&next, &config, &bootstrap).unwrap();
+        assert!(!next.nodelay().unwrap());
+        assert_eq!(selected.connect_timeout_ms, 700);
+        assert_eq!(selected.protocol, "mqtt");
+        assert_eq!(selected.upstream, "127.0.0.1:9001");
+        assert!(original.nodelay().unwrap());
+        original_client.write_all(b"alive").await.unwrap();
+        let mut payload = [0; 5];
+        original.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"alive");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

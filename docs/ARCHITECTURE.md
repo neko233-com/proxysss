@@ -72,7 +72,7 @@ Range 最多接受 16 个区间，合并重复/相邻/重叠区间，保留未�
 
 ## 游戏与 socket 长连接
 
-TCP 接受连接后执行流访问/限流和路由，选择内存上游池；没有脚本、亲和、健康和额外候选时走单上游直接路径。默认 TCP_NODELAY，连接阶段受 connect_timeout_ms 限制。半关闭先冲刷未发送字节，再传播写关闭，保留反向数据。
+TCP 接受连接后读取当前 listener 配置，再执行流访问/限流和路由，选择内存上游池；没有脚本、亲和、健康和额外候选时走单上游直接路径。nodelay 默认 true，同时作用于接入与上游 socket；显式 false 保留 Nagle 合并，自动系统调优不覆盖该选择。同名同 bind listener 的 nodelay、connect_timeout_ms、protocol 更新应用于随后建立的连接，已建立会话保留原选项与上游。连接阶段受 connect_timeout_ms 限制。半关闭先冲刷未发送字节，再传播写关闭，保留反向数据。
 
 UDP 按客户端建立上游 association；session_ttl_secs 管理空闲时间，max_associations 限制高频重连规模。创建去重使用分片 pending 集合，清理按时间、创建数和容量压力节流。已建 association 使用 worker 本地缓存，TTL 最多每秒刷新一次，数据报使用有界缓冲池。
 
@@ -133,3 +133,109 @@ HTTP/2 的快速路径仅处理已经结束的入站正文，不能仅凭 GET �
 Linux native TCP/WebSocket 与 sendfile owner 先消费完整个 epoll_wait 返回批次，再安装待接收的连接/下载，避免当前批次中的旧 ERR/HUP 作用于复用 fd 的新任务。每轮最多安装 256 个任务，有剩余则通过 eventfd 唤醒下一轮，已有流量先获得 I/O 处理机会；该边界只限制接收队列，不减少 CPU 自适应 owner 数，也不改变既有数据发送预算或背压。依据 [Linux epoll 事件缓存说明](https://www.man7.org/linux/man-pages/man7/epoll.7.html)；不能仅因 EPOLL_CTL_DEL 已调用，就假定用户态已取回的事件也被删除。
 
 原始 HTTP 上游空闲池给每个 Tokio socket 记录所属 runtime ID。checkout 在同一 runtime 内保持直接复用；跨 runtime（包括控制面预热转入数据面、不同 HTTP shard 之间复用）时先解除旧 reactor 注册，使用非阻塞 peek 排除已关闭或带残留数据的连接，再把同一 TCP 连接注册到当前 reactor。避免 socket 移动后仍依赖旧运行时唤醒；不额外预拨连接、不改变池容量，也不把每次普通转发变成重连。
+
+
+## 可执行路径示例
+
+以下片段与 HTML 架构页对应，经过真实配置解析、校验及逐字段回读。反代直接使用 hosts/path_prefix/upstream；TCP/UDP listener 直接指定 upstream；脚本必须显式 enabled 并指定 entry。完整参数教程见 [配置指南](CONFIGURATION.md)。
+
+### HTTP 监听与反向代理
+
+```yaml
+http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+
+services:
+  reverse_proxy:
+    routes:
+      - name: app
+        hosts: ["app.example.com"]
+        path_prefix: "/"
+        upstream: "http://127.0.0.1:9000"
+```
+
+### 游戏 TCP 与透明 QCP
+
+```yaml
+tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      nodelay: true
+      connect_timeout_ms: 1500
+      upstream: "10.0.1.10:7000"
+
+udp:
+  listeners:
+    - name: game-udp
+      bind: 0.0.0.0:7001
+      protocol: qcp
+      session_ttl_secs: 45
+      max_associations: 150000
+      upstream: "10.0.1.10:7001"
+```
+
+### 进程内脚本与插件入口
+
+```yaml
+script:
+  enabled: true
+  entry: "./gateway.ts"
+
+plugins:
+  enabled: true
+  auto_load_dir: "./plugins"
+```
+
+### 独立反向代理片段
+
+```yaml
+services:
+  reverse_proxy:
+    routes:
+      - name: app
+        hosts: ["app.example.com"]
+        path_prefix: "/"
+        upstream: "http://127.0.0.1:9000"
+```
+
+### New API 与流式 AI 请求
+
+```yaml
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
+
+services:
+  ai_proxy:
+    enabled: true
+    routes:
+      - name: llm-edge
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+        forward_headers: true
+        emit_metadata_headers: true
+```
+
+### MQTT 与 CoAP 上游
+
+```yaml
+tcp:
+  listeners:
+    - name: mqtt-tcp
+      bind: 0.0.0.0:1883
+      upstream: 127.0.0.1:18831
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      session_ttl_secs: 30
+      max_associations: 50000
+      upstream: 127.0.0.1:56831
+```

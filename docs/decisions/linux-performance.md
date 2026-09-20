@@ -2,6 +2,14 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：balanced 每连接独立任务与直接 sendfile，未接受
+
+候选 49b4782 为每条明文 TCP/WebSocket 连接建立独立 Tokio 就绪任务，留在接收连接的 HTTP 分片；每方向至多 16 个 I/O 步骤，线程共享 16 KiB 临时缓冲，背压时才保留独立缓冲。balanced 下载直接 sendfile，每 2 MiB 让出同一队列。339 项 Linux 测试连续两轮、Clippy、格式、文档与配置检查通过，覆盖半关闭、背压、取消和 WebSocket 交接。
+
+标准 Ubuntu 24.04 native-amd64 Docker Desktop VM，gateway/backend/client CPU 为 0–5/6–11/12–23，完整 1×/2×/4× 混合矩阵失败。198 个原始样本零错误，双方等负载完成率通过；大文件吞吐比 0.814/0.700/0.763，其余吞吐通过。游戏 TCP p99 比为 1.346/1.357/1.184，普通 TCP 为 1.552/1.307/1.435，WebSocket 为 1.446/1.039/1.386；静态小文件 p99 为 1.545/1.475/1.405。共享任务队列没有证明跨协议尾延迟改善，不能仅凭部分 HTTP 相对比值降低接受该设计。
+
+4× cgroup current/peak：proxysss 59404288/247631872、nginx 209674240/374738944 bytes。18 秒活跃、162 秒矩阵 wall、202 秒总耗时。候选已由 cf03b23 完整撤回，保留此前文件版本与下载边界正确性修复。工件 `.benchmark/direct-ubuntu24-amd64/goal-pair-tasks/`；固定二进制 SHA256 为 `98e80089432c2f781f06ce76ead1d9e128849c68d38d9d026565bb31651fcdac`。不同轮次的参考吞吐和目标会变化，不能将单轮差值解释为精确因果收益。
+
 ## 2026-09-21：balanced native relay 与 sendfile 作为 HTTP 分片任务，未接受
 
 候选 35afe39 将 balanced 每核 native relay 和 sendfile 的子 epoll 交给同核 HTTP Tokio runtime 的 AsyncFd 驱动。relay 每轮至多 64 个事件和 64 个接入，sendfile 每轮一个作业、2 MiB；处理后让出 Tokio。保留半关闭、背压、取消清理与 fd 复用顺序，336 项 Linux 测试两轮、fmt、Clippy 与场景配置检查全部通过，但功能通过不能证明调度公平。

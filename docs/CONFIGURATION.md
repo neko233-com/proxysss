@@ -302,6 +302,8 @@ tcp:
       upstream: 10.0.0.12:5432
 ```
 
+nodelay 默认 true，同时控制网关接入与上游 socket；显式设为 false 时启用 Nagle 合并，Linux 自动调优不会覆盖它。同名同 bind 的 listener 热更新 nodelay、connect_timeout_ms、protocol 后，新连接读取当前值，已建立的长连接保持原选项与上游。
+
 这类配置适合：
 
 - PostgreSQL / MySQL / Redis / MongoDB 这类纯 TCP 服务
