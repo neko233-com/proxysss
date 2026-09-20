@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>proxysss Configuration</title>
+  <title>proxysss 配置指南</title>
   <style>
     :root {
       --bg: #f5efe6;
@@ -399,7 +399,7 @@
       <div class="brand">
         <div class="logo"></div>
         <div>
-          <strong>proxysss configuration</strong>
+          <strong>proxysss 配置指南</strong>
           <span>先知道该配哪一层，再开始抄 YAML</span>
         </div>
       </div>
@@ -447,7 +447,7 @@
         <div class="sidebar-links">
           <a href="#beginner">新手起步</a>
           <a href="#surfaces">怎么选配置面</a>
-          <a href="#combos">常用组合</a>
+          <a href="#protocol-examples">协议与服务示例</a><a href="#combos">常用组合</a>
           <a href="#reload">热重载和预热</a>
           <a href="#windows-startup">Windows 后台启动</a>
           <a href="#performance">性能建议</a>
@@ -478,11 +478,9 @@ services:
   reverse_proxy:
     routes:
       - name: app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:9000"</code></pre>
+        hosts: [app.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:9000</code></pre>
             </article>
 
             <article class="card">
@@ -494,35 +492,37 @@ services:
   tls_bind: 0.0.0.0:443
   tls:
     auto_https:
-      domains: [wss.example.com]
+      domains: [app.example.com]
 
 services:
   domain_routes:
     - name: game-wss
-      domains: [wss.example.com]
+      domains: [app.example.com]
       path_prefix: /ws
       upstream: ws://127.0.0.1:9000</code></pre>
             </article>
 
             <article class="card">
               <span class="tag beginner">官网 + API</span>
-              <h3>静态站点和 API 分开声明</h3>
-              <p class="subtle">静态文件适合单独走 <code>static_sites</code>，API 保持在 <code>reverse_proxy.routes</code>。HTML/CSS/JS/图片/字体/音视频和大文件下载支持 Range 断点续传，这样排障、缓存和性能预热都更清楚。</p>
-              <pre><code>services:
+              <h3>静态资源和 API 按路径分开</h3>
+              <p class="subtle">以下配置在 /assets 分发资源，api.example.com 的 /api 转到后端并去掉前缀。当前 <code>static_sites</code> 只按路径匹配，没有 hosts 或 root_dir 字段；它不能用来隔离不同域名的静态根目录。</p>
+              <pre><code>http:
+  plain_bind: 0.0.0.0:80
+
+services:
   static_sites:
     - name: homepage
-      hosts: ["www.example.com"]
-      root_dir: "./www"
+      path_prefix: /assets
+      root: ./www
       index_files: ["index.html"]
 
   reverse_proxy:
     routes:
       - name: api
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:8080"</code></pre>
+        hosts: [api.example.com]
+        path_prefix: /api
+        upstream: http://127.0.0.1:8080
+        strip_prefix: true</code></pre>
             </article>
           </div>
         </section>
@@ -551,9 +551,9 @@ services:
                 <td>不要把所有业务逻辑都塞进脚本替代它。</td>
               </tr>
               <tr>
-                <td><strong>services.domain_routes</strong><br>站点总编排</td>
-                <td>一个域名下有静态、API、WebDAV 等多个服务，需要统一入口视图。</td>
-                <td>不要把它理解成唯一实际执行面。</td>
+                <td><strong>services.domain_routes</strong><br>域名与路径代理</td>
+                <td>按 domains 与 path_prefix 转发到 upstream，并可设置路由证书策略。</td>
+                <td>不支持嵌套 routes 或 service: static:... 引用。</td>
               </tr>
               <tr>
                 <td><strong>services.ai_proxy</strong><br>AI / SSE / OpenAI-compatible</td>
@@ -562,7 +562,7 @@ services:
               </tr>
               <tr>
                 <td><strong>services.static_sites</strong><br>静态文件分发</td>
-                <td>官网、文档站、资源分发、CDN 回源、预热缓存、404 页面、Range 下载。</td>
+                <td>官网、文档站、资源分发、CDN 回源、预热缓存、条件请求、Range 下载。</td>
                 <td>不要为了分发静态资源先写一层脚本。</td>
               </tr>
               <tr>
@@ -587,7 +587,16 @@ services:
         <section id="sse-framing" class="panel">
           <h2>AI 与 SSE：先保证消息边界</h2>
           <p>将以下片段合入 proxysss.yaml，修改域名和本地兼容 API 服务地址。AI 路由使用单个 <code>upstream</code>；多上游权重、健康与重试使用通用反代及根 <code>load_balance</code>。供应商账号、密钥和模型选择由上游 New API/sub2api 服务管理。</p>
-          <pre><code>services:
+          <pre><code>http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
+
+services:
   ai_proxy:
     enabled: true
     routes:
@@ -602,6 +611,116 @@ services:
           <p>内建 SSE 按下游需求读取，不积累完整事件。TCP_NODELAY 由运行时启用；AI route 没有 <code>transport.flush_interval_ms</code> 等字段。原始 SSE 转 TLS/HTTP2 时先解码 chunked，按终止块或 Content-Length 结束，不等 keep-alive 连接断开。分块元数据行上限 16 KiB、trailer 总上限 64 KiB；trailer 不作为事件数据转发。提前 EOF 报错，已有 gzip 等 Content-Encoding 保留。</p>
           <p><a href="architecture.html#sse-response-framing">查看流式转发与资源所有权</a></p>
         </section>
+<section id="protocol-examples" class="panel"><h2>协议与服务配置示例</h2><p>将需要的片段合并到同一个 proxysss.yaml；合并同名顶层映射，不要重复声明 services、http 或 runtime 键。</p><div class="cards">
+<article class="card"><h3>域名与路径代理</h3><p>domains 匹配域名，每条路由直接指定 upstream。/api 去掉前缀，/ws 保留路径；静态和 WebDAV 使用各自的配置面。</p><pre><code>services:
+  domain_routes:
+    - name: main-api
+      domains: [example.com]
+      path_prefix: /api
+      upstream: http://127.0.0.1:8080
+      strip_prefix: true
+    - name: game-ws
+      domains: [example.com]
+      path_prefix: /ws
+      upstream: ws://127.0.0.1:9000</code></pre></article>
+<article class="card"><h3>静态资源与下载</h3><p>按路径映射 root。支持 GET/HEAD、条件请求、单段与最多 16 段 Range；合法但全部越界返回 416，语法无效的 Range 忽略并返回完整表示。</p><pre><code>services:
+  static_sites:
+    - name: public-assets
+      path_prefix: /assets
+      root: ./public
+      index_files: [index.html, index.htm]
+      autoindex: false</code></pre></article>
+<article class="card"><h3>注册中心联动</h3><p>Consul、etcd、Nacos 发现运行在控制面，普通 HTTP/TCP/UDP 只从内存池选上游。此片段声明映射，部署时还需创建名为 api 的反代目标。</p><pre><code>services:
+  service_discovery:
+    enabled: true
+    interval_secs: 15
+    registries:
+      - name: consul-main
+        provider: consul
+        endpoint: http://consul.service.consul:8500
+      - name: etcd-main
+        provider: etcd
+        endpoint: http://etcd.default.svc.cluster.local:2379
+      - name: nacos-main
+        provider: nacos
+        endpoint: http://nacos.default.svc.cluster.local:8848
+    mappings:
+      - name: api-from-consul
+        registry: consul-main
+        service: spring-api
+        target: reverse_proxy_route
+        target_name: api
+        scheme: http</code></pre></article>
+<article class="card"><h3>混合下载站点</h3><p>balanced 是混合负载选项，产品默认仍为 small。cache_control 控制客户端缓存；静态文件没有 not_found_page 或 response cache 配置。热文件缓存与 warm-up 由运行时管理。</p><pre><code>runtime:
+  performance:
+    enabled: true
+    traffic_profile: balanced
+
+services:
+  static_sites:
+    - name: docs
+      path_prefix: /docs-site
+      root: ./site
+      index_files: ["index.html"]
+      cache_control: "public, max-age=300"</code></pre></article>
+<article class="card"><h3>只读 WebDAV</h3><p>webdav 是单个配置对象，默认示例关闭写入。这个配置面没有 auth.basic；写入应放在可信网络、外部认证或明确的扩展认证之后。内建密码文件管理使用 services.filecloud。</p><pre><code>services:
+  webdav:
+    enabled: true
+    path_prefix: /dav
+    root: ./dav-data
+    allow_write: false</code></pre></article>
+<article class="card"><h3>TCP 直通</h3><p>listener 直接指定 upstream，或使用字符串数组 upstreams；不嵌套 routes。适合数据库、游戏和自定义 TCP 协议。SNI 策略另用 tcp.stream_routes。</p><pre><code>tcp:
+  listeners:
+    - name: postgres
+      bind: 0.0.0.0:5432
+      nodelay: true
+      connect_timeout_ms: 2000
+      upstream: 10.0.0.12:5432</code></pre></article>
+<article class="card"><h3>KCP 与 QCP 透明 UDP 转发</h3><p>两个 listener 分别转发到对应服务。session_ttl_secs 控制空闲关联寿命，max_associations 限制关联数量；帧语义与可靠性由上游负责。</p><pre><code>udp:
+  listeners:
+    - name: kcp-gateway
+      bind: 0.0.0.0:4000
+      session_ttl_secs: 120
+      max_associations: 200000
+      protocol: kcp
+      upstream: 10.0.0.20:4000
+    - name: qcp-gateway
+      bind: 0.0.0.0:4001
+      protocol: qcp
+      session_ttl_secs: 120
+      max_associations: 200000
+      upstreams:
+        - 10.0.0.21:4001</code></pre></article>
+<article class="card"><h3>MQTT 与 IoT</h3><p>MQTT over WebSocket 走 HTTP 反代，原生 MQTT 走 TCP，CoAP-style 走 UDP。proxysss 是 broker 前的通用边缘网关。</p><pre><code>services:
+  reverse_proxy:
+    routes:
+      - name: mqtt-ws
+        hosts: [iot.example.com]
+        path_prefix: /mqtt
+        upstream: http://127.0.0.1:8083
+
+tcp:
+  listeners:
+    - name: mqtt-tcp
+      bind: 0.0.0.0:1883
+      nodelay: true
+      upstream: 10.0.0.30:1883
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      session_ttl_secs: 30
+      max_associations: 50000
+      upstream: 10.0.0.31:5683</code></pre></article>
+<article class="card"><h3>独立只读监控</h3><p>monitor 使用独立密码和 monitor:read 会话，仅在 HTTPS 暴露健康、摘要、统计与 SSL 状态。不能复用管理员 bearer token，不能读取配置或执行写操作。</p><pre><code>admin:
+  monitor:
+    enabled: true
+    path_prefix: /_proxysss/monitor
+    password: "至少 12 位的独立监控密码"
+    session_ttl_secs: 43200
+    hosts: [monitor.example.com]</code></pre></article>
+</div></section>
         <section id="combos" class="panel">
           <div class="section-head">
             <div>
@@ -614,46 +733,51 @@ services:
           <div class="cards">
             <article class="card">
               <span class="tag expert">API 集群</span>
-              <h3>反向代理 + 权重 + 健康检查 + 缓存 + 限流</h3>
-              <pre><code>services:
+              <h3>反向代理 + 权重 + 健康检查 + 缓存 + 限流</h3><p>根 load_balance 选择算法与健康默认值。路由 upstreams 是字符串数组，upstream_weights 按完整地址设置权重。缓存、限流均需 enabled；respect_origin 尊重是否允许缓存，边缘存储时长使用 ttl_secs。仅缓存可共享响应。</p>
+              <pre><code>load_balance:
+  algorithm: weighted
+  active_health:
+    enabled: true
+    interval_secs: 5
+    timeout_ms: 1200
+    path: /healthz
+
+services:
   reverse_proxy:
     routes:
       - name: api-cluster
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://10.0.0.11:8080"
-            weight: 3
-          - url: "http://10.0.0.12:8080"
-            weight: 2
-        load_balance:
-          strategy: weighted_round_robin
-          active_health:
-            interval_secs: 5
-            timeout_ms: 1200
-            path: "/healthz"
+        hosts: [api.example.com]
+        path_prefix: /
+        upstream: http://10.0.0.11:8080
+        upstreams: [http://10.0.0.11:8080, http://10.0.0.12:8080]
+        upstream_weights:
+          "http://10.0.0.11:8080": 3
+          "http://10.0.0.12:8080": 2
         cache:
-          strategy: respect_origin
+          enabled: true
+          behavior: respect_origin
+          ttl_secs: 30
           stale_while_revalidate_secs: 30
           stale_if_error_secs: 120
         rate_limit:
-          requests_per_second: 200
+          enabled: true
+          requests: 200
+          window_ms: 1000
           burst: 400</code></pre>
             </article>
 
             <article class="card">
               <span class="tag expert">Wildcard TLS</span>
-              <h3>泛域名证书优先走内建 DNS-01</h3>
+              <h3>泛域名证书优先走内建 DNS-01</h3><p>domains 必填。替换示例凭据并保护配置文件权限；REDACTED 不能用于真实签证。</p>
               <pre><code>http:
   tls_bind: 0.0.0.0:443
   tls:
     mode: acme_managed
     acme:
-      enabled: true
+      domains: [example.com, "*.example.com"]
       email: "ops@example.com"
       challenge: dns01
-      key_algorithm: ecdsa_p256
+      key_algorithm: ecdsa_p256 # 推荐默认；兼容极老旧客户端时改 rsa2048
       dns:
         provider: cloudflare
         credentials:
@@ -662,13 +786,13 @@ services:
 
             <article class="card">
               <span class="tag expert">Admin API</span>
-              <h3>自动化前先把管理面姿势摆对</h3>
+              <h3>自动化前先把管理面姿势摆对</h3><p>将 bearer_token 占位符换为随机 token，日常通过 proxysss token set/show 管理。admin.token 不是有效字段；普通配置展示使用脱敏输出。</p>
               <pre><code>admin:
   enabled: true
   bind: 127.0.0.1:7777
   enable_write_ops: true
   expose_config: false
-  token: "REDACTED"</code></pre>
+  bearer_token: "REPLACE-WITH-A-LONG-RANDOM-TOKEN"</code></pre>
             </article>
 
             <article class="card">
@@ -680,13 +804,15 @@ services:
       bind: 0.0.0.0:7000
       nodelay: true
       connect_timeout_ms: 1500
+      upstream: 10.0.1.10:7000
 
 udp:
   listeners:
     - name: game-udp
       bind: 0.0.0.0:7001
       session_ttl_secs: 45
-      max_associations: 150000</code></pre>
+      max_associations: 150000
+      upstream: 10.0.1.10:7001</code></pre>
             </article>
           </div>
         </section>
@@ -746,7 +872,7 @@ proxysss service stop</code></pre>
               <div class="kicker">Performance</div>
               <h2>验证混合流量下的性能</h2>
             </div>
-              <p class="subtle">proxysss 的性能优化必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 作为独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。</p>
+              <p class="subtle">proxysss 的性能优化必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、WebSocket、TCP、UDP 要一起看；KCP/QCP 保留透明 UDP 转发能力；通用发布矩阵默认不包含特殊协议，严格 Ubuntu 24 Docker 矩阵另含透明 QCP，均不表示终止 QCP 帧。</p>
           </div>
 
           <div class="cards">
@@ -759,12 +885,12 @@ proxysss config reload-plan
 scripts/verify-docker-scenarios.sh
 .\scripts\verify-docker-scenarios.ps1
 scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
-              <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。严格性能入口在本机 Docker 或原生 amd64 Docker 运行，硬校验容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，并把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大。arm64 daemon 会记录 <code>execution_mode=emulated-amd64</code>，不能冒充物理 x86。role-isolated 默认 4+4+8 CPU 包络会先拒绝 cpuset 重叠；物理网络 WSS 结论还要从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>：它检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制 <code>4 CPU / 300k nofile</code>，保存同 SHA、<code>nginx -V</code>、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 <code>GATEWAY_MEMORY_MAX</code> 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 当前专项结果是 <code>udp-stream 4.045x</code>，<code>proxysss 127742.75 ops/s</code> vs <code>nginx 31577.33 ops/s</code>，两边 0 错误。</p>
+              <p class="subtle">默认 GitHub Actions CI 只负责全平台二进制打包，禁止自动或手动 workflow 运行测试、smoke 或性能压测。严格性能入口在本机 Docker 或原生 amd64 Docker 运行，硬校验容器为 Ubuntu 24.04 x86_64，从容器读取 CPU 数，在容器内构建当前 checkout，并把 HTTP/HTTPS/static/SSE/WebSocket/TCP/UDP/透明 QCP 一起按 1x/2x/4x 放大。arm64 daemon 会记录 <code>execution_mode=emulated-amd64</code>，不能冒充物理 x86。严格入口默认把检测到的 CPU 按约 1/4 网关、1/4 后端、其余客户端分配，并拒绝 cpuset 重叠；物理网络 WSS 结论还要从独立 client 主机运行 <code>scripts/benchmark-cross-host-wss.sh</code>：它检查三台机器的 machine-id 不同，并用远端 systemd cgroup 强制 <code>4 CPU / 300k nofile</code>，保存同 SHA、<code>nginx -V</code>、cgroup memory current/peak、每连接成本、主机指纹和原始样本。内存上限仅在声明生产预算时通过 <code>GATEWAY_MEMORY_MAX</code> 设置，默认不以固定物理 RAM 拒绝结果。v1.3.5 UDP fast path 历史专项结果是 <code>udp-stream 4.045x</code>，<code>proxysss 127742.75 ops/s</code> vs <code>nginx 31577.33 ops/s</code>，两边 0 错误。</p>
             </article>
 
             <article class="card">
               <span class="tag expert">traffic_profile</span>
-              <p class="subtle"><code>small</code> 适合小文件、SSE、HTTP2、小包 flush；<code>balanced</code> 是默认推荐；<code>bulk</code> 适合明显偏大文件和下载分发。</p>
+              <p class="subtle"><code>small</code> 适合小文件、SSE、HTTP2、小包 flush；<code>small</code> 是产品默认，<code>balanced</code> 是大文件与实时流量混合时的可选配置；<code>bulk</code> 适合明显偏大文件和下载分发。</p>
               <pre><code>runtime:
   performance:
     enabled: true

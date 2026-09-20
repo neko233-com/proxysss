@@ -643,7 +643,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">HTTP flow</div>
-              <h2>一条 HTTP 请求怎么走</h2>
+              <h2>一条 HTTP 请求怎么走</h2><p>配置边界：reverse_proxy.routes 用 hosts，domain_routes 用 domains，每条路由直接指向 upstream；后者不引用静态或 WebDAV 服务。当前 static_sites 与单个 webdav 按路径匹配，没有域名隔离字段，WebDAV 也没有内建 Basic auth 配置。<a href="configuration.html#protocol-examples">查看真实配置与限制</a>。</p>
             </div>
             <p class="subtle">这是大多数人最先要理解的路径，因为它串起了反向代理、AI SSE、静态站点和脚本扩展。</p>
           </div>

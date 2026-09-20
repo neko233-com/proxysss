@@ -4037,6 +4037,101 @@ mod tests {
             .contains("admin.monitor.path_prefix cannot equal admin.https.path_prefix"));
     }
 
+    fn assert_documented_fields_preserved(
+        source: &serde_yaml::Value,
+        effective: &serde_yaml::Value,
+        path: &str,
+    ) {
+        match source {
+            serde_yaml::Value::Mapping(fields) => {
+                for (key, value) in fields {
+                    let name = key.as_str().expect("configuration field name");
+                    let child = format!("{path}.{name}");
+                    let actual = effective.get(key).unwrap_or_else(|| {
+                        panic!("{child}: documented field is silently ignored or noncanonical")
+                    });
+                    assert_documented_fields_preserved(value, actual, &child);
+                }
+            }
+            serde_yaml::Value::Sequence(items) => {
+                let actual = effective.as_sequence().expect("configuration sequence");
+                assert_eq!(items.len(), actual.len(), "{path}");
+                for (index, value) in items.iter().enumerate() {
+                    assert_documented_fields_preserved(
+                        value,
+                        &actual[index],
+                        &format!("{path}[{index}]"),
+                    );
+                }
+            }
+            _ => assert_eq!(
+                source, effective,
+                "{path}: example value changed during parsing"
+            ),
+        }
+    }
+
+    #[test]
+    fn configuration_guide_examples_are_executable_and_keep_every_field() {
+        let markdown = include_str!("../docs/CONFIGURATION.md");
+        let html = include_str!("../docs/configuration.html");
+        let markdown_examples = markdown
+            .split("```yaml")
+            .skip(1)
+            .map(|part| part.split("```").next().unwrap().trim().to_owned());
+        let html_examples = html.split("<pre><code>").skip(1).filter_map(|part| {
+            let code = part.split("</code></pre>").next().unwrap().trim();
+            [
+                "http:",
+                "services:",
+                "runtime:",
+                "admin:",
+                "tcp:",
+                "udp:",
+                "load_balance:",
+            ]
+            .iter()
+            .any(|root| code.starts_with(root))
+            .then(|| {
+                code.replace("&quot;", "\"")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
+            })
+        });
+        let documents = [
+            ("CONFIGURATION.md", markdown_examples.collect::<Vec<_>>()),
+            ("configuration.html", html_examples.collect::<Vec<_>>()),
+        ];
+        let mut parsed_examples = [Vec::new(), Vec::new()];
+        for (document_index, (document, examples)) in documents.iter().enumerate() {
+            assert!(examples.len() >= 9, "missing examples in {document}");
+            for (index, yaml) in examples.iter().enumerate() {
+                let label = format!("{document} YAML #{}", index + 1);
+                let config: GatewayConfig =
+                    serde_yaml::from_str(yaml).unwrap_or_else(|error| panic!("{label}: {error}"));
+                config
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                let source: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+                let effective = serde_yaml::to_value(config).unwrap();
+                assert_documented_fields_preserved(&source, &effective, &label);
+                parsed_examples[document_index].push(source);
+            }
+        }
+        assert_eq!(
+            parsed_examples[0].len(),
+            parsed_examples[1].len(),
+            "MD/HTML example count"
+        );
+        for example in &parsed_examples[0] {
+            assert!(
+                parsed_examples[1].contains(example),
+                "MD example missing or different in HTML: {example:?}"
+            );
+        }
+    }
+
     #[test]
     fn documented_ai_streaming_example_uses_supported_route_fields() {
         let section = include_str!("../docs/CONFIGURATION.md")

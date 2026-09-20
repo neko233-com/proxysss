@@ -654,13 +654,13 @@ tcp:
               </tr>
               <tr>
                 <td><strong>services.ai_proxy</strong>OpenAI-compatible / New API</td>
-                <td>需要更明确的 AI 网关语义、上游池、SSE 传输策略。</td>
+                <td>代理到单个 New API/sub2api 服务，保留兼容 API 与 SSE 流式响应。</td>
                 <td>不要把所有 HTTP 都硬塞进 AI proxy。</td>
               </tr>
               <tr>
-                <td><strong>services.domain_routes</strong>站点级编排</td>
-                <td>按域名把静态、API、WebDAV 等能力拼成一个站点。</td>
-                <td>不要把它当成唯一实际执行面。</td>
+                <td><strong>services.domain_routes</strong>域名与路径代理</td>
+                <td>按 domains 与 path_prefix 直接代理到 upstream，可设置路由证书策略。</td>
+                <td>不支持引用静态或 WebDAV 服务的嵌套 routes。</td>
               </tr>
               <tr>
                 <td><strong>services.static_sites</strong>静态资源 / CDN 回源</td>

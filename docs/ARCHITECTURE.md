@@ -22,6 +22,8 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 
 ## HTTP 请求路径
 
+配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。当前 `static_sites` 和单个 `webdav` 按路径匹配，没有域名隔离字段；WebDAV 没有内建 Basic auth 配置。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
+
 1. 公共 HTTP 默认监听 80，TLS/H2/H3 默认使用 443。accept 与握手由监听运行时负责，H2/H3 分别管理多路复用流。
 2. 判断协议与配置路由，处理内建服务、ACME challenge、管理 HTTPS/monitor。用户公共路由优先于欢迎页兜底；默认 `/` 仅显示 `Welcome to proxysss`、GitHub 与 GitHub Docs 链接。
 3. 执行配置的访问控制、限流和连接上限。静态源站额外检查真实 TCP 对端、令牌/签名及路径边界；HEAD、Range、缓存和条件响应不能绕过授权。

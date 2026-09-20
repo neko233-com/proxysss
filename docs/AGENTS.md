@@ -23,6 +23,8 @@
 3. 同步 HTML、内置文档和受影响的配置示例、CLI 能力输出；脚本 API 变化还要同步声明与脚本指南。
 4. 运行 `go run scripts/verify-docs.go` 检查文档配对、导航链接和架构入口。页面视觉/交互验证仍只用应用内 Browser。
 
+配置教程的 YAML 必须通过实际 `GatewayConfig` 解析、`validate` 和逐字段序列化回读测试（`cargo test configuration_guide_examples_are_executable_and_keep_every_field`）。只运行 `check-config` 不足以发现被 serde 忽略的未知字段。`CONFIGURATION.md` 与 `configuration.html` 保持相同示例集合；不要声称不存在的 host 匹配、认证、缓存或路由字段已生效。主配置字段按当前 Rust 类型书写，别名在专门参考中说明。
+
 教程按读者实际操作顺序组织；参考页按查询主题组织。不要把旧参数旁追加“当前修订”当成同步维护，应替换过期叙述，把原有取舍移到决策记录。文档不能把“目标”“支持能力”“本次验证通过”写成同一件事。
 
 本分层参考 [DeepSeek Harness 文档规范](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/AGENTS.md)，按 proxysss 的 Rust 单进程网关、中文 HTML 文档和本地验证流程调整。

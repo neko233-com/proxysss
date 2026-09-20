@@ -163,13 +163,13 @@ scripts/verify-docker-scenarios.sh
             </tr>
             <tr>
               <td><strong>services.ai_proxy</strong>OpenAI-compatible / New API</td>
-              <td>更明确的 AI 网关语义、上游池和流式传输细节。</td>
+              <td>代理到单个 New API/sub2api 服务，保持兼容 API 与流式响应。</td>
               <td>普通网站代理请使用 reverse_proxy。</td>
             </tr>
             <tr>
-              <td><strong>services.domain_routes</strong>站点级编排</td>
-              <td>同一域名下把静态、API、WebDAV 等组合成统一入口。</td>
-              <td>不要把它理解成唯一执行面。</td>
+              <td><strong>services.domain_routes</strong>域名与路径代理</td>
+              <td>按 domains 与 path_prefix 直接代理到 upstream，可设置路由证书策略。</td>
+              <td>不支持引用静态或 WebDAV 服务的嵌套 routes。</td>
             </tr>
             <tr>
               <td><strong>services.static_sites</strong>静态资源 / CDN 回源</td>

@@ -53,6 +53,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - 官方文档统一 `中文 first`，只在必要术语、协议名、配置面名、命令名处保留 `English`。不要把官方文档写成英文营销页，也不要写成只给熟手看的参数堆。
 - `docs/*.html` 是给人看的官方文档入口，公共站点和内建 docs 导航必须只链接 HTML，不要把用户从 HTML 页面跳到 `.md`；`.md` 文档主要给 agent / 机器 / 仓库检索使用，`README.md` 和性能对比文档除外。
 - 官方文档中的重要主题应同时维护 `.md` 与 `docs/*.html` 两个入口，尤其是 `docs/index.html`、`docs/configuration.html`、`docs/architecture.html`、`docs/ts-how-to-use.html`、`docs/nginx-to-proxysss.html`、`docs/caddy-to-proxysss.html` 及其对应 Markdown 文档，并保持内容口径一致。
+- 配置指南中的 YAML 必须通过真实类型解析、校验与逐字段回读，防止未知字段静默失效；MD/HTML 示例集合保持一致，规则见 `docs/AGENTS.md`。
 - **Agents MUST update `docs/architecture.html`** whenever proxysss architecture or request/data-path behavior changes (new listeners, policy chains, reload boundaries, extension hooks, etc.).
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance must be treated as a core product requirement: production performance claims and release gates are Linux-only because proxysss targets real Linux gateway deployments, not Windows/macOS desktop benchmarks. Aim to match or exceed nginx on Ubuntu/Linux after `proxysss tune linux`, where proxysss can use Rust, async IO, Linux `SO_REUSEPORT` HTTP/TCP accept fanout, direct no-policy TCP fast paths, and script isolation effectively.
