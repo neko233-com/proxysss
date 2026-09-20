@@ -63,7 +63,7 @@ CPU 数从 cgroup effective cpuset 探测，不从已绑核线程误推全局资
 
 balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
 
-balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。balanced 活跃大文件传输超过半数数据核时，临时把尚未发送数据的门槛限制到 256 KiB（TCP_NOTSENT_LOWAT）；更严格的 socket 或启动时 namespace 策略优先，完成/取消恢复原值及零值继承。该选项不修改发送缓冲自动调优。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
+balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 
 明文 HTTP I/O event interval 为 8，shared-small 为 16，global queue interval 为 31。H2 每连接用本地 FuturesUnordered 驱动流，每个完成流后让出。静态 freshness 为 2 秒，nice-10 控制运行时重验证并原子发布快照。改变策略前阅读 [性能决策](decisions/linux-performance.md)，验证方法见 [验证流程](VALIDATION.md)。
 

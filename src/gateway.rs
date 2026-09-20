@@ -14,8 +14,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
@@ -1620,8 +1618,6 @@ static STATIC_SENDFILE_REACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
-static STATIC_SENDFILE_DEFAULT_LOWAT: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
@@ -1915,15 +1911,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
                 config.runtime.performance.traffic_profile,
                 RuntimePerformanceTrafficProfile::Balanced
             ),
-            Ordering::Relaxed,
-        );
-        // Read the namespace policy on the control path; zero/unknown disables
-        // our queue cap rather than silently loosening an operator's limit.
-        STATIC_SENDFILE_DEFAULT_LOWAT.store(
-            std::fs::read_to_string("/proc/sys/net/ipv4/tcp_notsent_lowat")
-                .ok()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .unwrap_or(0),
             Ordering::Relaxed,
         );
         STATIC_SENDFILE_REACTOR_CPU_DIVISOR.store(
@@ -12716,16 +12703,6 @@ async fn sendfile_all_async(
     // SO_SNDBUF sets a persistent user lock; restoring its numeric value does
     // not restore autotuning, and wmem_max can even turn a requested raise
     // into a smaller queue. EAGAIN/readiness remain the backpressure boundary.
-    let _queue_guard = (STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed)
-        && transfer_guard.active > data_plane_cores.max(1).div_ceil(2))
-    .then(|| {
-        ScopedSendQueueLimit::apply(
-            out_fd,
-            256 * 1024,
-            STATIC_SENDFILE_DEFAULT_LOWAT.load(Ordering::Relaxed),
-        )
-    })
-    .flatten();
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
@@ -12901,70 +12878,6 @@ fn sendfile_reactor_active_workers(
         reactor_workers.max(1).div_ceil(2)
     } else {
         reactor_workers.max(1)
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct ScopedSendQueueLimit {
-    fd: std::os::fd::RawFd,
-    previous: libc::c_uint,
-}
-
-#[cfg(target_os = "linux")]
-impl ScopedSendQueueLimit {
-    fn apply(fd: std::os::fd::RawFd, limit: u32, namespace_default: u32) -> Option<Self> {
-        let mut previous: libc::c_uint = 0;
-        let mut len = std::mem::size_of_val(&previous) as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &mut previous as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        } != 0
-        {
-            return None;
-        }
-        let effective = if previous == 0 {
-            namespace_default
-        } else {
-            previous
-        };
-        if effective <= limit || limit == 0 {
-            return None;
-        }
-        if unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &limit as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&limit) as libc::socklen_t,
-            )
-        } != 0
-        {
-            return None;
-        }
-        Some(Self { fd, previous })
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ScopedSendQueueLimit {
-    fn drop(&mut self) {
-        // Zero restores namespace inheritance; this TCP option has no send-
-        // buffer user-lock side effect. Never substitute the effective value.
-        unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &self.previous as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&self.previous) as libc::socklen_t,
-            );
-        }
     }
 }
 
@@ -23540,60 +23453,6 @@ mod tests {
 
         config.runtime.performance.enabled = false;
         assert_eq!(tcp_stream_accept_worker_count_for(&config, &listener, 4), 1);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn send_queue_limit_restores_inheritance_and_respects_stricter_policy() {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = socket.as_raw_fd();
-        let get = |level, name| {
-            let mut value: u32 = 0;
-            let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-            assert_eq!(
-                unsafe {
-                    libc::getsockopt(
-                        fd,
-                        level,
-                        name,
-                        &mut value as *mut _ as *mut libc::c_void,
-                        &mut len,
-                    )
-                },
-                0
-            );
-            value
-        };
-        let send_buffer = get(libc::SOL_SOCKET, libc::SO_SNDBUF);
-        for (previous, namespace_default, changed) in [
-            (0u32, u32::MAX, true),
-            (1_048_576, u32::MAX, true),
-            (65_536, u32::MAX, false),
-            (0, 131_072, false),
-            (0, 0, false),
-        ] {
-            assert_eq!(
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_NOTSENT_LOWAT,
-                        &previous as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&previous) as libc::socklen_t,
-                    )
-                },
-                0
-            );
-            let guard = ScopedSendQueueLimit::apply(fd, 262_144, namespace_default);
-            assert_eq!(guard.is_some(), changed);
-            assert_eq!(
-                get(libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT),
-                if changed { 262_144 } else { previous }
-            );
-            drop(guard);
-            assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT), previous);
-            assert_eq!(get(libc::SOL_SOCKET, libc::SO_SNDBUF), send_buffer);
-        }
     }
 
     #[test]
