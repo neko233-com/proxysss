@@ -2,6 +2,14 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：CPU 资源语义修复，性能门槛仍未通过
+
+提交 7dc3e82 修复 taskset 启动范围被外层 cpuset 扩大、数据面忽略 quota 预算的问题。349 项 Linux 测试连续两轮、Clippy/格式/文档/CLI 和真实网关 CPU 探针通过；额外 cpuset=0–3、taskset=0,3、quota=1.5/0.5 CPU 容器中，基础预算均为 1，HTTP/native relay/sendfile owner 各 1，所有线程范围和 HTTP/TCP/UDP 正文验证通过。功能证据保存在 `.benchmark/cpu-resources-verification/`。
+
+同提交的无记录器完整矩阵仍失败：Ubuntu 24.04 native-amd64 Docker Desktop VM，标准 6/6/12 核，198 原始样本零错误、双方等负载完成率通过。大文件吞吐比 0.700/0.630/0.740；CDN p99 比 3.041/2.261/1.896，小静态 p99 为 3.149/2.560/2.225。4× TCP p50/p95/p99 为 1.105/1.080/1.032，WebSocket 为 1.118/1.151/1.082。保留资源配置的正确性修复，但不能声称 CPU 发现修复解决了既有吞吐或尾延迟问题，也不能把不同轮次波动当作因果收益。
+
+4× cgroup current/peak bytes：proxysss 90849280/279580672，nginx 209395712/372604928。18 秒活跃、163 秒矩阵 wall、330 秒总耗时，包含 2m17s release 构建。工件 `.benchmark/direct-ubuntu24-amd64/goal-cpu-resources/`，固定二进制 SHA256 `efb96f789b211cabc7d059bf903bf2afa3fd011ce7fdc37d20fbdeb64ee484b7`。未进入 Windows、push 或发布。
+
 ## 2026-09-21：sendfile 墙钟与线程 CPU 诊断
 
 固定基线 5427540，在 Ubuntu 24.04 native-amd64 Docker Desktop VM 使用标准 0–5/6–11/12–23 CPU 分配。C preload 仅记录两种网关的 sendfile/sendfile64，客户端与后端不变；有界 mmap 保存开始时刻、墙钟、线程 CPU、字节数、线程和 fd，真实 socket 自检覆盖完整内容、EOF、EBADF。18 个混合窗口全部捕获，proxysss/nginx 总记录为 14913/296483，无丢弃或未完成记录；198 个原始协议样本零错误。活跃测量 18 秒，矩阵 wall 163 秒。
