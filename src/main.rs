@@ -550,7 +550,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "TCP/UDP stream proxy",
         status: ParityStatus::Supported,
-        evidence: "tcp.listeners support nodelay/connect_timeout_ms and udp.listeners support protocol/session_ttl_secs/max_associations with YAML upstream pools, independent KCP-style UDP and QCP UDP listener configs, and optional script extension hooks",
+        evidence: "tcp.listeners support nodelay/connect_timeout_ms and udp.listeners support protocol/session_ttl_secs/max_associations with atomic in-flight admission, live-session preservation at capacity, new-session reload, YAML upstream pools, independent KCP-style UDP and QCP UDP listener configs, and optional script extension hooks",
         next_gap: "",
     },
     NginxParityItem {

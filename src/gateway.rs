@@ -19,6 +19,9 @@ mod static_snapshot;
 #[cfg(test)]
 #[path = "stream_endpoint_tests.rs"]
 mod stream_endpoint_tests;
+#[cfg(test)]
+#[path = "udp_session_tests.rs"]
+mod udp_session_tests;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -31,7 +34,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1489,6 +1492,62 @@ struct UdpAssociation {
     socket: Arc<UdpSocket>,
     last_seen_epoch: AtomicU64,
     active: AtomicBool,
+    session_ttl_secs: u64,
+    retired: tokio::sync::Notify,
+    // Last field: release capacity only after the owned socket is released.
+    _permit: Option<UdpSessionPermit>,
+}
+
+impl UdpAssociation {
+    fn deactivate(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.retired.notify_waiters();
+        }
+    }
+
+    async fn wait_retired(&self) {
+        let notified = self.retired.notified();
+        tokio::pin!(notified);
+        // Register before checking the flag: retirement must wake both a
+        // blocked sender and reader, including the check/register race.
+        notified.as_mut().enable();
+        if self.active.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+}
+
+struct UdpSessionPermit {
+    state: Arc<UdpPruneState>,
+}
+
+impl Drop for UdpSessionPermit {
+    fn drop(&mut self) {
+        self.state.sessions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct UdpListenerLifetime {
+    state: Arc<UdpPruneState>,
+    associations: Arc<DashMap<SocketAddr, Arc<UdpAssociation>>>,
+}
+
+impl Drop for UdpListenerLifetime {
+    fn drop(&mut self) {
+        self.state.closing.store(true, Ordering::Release);
+        for association in self.associations.iter() {
+            association.deactivate();
+        }
+        self.associations.clear();
+    }
+}
+
+struct AbortUdpWorkerOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortUdpWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct PendingUdpSessionGuard {
@@ -1503,7 +1562,8 @@ impl Drop for PendingUdpSessionGuard {
 }
 
 struct LocalUdpAssociation {
-    association: Arc<UdpAssociation>,
+    // A quiet reuseport worker must not retain retired sockets or capacity.
+    association: Weak<UdpAssociation>,
     last_seen_epoch: u64,
 }
 
@@ -1511,6 +1571,8 @@ struct UdpPruneState {
     last_prune_epoch: AtomicU64,
     create_counter: AtomicU64,
     pruning: AtomicBool,
+    sessions: AtomicUsize,
+    closing: AtomicBool,
 }
 
 impl UdpPruneState {
@@ -1519,7 +1581,24 @@ impl UdpPruneState {
             last_prune_epoch: AtomicU64::new(now_unix_secs()),
             create_counter: AtomicU64::new(0),
             pruning: AtomicBool::new(false),
+            sessions: AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
         }
+    }
+
+    fn try_reserve(self: &Arc<Self>, limit: usize) -> Option<UdpSessionPermit> {
+        self.sessions
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                if self.closing.load(Ordering::Acquire) || (limit != 0 && count >= limit) {
+                    None
+                } else {
+                    count.checked_add(1)
+                }
+            })
+            .ok()?;
+        Some(UdpSessionPermit {
+            state: self.clone(),
+        })
     }
 }
 
@@ -1574,7 +1653,7 @@ struct UdpAssociationBuildContext<'a> {
     payload: &'a Bytes,
     request_id: &'a str,
     session_ttl_secs: u64,
-    max_associations: usize,
+    permit: UdpSessionPermit,
 }
 
 struct DirectUdpAssociationBuildContext<'a> {
@@ -1586,7 +1665,7 @@ struct DirectUdpAssociationBuildContext<'a> {
     upstream_addr: SocketAddr,
     client_addr: SocketAddr,
     session_ttl_secs: u64,
-    max_associations: usize,
+    permit: UdpSessionPermit,
 }
 
 pub(crate) struct GatewayHttpResponse {
@@ -7478,6 +7557,10 @@ impl Gateway {
         let associations = Arc::new(DashMap::<SocketAddr, Arc<UdpAssociation>>::new());
         let pending_sessions = Arc::new(DashSet::<SocketAddr>::new());
         let prune_state = Arc::new(UdpPruneState::new());
+        let _lifetime = UdpListenerLifetime {
+            state: prune_state.clone(),
+            associations: associations.clone(),
+        };
         let state = self.current_state().await;
         let worker_count = udp_listener_worker_count(&state.config);
         let weighted_runtime =
@@ -7535,7 +7618,9 @@ impl Gateway {
                         )
                         .await
                 });
+                let abort_worker = AbortUdpWorkerOnDrop(recv_task.abort_handle());
                 workers.spawn(async move {
+                    let _abort_worker = abort_worker;
                     recv_task
                         .await
                         .context("UDP weighted-runtime receive task failed")?
@@ -7575,17 +7660,15 @@ impl Gateway {
         worker_index: usize,
         pending_sessions: Arc<DashSet<SocketAddr>>,
     ) -> Result<()> {
-        let session_ttl_secs = listener_config.session_ttl_secs.max(1);
-        let max_associations = listener_config.max_associations;
-        let protocol_hint = listener_config.protocol.clone();
         let mut local_associations = FxHashMap::<SocketAddr, LocalUdpAssociation>::default();
+        let mut builders = JoinSet::new();
         let mut pending_udp_packets = 0_u64;
         let mut pending_udp_bytes = 0_u64;
         let mut shared_udp_packets_since_yield = 0_usize;
         let mut shared_udp_batch_started = Instant::now();
         let mut cached_now_secs = now_unix_secs();
         let mut cached_now_refreshed = Instant::now();
-        let local_prune_interval_secs = session_ttl_secs.clamp(1, 30);
+        let local_prune_interval_secs = listener_config.session_ttl_secs.clamp(1, 30);
         let mut next_local_prune_epoch = cached_now_secs.saturating_add(local_prune_interval_secs);
         let mut direct_udp_cache = DirectUdpRouteCache::new();
         // A policy-free listener's upstream identity only changes after a
@@ -7622,10 +7705,12 @@ impl Gateway {
             }
             let now = cached_now_secs;
             if now >= next_local_prune_epoch {
-                local_associations.retain(|_, local| {
-                    let keep = local_udp_association_is_live(local, session_ttl_secs, now);
+                local_associations.retain(|addr, local| {
+                    let keep = local_udp_association_current(local, now).is_some();
                     if !keep {
-                        local.association.active.store(false, Ordering::Relaxed);
+                        if let Some(association) = local.association.upgrade() {
+                            retire_udp_association(&associations, *addr, &association);
+                        }
                     }
                     keep
                 });
@@ -7634,35 +7719,33 @@ impl Gateway {
             let mut existing_association = None;
             let mut remove_local_association = false;
             if let Some(local) = local_associations.get_mut(&client_addr) {
-                if local_udp_association_is_live(local, session_ttl_secs, now) {
+                if let Some(association) = local_udp_association_current(local, now) {
                     if local.last_seen_epoch != now {
                         local.last_seen_epoch = now;
-                        local
-                            .association
-                            .last_seen_epoch
-                            .store(now, Ordering::Relaxed);
+                        association.last_seen_epoch.store(now, Ordering::Relaxed);
                     }
-                    existing_association = Some(local.association.clone());
+                    existing_association = Some(association);
                 } else {
-                    local.association.active.store(false, Ordering::Relaxed);
                     remove_local_association = true;
                 }
             }
             if remove_local_association {
                 if let Some(local) = local_associations.remove(&client_addr) {
-                    retire_udp_association(&associations, client_addr, &local.association);
+                    if let Some(association) = local.association.upgrade() {
+                        retire_udp_association(&associations, client_addr, &association);
+                    }
                 }
             }
             if existing_association.is_none() {
                 if let Some(existing) = associations.get(&client_addr) {
                     let association = existing.clone();
                     drop(existing);
-                    if udp_association_is_live(&association, session_ttl_secs, now) {
+                    if udp_association_is_live(&association, now) {
                         association.last_seen_epoch.store(now, Ordering::Relaxed);
                         local_associations.insert(
                             client_addr,
                             LocalUdpAssociation {
-                                association: association.clone(),
+                                association: Arc::downgrade(&association),
                                 last_seen_epoch: now,
                             },
                         );
@@ -7674,9 +7757,7 @@ impl Gateway {
             }
 
             if let Some(existing) = existing_association {
-                let upstream_socket = existing.socket.clone();
-                if let Err(error) = send_udp_connected(&upstream_socket, &buffer[..received]).await
-                {
+                if let Err(error) = send_udp_connected(&existing, &buffer[..received]).await {
                     tracing::warn!(
                         ?error,
                         %client_addr,
@@ -7702,22 +7783,48 @@ impl Gateway {
                 continue;
             }
 
+            // Reserve before copying payloads, spawning tasks, scripts or DNS.
+            // Existing packets never touch this listener-local atomic counter.
+            while builders.try_join_next().is_some() {}
+            let Some(current_listener) =
+                direct_udp_state
+                    .config
+                    .udp
+                    .listeners
+                    .iter()
+                    .find(|listener| {
+                        listener.name == listener_config.name
+                            && listener.bind == listener_config.bind
+                    })
+            else {
+                continue;
+            };
+            let session_ttl_secs = current_listener.session_ttl_secs.max(1);
+            let max_associations = current_listener.max_associations;
+            let protocol_hint = current_listener.protocol.clone();
+            if !pending_sessions.insert(client_addr) {
+                continue;
+            }
+            let pending_guard = PendingUdpSessionGuard {
+                sessions: pending_sessions.clone(),
+                addr: client_addr,
+            };
+            maybe_prune_udp_associations(&associations, &prune_state, max_associations);
+            let Some(permit) = prune_state.try_reserve(max_associations) else {
+                self.stats
+                    .blocked_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             let gateway = self.clone();
             let listener_name = listener_config.name.clone();
             let listener_socket = listener_socket.clone();
             let associations = associations.clone();
             let prune_state = prune_state.clone();
-            let protocol_hint = protocol_hint.clone();
             if let Some(upstream_addr) =
                 direct_udp_cache.get_or_refresh(direct_udp_state.clone(), &listener_config.name)
             {
-                if !pending_sessions.insert(client_addr) {
-                    continue;
-                }
-                let _pending_guard = PendingUdpSessionGuard {
-                    sessions: pending_sessions.clone(),
-                    addr: client_addr,
-                };
+                let _pending_guard = pending_guard;
 
                 match Self::create_direct_udp_upstream_association(
                     DirectUdpAssociationBuildContext {
@@ -7729,14 +7836,17 @@ impl Gateway {
                         upstream_addr,
                         client_addr,
                         session_ttl_secs,
-                        max_associations,
+                        permit,
                     },
                 )
                 .await
                 {
                     Ok(association) => {
+                        if !association.active.load(Ordering::Acquire) {
+                            continue;
+                        }
                         if let Err(error) =
-                            send_udp_connected(&association.socket, &buffer[..received]).await
+                            send_udp_connected(&association, &buffer[..received]).await
                         {
                             tracing::warn!(
                                 ?error,
@@ -7750,7 +7860,7 @@ impl Gateway {
                             local_associations.insert(
                                 client_addr,
                                 LocalUdpAssociation {
-                                    association,
+                                    association: Arc::downgrade(&association),
                                     last_seen_epoch: now,
                                 },
                             );
@@ -7769,28 +7879,19 @@ impl Gateway {
                 continue;
             }
             let payload = Bytes::copy_from_slice(&buffer[..received]);
-            if !pending_sessions.insert(client_addr) {
-                continue;
-            }
-
-            let pending_sessions = pending_sessions.clone();
-            tokio::spawn(async move {
-                let _pending_guard = PendingUdpSessionGuard {
-                    sessions: pending_sessions,
-                    addr: client_addr,
-                };
+            let state = direct_udp_state.clone();
+            builders.spawn(async move {
+                let _pending_guard = pending_guard;
                 let request_id = Uuid::new_v4().to_string();
 
                 if let Err(error) = async {
-                    let state = gateway.current_state().await;
-
-                    let upstream_socket = if let Some(existing) = associations.get(&client_addr) {
+                    let association = if let Some(existing) = associations.get(&client_addr) {
                         let association = existing.clone();
                         drop(existing);
                         let now = now_unix_secs();
-                        if udp_association_is_live(&association, session_ttl_secs, now) {
+                        if udp_association_is_live(&association, now) {
                             association.last_seen_epoch.store(now, Ordering::Relaxed);
-                            association.socket.clone()
+                            association
                         } else {
                             retire_udp_association(&associations, client_addr, &association);
                             Self::create_udp_upstream_association(UdpAssociationBuildContext {
@@ -7805,7 +7906,7 @@ impl Gateway {
                                 payload: &payload,
                                 request_id: &request_id,
                                 session_ttl_secs,
-                                max_associations,
+                                permit,
                             })
                             .await?
                         }
@@ -7822,14 +7923,18 @@ impl Gateway {
                             payload: &payload,
                             request_id: &request_id,
                             session_ttl_secs,
-                            max_associations,
+                            permit,
                         })
                         .await?
                     };
 
-                    send_udp_connected(&upstream_socket, &payload)
-                        .await
-                        .context("failed forwarding udp payload to upstream")?;
+                    if !association.active.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if let Err(error) = send_udp_connected(&association, &payload).await {
+                        retire_udp_association(&associations, client_addr, &association);
+                        return Err(error).context("failed forwarding udp payload to upstream");
+                    }
 
                     Ok::<_, anyhow::Error>(())
                 }
@@ -7853,26 +7958,8 @@ impl Gateway {
             upstream_addr,
             client_addr,
             session_ttl_secs,
-            max_associations,
+            permit,
         } = ctx;
-
-        maybe_prune_udp_associations(
-            associations,
-            prune_state,
-            session_ttl_secs,
-            max_associations,
-        );
-        if max_associations > 0 && associations.len() >= max_associations {
-            gateway
-                .stats
-                .blocked_requests_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!(
-                "udp listener {} reached max_associations {}",
-                listener_name,
-                max_associations
-            ));
-        }
 
         let bind_any = if upstream_addr.is_ipv4() {
             "0.0.0.0:0"
@@ -7893,18 +7980,19 @@ impl Gateway {
         let upstream = upstream_addr.to_string();
         let lease = gateway.acquire_upstream_lease("udp", Some(listener_name), &upstream);
         let association = Arc::new(UdpAssociation {
-            socket: socket.clone(),
+            socket,
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
+            session_ttl_secs,
+            retired: tokio::sync::Notify::new(),
+            _permit: Some(permit),
         });
-        install_udp_association(associations, client_addr, association.clone());
+        publish_udp_association(associations, client_addr, association.clone(), prune_state)?;
         spawn_udp_association_reader(
             listener_socket.clone(),
-            socket,
             associations.clone(),
             association.clone(),
             client_addr,
-            session_ttl_secs,
             lease,
         );
 
@@ -7913,7 +8001,7 @@ impl Gateway {
 
     async fn create_udp_upstream_association(
         ctx: UdpAssociationBuildContext<'_>,
-    ) -> Result<Arc<UdpSocket>> {
+    ) -> Result<Arc<UdpAssociation>> {
         let UdpAssociationBuildContext {
             gateway,
             state,
@@ -7926,26 +8014,8 @@ impl Gateway {
             payload,
             request_id,
             session_ttl_secs,
-            max_associations,
+            permit,
         } = ctx;
-
-        maybe_prune_udp_associations(
-            associations,
-            prune_state,
-            session_ttl_secs,
-            max_associations,
-        );
-        if max_associations > 0 && associations.len() >= max_associations {
-            gateway
-                .stats
-                .blocked_requests_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!(
-                "udp listener {} reached max_associations {}",
-                listener_name,
-                max_associations
-            ));
-        }
         let player_id = extract_stream_player_id(payload, &state.config.affinity.stream);
         let route = if let Some(route) =
             configured_udp_listener_route(&state.config, listener_name, player_id.clone())
@@ -8041,22 +8111,23 @@ impl Gateway {
             );
         }
         let association = Arc::new(UdpAssociation {
-            socket: socket.clone(),
+            socket,
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
+            session_ttl_secs,
+            retired: tokio::sync::Notify::new(),
+            _permit: Some(permit),
         });
-        install_udp_association(associations, client_addr, association.clone());
+        publish_udp_association(associations, client_addr, association.clone(), prune_state)?;
         spawn_udp_association_reader(
             listener_socket.clone(),
-            socket.clone(),
             associations.clone(),
-            association,
+            association.clone(),
             client_addr,
-            session_ttl_secs,
             lease,
         );
 
-        Ok(socket)
+        Ok(association)
     }
 
     async fn handle_hyper_request(
@@ -16648,25 +16719,44 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, now: u64) -> bool {
+fn udp_association_is_live(association: &UdpAssociation, now: u64) -> bool {
     association.active.load(Ordering::Relaxed)
         && now.saturating_sub(association.last_seen_epoch.load(Ordering::Relaxed))
-            <= session_ttl_secs
+            <= association.session_ttl_secs
 }
 
-fn local_udp_association_is_live(
+fn local_udp_association_current(
     local: &mut LocalUdpAssociation,
-    session_ttl_secs: u64,
     now: u64,
-) -> bool {
-    if !local.association.active.load(Ordering::Relaxed) {
-        return false;
+) -> Option<Arc<UdpAssociation>> {
+    let association = local.association.upgrade()?;
+    if !association.active.load(Ordering::Relaxed) {
+        return None;
     }
-    if now.saturating_sub(local.last_seen_epoch) > session_ttl_secs {
+    if now.saturating_sub(local.last_seen_epoch) > association.session_ttl_secs {
         // Another reuseport worker may have refreshed the shared association.
-        local.last_seen_epoch = local.association.last_seen_epoch.load(Ordering::Relaxed);
+        local.last_seen_epoch = association.last_seen_epoch.load(Ordering::Relaxed);
     }
-    now.saturating_sub(local.last_seen_epoch) <= session_ttl_secs
+    (now.saturating_sub(local.last_seen_epoch) <= association.session_ttl_secs)
+        .then_some(association)
+}
+
+fn publish_udp_association(
+    associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
+    client_addr: SocketAddr,
+    association: Arc<UdpAssociation>,
+    state: &UdpPruneState,
+) -> Result<()> {
+    if state.closing.load(Ordering::Acquire) {
+        return Err(anyhow!("UDP listener is closing"));
+    }
+    install_udp_association(associations, client_addr, association.clone());
+    // Closing may have cleared the table between the first check and insertion.
+    if state.closing.load(Ordering::Acquire) {
+        retire_udp_association(associations, client_addr, &association);
+        return Err(anyhow!("UDP listener closed during association creation"));
+    }
+    Ok(())
 }
 
 fn install_udp_association(
@@ -16675,7 +16765,7 @@ fn install_udp_association(
     association: Arc<UdpAssociation>,
 ) {
     if let Some(previous) = associations.insert(client_addr, association) {
-        previous.active.store(false, Ordering::Relaxed);
+        previous.deactivate();
     }
 }
 
@@ -16684,7 +16774,7 @@ fn retire_udp_association(
     client_addr: SocketAddr,
     association: &Arc<UdpAssociation>,
 ) {
-    association.active.store(false, Ordering::Relaxed);
+    association.deactivate();
     // A reader or sender can finish after another worker replaces this address.
     // Identity must be checked while holding the same shard lock as removal.
     associations.remove_if(&client_addr, |_, current| Arc::ptr_eq(current, association));
@@ -16698,42 +16788,93 @@ fn balanced_udp_batch_is_sustained(elapsed: Duration) -> bool {
     elapsed <= BALANCED_UDP_FAIRNESS_WINDOW
 }
 
+struct UdpReaderLifetime {
+    associations: Arc<DashMap<SocketAddr, Arc<UdpAssociation>>>,
+    association: Arc<UdpAssociation>,
+    client_addr: SocketAddr,
+    _lease: UpstreamLease,
+}
+
+impl Drop for UdpReaderLifetime {
+    fn drop(&mut self) {
+        retire_udp_association(&self.associations, self.client_addr, &self.association);
+    }
+}
+
 fn spawn_udp_association_reader(
     send_socket: Arc<UdpSocket>,
-    read_socket: Arc<UdpSocket>,
     associations_for_reader: Arc<DashMap<SocketAddr, Arc<UdpAssociation>>>,
     association_for_reader: Arc<UdpAssociation>,
     client_addr: SocketAddr,
-    session_ttl_secs: u64,
     lease: UpstreamLease,
 ) -> tokio::task::JoinHandle<()> {
+    // Construct before spawn so aborting an unpolled task also removes its entry.
+    let lifetime = UdpReaderLifetime {
+        associations: associations_for_reader,
+        association: association_for_reader,
+        client_addr,
+        _lease: lease,
+    };
     tokio::spawn(async move {
-        let _lease = lease;
+        let association_for_reader = &lifetime.association;
+        let read_socket = &association_for_reader.socket;
+        let session_ttl_secs = association_for_reader.session_ttl_secs;
         let mut response = udp_buffer_pool().acquire();
         let check_interval = Duration::from_secs(session_ttl_secs.clamp(1, 30));
+        let mut next_check = tokio::time::Instant::now() + check_interval;
         'reader: while association_for_reader.active.load(Ordering::Relaxed) {
-            match tokio::time::timeout(check_interval, read_socket.recv(&mut response)).await {
+            if tokio::time::Instant::now() >= next_check {
+                if !udp_association_is_live(association_for_reader, now_unix_secs()) {
+                    tracing::debug!(%client_addr, ttl_secs = session_ttl_secs, "udp upstream association expired");
+                    break;
+                }
+                next_check = tokio::time::Instant::now() + check_interval;
+            }
+            let received = tokio::select! {
+                biased;
+                _ = association_for_reader.wait_retired() => break,
+                result = tokio::time::timeout_at(next_check, read_socket.recv(&mut response)) => result,
+            };
+            match received {
                 Ok(Ok(size)) => {
                     if !association_for_reader.active.load(Ordering::Relaxed) {
                         break;
                     }
-                    if let Err(error) =
-                        send_udp_to(&send_socket, &response[..size], client_addr).await
+                    if let Err(error) = send_udp_to(
+                        &send_socket,
+                        &response[..size],
+                        client_addr,
+                        association_for_reader,
+                    )
+                    .await
                     {
                         tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
                         break;
                     }
+                    // A continuously sending backend must not postpone client
+                    // idle expiry or monopolize the runtime indefinitely.
+                    let mut drained = 0;
                     loop {
                         if !association_for_reader.active.load(Ordering::Relaxed) {
                             break 'reader;
                         }
                         match read_socket.try_recv(&mut response) {
                             Ok(size) => {
-                                if let Err(error) =
-                                    send_udp_to(&send_socket, &response[..size], client_addr).await
+                                if let Err(error) = send_udp_to(
+                                    &send_socket,
+                                    &response[..size],
+                                    client_addr,
+                                    association_for_reader,
+                                )
+                                .await
                                 {
                                     tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
                                     break 'reader;
+                                }
+                                drained += 1;
+                                if drained == 64 {
+                                    tokio::task::yield_now().await;
+                                    break;
                                 }
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -16750,28 +16891,10 @@ fn spawn_udp_association_reader(
                     tracing::warn!(?error, %client_addr, "udp upstream association closed");
                     break;
                 }
-                Err(_) => {
-                    let expired = !udp_association_is_live(
-                        &association_for_reader,
-                        session_ttl_secs,
-                        now_unix_secs(),
-                    );
-                    if expired {
-                        tracing::debug!(
-                            %client_addr,
-                            ttl_secs = session_ttl_secs,
-                            "udp upstream association expired"
-                        );
-                        break;
-                    }
-                }
+                Err(_) => {}
             }
         }
-        retire_udp_association(
-            &associations_for_reader,
-            client_addr,
-            &association_for_reader,
-        );
+        drop(lifetime);
     })
 }
 
@@ -16788,7 +16911,8 @@ fn flush_udp_stats(stats: &GatewayStats, packets: &mut u64, bytes: &mut u64) {
     }
 }
 
-async fn send_udp_connected(socket: &UdpSocket, payload: &[u8]) -> std::io::Result<()> {
+async fn send_udp_connected(association: &UdpAssociation, payload: &[u8]) -> std::io::Result<()> {
+    let socket = &association.socket;
     match socket.try_send(payload) {
         Ok(written) if written == payload.len() => Ok(()),
         Ok(_) => Err(std::io::Error::new(
@@ -16796,7 +16920,11 @@ async fn send_udp_connected(socket: &UdpSocket, payload: &[u8]) -> std::io::Resu
             "udp connected send wrote a partial datagram",
         )),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            let written = socket.send(payload).await?;
+            let written = tokio::select! {
+                biased;
+                _ = association.wait_retired() => return Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                result = socket.send(payload) => result?,
+            };
             if written == payload.len() {
                 Ok(())
             } else {
@@ -16810,7 +16938,12 @@ async fn send_udp_connected(socket: &UdpSocket, payload: &[u8]) -> std::io::Resu
     }
 }
 
-async fn send_udp_to(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> std::io::Result<()> {
+async fn send_udp_to(
+    socket: &UdpSocket,
+    payload: &[u8],
+    addr: SocketAddr,
+    association: &UdpAssociation,
+) -> std::io::Result<()> {
     match socket.try_send_to(payload, addr) {
         Ok(written) if written == payload.len() => Ok(()),
         Ok(_) => Err(std::io::Error::new(
@@ -16818,7 +16951,11 @@ async fn send_udp_to(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> st
             "udp send_to wrote a partial datagram",
         )),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            let written = socket.send_to(payload, addr).await?;
+            let written = tokio::select! {
+                biased;
+                _ = association.wait_retired() => return Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                result = socket.send_to(payload, addr) => result?,
+            };
             if written == payload.len() {
                 Ok(())
             } else {
@@ -16838,7 +16975,6 @@ const UDP_ASSOCIATION_PRUNE_CREATE_STRIDE: u64 = 256;
 fn maybe_prune_udp_associations(
     associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
     prune_state: &UdpPruneState,
-    session_ttl_secs: u64,
     max_associations: usize,
 ) {
     let create_count = prune_state
@@ -16853,7 +16989,7 @@ fn maybe_prune_udp_associations(
     let periodic = now.saturating_sub(last_prune) >= UDP_ASSOCIATION_PRUNE_INTERVAL_SECS
         || create_count.is_multiple_of(UDP_ASSOCIATION_PRUNE_CREATE_STRIDE);
 
-    if !cap_pressure && !periodic {
+    if now <= last_prune || (!cap_pressure && !periodic) {
         return;
     }
     if prune_state
@@ -16864,8 +17000,12 @@ fn maybe_prune_udp_associations(
         return;
     }
 
-    prune_udp_associations(associations, session_ttl_secs, max_associations);
-    prune_state.last_prune_epoch.store(now, Ordering::Relaxed);
+    // Full listeners must not scan their whole table for every rejected packet.
+    // Recheck under the prune claim so racing workers cannot repeat this second.
+    if now > prune_state.last_prune_epoch.load(Ordering::Relaxed) {
+        prune_udp_associations(associations);
+        prune_state.last_prune_epoch.store(now, Ordering::Relaxed);
+    }
     prune_state.pruning.store(false, Ordering::Release);
 }
 
@@ -16877,51 +17017,18 @@ fn udp_prune_pressure_threshold(max_associations: usize) -> usize {
     }
 }
 
-fn prune_udp_associations(
-    associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
-    session_ttl_secs: u64,
-    max_associations: usize,
-) {
+fn prune_udp_associations(associations: &DashMap<SocketAddr, Arc<UdpAssociation>>) {
     let now = now_unix_secs();
     associations.retain(|_, association| {
-        let keep = udp_association_is_live(association, session_ttl_secs, now);
+        let keep = udp_association_is_live(association, now);
         if !keep {
-            association.active.store(false, Ordering::Relaxed);
+            association.deactivate();
         }
         keep
     });
 
-    if max_associations == 0 || associations.len() < max_associations {
-        return;
-    }
-
-    let mut oldest = associations
-        .iter()
-        .map(|entry| {
-            (
-                *entry.key(),
-                entry.last_seen_epoch.load(Ordering::Relaxed),
-                entry.value().clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    oldest.sort_by_key(|(_, last_seen, _)| *last_seen);
-
-    let remove_count = associations.len().saturating_sub(
-        max_associations
-            .saturating_sub(max_associations / 10)
-            .max(1),
-    );
-    for (addr, last_seen, candidate) in oldest.into_iter().take(remove_count) {
-        associations.remove_if(&addr, |_, current| {
-            let remove = Arc::ptr_eq(current, &candidate)
-                && current.last_seen_epoch.load(Ordering::Relaxed) == last_seen;
-            if remove {
-                current.active.store(false, Ordering::Relaxed);
-            }
-            remove
-        });
-    }
+    // The admission counter enforces the cap; live game/voice sessions are not
+    // evicted merely because new clients arrive at a full listener.
 }
 
 fn admin_session_signing_key(admin: &AdminConfig) -> Vec<u8> {
@@ -25525,21 +25632,25 @@ mod tests {
             socket: old_socket.clone(),
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
+            session_ttl_secs: 180,
+            retired: tokio::sync::Notify::new(),
+            _permit: None,
         });
         let current = Arc::new(UdpAssociation {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
+            session_ttl_secs: 180,
+            retired: tokio::sync::Notify::new(),
+            _permit: None,
         });
         let associations = Arc::new(DashMap::new());
         install_udp_association(&associations, client_addr, old.clone());
         let reader = spawn_udp_association_reader(
             listener,
-            old_socket.clone(),
             associations.clone(),
             old.clone(),
             client_addr,
-            180,
             UpstreamLease {
                 runtime: Arc::new(DashMap::new()),
                 key: "test".into(),
@@ -25579,21 +25690,24 @@ mod tests {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             last_seen_epoch: AtomicU64::new(200),
             active: AtomicBool::new(true),
+            session_ttl_secs: 30,
+            retired: tokio::sync::Notify::new(),
+            _permit: None,
         });
         let mut local = LocalUdpAssociation {
-            association: association.clone(),
+            association: Arc::downgrade(&association),
             last_seen_epoch: 100,
         };
-        assert!(local_udp_association_is_live(&mut local, 30, 210));
+        assert!(local_udp_association_current(&mut local, 210).is_some());
         assert_eq!(local.last_seen_epoch, 200);
-        assert!(!local_udp_association_is_live(&mut local, 30, 231));
+        assert!(local_udp_association_current(&mut local, 231).is_none());
         association.last_seen_epoch.store(231, Ordering::Relaxed);
         association.active.store(false, Ordering::Relaxed);
-        assert!(!local_udp_association_is_live(&mut local, 30, 231));
+        assert!(local_udp_association_current(&mut local, 231).is_none());
     }
 
     #[tokio::test]
-    async fn udp_association_prune_expires_and_caps_entries() {
+    async fn udp_association_prune_removes_expired_entries() {
         let associations = DashMap::<SocketAddr, Arc<UdpAssociation>>::new();
         let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp socket");
         std_socket.set_nonblocking(true).expect("nonblocking");
@@ -25607,6 +25721,9 @@ mod tests {
                     socket: socket.clone(),
                     last_seen_epoch: AtomicU64::new(now.saturating_sub(1_000 + port as u64)),
                     active: AtomicBool::new(true),
+                    session_ttl_secs: 180,
+                    retired: tokio::sync::Notify::new(),
+                    _permit: None,
                 }),
             );
         }
@@ -25616,10 +25733,13 @@ mod tests {
                 socket,
                 last_seen_epoch: AtomicU64::new(now),
                 active: AtomicBool::new(true),
+                session_ttl_secs: 180,
+                retired: tokio::sync::Notify::new(),
+                _permit: None,
             }),
         );
 
-        prune_udp_associations(&associations, 180, 4);
+        prune_udp_associations(&associations);
 
         assert_eq!(associations.len(), 1);
         assert!(associations.contains_key(&"127.0.0.1:30000".parse::<SocketAddr>().expect("addr")));

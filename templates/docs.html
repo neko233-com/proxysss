@@ -97,6 +97,7 @@ scripts/verify-docker-scenarios.sh
           <article class="card">
             <span class="tag expert">TCP / UDP</span>
             <h3>游戏 / 原生协议网关</h3>
+            <p class="subtle">UDP 容量包含在途创建与存活会话，满额保留活跃玩家并拒绝新建；失败和取消自动归还名额。<a href="https://neko233-com.github.io/proxysss/configuration.html#udp-session-capacity">会话容量、TTL 与热更新边界</a>。</p>
             <p class="subtle">流式目标使用 host:port 或 [IPv6]:port，不加 tcp://、udp:// 或路径；主目标、候选池和权重键统一校验。UDP 域名仅在新会话建立时有界解析，已有数据报复用 socket。<a href="https://neko233-com.github.io/proxysss/configuration.html#stream-targets">地址与 DNS 说明</a>。</p>
             <p class="subtle">HTTP 面解决不了的实时流量，应该直接落到 <code>tcp.listeners</code> / <code>udp.listeners</code>。</p>
             <pre><code>{{STREAMS}}</code></pre>

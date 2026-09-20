@@ -338,11 +338,13 @@ udp:
 
 理解方式：
 
-- `session_ttl_secs` 控制 UDP 会话保活窗口。
-- `max_associations` 控制实时设备或玩家会话上限，避免无界膨胀。
+- `session_ttl_secs` 控制自最后一个客户端数据报起的空闲窗口；后端单向持续回复不会延长它，reader 最迟在下一个检查点清理（检查间隔为 TTL，最长 30 秒）。
+- `max_associations` 同时限制正在创建与仍占用资源的会话，0 表示不设上限。名额在脚本/DNS 前预留，创建失败、取消或会话释放后归还；满额拒绝新会话，不挤掉已有活跃玩家。
 - KCP 和 QCP 是两套独立 UDP listener：KCP 用 `protocol: kcp`，neko233-com/QCP 用 `protocol: qcp`。
 - QCP 走透明 UDP 转发；QCP 帧、可靠性和业务语义仍由上游服务处理。
 - 这条面向的是转发和边缘治理，不是协议终端本身。
+
+同名同 bind 更新 `max_associations`、`session_ttl_secs`、`protocol` 后，新会话最多一秒内读取新值；已有会话保留原 TTL 和上游。降低容量不主动断开旧会话，它们仍占名额，低于新上限后才能继续新建。停用或移除 listener 会关闭其接收 worker、在途创建和上游会话，释放端口；它不是保留已有 UDP 会话的迁移操作。
 
 ### 2.9 MQTT / IoT
 

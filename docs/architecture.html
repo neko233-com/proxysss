@@ -718,7 +718,7 @@ services:
             <article class="card">
               <span class="tag beginner">UDP</span>
               <h3>UDP listener</h3>
-              <p class="subtle">重点不只是转发，还有 <code>session_ttl_secs</code> 和 <code>max_associations</code> 这类会话治理；KCP 和 QCP 是独立 listener，协议帧都留给各自上游服务。</p>
+              <p class="subtle">listener 私有原子计数器在首包复制、任务创建、脚本和 DNS 前预留容量，max_associations 覆盖在途创建与尚未释放的会话；失败、取消、最后所有者退出归还许可，已有数据报不操作计数。满额拒绝新建，保留活跃玩家；过期扫描最多每秒一次。worker 缓存用 Weak 引用，转发时取得 Arc，避免旧缓存持有 socket；退休广播唤醒等待回复或可写事件的任务，reader 释放守卫清理自身版本、缓冲和统计。</p><p class="subtle">listener 退出先禁止新发布，取消独立运行时的接收 worker、JoinSet 管理的创建任务，清空并退休已有会话；发布前后检查关闭状态，避免孤儿任务。容量/TTL/protocol 热更新最多一秒供新会话使用，既有会话保留原 TTL 和上游；降低容量不踢旧会话，它们继续占名额。0 表示不设上限。KCP/QCP 帧仍由上游负责。<a href="configuration.html#udp-session-capacity">配置与生效边界</a>。</p>
             </article>
             <article class="card">
               <span class="tag expert">Hook</span>
@@ -987,7 +987,7 @@ udp:
 </main>
     </div>
 
-    <section class="section"><h2>UDP 会话替换与清理</h2><p>UDP 清理在同一分片操作内核对 association 的 Arc 身份，旧 reader、发送失败或容量清理不能误删同地址的新会话。替换会话会停用旧实例；reader 检查自身活跃状态和 TTL，观察到停用后退出并停止转发迟到回复，不借用新实例的活跃时间维持旧 socket。本地缓存判定过期前读取共享刷新时间，避免其他 worker 的活跃会话被旧缓存关闭；容量候选已刷新或替换时跳过本次淘汰。</p></section>
+    <section class="section"><h2>UDP 会话替换与清理</h2><p>UDP 清理在同一分片操作内核对 association 的 Arc 身份，旧 reader、发送失败或容量清理不能误删同地址的新会话。替换会话会停用旧实例；reader 检查自身活跃状态和 TTL，观察到停用后退出并停止转发迟到回复，不借用新实例的活跃时间维持旧 socket。本地缓存判定过期前读取共享刷新时间，避免其他 worker 的活跃会话被旧缓存关闭。TTL 由客户端数据报刷新，后端持续回复不能推迟固定检查期限；持续就绪的回复每批最多追加读取 64 包后让出，保证取消与过期检查获得执行机会。</p></section>
 
     <section class="section"><h2>低频 HTTP/1 静态连接的时效</h2><p>明文 HTTP/1 连接缓存每次命中都检查单调时间上的 2 秒 freshness，不按请求次数推迟检查。低频复用同一连接仍会触发共享后台重验证，不能因尚未积累 256 次访问而长期保留旧版本；过期不等于每次同步 stat，文件刷新仍由现有控制运行时合并执行。</p></section>
     <footer class="footer">
