@@ -1743,7 +1743,10 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
         let worker_count = http_data_plane_workers_for(adaptive_data_plane_workers(1));
         if SHARDED_PLAIN_HTTP_DATA_RUNTIMES.load(Ordering::Relaxed) {
             let runtime_shards = plain_http_runtime_shard_count_for(worker_count, true);
-            tracing::info!(runtime_shards, "starting per-core plain HTTP data runtimes");
+            tracing::info!(
+                runtime_shards,
+                "starting CPU-adaptive migratable plain HTTP data runtimes"
+            );
             return (0..runtime_shards)
                 .map(|worker_index| {
                     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -1752,7 +1755,7 @@ fn dedicated_http_connection_runtimes() -> &'static [tokio::runtime::Runtime] {
                         .thread_name(format!("proxysss-http-{worker_index}"))
                         .global_queue_interval(DATA_RUNTIME_GLOBAL_QUEUE_INTERVAL)
                         .event_interval(SHARDED_PLAIN_HTTP_EVENT_INTERVAL)
-                        .on_thread_start(move || pin_current_data_plane_thread(worker_index))
+                        .on_thread_start(move || register_migratable_http_thread(worker_index))
                         .enable_all();
                     builder
                         .build()
@@ -1933,6 +1936,25 @@ fn pin_current_data_plane_thread(worker_index: usize) {
 fn register_current_data_plane_thread() {
     let worker_index = DATA_RUNTIME_THREAD_INDEX.fetch_add(1, Ordering::Relaxed);
     pin_current_data_plane_thread(worker_index);
+}
+
+fn register_migratable_http_thread(worker_index: usize) {
+    DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
+    // Each listener and connection still belongs to one independent reactor.
+    // Let CFS move its thread when long-lived reuseport placement leaves unequal
+    // work across shards; never move an established socket to another reactor.
+    #[cfg(target_os = "linux")]
+    {
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        for &cpu in data_plane_cpu_ids() {
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+        }
+        let result = unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) };
+        if result != 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), worker_index,
+                "could not restore HTTP worker data-plane CPU mask; retaining inherited affinity");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2398,7 +2420,7 @@ impl Default for PaddedAtomicU64 {
 struct GatewayStats {
     // Request counters are written by every HTTP data-plane shard. A single
     // global atomic bounces one cache line across all gateway cores and makes
-    // metrics collection part of request latency. Each pinned shard owns one
+    // metrics collection part of request latency. Each runtime shard owns one
     // padded cell; control-plane threads use the fallback counter.
     http_requests: AtomicU64,
     http_request_shards: [PaddedAtomicU64; DATA_PLANE_STATS_SHARDS],
@@ -13074,7 +13096,7 @@ async fn sendfile_all_async(
     let reactor_enabled = STATIC_SENDFILE_REACTOR_ENABLED.load(Ordering::Relaxed);
     let reactor_adaptive = STATIC_SENDFILE_REACTOR_ADAPTIVE.load(Ordering::Relaxed);
     if reactor_enabled && reactor_adaptive && transfer_guard.active <= data_plane_cores {
-        // Let sibling large responses on the same pinned HTTP owners register
+        // Let sibling large responses on the same HTTP owners register
         // before classifying pressure. Equal-load remains sparse after this
         // one cooperative turn; saturation exposes its real transfer band.
         tokio::task::yield_now().await;
@@ -22677,6 +22699,29 @@ mod tests {
         AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn balanced_http_worker_restores_full_allowed_mask_from_a_pinned_parent() {
+        // Affinity is thread-local: exercise a real child and leave the test
+        // runner's mask unchanged. Startup must also escape inherited pinning.
+        std::thread::spawn(|| {
+            pin_current_data_plane_thread(0);
+            register_migratable_http_thread(7);
+            let mut actual = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            assert_eq!(
+                unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&actual), &mut actual) },
+                0
+            );
+            let cpus: Vec<_> = (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &actual) })
+                .collect();
+            assert_eq!(cpus, data_plane_cpu_ids());
+            DATA_PLANE_STATS_SHARD.with(|shard| assert_eq!(shard.get(), Some(7)));
+        })
+        .join()
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn unknown_config_field_rejects_reload_without_changing_live_service() {

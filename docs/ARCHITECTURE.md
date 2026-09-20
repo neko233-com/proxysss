@@ -87,8 +87,10 @@ CPU 数从 cgroup effective cpuset 探测，不从已绑核线程误推全局资
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
 | small（默认） | HTTP/1、TLS/H2 共用每允许核心一个 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
-| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 每允许 CPU 一个 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
+| balanced | 明文 HTTP 按允许核心数创建独立单线程 runtime，线程可在完整 CPU 集内迁移；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 每允许 CPU 一个 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
+
+balanced 的 HTTP listener、连接、缓存和 reactor 所有权仍留在原分片，只允许 Linux 调度器把该线程迁移到同一 cgroup 获准的 CPU；不迁移已建立 socket 的 Tokio 注册。这样允许调度器处理 SO_REUSEPORT 长连接分布不均，worker 数量仍随允许核心数扩展。该调度方案必须由完整混合矩阵验证，不能从 CPU mask 变化推断性能收益。
 
 balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
 
