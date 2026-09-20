@@ -88,3 +88,5 @@ admin.monitor 是独立 HTTPS 只读入口，使用专用密码与 monitor:read 
 QuickJS 与 swc_ts_fast_strip 内嵌进程，无外部 Node/Deno/tsc。routeHttp/routeTcp/routeUdp 与插件钩子负责可选业务扩展；核心边缘策略保持原生实现。主动健康覆盖 HTTP/TCP 和显式 UDP 探测，被动失败可隔离上游；watchdog 观察关键后台任务，metrics 暴露重启/失败计数。
 
 管理 HTML/CSS、内置文档和站点资源嵌入二进制。管理 `/docs` 与 `/docs.html` 经过管理传输检查；公开文档导航只链接 HTML。详细配置见 [配置指南](CONFIGURATION.md)，扩展见 [脚本指南](../ts-how-to-use.md)，交付顺序见 [验证与发布](VALIDATION.md)。
+
+Linux 原生 TCP/明文 WebSocket relay 在一次短读被完整写出后返回 level-triggered epoll，后续数据与 EOF 继续触发可读事件；读满缓冲区时仍使用有界批处理，写阻塞时仍暂停源读取并先排空 pending bytes，再传播半关闭。此优化须通过混合矩阵后才能作为性能结论。

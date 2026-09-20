@@ -350,9 +350,8 @@ fn run_reactor(
             } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
                 // Fixed-rate game/WebSocket ticks commonly block before the
                 // client request arrives. Sparse owners use one/two immediate
-                // probes. Dense owners use eight: enough to cover the short
-                // backend scheduling gap without restoring the rejected
-                // 32-poll loop that starved sibling HTTP work.
+                // probes. Dense owners return to blocking epoll instead of
+                // stealing CPU from sibling HTTP work.
                 active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
             } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
                 // The zero-valued knob deliberately disables dense spinning.
@@ -537,6 +536,13 @@ fn relay_read(
             Err(_) => return RelayReadOutcome::Failed,
         };
         if sent == read {
+            // A short nonblocking read drained the bytes available at this
+            // instant. Level-triggered epoll reports later data or EOF, so a
+            // second recv only to observe EAGAIN is unnecessary for small
+            // game/WebSocket frames. Full buffers retain bounded draining.
+            if read < buffer.len() {
+                return RelayReadOutcome::Open;
+            }
             continue;
         }
 
@@ -792,5 +798,58 @@ mod tests {
         client.read_exact(&mut received).unwrap();
         assert_eq!(received, pong);
         assert_eq!(client.read(&mut eof).unwrap(), 0);
+    }
+
+    #[test]
+    fn reactor_drains_backpressure_before_half_close_and_completion() {
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(downstream_listener.local_addr().unwrap()).unwrap();
+        let (downstream, _) = downstream_listener.accept().unwrap();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = TcpStream::connect(backend_listener.local_addr().unwrap()).unwrap();
+        let (mut backend, _) = backend_listener.accept().unwrap();
+        for socket in [&client, &downstream, &upstream, &backend] {
+            socket.set_nodelay(true).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+        }
+        // Force pending relay bytes while the backend temporarily stops reading.
+        socket2::SockRef::from(&upstream)
+            .set_send_buffer_size(8192)
+            .unwrap();
+        let mut completion =
+            dispatch_with_completion(downstream.as_raw_fd(), upstream.as_raw_fd(), 1, 0).unwrap();
+        drop(downstream);
+        drop(upstream);
+        let payload: Vec<u8> = (0..2 * 1024 * 1024 + 37).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let backend_worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut received = Vec::new();
+            backend.read_to_end(&mut received).unwrap();
+            assert_eq!(received, expected);
+            backend.write_all(b"complete-after-eof").unwrap();
+            backend.shutdown(Shutdown::Write).unwrap();
+        });
+        client.write_all(&payload).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"complete-after-eof");
+        backend_worker.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match completion.try_recv() {
+                Ok(()) => break,
+                Err(oneshot::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                other => panic!("relay completion missing after both halves closed: {other:?}"),
+            }
+        }
     }
 }
