@@ -1915,6 +1915,11 @@ impl GatewayConfig {
 
         if self.services.ftp.enabled {
             validate_bind_required("services.ftp.bind", &self.services.ftp.bind, &mut errors);
+            if let Err(error) =
+                crate::stream_endpoint::StreamEndpoint::parse(&self.services.ftp.upstream)
+            {
+                errors.push(format!("services.ftp.upstream: {error}"));
+            }
             if self.services.ftp.upstream.trim().is_empty() {
                 errors
                     .push("services.ftp.upstream cannot be empty when ftp is enabled".to_string());
@@ -2019,6 +2024,13 @@ impl GatewayConfig {
 
         let mut stream_route_names = HashSet::<String>::new();
         for route in &self.tcp.stream_routes {
+            validate_stream_upstreams(
+                &format!("tcp.stream_routes.{}", route.name),
+                &route.upstream,
+                &route.upstreams,
+                &route.upstream_weights,
+                &mut errors,
+            );
             if route.name.trim().is_empty() {
                 errors.push("tcp.stream_routes[].name cannot be empty".to_string());
             }
@@ -2056,6 +2068,13 @@ impl GatewayConfig {
         let mut tcp_names = HashSet::<String>::new();
         let mut tcp_binds = HashSet::<String>::new();
         for listener in &self.tcp.listeners {
+            validate_stream_upstreams(
+                &format!("tcp.listeners.{}", listener.name),
+                &listener.upstream,
+                &listener.upstreams,
+                &listener.upstream_weights,
+                &mut errors,
+            );
             if listener.name.trim().is_empty() {
                 errors.push("tcp listener name cannot be empty".to_string());
             }
@@ -2090,6 +2109,13 @@ impl GatewayConfig {
         let mut udp_names = HashSet::<String>::new();
         let mut udp_binds = HashSet::<String>::new();
         for listener in &self.udp.listeners {
+            validate_stream_upstreams(
+                &format!("udp.listeners.{}", listener.name),
+                &listener.upstream,
+                &listener.upstreams,
+                &listener.upstream_weights,
+                &mut errors,
+            );
             if listener.name.trim().is_empty() {
                 errors.push("udp listener name cannot be empty".to_string());
             }
@@ -3279,6 +3305,29 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
 fn normalize_vec_lowercase(values: &mut [String]) {
     for value in values {
         *value = value.to_ascii_lowercase();
+    }
+}
+
+fn validate_stream_upstreams(
+    prefix: &str,
+    upstream: &str,
+    upstreams: &[String],
+    weights: &BTreeMap<String, u32>,
+    errors: &mut Vec<String>,
+) {
+    let mut check = |label: String, value: &str| {
+        if let Err(error) = crate::stream_endpoint::StreamEndpoint::parse(value) {
+            errors.push(format!("{label}: {error}"));
+        }
+    };
+    if !upstream.is_empty() {
+        check(format!("{prefix}.upstream"), upstream);
+    }
+    for (index, value) in upstreams.iter().enumerate() {
+        check(format!("{prefix}.upstreams.{index}"), value);
+    }
+    for (index, value) in weights.keys().enumerate() {
+        check(format!("{prefix}.upstream_weights key {index}"), value);
     }
 }
 

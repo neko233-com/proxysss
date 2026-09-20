@@ -577,6 +577,7 @@ export default plugin;</code></pre>
             <article class="card">
               <span class="tag expert">TCP / UDP 预读</span>
               <h3><code>preread</code></h3>
+              <p>返回的 upstream、upstreams 和 upstream_weights 键使用 host:port 或 [IPv6]:port，不带协议前缀、路径。最终流路由在连接前统一校验；非法目标使路由失败。UDP 域名仅在新 association 建立时有界解析，已有会话不逐包查询。HTTP URL 与内建 proxysss:// 目标保持原语义。<a href="configuration.html#stream-targets">地址格式与 DNS 边界</a>。</p>
               <p class="subtle">适合根据 listener、player_id、首包预览做非 HTTP 流量落点选择，比如游戏分区和设备亲和。</p>
               <pre><code>preread(message, current) {
   if (message.listener === "game-tcp" && message.ctx.player_id) {

@@ -11,8 +11,9 @@ use url::Url;
 use crate::config::{
     AdminAuthRateLimitConfig, DdosProtectionConfig, DomainRouteConfig, DynamicBlacklistConfig,
     HttpAccessControlConfig, KubernetesConfig, ReverseProxyRouteConfig, SecurityConfig,
-    StreamAccessControlConfig, TcpListenerConfig, UdpListenerConfig,
+    StreamAccessControlConfig, StreamRouteConfig, TcpListenerConfig, UdpListenerConfig,
 };
+use crate::stream_endpoint::StreamEndpoint;
 
 #[derive(Clone)]
 pub struct AdminAuthGuard {
@@ -240,24 +241,27 @@ pub fn validate_udp_listener_mutation(
 }
 
 fn validate_stream_upstream(upstream: &str, security: &SecurityConfig) -> Result<()> {
-    let trimmed = upstream.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("stream upstream cannot be empty"));
-    }
-    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
-        if security.block_ssrf_targets {
-            reject_ssrf_ip(socket.ip(), security)?;
-        }
-        return Ok(());
-    }
-    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        if security.block_ssrf_targets {
-            reject_ssrf_ip(ip, security)?;
-        }
-        return Ok(());
-    }
+    let endpoint = StreamEndpoint::parse(upstream)?;
     if security.block_ssrf_targets {
-        reject_ssrf_host(trimmed, security)?;
+        match endpoint {
+            StreamEndpoint::Socket(address) => reject_ssrf_ip(address.ip(), security)?,
+            StreamEndpoint::Host { name, .. } => reject_ssrf_host(name, security)?,
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_stream_route_mutation(
+    route: &StreamRouteConfig,
+    security: &SecurityConfig,
+) -> Result<()> {
+    if !security.validate_admin_mutations {
+        return Ok(());
+    }
+    validate_route_name(&route.name)?;
+    validate_stream_upstream(&route.upstream, security)?;
+    for upstream in &route.upstreams {
+        validate_stream_upstream(upstream, security)?;
     }
     Ok(())
 }
@@ -287,11 +291,15 @@ fn validate_domain_name(domain: &str) -> Result<()> {
 }
 
 fn reject_ssrf_host(host: &str, security: &SecurityConfig) -> Result<()> {
-    let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let normalized = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if security
         .blocked_upstream_hosts
         .iter()
-        .any(|item| item.eq_ignore_ascii_case(&normalized))
+        .any(|item| item.trim_end_matches('.').eq_ignore_ascii_case(&normalized))
     {
         return Err(anyhow!(
             "upstream host {host} is blocked by security policy"

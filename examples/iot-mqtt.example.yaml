@@ -18,7 +18,7 @@ tcp:
     - name: mqtt-tls
       domains: [mqtt.example.com]
       listen: 0.0.0.0:8883
-      upstream: 127.0.0.1:88831
+      upstream: 127.0.0.1:18833
       protocol: mqtt
       tls_mode: passthrough
 

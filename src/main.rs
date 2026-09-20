@@ -18,6 +18,7 @@ mod security_guidance;
 mod sendfile_reactor;
 mod static_hosts;
 mod static_security;
+mod stream_endpoint;
 #[cfg(target_os = "linux")]
 mod stream_reactor;
 mod stream_routes;
@@ -1925,7 +1926,7 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
             "script:\n  enabled: true\n  entry: gateway.ts\n  cwd: .\n  timeout_ms: 500\n  memory_limit_mb: 64\n  max_stack_size_kb: 512\nplugins:\n  enabled: false\n"
         }
         ConfigTemplateKind::Iot => {
-            "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams:\n        - 127.0.0.1:18831\n        - 127.0.0.1:18832\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:56831\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n  rate_limit:\n    stream:\n      enabled: true\n      algorithm: token_bucket\n      connections: 600\n      window_ms: 60000\n      burst: 1200\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  performance:\n    enabled: true\n    profile: latency\n    traffic_profile: small\n    adaptive_system: true\n    socket_extreme: true\n    log_on_start: true\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
+            "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams:\n        - 127.0.0.1:18831\n        - 127.0.0.1:18832\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:18833\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams:\n        - 127.0.0.1:56831\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n  rate_limit:\n    stream:\n      enabled: true\n      algorithm: token_bucket\n      connections: 600\n      window_ms: 60000\n      burst: 1200\nload_balance:\n  active_health:\n    enabled: true\n    http_enabled: true\n    tcp_enabled: true\n    udp_enabled: false\n    udp_payload: proxysss-health\n    udp_expect_response: true\nruntime:\n  performance:\n    enabled: true\n    profile: latency\n    traffic_profile: small\n    adaptive_system: true\n    socket_extreme: true\n    log_on_start: true\n  watchdog:\n    enabled: true\n    restart_critical_tasks: true\n    restart_backoff_secs: 2\n    heartbeat_interval_secs: 30\n"
         }
     }
 }

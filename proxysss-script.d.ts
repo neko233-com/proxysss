@@ -35,10 +35,12 @@ export type JsonValue =
  * 返回给 Rust 网关运行时的最终路由决策结构。
  */
 export interface RouteDecision {
-  /** Primary upstream target. / 主上游目标。 */
+  /** 主上游目标。TCP/UDP 使用 host:port 或 [IPv6]:port，不带 scheme/路径；HTTP 使用 URL。 */
   upstream: string;
   /** Optional upstream pool for load balancing. / 可选上游池，用于负载均衡。 */
   upstreams?: string[];
+  /** 候选目标的权重；流式路由的键也须符合 host:port / [IPv6]:port 格式。 */
+  upstream_weights?: Record<string, number>;
   /** Optional sticky key for affinity routing. / 可选亲和路由键。 */
   affinity_key?: string;
   /** Optional rewritten path sent downstream. / 发往下游的可选改写路径。 */

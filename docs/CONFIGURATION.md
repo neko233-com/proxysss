@@ -294,6 +294,8 @@ WebDAV 与 FileCloud 支持 GET/HEAD、最多 16 段 Range、ETag/日期条件�
 
 ### 2.7 TCP 直通
 
+流式上游写为 `host:port` 或 `[IPv6]:port`，例如 `game.internal:9000`、`127.0.0.1:9000`、`[::1]:9000`，端口为 1–65535。域名使用 ASCII（国际化域名先转换为 Punycode），支持容器内部带下划线的名称。不要加 `tcp://`、`udp://`、路径或空白。TCP/UDP listener、stream route 的 `upstream`、`upstreams`、`upstream_weights` 键以及启用的 FTP 上游都在加载时校验；管理更新校验失败不改写文件，失败重载保留旧状态。检查配置不触发 DNS，不保证源站当前可达。
+
 ```yaml
 tcp:
   listeners:
@@ -313,6 +315,8 @@ nodelay 默认 true，同时控制网关接入与上游 socket；显式设为 fa
 - 你不想让业务协议被 HTTP 层感知的场景
 
 ### 2.8 UDP、KCP-style、QCP、CoAP-style
+
+UDP 域名在新 association 建立时通过系统解析器查询，使用返回的首个地址，并按实际 IPv4/IPv6 绑定上游 socket。解析最长等待 5 秒，全进程最多 64 个在途 DNS 作业；超时后的底层系统调用继续占用名额直至结束，满额时新解析失败，不无限排队。已建立会话复用同一 socket，不逐包解析，也不会因 DNS 更新立即迁移；会话重建时重新解析。数字 IP 保持直接路径。需要在多个后端间重试或检查可达性时，配置上游池与健康策略；UDP connect 成功本身不证明对端存活。UDP 健康探测的 timeout_ms 覆盖解析、绑定、发送及等待回复整个过程。
 
 ```yaml
 udp:

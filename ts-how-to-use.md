@@ -183,6 +183,8 @@ export default plugin;
 
 适合：TCP / UDP 路由阶段，根据 listener、player_id、首包预览选上游。
 
+`preread` 返回的 `upstream`、`upstreams` 和 `upstream_weights` 键必须是 `host:port` 或 `[IPv6]:port`，不带协议前缀或路径。最终路由统一校验后才交给连接阶段；非法目标使该路由失败，不会被当成可用后端。UDP 域名仅在新 association 建立时有界解析，已有会话不逐包查询。地址格式和 DNS 边界见 [配置指南](docs/CONFIGURATION.md)。HTTP 的 URL 与内建 `proxysss://` 目标保持原语义。
+
 ```ts
 const plugin: ProxysssPlugin = {
   name: "player-affinity",

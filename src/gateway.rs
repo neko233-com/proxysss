@@ -16,6 +16,9 @@ mod http_stream_tests;
 mod static_ranges;
 #[path = "static_snapshot.rs"]
 mod static_snapshot;
+#[cfg(test)]
+#[path = "stream_endpoint_tests.rs"]
+mod stream_endpoint_tests;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -120,6 +123,7 @@ use crate::security::{
     validate_tcp_listener_mutation, validate_udp_listener_mutation, AdminAuthGuard, DdosGuard,
     DynamicBlacklist,
 };
+use crate::stream_endpoint::StreamEndpoint;
 use crate::stream_routes::{parse_tls_client_hello_sni, StreamRouteTable};
 
 #[derive(Clone)]
@@ -1546,20 +1550,10 @@ impl DirectUdpRouteCache {
         }
 
         self.upstream = if state.script.is_none() {
-            direct_udp_listener_upstream(&state.config, listener_name).and_then(|upstream| {
-                match upstream.parse::<SocketAddr>() {
-                    Ok(addr) => Some(addr),
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            listener = %listener_name,
-                            upstream = %upstream,
-                            "direct udp fast path ignored invalid upstream"
-                        );
-                        None
-                    }
-                }
-            })
+            // Numeric targets keep the no-resolution fast lane. Host names
+            // establish through the bounded resolver once per association.
+            direct_udp_listener_upstream(&state.config, listener_name)
+                .and_then(|upstream| upstream.parse::<SocketAddr>().ok())
         } else {
             None
         };
@@ -4042,7 +4036,9 @@ impl Gateway {
                     ));
                 }
             };
-            if let Err(error) = security::validate_route_name(&route.name) {
+            if let Err(error) =
+                security::validate_stream_route_mutation(&route, &state.config.security)
+            {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({"ok": false, "error": error.to_string()}),
@@ -8008,41 +8004,9 @@ impl Gateway {
         let mut last_error: Option<anyhow::Error> = None;
 
         for upstream in upstream_plan.iter().take(max_attempts) {
-            let upstream_addr: SocketAddr = match upstream.parse() {
-                Ok(value) => value,
-                Err(error) => {
-                    gateway.on_upstream_failure(
-                        &state.config,
-                        "udp",
-                        Some(listener_name),
-                        upstream,
-                    );
-                    last_error = Some(anyhow!("invalid udp upstream {upstream}: {error}"));
-                    continue;
-                }
-            };
-
-            let bind_any = if upstream_addr.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-            let socket = match UdpSocket::bind(bind_any).await {
-                Ok(value) => Arc::new(value),
-                Err(error) => {
-                    gateway.on_upstream_failure(
-                        &state.config,
-                        "udp",
-                        Some(listener_name),
-                        upstream,
-                    );
-                    last_error = Some(anyhow!("failed to bind udp upstream socket: {error}"));
-                    continue;
-                }
-            };
-
-            match socket.connect(upstream_addr).await {
-                Ok(()) => {
+            match connect_udp_upstream(upstream).await {
+                Ok(socket) => {
+                    let socket = Arc::new(socket);
                     gateway.on_upstream_success("udp", Some(listener_name), upstream);
                     tune_udp_upstream_socket_for_gateway(&socket);
                     let lease =
@@ -11671,125 +11635,56 @@ async fn probe_tcp_upstream(
     }
 }
 
+async fn connect_udp_upstream(upstream: &str) -> Result<UdpSocket> {
+    let address = StreamEndpoint::parse(upstream)?.resolve_first().await?;
+    let bind_any = if address.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_any)
+        .await
+        .context("failed binding UDP upstream socket")?;
+    socket
+        .connect(address)
+        .await
+        .context("failed connecting UDP upstream socket")?;
+    Ok(socket)
+}
+
 async fn probe_udp_upstream(
     upstream: &str,
     settings: &ResolvedActiveHealthConfig,
 ) -> (bool, Option<u16>, Option<String>, Option<u64>) {
     let started_at = Instant::now();
     let timeout = Duration::from_millis(settings.timeout_ms.max(100));
-    let target = match tcp_probe_target(upstream) {
-        Ok(target) => target,
-        Err(error) => return (false, None, Some(error.to_string()), None),
-    };
-    let bind_any = if target.contains(':') && !target.contains('.') {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match UdpSocket::bind(bind_any).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            return (
-                false,
-                None,
-                Some(error.to_string()),
-                Some(
-                    started_at
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                ),
-            )
+    // One deadline covers DNS, address-family selection, send and reply. Host
+    // names without a dot must not be mistaken for IPv6 socket addresses.
+    let result = tokio::time::timeout(timeout, async {
+        let target = tcp_probe_target(upstream)?;
+        let socket = connect_udp_upstream(&target).await?;
+        socket.send(settings.udp_payload.as_bytes()).await?;
+        if settings.udp_expect_response {
+            let mut buffer = [0_u8; 2048];
+            socket.recv(&mut buffer).await?;
         }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    let error = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(_) => Some(format!("UDP probe timeout after {}ms", timeout.as_millis())),
     };
-    if let Err(error) = socket.connect(&target).await {
-        return (
-            false,
-            None,
-            Some(error.to_string()),
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        );
-    }
-    if let Err(error) = socket.send(settings.udp_payload.as_bytes()).await {
-        return (
-            false,
-            None,
-            Some(error.to_string()),
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        );
-    }
-    if !settings.udp_expect_response {
-        return (
-            true,
-            None,
-            None,
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        );
-    }
-
-    let mut buffer = [0_u8; 2048];
-    match tokio::time::timeout(timeout, socket.recv(&mut buffer)).await {
-        Ok(Ok(_)) => (
-            true,
-            None,
-            None,
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        ),
-        Ok(Err(error)) => (
-            false,
-            None,
-            Some(error.to_string()),
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        ),
-        Err(_) => (
-            false,
-            None,
-            Some(format!(
-                "udp response timeout after {}ms",
-                timeout.as_millis()
-            )),
-            Some(
-                started_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        ),
-    }
+    let elapsed = Some(
+        started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+    (error.is_none(), None, error, elapsed)
 }
-
 fn tcp_probe_target(upstream: &str) -> Result<String> {
     if upstream.starts_with("http://")
         || upstream.starts_with("https://")
@@ -21657,7 +21552,7 @@ fn docs_template_streams() -> &'static str {
 }
 
 fn docs_template_iot() -> &'static str {
-    "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams: [127.0.0.1:18831, 127.0.0.1:18832]\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:88831\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams: [127.0.0.1:56831]\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n"
+    "tcp:\n  listeners:\n    - name: mqtt\n      bind: 0.0.0.0:1883\n      protocol: mqtt\n      nodelay: true\n      connect_timeout_ms: 3000\n      upstreams: [127.0.0.1:18831, 127.0.0.1:18832]\n  stream_routes:\n    - name: mqtt-tls\n      domains: [mqtt.example.com]\n      listen: 0.0.0.0:8883\n      upstream: 127.0.0.1:18833\n      protocol: mqtt\n      tls_mode: passthrough\nudp:\n  listeners:\n    - name: coap\n      bind: 0.0.0.0:5683\n      protocol: coap\n      session_ttl_secs: 120\n      max_associations: 262144\n      upstreams: [127.0.0.1:56831]\nservices:\n  reverse_proxy:\n    routes:\n      - name: mqtt-websocket\n        hosts: [mqtt-ws.example.com]\n        path_prefix: /mqtt\n        upstream: ws://127.0.0.1:8083\n"
 }
 
 fn docs_template_ftp() -> &'static str {

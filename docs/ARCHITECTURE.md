@@ -74,6 +74,10 @@ Range 最多接受 16 个区间，合并重复/相邻/重叠区间，保留未�
 
 ## 游戏与 socket 长连接
 
+管理 API 的 TCP/UDP listener 与 stream route 使用相同目标策略：主机名去除端口与末尾点后比较规则，数字地址检查 IP/CIDR，校验先于落盘和重载。该控制面检查不做 DNS 解析，不等于 DNS 重绑定防护，也不限制本地可信配置与脚本的内网目标。
+
+`src/stream_endpoint.rs` 统一流目标语法，配置加载/管理更新与脚本返回路由时校验主目标、候选和权重键，不在普通转发中重复检查。UDP 域名仅在新 association 建立时进入有界系统 DNS 解析，数字 IP 保持直接路径；最多 64 个在途解析、5 秒等待，超时后许可仍由实际系统解析任务持有，防止遗留任务无界增长。取首个解析地址并按其地址族绑定，已有会话继续复用 socket。健康探测共用地址处理，单个期限覆盖 DNS、发送与回复；详细输入格式与 DNS 生效边界见 [配置指南](CONFIGURATION.md)。
+
 TCP 接受连接后读取当前 listener 配置，再执行流访问/限流和路由，选择内存上游池；没有脚本、亲和、健康和额外候选时走单上游直接路径。nodelay 默认 true，同时作用于接入与上游 socket；显式 false 保留 Nagle 合并，自动系统调优不覆盖该选择。同名同 bind listener 的 nodelay、connect_timeout_ms、protocol 更新应用于随后建立的连接，已建立会话保留原选项与上游。连接阶段受 connect_timeout_ms 限制。半关闭先冲刷未发送字节，再传播写关闭，保留反向数据。
 
 UDP 按客户端建立上游 association；session_ttl_secs 管理空闲时间，max_associations 限制高频重连规模。创建去重使用分片 pending 集合，清理按时间、创建数和容量压力节流。已建 association 使用 worker 本地缓存，TTL 最多每秒刷新一次，数据报使用有界缓冲池。

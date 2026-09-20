@@ -703,6 +703,8 @@ services:
             <div>
               <div class="kicker">Stream flow</div>
               <h2>一条 TCP / UDP 流量怎么走</h2>
+              <p>管理 API 的 TCP/UDP listener 和 stream route 在落盘及重载前使用相同目标策略：主机规则比较去除端口与末尾点后的名称，数字地址检查 IP/CIDR。检查不解析 DNS，不等于重绑定防护，也不限制本地可信 YAML 与脚本使用内网目标。<a href="security-performance.html">开关与边界</a>。</p>
+              <p>stream_endpoint 统一目标语法，在配置加载、管理更新及脚本路由返回时检查主目标、候选和权重键。UDP 域名仅在建立 association 时查询系统 DNS，取首个解析地址并按其地址族绑定；数字 IP 保持直接路径，已有会话复用 socket。解析等待最多 5 秒、全进程最多 64 个作业，超时后实际系统调用仍持有名额直到结束。健康探测的单一期限覆盖解析、发送和回复。<a href="configuration.html#stream-targets">地址格式与生效边界</a>。</p>
             </div>
             <p class="subtle">这里是 proxysss 和“只会讲 HTTP 的文档”最不一样的地方。实时流量不是附属功能，而是一等公民。</p>
           </div>

@@ -581,6 +581,13 @@ impl<'a, 'js> Engine<'a, 'js> {
                 kind.as_str()
             )
         })?;
+        for upstream in std::iter::once(&decision.upstream)
+            .chain(decision.upstreams.iter())
+            .chain(decision.upstream_weights.keys())
+        {
+            crate::stream_endpoint::StreamEndpoint::parse(upstream)
+                .with_context(|| format!("invalid {} script route target", kind.as_str()))?;
+        }
         self.run_log_hooks(plugins, fallback, message, &decision);
         Ok(decision)
     }

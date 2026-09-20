@@ -14,6 +14,8 @@ proxysss -c proxysss.yaml config reload-plan
 
 ## 安全配置如何开关
 
+管理 API 的 TCP/UDP listener 与 stream route 更新在落盘前统一检查上游主目标和候选池。主机黑名单按去除端口、统一大小写及末尾点的名称匹配；数字地址检查 IP/CIDR。`validate_admin_mutations=false` 跳过管理策略，`block_ssrf_targets=false` 只停用上游限制，均不跳过配置语法校验。这些检查不解析 DNS，不能防止允许的域名解析到受限地址或后续重绑定；不改变本地可信 YAML 与脚本配置内网源站的权限。
+
 | 配置面 | 开关与默认行为 | 配置建议 |
 | --- | --- | --- |
 | 管理 API 输入校验 | `security.validate_admin_mutations: true` | 生产保留。关闭不绕过配置语法和类型校验。 |
