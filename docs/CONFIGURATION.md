@@ -182,32 +182,24 @@ runtime:
 
 services:
   ai_proxy:
+    enabled: true
     routes:
       - name: llm-edge
-        match:
-          hosts: ["ai.example.com"]
-          path_prefix: "/v1"
-        upstreams:
-          - url: "https://api.openai.com"
-          - url: "https://api.deepseek.com"
-        load_balance:
-          strategy: latency_first
-          active_health:
-            interval_secs: 5
-            timeout_ms: 1500
-            path: "/v1/models"
-        transport:
-          flush_interval_ms: 0
-          tcp_nodelay: true
-          keepalive_secs: 75
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+        forward_headers: true
+        emit_metadata_headers: true
 ```
 
 为什么这份配置适合 SSE：
 
 - `traffic_profile: small` 更偏向小包、频繁 flush、HTTP2/SSE/TCP/UDP 的交互式流量。
-- `flush_interval_ms: 0` 让事件尽快往下游刷，减少 token 被代理层攒包。
-- `tcp_nodelay: true` 降低小块流式响应等待合并的概率。
-- `active_health` 让长连接代理在上游异常时更快切走。
+- 内建 SSE 转发按下游需求读取，不等待完整事件再发送。TCP_NODELAY 由运行时启用，AI route 没有 `transport.flush_interval_ms` 等字段。
+- `match_host` 和 `path_prefix` 匹配入口，`upstream` 是单个 New API/sub2api/兼容 API 服务；不同供应商的账号、密钥和模型选择由该服务管理。通用多上游权重与健康检查使用 `services.reverse_proxy.routes` 和根 `load_balance` 配置。
+- 原始 SSE 转 TLS/HTTP2 时解码 chunked，按终止块或 Content-Length 结束，不等 keep-alive 连接断开。分块行上限 16 KiB、trailer 总上限 64 KiB；trailer 不作为事件数据转发。提前 EOF 报错，已有 gzip 等 Content-Encoding 保留。
 
 建议：
 

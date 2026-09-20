@@ -90,7 +90,7 @@ scripts/verify-docker-scenarios.sh
           <article class="card">
             <span class="tag beginner">AI / SSE</span>
             <h3>流式 AI 代理</h3>
-            <p class="subtle">面向 OpenAI-compatible / New API / SSE，优先关注小包 flush、nodelay 和上游健康。</p>
+            <p class="subtle">使用真实的 match_host、path_prefix 和单个 upstream 配置兼容 API。SSE 按下游需求读取；转 TLS/HTTP2 时解码 chunked，完整响应按消息边界结束，保留上游已有 Content-Encoding。AI route 没有 transport.flush_interval_ms 字段。</p>
             <pre><code>{{AI_PROXY}}</code></pre>
           </article>
 

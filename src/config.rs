@@ -4038,6 +4038,33 @@ mod tests {
     }
 
     #[test]
+    fn documented_ai_streaming_example_uses_supported_route_fields() {
+        let section = include_str!("../docs/CONFIGURATION.md")
+            .split("### 2.3 AI / SSE / OpenAI-compatible 代理")
+            .nth(1)
+            .expect("AI documentation section");
+        let yaml = section
+            .split("```yaml")
+            .nth(1)
+            .expect("AI YAML example")
+            .split("```")
+            .next()
+            .unwrap();
+        let config: GatewayConfig = serde_yaml::from_str(yaml).expect("executable AI example");
+        config.validate().expect("valid AI configuration");
+        assert!(config.services.ai_proxy.enabled);
+        assert_eq!(config.services.ai_proxy.routes.len(), 1);
+        assert_eq!(
+            config.services.ai_proxy.routes[0].upstream,
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            config.services.ai_proxy.routes[0].match_host,
+            "ai.example.com"
+        );
+    }
+
+    #[test]
     fn default_yaml_does_not_expose_default_bearer_token() {
         let yaml = GatewayConfig::render_default_yaml();
         assert!(!yaml.contains("bearer_token"));

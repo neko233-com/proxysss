@@ -11,6 +11,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 | `src/gateway.rs` | 监听器、HTTP 分发、上游池、缓存、健康状态、TCP/UDP 与管理 API |
 | `src/static_security.rs` | 静态源站令牌、真实路径边界、签名 URL 和目录规则 |
 | `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
+| `src/http1_body.rs` | 原始 SSE 转换为 Hyper 响应前的有界 HTTP/1 正文解码 |
 | `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
 | `src/runtime_tuning.rs`、`src/linux_cpu.rs`、`src/linux_tune/` | 系统能力、cgroup cpuset、运行时/socket 适配与显式主机调优 |
 | `src/script.rs`、`src/ts_transpile.rs` | 进程内 QuickJS、TypeScript 类型剥离、扩展调用与热重载 |
@@ -30,6 +31,8 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 7. 更新分片指标，按配置记录访问/错误日志；流式正文发送后遇到文件截断则终止传输，不补成成功短正文。
 
 快路径只在语义等价时启用。raw reverse/SSE 保留默认转发头并复用请求/响应缓冲与上游 lane。条件请求和 Range 进入完整静态处理。启用热重载/管理更新时不复用连接上的免策略静态响应；不可变无策略 H2 使用连接 OnceLock 和只读 ArcSwap/FxHashMap 响应快照。
+
+原始 SSE 转换为 TLS/HTTP2 下游响应前先按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB；长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件，完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding；移除编码头而保留压缩字节会破坏正文。
 
 ## CDN 和复杂下载
 

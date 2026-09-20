@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+#[path = "http1_body.rs"]
+mod http1_body;
 #[path = "static_ranges.rs"]
 mod static_ranges;
 #[path = "static_snapshot.rs"]
@@ -9406,6 +9408,7 @@ impl Gateway {
         let (status, response_headers, leftover) = read_http_response_head(&mut upstream_io)
             .await
             .with_context(|| format!("failed reading raw SSE response from {upstream_url}"))?;
+        let decoder = http1_body::ResponseBodyDecoder::new(method, status, &response_headers)?;
         let response_headers = response_headers
             .into_iter()
             .filter(|(name, _)| !is_hop_header(name.as_str()))
@@ -9414,7 +9417,7 @@ impl Gateway {
             status,
             headers: response_headers,
             body: Bytes::new(),
-            stream_body: Some(raw_sse_streaming_body(upstream_io, leftover)),
+            stream_body: Some(raw_sse_streaming_body(upstream_io, leftover, decoder)),
             upstream: upstream_url.to_string(),
         };
         finalize_http_response(
@@ -13310,37 +13313,43 @@ where
 
 struct RawSseStreamState {
     upstream: BoxedProxyIo,
-    leftover: Option<Bytes>,
+    pending: Bytes,
     buffer: PooledBuffer,
+    decoder: http1_body::ResponseBodyDecoder,
 }
 
-fn raw_sse_streaming_body(upstream: BoxedProxyIo, leftover: Option<Bytes>) -> GatewayBody {
+fn raw_sse_streaming_body(
+    upstream: BoxedProxyIo,
+    leftover: Option<Bytes>,
+    decoder: http1_body::ResponseBodyDecoder,
+) -> GatewayBody {
     let state = RawSseStreamState {
         upstream,
-        leftover,
+        pending: leftover.unwrap_or_default(),
         buffer: relay_buffer_pool().acquire(),
+        decoder,
     };
     let stream = futures::stream::try_unfold(state, |mut state| async move {
-        // Forward the head-read leftover first, then stream upstream reads as
-        // they arrive with NO event-boundary buffering (nginx `proxy_buffering
-        // off`): lowest first-token and inter-token latency for AI SSE. Upstream
-        // EOF ends the stream, which naturally covers `data: [DONE]` + close.
-        if let Some(leftover) = state.leftover.take() {
-            if !leftover.is_empty() {
-                return Ok(Some((leftover, state)));
+        loop {
+            if let Some(data) = state.decoder.next_data(&mut state.pending)? {
+                return Ok(Some((data, state)));
             }
+            if state.decoder.is_done() {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            let read = state
+                .upstream
+                .read(&mut state.buffer)
+                .await
+                .context("raw SSE upstream stream read failed")?;
+            if read == 0 {
+                state.decoder.finish_eof()?;
+                return Ok(None);
+            }
+            // Preserve pooled, pull-driven I/O and release data slices as soon
+            // as downstream consumes them; never buffer a complete SSE event.
+            state.pending = Bytes::copy_from_slice(&state.buffer[..read]);
         }
-
-        let read = state
-            .upstream
-            .read(&mut state.buffer)
-            .await
-            .context("raw SSE upstream stream read failed")?;
-        if read == 0 {
-            return Ok::<_, anyhow::Error>(None);
-        }
-        let chunk = Bytes::copy_from_slice(&state.buffer[..read]);
-        Ok(Some((chunk, state)))
     })
     .map_ok(Frame::data);
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
@@ -15042,9 +15051,7 @@ fn apply_streaming_response_headers(response: &mut GatewayHttpResponse) -> Resul
     }
     append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-cache")?;
     append_header_token_once(&mut response.headers, CACHE_CONTROL, "no-transform")?;
-    response
-        .headers
-        .retain(|(name, _)| *name != CONTENT_LENGTH && *name != CONTENT_ENCODING);
+    response.headers.retain(|(name, _)| *name != CONTENT_LENGTH);
     set_header(
         &mut response.headers,
         HeaderName::from_static("x-accel-buffering"),
@@ -15061,7 +15068,8 @@ fn apply_streaming_response_headers_map(headers: &mut HeaderMap) -> Result<()> {
     append_header_token_once_map(headers, CACHE_CONTROL, "no-cache")?;
     append_header_token_once_map(headers, CACHE_CONTROL, "no-transform")?;
     headers.remove(CONTENT_LENGTH);
-    headers.remove(CONTENT_ENCODING);
+    // Streaming changes framing, not representation coding. An upstream gzip
+    // body must keep its Content-Encoding so the client can decode it.
     headers.insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
