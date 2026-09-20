@@ -93,6 +93,8 @@ macOS 使用 kqueue 和系统调度，保留 macOS/Mio 的 SO_NOSIGPIPE 行为�
 
 Linux 延续 epoll、按可用 CPU 扩展的 HTTP/TCP/UDP 并行度、无策略快速转发、静态预热与有界 buffer 池；Ubuntu 24.x 使用已有的极限 socket 策略，旧版/未知发行版明确降级并说明原因。`socket_extreme: false` 关闭极限参数，`adaptive_system: false` 跳过系统 socket 适配，`enabled: false` 关闭可选运行时性能路径。持久主机调优仍需显式 `proxysss tune linux --apply`。
 
+Linux 的 `config performance` 用 `linux_cpu.allowed_cpu_ids` 展示启动允许的 CPU ID，用 `linux_cpu.data_plane_workers` 展示考虑 quota 后的基础数据核预算；各协议按 profile 比例使用预算。`gateway_runtime_workers: 1` 是控制运行时，不表示数据面单线程。`taskset` 与容器 cpuset 均须保留，不能因自动绑核扩大范围；CPU 资源变更需重启。完整发现、缓存与失败边界见 [架构](ARCHITECTURE.md)。
+
 Windows/macOS 保持现有运行时调度，平台 enabled=false 关闭对应平台新增 socket 设置；基础异步 I/O 和监听器配置的 TCP_NODELAY 仍保留。`tcp_keepalive_secs: 0` 跳过 keepalive 设置；缓冲为 0 跳过对应 setsockopt。正数缓冲上限 16 MiB，内核可进一步限制实际值；不要给大量连接盲目分配大缓冲。keepalive idle 上限 86400 秒，interval 范围 1–3600 秒。
 
 启动时记录计划、OS 版本、参数探测成功/失败和 UDP 实际缓冲值；运行时设置失败首次记录告警，保留 OS 回退。能力探测不等于性能证明。`small` 偏向小文件与实时反馈，`bulk` 偏向大文件流式/零拷贝，`balanced` 同时准备两种静态路径；根据真实混合流量选择。

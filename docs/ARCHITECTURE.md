@@ -17,7 +17,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 | `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
 | `src/http1_body.rs` | 原始 SSE 转换为 Hyper 响应前的有界 HTTP/1 正文解码 |
 | `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
-| `src/runtime_tuning.rs`、`src/linux_cpu.rs`、`src/linux_tune/` | 系统能力、cgroup cpuset、运行时/socket 适配与显式主机调优 |
+| `src/runtime_tuning.rs`、`src/linux_cpu.rs`、`src/linux_tune/` | 系统能力、启动 CPU affinity/quota、运行时/socket 适配与显式主机调优 |
 | `src/script.rs`、`src/ts_transpile.rs` | 进程内 QuickJS、TypeScript 类型剥离、扩展调用与热重载 |
 | `src/security.rs`、`src/acme/`、`src/filecloud/` | 访问/限流/管理鉴权、证书与 DNS provider、文件服务 |
 | `src/install.rs` | 安装、升级、后台服务与平台集成 |
@@ -82,12 +82,14 @@ MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与
 
 ## Linux 调度
 
-CPU 数从 cgroup effective cpuset 探测，不从已绑核线程误推全局资源，也不硬编码小型 worker 上限。SO_REUSEPORT listener fanout 与数据核数成比例，socket 分配交给 Linux。
+进程入口在数据线程绑核前记录主线程的启动 CPU affinity；内核返回值已经受 cpuset 限制，也保留 taskset 的更窄范围，不能用外层 cgroup CPU 列表扩大它。数据核预算取此集合与 Rust available_parallelism 的较小值，后者考虑可读取的 cgroup CPU quota，向下取完整 CPU、最少一核。HTTP/TCP/UDP fanout、TLS/UDP runtime、native relay/sendfile owner 和缓存池共同使用这份启动快照；各 profile 仍按其比例分配，因此预算不是整个进程的线程总数上限。没有 quota 时随全部允许核心扩展，不设置小型 worker 上限。
+
+绑核使用动态位图，支持 CPU ID 超过 1023；失败时记录原因并保留继承 mask。已绑单核的 worker 不重新探测全局资源，soft-affinity realtime owner 只能恢复到启动允许集合。资源快照在重启时刷新，不在普通转发或热重载时读 procfs。config performance 的 linux_cpu 分别展示 allowed_cpu_ids 和 data_plane_workers；gateway_runtime_workers=1 指控制运行时。依据：[Linux affinity](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html)、[Rust available_parallelism](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html)。
 
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
-| small（默认） | HTTP/1、TLS/H2 共用每允许核心一个 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
-| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 每允许 CPU 一个 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
+| small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
+| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 按数据核预算建立 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
 balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。

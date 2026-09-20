@@ -221,7 +221,7 @@ impl Reactors {
                 wake_fd,
             });
             let reactor_worker = worker.clone();
-            let cpu = allowed_cpus.get(index % allowed_cpus.len()).copied();
+            let cpu = allowed_cpus.get(index % allowed_cpus.len().max(1)).copied();
             thread::Builder::new()
                 .name(format!("proxysss-sendfile-epoll-{index}"))
                 .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
@@ -556,13 +556,11 @@ fn drain_wake(fd: RawFd) {
 }
 
 fn pin_current_thread(cpu: usize) {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    unsafe {
-        libc::CPU_SET(cpu, &mut set);
-        let _ = libc::sched_setaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
+    if let Err(error) = crate::linux_cpu::set_current_thread_affinity(&[cpu]) {
+        tracing::warn!(
+            cpu,
+            ?error,
+            "sendfile owner CPU affinity unavailable; retaining inherited mask"
         );
     }
 }

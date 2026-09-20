@@ -98,17 +98,25 @@ pub fn plan(config: &RuntimePerformanceConfig) -> RuntimeTunePlan {
 }
 
 pub fn report(config: &RuntimePerformanceConfig) -> serde_json::Value {
-    serde_json::json!({
+    #[allow(unused_mut)]
+    let mut report = serde_json::json!({
         "plan": plan(config),
         "io_backend": io_backend(std::env::consts::OS),
         "available_cpu_threads": std::thread::available_parallelism().map(usize::from).unwrap_or(1),
         "gateway_runtime_workers": 1,
+        "gateway_runtime_role": "control-plane",
         "windows": config.windows,
         "macos": config.macos,
         "activation": "启动时应用；runtime.performance 配置变更需要重启。探测只证明当前内核接受参数，不证明吞吐提升。",
         "recommendation": "默认保留 TCP 自动调节；UDP 缓冲只在建 socket 时设置。先用真实混合负载比较吞吐、尾延迟和内存，再增大缓冲。",
         "host_changes": "无注册表、netsh、sysctl、路由、防火墙或系统电源设置写入；Linux 持久调优仍需显式 tune linux --apply。"
-    })
+    });
+    #[cfg(target_os = "linux")]
+    {
+        report["linux_cpu"] = serde_json::json!(crate::linux_cpu::resources());
+        report["available_cpu_threads"] = serde_json::json!(crate::linux_cpu::data_plane_workers());
+    }
+    report
 }
 
 // Probe unbound sockets: no listener, external connection, or host mutation.

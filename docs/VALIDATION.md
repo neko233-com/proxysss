@@ -12,6 +12,8 @@ Windows Docker Desktop 在 PowerShell 运行：
 
 Linux/macOS 使用 `scripts/verify-docker-scenarios.sh`。脚本探测 Ubuntu 24.04 x86_64，检查格式、Clippy、两轮测试、全场景配置、CLI 能力和 nginx 对照声明。固定容器名 `proxysss-verify` 带项目所有者标记；不得清理其他任务的容器。最新报告位于 `.tmp/docker-scenarios/`，测试目录在结束或失败后清理。
 
+CPU 功能探针 `scripts/verify-linux-cpu/main.go` 随 Docker 功能检查运行：用 taskset 收窄真实网关的 CPU 范围，验证 HTTP/TCP/UDP 正文、所有线程 affinity，以及 HTTP/native relay/sendfile owner 数量。单独在带 CPU quota 的容器中可使用 `go run scripts/verify-linux-cpu/main.go --binary <Linux二进制> --expected-workers <预算>` 断言 quota 生效；这是功能检查，不是性能胜出证据。检查结果保存为 cpu-confinement.txt。
+
 下载验收包括 GET/HEAD、单段/多段 Range、后缀与开放区间、重叠合并、越界、条件响应、鉴权顺序、超大文件局部读取和截断错误。协议测试应穿过真实监听器，覆盖 HTTP/1.1、HTTP/2 与 TLS。长连接检查双向背压、半关闭、断连清理、超时、重载和 UDP association 上限。现有套件不等于任意第三方客户端、真实云 DNS/ACME 或所有故障组合已验收。
 
 ## 2. Linux 混合性能

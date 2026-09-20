@@ -34,6 +34,7 @@ for ((pass=1; pass<=repeat; pass++)); do
 done
 cargo build --locked
 binary=/work/.benchmark/linux-target/debug/proxysss
+go run /work/scripts/verify-linux-cpu/main.go --binary "$binary" | tee "$report/cpu-confinement.txt"
 "$binary" -c "$config" check-config
 "$binary" -c examples/security-performance.example.yaml check-config
 "$binary" -c "$config" config explain > "$report/explain.txt"

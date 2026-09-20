@@ -2,6 +2,16 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：sendfile 墙钟与线程 CPU 诊断
+
+固定基线 5427540，在 Ubuntu 24.04 native-amd64 Docker Desktop VM 使用标准 0–5/6–11/12–23 CPU 分配。C preload 仅记录两种网关的 sendfile/sendfile64，客户端与后端不变；有界 mmap 保存开始时刻、墙钟、线程 CPU、字节数、线程和 fd，真实 socket 自检覆盖完整内容、EOF、EBADF。18 个混合窗口全部捕获，proxysss/nginx 总记录为 14913/296483，无丢弃或未完成记录；198 个原始协议样本零错误。活跃测量 18 秒，矩阵 wall 163 秒。
+
+等负载 proxysss 全部 sendfile 位于 HTTP owner，单次请求最多 16 MiB，线程 CPU p99 约 3.05–3.29 ms。nginx 也用 sendfile 发送小文件，不能混用全部调用分位数；只筛 requested≥1MiB 时，其 CPU p99 约 0.605–0.733 ms。这个证据确认 HTTP owner 有毫秒级同步 CPU 占用。饱和时部分 HTTP-owned 调用另有数毫秒 wall−CPU 差值，native sendfile owner 的对应 p99 较小；不能据此认定独立 reactor 必然更优。
+
+wall−CPU 不是纯调度等待，也不是请求延迟；按开始时刻归属窗口，末次调用可能跨越结束边界。时钟调用和 trace 映射会影响吞吐及内存，因此此轮失败矩阵只作诊断，不能当发布证据。既有每 2 MiB 让出和全核常驻 reactor 的混合回归仍有效，下一方案须同时解释 HTTP 单次占用和实时 owner 竞争。
+
+工件 `.benchmark/goal-sendfile-calls/` 保存原始 trace、18 个窗口时间、按线程/大调用分组报告与 collector 源码/二进制/摘要。基线二进制 SHA256：`566fde7932ef6c07c45b87da2cba7be4ab158560759a17b5686a5b82cc09f02c`。后续 CPU 发现修复处理 taskset/quota 配置语义，不应宣称它已解决这里的大文件性能瓶颈。
+
 ## 2026-09-21：balanced HTTP 分片允许 CPU 迁移，未接受
 
 候选 6e48083 保留每允许 CPU 一个独立单线程 HTTP runtime、连接/socket/reactor 所有权、实时 native owner 和原 sendfile 边界，只将 HTTP worker 从单核硬绑定改为可在完整获准 CPU 集内迁移。349 项 Linux 功能测试连续两轮、Clippy、格式、文档与 CLI 检查通过，新增真实线程 mask 检查。该方案用于检验 SO_REUSEPORT 长连接分布不均的影响，并未证明这是主要瓶颈。

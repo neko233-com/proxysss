@@ -738,19 +738,13 @@ fn drain_wake(fd: RawFd) {
 }
 
 fn set_current_thread_affinity(cpu: Option<usize>, allowed_cpus: &[usize]) {
-    let mut set = unsafe { mem::zeroed::<libc::cpu_set_t>() };
-    unsafe {
-        if let Some(cpu) = cpu {
-            libc::CPU_SET(cpu, &mut set);
-        } else {
-            for &allowed_cpu in allowed_cpus {
-                libc::CPU_SET(allowed_cpu, &mut set);
-            }
-        }
-        let _ = libc::sched_setaffinity(
-            0,
-            mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
+    let cpus = cpu.as_slice();
+    let selected = if cpus.is_empty() { allowed_cpus } else { cpus };
+    if let Err(error) = crate::linux_cpu::set_current_thread_affinity(selected) {
+        tracing::warn!(
+            ?cpu,
+            ?error,
+            "realtime owner CPU affinity unavailable; retaining inherited mask"
         );
     }
 }

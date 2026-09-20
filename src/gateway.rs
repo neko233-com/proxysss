@@ -1913,14 +1913,16 @@ fn data_plane_cpu_ids() -> &'static [usize] {
 fn pin_current_data_plane_thread(worker_index: usize) {
     DATA_PLANE_STATS_SHARD.with(|shard| shard.set(Some(worker_index % DATA_PLANE_STATS_SHARDS)));
     let cpus = data_plane_cpu_ids();
+    if cpus.is_empty() {
+        tracing::warn!("Linux CPU affinity discovery unavailable; retaining inherited mask");
+        return;
+    }
     let cpu = cpus[worker_index % cpus.len()];
-    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-    unsafe {
-        libc::CPU_SET(cpu, &mut set);
-        let _ = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set as *const libc::cpu_set_t,
+    if let Err(error) = crate::linux_cpu::set_current_thread_affinity(&[cpu]) {
+        tracing::warn!(
+            cpu,
+            ?error,
+            "HTTP worker CPU affinity unavailable; retaining inherited mask"
         );
     }
 }
@@ -1966,6 +1968,8 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
     crate::runtime_tuning::configure(&config.runtime.performance);
     #[cfg(target_os = "linux")]
     {
+        let cpus = crate::linux_cpu::resources();
+        tracing::info!(allowed_cpu_ids = ?cpus.allowed_cpu_ids, data_plane_workers = cpus.data_plane_workers, "Linux startup CPU resources");
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
         SHARDED_PLAIN_HTTP_DATA_RUNTIMES.store(
             config.runtime.performance.enabled
@@ -13365,7 +13369,7 @@ fn tcp_stream_accept_worker_count_for(
 fn adaptive_data_plane_workers(min_workers: usize) -> usize {
     #[cfg(target_os = "linux")]
     {
-        data_plane_cpu_ids().len().max(min_workers.max(1))
+        crate::linux_cpu::data_plane_workers().max(min_workers.max(1))
     }
 
     #[cfg(not(target_os = "linux"))]

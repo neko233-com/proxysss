@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- Linux 数据面统一记录启动 affinity 与 quota 预算，不再用 cgroup CPU 列表覆盖 taskset 限制；HTTP/TCP/UDP、TLS 与 native owner 共享预算。动态亲和位图支持 CPU ID 超过 1023，诊断输出区分控制运行时和数据核预算；真实受限进程的 HTTP/TCP/UDP 收发、线程范围与 owner 数量纳入 Docker 功能验证。
+
 - 主配置与嵌套对象严格拒绝未知字段，错误信息包含文件与字段；合法别名和自定义键值映射保留，错误重载不替换有效服务状态。修复首页、nginx/Caddy 迁移指南失效配置；迁移 HTML 正文从 Markdown 生成并校验源/正文摘要，全部公开和内置文档及随包 YAML 纳入可执行配置验证。
 
 - 修复 Linux 自动 socket 调优覆盖 TCP listener 显式 nodelay=false 的问题；接入、直接上游与策略上游统一应用配置。接入循环读取当前 listener 的 nodelay、连接超时和协议提示，热更新后新连接生效，已有连接保持；真实 socket 开关与收发行为纳入回归。架构页的反代、游戏、AI 和脚本示例改为可执行配置，纳入 Markdown/HTML 配对与逐字段回读验证。

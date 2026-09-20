@@ -713,6 +713,8 @@ const CADDY_FEATURE_MATRIX: &[CaddyFeatureItem] = &[
 
 #[tokio::main(worker_threads = 1)]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let _ = linux_cpu::resources();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
     let global_config = cli.config_file.clone();
