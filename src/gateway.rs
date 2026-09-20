@@ -190,7 +190,7 @@ struct RawHttpUpstreamPool {
     host: String,
     port: u16,
     socket_addr: Option<SocketAddr>,
-    idle: ArrayQueue<TcpStream>,
+    idle: ArrayQueue<(tokio::runtime::Id, TcpStream)>,
 }
 
 impl RawHttpUpstreamPool {
@@ -208,7 +208,24 @@ impl RawHttpUpstreamPool {
     }
 
     async fn checkout(&self) -> Result<TcpStream> {
-        while let Some(stream) = self.idle.pop() {
+        while let Some((owner, stream)) = self.idle.pop() {
+            if owner != tokio::runtime::Handle::current().id() {
+                // Moving a Tokio socket does not move its reactor registration.
+                // Rebind only cross-runtime checkouts, including startup pre-dial
+                // and balanced HTTP shard reuse. Same-runtime pooling stays cheap.
+                let Ok(stream) = stream.into_std() else {
+                    // A retired reactor can invalidate its registration.
+                    // Treat that idle entry like a closed keepalive socket.
+                    continue;
+                };
+                let mut probe = [0_u8; 1];
+                if !matches!(stream.peek(&mut probe), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    continue;
+                }
+                return TcpStream::from_std(stream)
+                    .context("failed registering pooled upstream socket on current reactor");
+            }
             if raw_http_idle_stream_reusable(&stream) {
                 return Ok(stream);
             }
@@ -230,7 +247,9 @@ impl RawHttpUpstreamPool {
     }
 
     fn checkin(&self, stream: TcpStream) {
-        let _ = self.idle.push(stream);
+        let _ = self
+            .idle
+            .push((tokio::runtime::Handle::current().id(), stream));
     }
 }
 

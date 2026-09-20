@@ -299,3 +299,107 @@ async fn https_upstream_sse_outlives_total_timeout_but_stalled_body_fails() -> R
     server.await??;
     Ok(())
 }
+
+#[test]
+fn raw_http_pool_rebinds_idle_connections_between_parked_reactors() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let backend = std::thread::spawn(move || {
+        // Exactly one accepted connection must survive every runtime handoff.
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        for expected in b"abcd" {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], *expected);
+            stream.write_all(&byte).unwrap();
+        }
+    });
+    let source = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let destination = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pool = RawHttpUpstreamPool::new(address.ip().to_string(), address.port());
+    let mut local_address = None;
+    for (runtime, byte) in [&source, &destination, &source, &destination]
+        .into_iter()
+        .zip(b"abcd")
+    {
+        let actual = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut stream = pool.checkout().await.unwrap();
+                let local = stream.local_addr().unwrap();
+                stream.write_all(&[*byte]).await.unwrap();
+                let mut reply = [0];
+                stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0], *byte);
+                pool.checkin(stream);
+                local
+            })
+            .await
+            .expect("pooled socket remained attached to a parked runtime")
+        });
+        assert_eq!(
+            *local_address.get_or_insert(actual),
+            actual,
+            "handoff must reuse TCP, not reconnect"
+        );
+    }
+    backend.join().unwrap();
+}
+
+#[test]
+fn raw_http_pool_cross_runtime_discards_unread_upstream_bytes() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let backend = std::thread::spawn(move || {
+        let (mut contaminated, _) = listener.accept().unwrap();
+        contaminated.write_all(b"unsolicited-response").unwrap();
+        sent.send(()).unwrap();
+        let (mut clean, _) = listener.accept().unwrap();
+        clean
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = [0];
+        clean.read_exact(&mut request).unwrap();
+        clean.write_all(&request).unwrap();
+    });
+    let source = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let destination = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pool = RawHttpUpstreamPool::new(address.ip().to_string(), address.port());
+    let old = source.block_on(async {
+        let stream = pool.checkout().await.unwrap();
+        let address = stream.local_addr().unwrap();
+        pool.checkin(stream);
+        address
+    });
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    destination.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = pool.checkout().await.unwrap();
+            assert_ne!(stream.local_addr().unwrap(), old);
+            stream.write_all(b"x").await.unwrap();
+            let mut reply = [0];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"x");
+        })
+        .await
+        .unwrap();
+    });
+    backend.join().unwrap();
+}

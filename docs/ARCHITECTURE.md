@@ -120,3 +120,5 @@ HTTP 上游等待采用连接/响应头期限与逐帧正文空闲期限，持�
 HTTP/2 的快速路径仅处理已经结束的入站正文，不能仅凭 GET 或缺少 Content-Length 推断无正文。HTTP/3 每个请求流独立驱动，慢上传/下载不会串行阻塞同连接其他请求；逐帧发送保持 QUIC 背压并保留响应 trailers，正文生产失败会重置流而非发送正常 FIN。HTTP/3 使用与其他 HTTP 路径相同的访问日志和错误装饰。入站正文具有单请求大小与空闲期限，失败正文不会进入业务分发；当前入站正文仍按请求缓冲，不宣称已实现大上传零拷贝。
 
 Linux native TCP/WebSocket 与 sendfile owner 先消费完整个 epoll_wait 返回批次，再安装待接收的连接/下载，避免当前批次中的旧 ERR/HUP 作用于复用 fd 的新任务。每轮最多安装 256 个任务，有剩余则通过 eventfd 唤醒下一轮，已有流量先获得 I/O 处理机会；该边界只限制接收队列，不减少 CPU 自适应 owner 数，也不改变既有数据发送预算或背压。依据 [Linux epoll 事件缓存说明](https://www.man7.org/linux/man-pages/man7/epoll.7.html)；不能仅因 EPOLL_CTL_DEL 已调用，就假定用户态已取回的事件也被删除。
+
+原始 HTTP 上游空闲池给每个 Tokio socket 记录所属 runtime ID。checkout 在同一 runtime 内保持直接复用；跨 runtime（包括控制面预热转入数据面、不同 HTTP shard 之间复用）时先解除旧 reactor 注册，使用非阻塞 peek 排除已关闭或带残留数据的连接，再把同一 TCP 连接注册到当前 reactor。避免 socket 移动后仍依赖旧运行时唤醒；不额外预拨连接、不改变池容量，也不把每次普通转发变成重连。
