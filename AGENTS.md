@@ -13,6 +13,10 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 根文件放常驻规则；架构页描述当前实现；主题页维护详细语义；决策页保存取舍。代码与相关文档同批更新，不能在现状说明中堆叠失效参数或以历史实验作为新提交证据。该组织参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，不引入其运行时或插件框架。
 
+## 当前验收约束
+
+允许根据实测调整不合理的内部架构，但不能减少现有功能。关联问题集中修复后统一验证：先 Ubuntu 24 Docker 完整功能与混合性能，再本机 Windows 快速运行 cargo test --locked；全部通过后才 push 与发布。共享调度器改动必须覆盖就绪重装、背压、半关闭、取消和 fd 复用，不能只验证单项吞吐。
+
 ## Product Direction
 
 proxysss exists to **fully replace nginx** as a same-level general-purpose gateway. It is **not** a business gateway. Business-aware behavior belongs in optional scripts/plugins, similar to using Lua modules with nginx.

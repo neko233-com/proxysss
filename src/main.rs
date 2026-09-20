@@ -2,6 +2,8 @@ mod acme;
 mod ai_proxy;
 mod bench;
 mod config;
+#[cfg(target_os = "linux")]
+mod cooperative_epoll;
 mod demo;
 mod filecloud;
 mod filesystem_boundary;

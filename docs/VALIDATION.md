@@ -45,7 +45,7 @@ WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websock
 
 ## 3. Windows 功能验收
 
-Linux 功能与性能通过后，运行 `scripts/verify-local.ps1` 完成格式、Clippy、两轮本机测试及本地打包。需要时增加安装/升级/回滚与后台服务检查。Windows 要求功能正确，不以 Windows 桌面成绩代替 Linux 性能证据。
+Linux 全部功能与性能门槛通过后，在本机 Windows 快速运行 `cargo test --locked`，确认现有单元与集成用例通过；不执行 Windows 性能矩阵。用户当前验收要求以这轮本机测试作为 Windows 快速功能验证；不能把未覆盖的安装器、第三方服务或外部系统场景写成已实测。Windows 桌面成绩不代替 Linux 性能证据。
 
 ## 4. Push 与发布
 

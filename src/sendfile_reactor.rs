@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const REGISTRATION_BATCH: usize = 256;
+const COOPERATIVE_JOB_BYTES: u64 = 2 * 1024 * 1024;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 pub(crate) struct SendfileCompletion {
@@ -137,6 +138,7 @@ struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
     worker_cpus: Vec<Option<usize>>,
     next: AtomicUsize,
+    cooperative: bool,
 }
 
 enum DriveResult {
@@ -148,6 +150,11 @@ static REACTORS: OnceLock<Reactors> = OnceLock::new();
 
 pub(crate) fn warm(requested_workers: usize, scheduler_nice: i32) {
     let _ = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+}
+
+pub(crate) fn warm_cooperative(runtimes: &[tokio::runtime::Handle]) {
+    assert!(!runtimes.is_empty());
+    let _ = REACTORS.get_or_init(|| Reactors::start_on_runtimes(runtimes.len(), 0, Some(runtimes)));
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit ownership/limits on the existing reactor boundary.
@@ -182,7 +189,11 @@ pub(crate) fn dispatch(
         file,
         offset,
         len,
-        max_chunk_bytes: max_chunk_bytes.max(1),
+        max_chunk_bytes: if reactors.cooperative {
+            max_chunk_bytes.clamp(1, COOPERATIVE_JOB_BYTES)
+        } else {
+            max_chunk_bytes.max(1)
+        },
         completion: sender,
     };
     let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
@@ -191,7 +202,11 @@ pub(crate) fn dispatch(
         &reactors.worker_cpus,
         current_cpu,
         fallback,
-        active_workers,
+        if reactors.cooperative {
+            reactors.workers.len()
+        } else {
+            active_workers
+        },
     );
     let worker = &reactors.workers[index];
     worker
@@ -207,6 +222,14 @@ pub(crate) fn dispatch(
 
 impl Reactors {
     fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
+        Self::start_on_runtimes(requested_workers, scheduler_nice, None)
+    }
+
+    fn start_on_runtimes(
+        requested_workers: usize,
+        scheduler_nice: i32,
+        runtimes: Option<&[tokio::runtime::Handle]>,
+    ) -> Self {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
@@ -222,10 +245,19 @@ impl Reactors {
             });
             let reactor_worker = worker.clone();
             let cpu = allowed_cpus.get(index % allowed_cpus.len()).copied();
-            thread::Builder::new()
-                .name(format!("proxysss-sendfile-epoll-{index}"))
-                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
-                .expect("failed spawning sendfile epoll reactor");
+            if let Some(runtimes) = runtimes {
+                let runtime = &runtimes[index];
+                let epoll = crate::cooperative_epoll::CooperativeEpoll::new(
+                    runtime, wake_fd, WAKE_TOKEN, 1,
+                )
+                .expect("failed registering cooperative sendfile reactor");
+                std::mem::drop(runtime.spawn(run_cooperative_reactor(reactor_worker, epoll)));
+            } else {
+                thread::Builder::new()
+                    .name(format!("proxysss-sendfile-epoll-{index}"))
+                    .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice))
+                    .expect("failed spawning sendfile epoll reactor");
+            }
             workers.push(worker);
             worker_cpus.push(cpu);
         }
@@ -233,7 +265,30 @@ impl Reactors {
             workers,
             worker_cpus,
             next: AtomicUsize::new(0),
+            cooperative: runtimes.is_some(),
         }
+    }
+}
+
+async fn run_cooperative_reactor(
+    worker: Arc<ReactorWorker>,
+    mut epoll: crate::cooperative_epoll::CooperativeEpoll,
+) {
+    let epoll_fd = epoll.as_raw_fd();
+    let mut jobs = SendfileTable::default();
+    loop {
+        let events = match epoll.next().await {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::error!(?error, "cooperative sendfile reactor failed");
+                fail_all_jobs(epoll_fd, &mut jobs, "cooperative sendfile reactor failed");
+                return;
+            }
+        };
+        // One existing job or one admission per turn; admission itself tries
+        // sendfile immediately, so it must share the same byte/turn bound.
+        process_event_batch_with_admission_limit(epoll_fd, &mut jobs, events, &worker, 1);
+        tokio::task::yield_now().await;
     }
 }
 
@@ -357,6 +412,16 @@ fn process_event_batch(
     events: &[libc::epoll_event],
     worker: &ReactorWorker,
 ) {
+    process_event_batch_with_admission_limit(epoll_fd, jobs, events, worker, REGISTRATION_BATCH);
+}
+
+fn process_event_batch_with_admission_limit(
+    epoll_fd: RawFd,
+    jobs: &mut SendfileTable,
+    events: &[libc::epoll_event],
+    worker: &ReactorWorker,
+    registration_limit: usize,
+) {
     let mut registrations_ready = false;
     for event in events {
         let token = event.u64;
@@ -389,12 +454,17 @@ fn process_event_batch(
     // In particular, an old HUP must never fail a newly registered download.
     if registrations_ready {
         cancel_abandoned_jobs(epoll_fd, jobs, worker);
-        register_pending_jobs(epoll_fd, jobs, worker);
+        register_pending_jobs(epoll_fd, jobs, worker, registration_limit);
     }
 }
 
-fn register_pending_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &ReactorWorker) {
-    for _ in 0..REGISTRATION_BATCH {
+fn register_pending_jobs(
+    epoll_fd: RawFd,
+    jobs: &mut SendfileTable,
+    worker: &ReactorWorker,
+    limit: usize,
+) {
+    for _ in 0..limit {
         let Some(job) = worker.registrations.pop() else {
             break;
         };
@@ -610,6 +680,95 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::OwnedFd;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn cooperative_downloads_progress_beside_blocked_and_cancelled_clients() {
+        use tokio::io::AsyncReadExt;
+
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(wake_fd >= 0);
+        let wake_owner = unsafe { OwnedFd::from_raw_fd(wake_fd) };
+        let worker = Arc::new(ReactorWorker {
+            registrations: ArrayQueue::new(2),
+            cancellations: ArrayQueue::new(2),
+            sweep_cancelled: AtomicBool::new(false),
+            wake_fd,
+        });
+        let epoll = crate::cooperative_epoll::CooperativeEpoll::new(
+            &tokio::runtime::Handle::current(),
+            wake_fd,
+            WAKE_TOKEN,
+            1,
+        )
+        .unwrap();
+        let driver = tokio::spawn(run_cooperative_reactor(worker.clone(), epoll));
+        let name = CString::new("proxysss-cooperative-sendfile-test").unwrap();
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(file_fd) };
+        let expected: Vec<u8> = (0..8 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        file.write_all(&expected).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut clients = Vec::new();
+        let mut pending = Vec::new();
+        for (index, length) in [expected.len(), expected.len()].into_iter().enumerate() {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.set_nonblocking(true).unwrap();
+            clients.push(tokio::net::TcpStream::from_std(client).unwrap());
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            if index == 0 {
+                socket2::SockRef::from(&socket)
+                    .set_send_buffer_size(8192)
+                    .unwrap();
+            }
+            let reactor_fd = socket.as_raw_fd();
+            let (sender, receiver) = oneshot::channel();
+            assert!(worker
+                .registrations
+                .push(SendfileJob {
+                    socket,
+                    file: file.try_clone().unwrap(),
+                    offset: 0,
+                    len: length as u64,
+                    max_chunk_bytes: COOPERATIVE_JOB_BYTES,
+                    completion: sender,
+                })
+                .is_ok());
+            pending.push(PendingSendfile {
+                receiver,
+                cancellation: Some((worker.clone(), reactor_fd)),
+            });
+        }
+        wake(wake_fd);
+        let mut fast = clients.pop().unwrap();
+        let mut fast_bytes = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(2), fast.read_exact(&mut fast_bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast_bytes, expected);
+        let complete = tokio::time::timeout(Duration::from_secs(2), pending.pop().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.bytes, expected.len() as u64);
+        drop(pending.pop().unwrap());
+        let mut cancelled_bytes = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            clients[0].read_to_end(&mut cancelled_bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(cancelled_bytes.len() < expected.len());
+        assert_eq!(cancelled_bytes, expected[..cancelled_bytes.len()]);
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        drop(wake_owner);
+    }
 
     #[test]
     fn admission_ignores_cached_hup_for_reused_descriptor_and_bounds_queued_work() {
