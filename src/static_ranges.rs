@@ -163,19 +163,20 @@ struct Download {
 /// polled; cancellation drops the descriptor without an independent producer.
 pub(super) async fn response(
     target: &Path,
-    file_len: u64,
+    metadata: &std::fs::Metadata,
     ranges: Vec<ByteRange>,
 ) -> Result<GatewayHttpResponse> {
-    response_typed(target, file_len, ranges, static_content_type(target), true).await
+    response_typed(target, metadata, ranges, static_content_type(target), true).await
 }
 
 pub(super) async fn response_typed(
     target: &Path,
-    file_len: u64,
+    metadata: &std::fs::Metadata,
     ranges: Vec<ByteRange>,
     content_type: &str,
     partial: bool,
 ) -> Result<GatewayHttpResponse> {
+    let file_len = metadata.len();
     let mut response = GatewayHttpResponse::bytes(
         if partial {
             StatusCode::PARTIAL_CONTENT
@@ -186,7 +187,7 @@ pub(super) async fn response_typed(
         Bytes::new(),
         "proxysss://static-range",
     );
-    let mut file = tokio::fs::File::open(target)
+    let mut file = super::file_io::open_checked(target, metadata)
         .await
         .context("open static range file")?;
     let mut parts = Vec::with_capacity(ranges.len());
@@ -369,10 +370,11 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut file, b"tail")
             .await
             .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut file).await.unwrap();
         drop(file);
         let result = response(
             &path,
-            size,
+            &std::fs::metadata(&path).unwrap(),
             vec![ByteRange {
                 start: size - 4,
                 end: size - 1,
@@ -391,7 +393,7 @@ mod tests {
         tokio::fs::write(&path, b"0123456789").await.unwrap();
         let mut result = response(
             &path,
-            10,
+            &std::fs::metadata(&path).unwrap(),
             vec![
                 ByteRange { start: 8, end: 9 },
                 ByteRange { start: 0, end: 1 },
@@ -438,13 +440,23 @@ mod tests {
     async fn truncation_is_an_error_instead_of_panic_or_successful_short_body() {
         let root = TestDir::new("range-truncated");
         let path = root.join("asset.bin");
+        tokio::fs::write(&path, b"0123456789").await.unwrap();
+        let old_metadata = std::fs::metadata(&path).unwrap();
         tokio::fs::write(&path, b"0123").await.unwrap();
-        assert!(response(&path, 10, vec![ByteRange { start: 8, end: 9 }])
-            .await
-            .is_err());
+        assert!(
+            response(&path, &old_metadata, vec![ByteRange { start: 8, end: 9 }])
+                .await
+                .is_err()
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(200_000)
+            .unwrap();
         let result = response(
             &path,
-            200_000,
+            &std::fs::metadata(&path).unwrap(),
             vec![ByteRange {
                 start: 0,
                 end: 199_999,
@@ -452,6 +464,12 @@ mod tests {
         )
         .await
         .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
         assert!(result.stream_body.unwrap().collect().await.is_err());
     }
 
@@ -463,7 +481,7 @@ mod tests {
         tokio::fs::write(&path, &data).await.unwrap();
         let result = response(
             &path,
-            data.len() as u64,
+            &std::fs::metadata(&path).unwrap(),
             vec![ByteRange {
                 start: 17,
                 end: 200_019,

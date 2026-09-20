@@ -1,10 +1,11 @@
 //! Shared bounded downloads for writable file services. Callers authorize and
 //! confine the path before entering this module; no file contents are cached.
-use super::{static_ranges, GatewayHttpResponse};
+use super::{file_io::FileVersion, static_ranges, GatewayHttpResponse};
 use anyhow::Result;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use std::fs::Metadata;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,14 +17,9 @@ pub(super) struct Validators {
 impl Validators {
     pub(super) fn new(metadata: &Metadata) -> Self {
         let modified = metadata.modified().ok();
-        let etag = format!(
-            "W/\"{:x}-{:x}\"",
-            metadata.len(),
-            modified
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
+        let mut hash = DefaultHasher::new();
+        FileVersion::new(metadata).hash(&mut hash);
+        let etag = format!("W/\"{:x}-{:x}\"", metadata.len(), hash.finish());
         Self { etag, modified }
     }
 
@@ -165,8 +161,7 @@ pub(crate) async fn response(
                 response
             }
             static_ranges::RangeDecision::Ranges(ranges) => {
-                static_ranges::response_typed(target, metadata.len(), ranges, content_type, true)
-                    .await?
+                static_ranges::response_typed(target, &metadata, ranges, content_type, true).await?
             }
             static_ranges::RangeDecision::NoRange if metadata.len() == 0 => {
                 let mut response = GatewayHttpResponse::bytes(
@@ -183,7 +178,7 @@ pub(crate) async fn response(
             static_ranges::RangeDecision::NoRange => {
                 static_ranges::response_typed(
                     target,
-                    metadata.len(),
+                    &metadata,
                     vec![static_ranges::ByteRange {
                         start: 0,
                         end: metadata.len() - 1,

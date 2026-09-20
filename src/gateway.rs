@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 #[path = "file_download.rs"]
 pub(crate) mod file_download;
+#[path = "file_io.rs"]
+mod file_io;
+use file_io::{ExactReader, FileVersion};
 #[path = "http1_body.rs"]
 mod http1_body;
 #[cfg(test)]
@@ -2123,7 +2126,7 @@ impl StaticCacheFreshness {
 
 struct CachedStaticFile {
     len: u64,
-    modified: Option<SystemTime>,
+    version: FileVersion,
     body: Bytes,
     sendfile: Option<Arc<StaticSendfilePool>>,
     content_type: HeaderValue,
@@ -2134,6 +2137,7 @@ struct CachedStaticFile {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct StaticSendfilePool {
+    anchor: std::fs::File,
     idle: ArrayQueue<std::fs::File>,
 }
 
@@ -2147,31 +2151,39 @@ impl StaticSendfilePool {
     }
 
     fn with_capacity(file: std::fs::File, capacity: usize) -> Self {
-        let idle = ArrayQueue::new(capacity);
-        idle.push(file)
-            .expect("new static sendfile descriptor pool has capacity");
-        Self { idle }
+        Self {
+            anchor: file,
+            idle: ArrayQueue::new(capacity.max(1)),
+        }
     }
 
-    fn checkout(&self, path: &Path) -> Result<std::fs::File> {
-        self.idle.pop().map_or_else(
-            || {
-                std::fs::File::open(path).with_context(|| {
-                    format!("failed opening static file for sendfile {}", path.display())
-                })
-            },
-            Ok,
-        )
+    fn reopen(&self) -> Result<std::fs::File> {
+        // Reopening the pathname can mix a new publication into an old pool.
+        // procfs gives an independent open file description of the pinned inode,
+        // even after rename/unlink. Without procfs, dup preserves correctness;
+        // sendfile always uses its own explicit offset.
+        #[cfg(target_os = "linux")]
+        if let Ok(file) = std::fs::File::open(format!("/proc/self/fd/{}", self.anchor.as_raw_fd()))
+        {
+            return Ok(file);
+        }
+        self.anchor
+            .try_clone()
+            .context("duplicate pinned static file")
+    }
+
+    fn checkout(&self) -> Result<std::fs::File> {
+        self.idle.pop().map_or_else(|| self.reopen(), Ok)
     }
 
     fn checkin(&self, file: std::fs::File) {
         let _ = self.idle.push(file);
     }
 
-    fn prewarm(&self, path: &Path) -> usize {
+    fn prewarm(&self) -> usize {
         let mut opened = 0;
         while self.idle.len() < self.idle.capacity() {
-            let Ok(file) = std::fs::File::open(path) else {
+            let Ok(file) = self.reopen() else {
                 break;
             };
             if self.idle.push(file).is_err() {
@@ -5900,6 +5912,7 @@ impl Gateway {
                     })
                 });
                 let cached = ConnectionStaticFastPathCache {
+                    version: candidate.version,
                     request_head: Bytes::copy_from_slice(request_head),
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
@@ -5977,6 +5990,7 @@ impl Gateway {
                                 &mut stream,
                                 &candidate.path,
                                 candidate.len,
+                                candidate.version,
                                 candidate.sendfile.clone(),
                                 false,
                             )
@@ -8639,9 +8653,7 @@ impl Gateway {
         let h2_static_response_refresh_lock = self.h2_static_response_refresh_lock.clone();
         spawn_static_revalidation_task(async move {
             let key = target.to_string_lossy().to_string();
-            let previous_identity = static_file_cache
-                .get(&key)
-                .map(|entry| (entry.len, entry.modified));
+            let previous_identity = static_file_cache.get(&key).map(|entry| entry.version);
             let mut refresh_h2_snapshot = false;
             let canonical_unchanged = tokio::fs::canonicalize(&target)
                 .await
@@ -8653,7 +8665,7 @@ impl Gateway {
             };
             match metadata_result {
                 Ok(metadata) if metadata.is_file() => {
-                    let current_identity = (metadata.len(), metadata.modified().ok());
+                    let current_identity = FileVersion::new(&metadata);
                     refresh_h2_snapshot = previous_identity != Some(current_identity);
                     let sendfile_entry = static_file_cache
                         .get(&key)
@@ -12102,6 +12114,7 @@ struct StaticFastPathRequest<'a> {
 }
 
 struct StaticFastPathCandidate {
+    version: FileVersion,
     path: PathBuf,
     len: u64,
     content_type: &'static str,
@@ -12111,6 +12124,7 @@ struct StaticFastPathCandidate {
 }
 
 struct ConnectionStaticFastPathCache {
+    version: FileVersion,
     request_head: Bytes,
     target: String,
     host: Option<String>,
@@ -12889,6 +12903,7 @@ async fn resolve_large_static_fast_path_candidate(
         build_static_http1_keep_alive_response(static_content_type(&target), metadata.len(), body)
     });
     Ok(Some(StaticFastPathCandidate {
+        version: FileVersion::new(&metadata),
         content_type: static_content_type(&target),
         len: metadata.len(),
         path: target,
@@ -12930,6 +12945,7 @@ async fn send_connection_static_fast_path(
                 stream,
                 &cached.file_path,
                 cached.len,
+                cached.version,
                 cached.sendfile.clone(),
                 cooperative_mid_yield,
             )
@@ -12971,17 +12987,20 @@ async fn send_static_file_fast(
     stream: &mut TcpStream,
     path: &Path,
     _len: u64,
+    version: FileVersion,
     sendfile: Option<Arc<StaticSendfilePool>>,
     cooperative_mid_yield: bool,
 ) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let (file, pool) = match sendfile {
-            Some(pool) => (pool.checkout(path)?, Some(pool)),
-            None => (
-                std::fs::File::open(path).context("failed opening static file for sendfile")?,
-                None,
-            ),
+            Some(pool) => (pool.checkout()?, Some(pool)),
+            None => {
+                let file =
+                    std::fs::File::open(path).context("failed opening static file for sendfile")?;
+                version.check(&file.metadata()?)?;
+                (file, None)
+            }
         };
         let result = sendfile_all_async(stream, file.as_raw_fd(), _len, cooperative_mid_yield)
             .await
@@ -12996,10 +13015,11 @@ async fn send_static_file_fast(
     {
         let _ = sendfile;
         let _ = cooperative_mid_yield;
-        let mut file = tokio::fs::File::open(path)
+        let file = tokio::fs::File::open(path)
             .await
             .context("failed opening static file for fast copy")?;
-        tokio::io::copy(&mut file, stream)
+        version.check(&file.metadata().await?)?;
+        tokio::io::copy(&mut ExactReader::new(file, _len), stream)
             .await
             .context("failed copying static fast path file")?;
         Ok(false)
@@ -13630,13 +13650,13 @@ fn upstream_idle_body(body: GatewayBody, timeout: Duration) -> GatewayBody {
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
 }
 
-fn file_streaming_body<R>(file: R) -> GatewayBody
+fn file_streaming_body<R>(file: R, len: u64) -> GatewayBody
 where
-    R: AsyncRead + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     // 1MB buffer: large static files (game hot-update, CDN assets) benefit from
     // fewer read syscalls and better kernel readahead alignment on Linux.
-    let stream = ReaderStream::with_capacity(file, 1024 * 1024)
+    let stream = ReaderStream::with_capacity(ExactReader::new(file, len), 1024 * 1024)
         .map_ok(Frame::data)
         .map_err(|error| anyhow!("static file stream failed: {error}"));
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
@@ -19795,7 +19815,7 @@ async fn dispatch_static_file_content(
             return Ok(response);
         }
         static_ranges::RangeDecision::Ranges(ranges) => {
-            return static_ranges::response(target, metadata.len(), ranges).await;
+            return static_ranges::response(target, metadata, ranges).await;
         }
     }
 
@@ -19808,12 +19828,12 @@ async fn dispatch_static_file_content(
     let (body, stream_body) = if method == Method::HEAD {
         (Bytes::new(), None)
     } else if metadata.len() >= STATIC_STREAM_THRESHOLD_BYTES {
-        let file = tokio::fs::File::open(target)
+        let file = file_io::open_checked(target, metadata)
             .await
             .context("failed opening static file")?;
         (
             Bytes::new(),
-            Some(file_streaming_body(file.take(metadata.len()))),
+            Some(file_streaming_body(file, metadata.len())),
         )
     } else {
         match cached_static_file_body(
@@ -19827,12 +19847,12 @@ async fn dispatch_static_file_content(
         {
             Ok(body) => (body, None),
             Err(error) if error.is::<static_snapshot::BudgetFull>() => {
-                let file = tokio::fs::File::open(target)
+                let file = file_io::open_checked(target, metadata)
                     .await
                     .context("failed opening streaming static fallback")?;
                 (
                     Bytes::new(),
-                    Some(file_streaming_body(file.take(metadata.len()))),
+                    Some(file_streaming_body(file, metadata.len())),
                 )
             }
             Err(error) => return Err(error),
@@ -19903,17 +19923,10 @@ async fn cached_static_file_body(
     static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
 ) -> Result<Bytes> {
     let key = target.to_string_lossy().to_string();
-    let modified = metadata.modified().ok();
-    if let Some(body) = fresh_static_cache_body(&key, metadata, modified, static_file_cache) {
+    if let Some(body) = fresh_static_cache_body(&key, metadata, static_file_cache) {
         return Ok(body);
     }
-    evict_stale_static_cache_entry(
-        &key,
-        metadata,
-        modified,
-        static_file_cache,
-        static_file_cache_bytes,
-    );
+    evict_stale_static_cache_entry(&key, metadata, static_file_cache, static_file_cache_bytes);
 
     let load_lock = if metadata.len() <= STATIC_STREAM_THRESHOLD_BYTES {
         Some(StaticFillLock {
@@ -19933,17 +19946,11 @@ async fn cached_static_file_body(
     };
 
     if load_lock.is_some() {
-        if let Some(body) = fresh_static_cache_body(&key, metadata, modified, static_file_cache) {
+        if let Some(body) = fresh_static_cache_body(&key, metadata, static_file_cache) {
             drop(guard);
             return Ok(body);
         }
-        evict_stale_static_cache_entry(
-            &key,
-            metadata,
-            modified,
-            static_file_cache,
-            static_file_cache_bytes,
-        );
+        evict_stale_static_cache_entry(&key, metadata, static_file_cache, static_file_cache_bytes);
     }
 
     let body = read_static_file_snapshot(target, metadata).await?;
@@ -19964,12 +19971,13 @@ async fn cached_static_file_body(
             build_static_http1_keep_alive_response(content_type_value, metadata.len(), &body);
         let sendfile = static_file_cache
             .get(&key)
+            .filter(|entry| entry.version == FileVersion::new(metadata))
             .and_then(|entry| entry.sendfile.clone());
         let replaced = static_file_cache.insert(
             key.clone(),
             CachedStaticFile {
                 len: metadata.len(),
-                modified,
+                version: FileVersion::new(metadata),
                 body: body.clone(),
                 sendfile,
                 content_type,
@@ -19988,7 +19996,7 @@ async fn cached_static_file_body(
 
 async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) -> Result<Bytes> {
     let expected_len = metadata.len();
-    let expected_modified = metadata.modified().ok();
+    let expected_version = FileVersion::new(metadata);
     if expected_len > STATIC_STREAM_THRESHOLD_BYTES {
         return Err(anyhow!(
             "static file exceeds bounded snapshot size; use streaming"
@@ -19999,20 +20007,13 @@ async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) 
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut file = std::fs::File::open(&target).context("open static snapshot")?;
-        let unchanged = |metadata: &std::fs::Metadata| {
-            metadata.len() == expected_len && metadata.modified().ok() == expected_modified
-        };
-        if !unchanged(&file.metadata()?) {
-            return Err(anyhow!("static file changed before snapshot read"));
-        }
+        expected_version.check(&file.metadata()?)?;
         // A mapped mutable file can SIGBUS inside TLS/compression after truncate.
         // Own immutable bytes instead; read_exact bounds both growth and memory.
         let mut data = vec![0_u8; expected_len as usize];
         file.read_exact(&mut data)
             .context("static snapshot truncated")?;
-        if !unchanged(&file.metadata()?) {
-            return Err(anyhow!("static file changed during snapshot read"));
-        }
+        expected_version.check(&file.metadata()?)?;
         Ok(reservation.into_bytes(data))
     })
     .await
@@ -20022,14 +20023,10 @@ async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) 
 fn fresh_static_cache_body(
     key: &str,
     metadata: &std::fs::Metadata,
-    modified: Option<SystemTime>,
     static_file_cache: &DashMap<String, CachedStaticFile>,
 ) -> Option<Bytes> {
     let entry = static_file_cache.get(key)?;
-    if entry.len == metadata.len()
-        && entry.modified == modified
-        && entry.body.len() as u64 == entry.len
-    {
+    if entry.version == FileVersion::new(metadata) && entry.body.len() as u64 == entry.len {
         entry.freshness.mark_checked();
         return Some(entry.body.clone());
     }
@@ -20039,13 +20036,12 @@ fn fresh_static_cache_body(
 fn evict_stale_static_cache_entry(
     key: &str,
     metadata: &std::fs::Metadata,
-    modified: Option<SystemTime>,
     static_file_cache: &DashMap<String, CachedStaticFile>,
     static_file_cache_bytes: &AtomicU64,
 ) {
-    if let Some((_, stale)) = static_file_cache.remove_if(key, |_, entry| {
-        entry.len != metadata.len() || entry.modified != modified
-    }) {
+    if let Some((_, stale)) =
+        static_file_cache.remove_if(key, |_, entry| entry.version != FileVersion::new(metadata))
+    {
         static_file_cache_bytes.fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
     }
 }
@@ -20099,8 +20095,7 @@ fn fresh_cached_static_file_response(
     }
     let key = target.to_string_lossy();
     let entry = static_file_cache.get(key.as_ref())?;
-    if entry.len != metadata.len()
-        || entry.modified != metadata.modified().ok()
+    if entry.version != FileVersion::new(metadata)
         || entry.body.len() as u64 != entry.len
         || entry.freshness.is_stale()
     {
@@ -20216,6 +20211,7 @@ fn stale_cached_static_file_candidate(
         None
     };
     let candidate = StaticFastPathCandidate {
+        version: entry.version,
         path: target.to_path_buf(),
         len: entry.len,
         content_type: static_content_type(target),
@@ -20256,6 +20252,7 @@ fn fresh_cached_static_file_candidate(
     };
 
     Some(StaticFastPathCandidate {
+        version: entry.version,
         path: target.to_path_buf(),
         len: entry.len,
         content_type: static_content_type(target),
@@ -20272,9 +20269,8 @@ fn cached_static_sendfile(
     static_file_cache_bytes: &AtomicU64,
 ) -> Result<Arc<StaticSendfilePool>> {
     let key = target.to_string_lossy().to_string();
-    let modified = metadata.modified().ok();
     if let Some(entry) = static_file_cache.get(&key) {
-        if entry.len == metadata.len() && entry.modified == modified {
+        if entry.version == FileVersion::new(metadata) {
             entry.freshness.mark_checked();
             if let Some(pool) = &entry.sendfile {
                 return Ok(pool.clone());
@@ -20288,9 +20284,10 @@ fn cached_static_sendfile(
             target.display()
         )
     })?;
+    FileVersion::new(metadata).check(&file.metadata()?)?;
     let pool = Arc::new(StaticSendfilePool::new(file));
     if let Some(mut entry) = static_file_cache.get_mut(&key) {
-        if entry.len == metadata.len() && entry.modified == modified {
+        if entry.version == FileVersion::new(metadata) {
             entry.freshness.mark_checked();
             entry.sendfile = Some(pool.clone());
             return Ok(pool);
@@ -20303,7 +20300,7 @@ fn cached_static_sendfile(
         key,
         CachedStaticFile {
             len: metadata.len(),
-            modified,
+            version: FileVersion::new(metadata),
             body: Bytes::new(),
             sendfile: Some(pool.clone()),
             content_type: HeaderValue::from_static(static_content_type(target)),
@@ -20440,7 +20437,7 @@ async fn preload_static_site_fast_lane_cache(
                 static_file_cache,
                 static_file_cache_bytes,
             )?;
-            pool.prewarm(&target);
+            pool.prewarm();
             preloaded = preloaded.saturating_add(1);
         }
     }
@@ -22983,7 +22980,7 @@ mod tests {
             "asset.js".to_string(),
             CachedStaticFile {
                 len: 4,
-                modified: None,
+                version: FileVersion::default(),
                 body: Bytes::from_static(b"test"),
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
@@ -23085,7 +23082,7 @@ mod tests {
             "asset.js".to_string(),
             CachedStaticFile {
                 len: 4,
-                modified: None,
+                version: FileVersion::default(),
                 body: Bytes::from_static(b"test"),
                 sendfile: None,
                 content_type: HeaderValue::from_static("application/javascript; charset=utf-8"),
@@ -23139,7 +23136,7 @@ mod tests {
             key.clone(),
             CachedStaticFile {
                 len: metadata.len(),
-                modified: metadata.modified().ok(),
+                version: FileVersion::new(&metadata),
                 body: Bytes::new(),
                 sendfile: Some(pool.clone()),
                 content_type: HeaderValue::from_static("application/octet-stream"),
@@ -23170,13 +23167,13 @@ mod tests {
             3,
         );
 
-        assert_eq!(pool.prewarm(&path), 2);
+        assert_eq!(pool.prewarm(), 3);
         assert_eq!(pool.idle.len(), 3);
-        let first = pool.checkout(&path).expect("checkout first descriptor");
-        let second = pool.checkout(&path).expect("checkout second descriptor");
-        let third = pool.checkout(&path).expect("checkout third descriptor");
+        let first = pool.checkout().expect("checkout first descriptor");
+        let second = pool.checkout().expect("checkout second descriptor");
+        let third = pool.checkout().expect("checkout third descriptor");
         assert_eq!(pool.idle.len(), 0);
-        let overflow = pool.checkout(&path).expect("open overflow descriptor");
+        let overflow = pool.checkout().expect("open overflow descriptor");
 
         pool.checkin(first);
         pool.checkin(second);

@@ -1,6 +1,167 @@
 use super::*;
 use crate::test_support::TestDir;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn preserved_mtime_publication_refreshes_cache_validators_and_open_checks() {
+    let root = TestDir::new("static-file-generation");
+    let path = root.join("asset.bin");
+    let next = root.join("next.bin");
+    let fixed = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let publish_file = |path: &Path, body: &[u8]| {
+        std::fs::write(path, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(fixed))
+            .unwrap();
+    };
+    publish_file(&path, b"old-body");
+    let original_metadata = std::fs::metadata(&path).unwrap();
+    let cache = DashMap::new();
+    let used = AtomicU64::new(0);
+    let locks = DashMap::new();
+    let original = cached_static_file_body(&path, &original_metadata, &cache, &used, &locks)
+        .await
+        .unwrap();
+    let old_response = file_download::response(
+        &path,
+        &Method::GET,
+        &HeaderMap::new(),
+        "application/octet-stream",
+        "test",
+    )
+    .await
+    .unwrap();
+    let old_etag = old_response
+        .headers
+        .iter()
+        .find(|(name, _)| name == http::header::ETAG)
+        .unwrap()
+        .1
+        .clone();
+
+    publish_file(&next, b"new-body");
+    std::fs::rename(&next, &path).unwrap();
+    let current_metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(original_metadata.len(), current_metadata.len());
+    assert_eq!(
+        original_metadata.modified().unwrap(),
+        current_metadata.modified().unwrap()
+    );
+    assert!(file_io::open_checked(&path, &original_metadata)
+        .await
+        .is_err());
+    assert!(read_static_file_snapshot(&path, &original_metadata)
+        .await
+        .is_err());
+    assert!(static_ranges::response(
+        &path,
+        &original_metadata,
+        vec![static_ranges::ByteRange { start: 0, end: 3 }]
+    )
+    .await
+    .is_err());
+    let current = cached_static_file_body(&path, &current_metadata, &cache, &used, &locks)
+        .await
+        .unwrap();
+    assert_eq!(current.as_ref(), b"new-body");
+    assert_eq!(original.as_ref(), b"old-body");
+    assert_eq!(used.load(Ordering::Relaxed), 8);
+    let mut conditions = HeaderMap::new();
+    conditions.insert(http::header::IF_NONE_MATCH, old_etag);
+    let response = file_download::response(
+        &path,
+        &Method::GET,
+        &conditions,
+        "application/octet-stream",
+        "test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_ref(), b"new-body");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sendfile_pool_overflow_and_prewarm_stay_on_the_pinned_publication() {
+    use std::io::Seek;
+    use std::os::unix::fs::FileExt;
+    let root = TestDir::new("sendfile-pinned-generation");
+    let path = root.join("asset.bin");
+    let next = root.join("next.bin");
+    std::fs::write(&path, b"old-body").unwrap();
+    let pool = StaticSendfilePool::with_capacity(std::fs::File::open(&path).unwrap(), 2);
+    assert_eq!(pool.prewarm(), 2);
+    let mut first = pool.checkout().unwrap();
+    let mut second = pool.checkout().unwrap();
+    first.seek(std::io::SeekFrom::Start(3)).unwrap();
+    assert_eq!(second.stream_position().unwrap(), 0);
+    std::fs::write(&next, b"new-and-longer-body").unwrap();
+    std::fs::rename(&next, &path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let overflow = pool.checkout().unwrap();
+    // Independent open descriptions preserve cursor isolation as well as inode
+    // identity. sendfile itself uses explicit offsets, including the dup fallback.
+    let mut body = [0; 8];
+    overflow.read_exact_at(&mut body, 0).unwrap();
+    assert_eq!(&body, b"old-body");
+    assert_eq!(pool.prewarm(), 2);
+    for file in [first, second, overflow] {
+        pool.checkin(file);
+    }
+    assert_eq!(pool.idle.len(), 2);
+    let retained = pool.checkout().unwrap();
+    retained.read_exact_at(&mut body, 0).unwrap();
+    assert_eq!(&body, b"old-body");
+}
+
+#[tokio::test]
+async fn complete_file_stream_bounds_growth_and_reports_truncation() {
+    let root = TestDir::new("static-stream-boundaries");
+    let path = root.join("asset.bin");
+    let original = vec![b'x'; 2 * 1024 * 1024 + 17];
+    std::fs::write(&path, &original).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let file = file_io::open_checked(&path, &metadata).await.unwrap();
+    let mut body = file_streaming_body(file, metadata.len());
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(!first.is_empty());
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(
+        body.collect().await.is_err(),
+        "H3 must receive an error, not a normal FIN"
+    );
+
+    std::fs::write(&path, &original).unwrap();
+    let file = tokio::fs::File::open(&path).await.unwrap();
+    let body = file_streaming_body(file, original.len() as u64);
+    std::io::Write::write_all(
+        &mut std::fs::File::options().append(true).open(&path).unwrap(),
+        b"must-not-leak",
+    )
+    .unwrap();
+    assert_eq!(body.collect().await.unwrap().to_bytes().as_ref(), original);
+    let mut exact = ExactReader::new(b"123extra".as_slice(), 3);
+    let mut empty = [];
+    assert_eq!(exact.read(&mut empty).await.unwrap(), 0);
+    let mut bytes = Vec::new();
+    exact.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"123");
+    let mut short = ExactReader::new(b"12".as_slice(), 3);
+    assert_eq!(
+        short.read_to_end(&mut Vec::new()).await.unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+}
+
 #[test]
 fn static_snapshot_survives_source_truncation_and_overwrite() {
     const CHILD: &str = "PROXYSSS_STATIC_SNAPSHOT_PROBE";
@@ -128,13 +289,7 @@ async fn concurrent_static_eviction_accounts_each_entry_once() {
         for _ in 0..24 {
             scope.spawn(|| {
                 barrier.wait();
-                evict_stale_static_cache_entry(
-                    &key,
-                    &metadata,
-                    metadata.modified().ok(),
-                    &cache,
-                    &used,
-                );
+                evict_stale_static_cache_entry(&key, &metadata, &cache, &used);
             });
         }
     });

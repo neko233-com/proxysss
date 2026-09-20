@@ -41,6 +41,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - 静态 hosts/path 按 YAML 首个匹配项选站；多站点预热、H2 和连接缓存必须按站点隔离，同路径不得串根目录。单站点无 hosts 的默认快路径保持原有性能，改动必须覆盖 Host 切换、Range、sendfile 与热重载撤销域名。
 - 可变静态源文件不得作为跨请求的裸 mmap 正文交给 TLS/压缩；使用有界不可变快照。文件截断、删除、局部下载及 H2 连接缓存失效必须有回归覆盖，具体规则见 [CDN 下载](docs/CDN-ORIGIN.md)。
 - 静态 HTTP/1 连接缓存按单调时间检查 freshness，不能用请求次数门槛代替时效；低频 keep-alive 也必须看到文件替换和删除。
+- Linux 文件缓存与弱 ETag 必须识别保留长度/mtime 的原子替换；sendfile 池持有版本锚点，池耗尽和预热不能重新按路径混入新版本。所有完整/Range 下载打开后核对版本，正文增长不得超出 Content-Length，提前 EOF 必须报告流错误，不能正常结束 H3。
 - API gateway surfaces must cover HTTP/1.1, HTTP/2, gRPC-style requests, WebSocket reverse proxying, edge rate limiting, active/passive health, retry, weighted/canary upstreams, and circuit-breaker-style passive quarantine without making proxysss a business gateway.
 - SSE 快路径必须保持 HTTP 消息边界与正文编码：转换到 TLS/HTTP2 响应时解码上游 chunked，按 Content-Length/终止块结束，截断报错；不能把 chunk 标记/trailer 当作事件数据，不能移除未解压正文的 Content-Encoding。
 - WAF, anti-CC, hotlink, and crawler defenses must stay split correctly: generic edge primitives live in core config (`security`, `services.access_control`, `services.rate_limit`), while business-specific Referer/User-Agent/bot-score decisions belong in scripts/plugins.
