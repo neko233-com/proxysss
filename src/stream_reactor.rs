@@ -1,9 +1,10 @@
 //! Linux realtime stream relay reactor.
 //!
-//! Tokio remains responsible for accepting sockets, parsing the HTTP upgrade,
-//! upstream selection, and the complete TLS/WSS path. Once a plain WebSocket
-//! upgrade is established, this module can take duplicated socket descriptors
-//! and relay them with one level-triggered epoll loop per allowed CPU. Small
+//! The bulk profile can hand plain established sockets to this separate native
+//! reactor. Balanced uses per-connection tasks in gateway::plain_relay. Tokio
+//! remains responsible for accepting sockets, parsing the HTTP upgrade,
+//! upstream selection, and TLS/WSS. This module relays duplicated descriptors
+//! on a CPU-adaptive set of level-triggered epoll loops. Small
 //! game frames therefore pay one batched epoll wake plus recv/send, without a
 //! generic async-future state machine on every direction and every frame.
 
