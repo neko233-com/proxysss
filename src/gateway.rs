@@ -22047,6 +22047,7 @@ mod tests {
         AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
+    use std::sync::RwLock;
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -22747,7 +22748,7 @@ mod tests {
             config_path: PathBuf::from("proxysss.yaml"),
             bootstrap_config: config.clone(),
             bootstrap_fast_lane: fast_lane.clone(),
-            dynamic: Arc::new(RwLock::new(Arc::new(DynamicState {
+            dynamic: Arc::new(ArcSwap::from(Arc::new(DynamicState {
                 config,
                 fast_lane,
                 http_client: reqwest::Client::new(),
@@ -22765,7 +22766,10 @@ mod tests {
             http_cache: Arc::new(DashMap::new()),
             raw_http_pools: Arc::new(DashMap::new()),
             static_route_cache: Arc::new(DashMap::new()),
+            h2_static_route_cache: Arc::new(DashMap::new()),
             static_file_cache: Arc::new(DashMap::new()),
+            h2_static_response_cache: Arc::new(ArcSwap::from_pointee(FxHashMap::default())),
+            h2_static_response_refresh_lock: Arc::new(TokioMutex::new(())),
             static_file_cache_bytes: Arc::new(AtomicU64::new(0)),
             static_file_load_locks: Arc::new(DashMap::new()),
             acme_http_challenges: Arc::new(DashMap::new()),
