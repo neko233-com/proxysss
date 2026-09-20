@@ -109,6 +109,8 @@ Windows 运行 `test.cmd`，等价于 `scripts/verify-local.ps1 -Repeat 2`：格
 
 If-Match / If-Unmodified-Since 优先于缓存验证和 Range，失败返回 412。元数据 ETag 是弱验证器，不能通过 If-Match 强比较，已存在文件可用 `*`；If-Range 保持精确日期且文件已稳定 60 秒的规则。单段按偏移读取，小范围不会整文件载入；多段持有一个文件描述符，按下游需求读取 64 KiB 有界池缓冲，空闲池最多 8 MiB。中途截断终止响应，取消释放文件与缓冲。部署资源推荐写新文件后原子替换。
 
+Linux 完整大文件走原生 sendfile 时，HTTP 等待任务被取消会主动唤醒后台 owner，清理该作业持有的 socket 和文件描述符；不依赖停止读取的客户端再次发送数据或关闭连接。这不等于自动断开所有慢下载：尚未取消的响应继续受正常 socket 背压控制。
+
 ```bash
 curl -i -H 'Range: bytes=0-15,1048576-1048591' http://127.0.0.1/assets/game.pak
 curl -I -H 'Range: bytes=0-15' http://127.0.0.1/assets/game.pak

@@ -7,12 +7,15 @@
 //! reports completion before the HTTP task reads the next request.
 
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::mem::{self, MaybeUninit};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
@@ -28,6 +31,38 @@ const WAKE_TOKEN: u64 = u64::MAX;
 pub(crate) struct SendfileCompletion {
     pub(crate) bytes: u64,
     pub(crate) uncorked: bool,
+}
+
+pub(crate) struct PendingSendfile {
+    receiver: oneshot::Receiver<io::Result<SendfileCompletion>>,
+    cancellation: Option<(Arc<ReactorWorker>, RawFd)>,
+}
+
+impl Future for PendingSendfile {
+    type Output = Result<io::Result<SendfileCompletion>, oneshot::error::RecvError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = Pin::new(&mut self.receiver).poll(context);
+        if result.is_ready() {
+            self.cancellation = None;
+        }
+        result
+    }
+}
+
+impl Drop for PendingSendfile {
+    fn drop(&mut self) {
+        if let Some((worker, fd)) = self.cancellation.take() {
+            // Publish closure before the wake: a blocked socket need never emit
+            // another event. Only abandoned jobs are eligible for cancellation,
+            // so an old fd token cannot abort a new live job after fd reuse.
+            self.receiver.close();
+            if worker.cancellations.push(fd).is_err() {
+                worker.sweep_cancelled.store(true, Ordering::Release);
+            }
+            wake(worker.wake_fd);
+        }
+    }
 }
 
 struct SendfileJob {
@@ -92,6 +127,8 @@ impl SendfileTable {
 
 struct ReactorWorker {
     registrations: ArrayQueue<SendfileJob>,
+    cancellations: ArrayQueue<RawFd>,
+    sweep_cancelled: AtomicBool,
     wake_fd: RawFd,
 }
 
@@ -122,17 +159,21 @@ pub(crate) fn dispatch(
     requested_workers: usize,
     active_workers: usize,
     scheduler_nice: i32,
-) -> io::Result<oneshot::Receiver<io::Result<SendfileCompletion>>> {
+) -> io::Result<PendingSendfile> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
         let _ = sender.send(Ok(SendfileCompletion {
             bytes: 0,
             uncorked: false,
         }));
-        return Ok(receiver);
+        return Ok(PendingSendfile {
+            receiver,
+            cancellation: None,
+        });
     }
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
     let socket = duplicate_stream(socket_fd)?;
+    let reactor_fd = socket.as_raw_fd();
     let file = duplicate_file(file_fd)?;
     let (sender, receiver) = oneshot::channel();
     let job = SendfileJob {
@@ -157,7 +198,10 @@ pub(crate) fn dispatch(
         .push(job)
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "sendfile reactor queue full"))?;
     wake(worker.wake_fd);
-    Ok(receiver)
+    Ok(PendingSendfile {
+        receiver,
+        cancellation: Some((worker.clone(), reactor_fd)),
+    })
 }
 
 impl Reactors {
@@ -171,6 +215,8 @@ impl Reactors {
             assert!(wake_fd >= 0, "failed creating sendfile reactor eventfd");
             let worker = Arc::new(ReactorWorker {
                 registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
+                cancellations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
+                sweep_cancelled: AtomicBool::new(false),
                 wake_fd,
             });
             let reactor_worker = worker.clone();
@@ -303,6 +349,7 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
                 while let Some(job) = worker.registrations.pop() {
                     register_job(epoll_fd, &mut jobs, job);
                 }
+                cancel_abandoned_jobs(epoll_fd, &mut jobs, &worker);
                 continue;
             }
 
@@ -333,6 +380,9 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
 }
 
 fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
+    if job.completion.is_closed() {
+        return;
+    }
     let fd = job.socket.as_raw_fd();
     jobs.insert(
         fd,
@@ -379,6 +429,13 @@ fn drive_job(jobs: &mut SendfileTable, fd: RawFd) -> DriveResult {
     let event_budget = (state.len - state.sent).min(state.max_chunk_bytes);
     let event_start = state.sent;
     while state.sent - event_start < event_budget {
+        if state
+            .completion
+            .as_ref()
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            return DriveResult::Complete(Err(cancelled_download()));
+        }
         let remaining_budget = event_budget - (state.sent - event_start);
         let remaining_file = state.len - state.sent;
         let count = remaining_budget.min(remaining_file) as usize;
@@ -408,6 +465,33 @@ fn drive_job(jobs: &mut SendfileTable, fd: RawFd) -> DriveResult {
         return DriveResult::Complete(Err(error));
     }
     DriveResult::Pending
+}
+
+fn cancelled_download() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "sendfile response cancelled")
+}
+
+fn cancel_abandoned_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &ReactorWorker) {
+    while let Some(fd) = worker.cancellations.pop() {
+        cancel_abandoned_job(epoll_fd, jobs, fd);
+    }
+    // A cancellation burst cannot grow the queue indefinitely. Only overflow
+    // triggers this scan; normal completions and cancellation use indexed slots.
+    if worker.sweep_cancelled.swap(false, Ordering::AcqRel) {
+        for index in 0..jobs.slots.len() {
+            cancel_abandoned_job(epoll_fd, jobs, index as RawFd);
+        }
+    }
+}
+
+fn cancel_abandoned_job(epoll_fd: RawFd, jobs: &mut SendfileTable, fd: RawFd) {
+    if jobs
+        .get_mut(fd)
+        .and_then(|state| state.completion.as_ref())
+        .is_some_and(oneshot::Sender::is_closed)
+    {
+        complete_job(epoll_fd, jobs, fd, Err(cancelled_download()));
+    }
 }
 
 fn complete_job(epoll_fd: RawFd, jobs: &mut SendfileTable, fd: RawFd, result: io::Result<u64>) {
@@ -501,6 +585,151 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn cancelled_queued_download_never_sends_a_body() {
+        let name = CString::new("proxysss-sendfile-queued-cancel-test").unwrap();
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(file_fd) };
+        file.write_all(b"cancelled body").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let (completion, receiver) = oneshot::channel();
+        drop(receiver);
+        let mut jobs = SendfileTable::default();
+        register_job(
+            -1,
+            &mut jobs,
+            SendfileJob {
+                socket,
+                file,
+                offset: 0,
+                len: 14,
+                max_chunk_bytes: 14,
+                completion,
+            },
+        );
+        assert!(jobs.active_fds().is_empty());
+        assert_eq!(client.read(&mut [0; 32]).unwrap(), 0);
+    }
+
+    #[test]
+    fn cancellation_overflow_releases_abandoned_jobs_and_preserves_live_fd() {
+        // A one-slot queue deterministically exercises overflow without needing
+        // thousands of sockets or depending on native owner scheduling.
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(wake_fd >= 0);
+        let _wake_owner = unsafe { std::os::fd::OwnedFd::from_raw_fd(wake_fd) };
+        let worker = Arc::new(ReactorWorker {
+            registrations: ArrayQueue::new(1),
+            cancellations: ArrayQueue::new(1),
+            sweep_cancelled: AtomicBool::new(false),
+            wake_fd,
+        });
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epoll_fd >= 0);
+        let _epoll_owner = unsafe { std::os::fd::OwnedFd::from_raw_fd(epoll_fd) };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut jobs = SendfileTable::default();
+        let mut clients = Vec::new();
+        let mut pending = Vec::new();
+        for _ in 0..3 {
+            clients.push(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+            let (socket, _) = listener.accept().unwrap();
+            let fd = socket.as_raw_fd();
+            let (completion, receiver) = oneshot::channel();
+            jobs.insert(
+                fd,
+                SendfileState {
+                    socket,
+                    file: File::open("/dev/null").unwrap(),
+                    offset: 0,
+                    sent: 0,
+                    len: 1,
+                    max_chunk_bytes: 1,
+                    completion: Some(completion),
+                },
+            );
+            pending.push(PendingSendfile {
+                receiver,
+                cancellation: Some((worker.clone(), fd)),
+            });
+        }
+        let live = pending.pop().unwrap();
+        let live_fd = live.cancellation.as_ref().unwrap().1;
+        drop(pending);
+        assert!(worker.sweep_cancelled.load(Ordering::Acquire));
+        cancel_abandoned_jobs(epoll_fd, &mut jobs, &worker);
+        assert_eq!(jobs.active_fds(), vec![live_fd]);
+        // A delayed token with a reused fd must not cancel a new live receiver.
+        worker.cancellations.push(live_fd).unwrap();
+        cancel_abandoned_jobs(epoll_fd, &mut jobs, &worker);
+        assert_eq!(jobs.active_fds(), vec![live_fd]);
+        complete_job(epoll_fd, &mut jobs, live_fd, Ok(0));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.bytes, 0);
+        assert!(
+            worker.cancellations.is_empty(),
+            "normal completion must not enqueue cancellation"
+        );
+        assert!(jobs.active_fds().is_empty());
+    }
+
+    #[test]
+    fn cancelled_blocked_download_releases_descriptors_without_client_disconnect() {
+        let name = CString::new("proxysss-sendfile-cancel-test").unwrap();
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let file = unsafe { File::from_raw_fd(file_fd) };
+        let len = 512 * 1024 * 1024;
+        file.set_len(len).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let completion =
+            dispatch(server.as_raw_fd(), file.as_raw_fd(), 0, len, len, 1, 1, 0).unwrap();
+        drop(server);
+        drop(file);
+        let retained_files = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|path| {
+                    path.to_string_lossy()
+                        .contains("proxysss-sendfile-cancel-test")
+                })
+                .count()
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            retained_files(),
+            1,
+            "blocked reactor must own the source file"
+        );
+        drop(completion);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while retained_files() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let retained = retained_files();
+        // Keep the peer alive and unread until after the cancellation observation.
+        drop(client);
+        assert_eq!(
+            retained, 0,
+            "cancelled sendfile retained its file descriptor"
+        );
+    }
+
+    #[test]
     fn reactor_sends_exact_file_bytes() {
         let name = CString::new("proxysss-sendfile-test").unwrap();
         let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
@@ -538,7 +767,12 @@ mod tests {
             client.read_exact(&mut received).unwrap();
             (received, expected[start..].to_vec())
         });
-        let completion = completion.blocking_recv().unwrap().unwrap();
+        let completion = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(completion)
+            .unwrap()
+            .unwrap();
         assert_eq!(completion.bytes, (64 * 1024 - start) as u64);
         assert!(completion.uncorked);
         let (received, expected) = reader.join().unwrap();

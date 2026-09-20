@@ -67,6 +67,8 @@ balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且�
 
 明文 HTTP I/O event interval 为 8，shared-small 为 16，global queue interval 为 31。H2 每连接用本地 FuturesUnordered 驱动流，每个完成流后让出。静态 freshness 为 2 秒，nice-10 控制运行时重验证并原子发布快照。改变策略前阅读 [性能决策](decisions/linux-performance.md)，验证方法见 [验证流程](VALIDATION.md)。
 
+原生 sendfile 的完成 future 同时拥有取消责任。HTTP 等待任务退出时关闭完成通道，经每 owner 的有界无锁取消队列和 eventfd 唤醒 reactor；队列溢出才扫描已放弃作业，普通完成不扫描。清理前检查完成通道确已关闭，防止旧 fd 通知误取消复用该数字的新下载。未注册作业和连续发送轮也检查取消；已阻塞的作业无需等待客户端再次产生 I/O 即可释放 socket/file 副本。
+
 ## 启动、预热和重载
 
 启动加载一个 YAML（默认 proxysss.yaml，支持 -config/--config/-c），校验后探测系统/socket 能力，记录启用与跳过原因。Ubuntu 24.x 使用支持的极限参数，旧/未知系统明确降级；持久 sysctl 修改只由显式 `proxysss tune linux --apply` 执行，保留 SSH 安全、备份与失败回滚。
