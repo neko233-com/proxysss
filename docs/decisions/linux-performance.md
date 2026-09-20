@@ -2,6 +2,13 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：balanced HTTP 分片允许 CPU 迁移，未接受
+
+候选 6e48083 保留每允许 CPU 一个独立单线程 HTTP runtime、连接/socket/reactor 所有权、实时 native owner 和原 sendfile 边界，只将 HTTP worker 从单核硬绑定改为可在完整获准 CPU 集内迁移。349 项 Linux 功能测试连续两轮、Clippy、格式、文档与 CLI 检查通过，新增真实线程 mask 检查。该方案用于检验 SO_REUSEPORT 长连接分布不均的影响，并未证明这是主要瓶颈。
+
+标准 Ubuntu 24.04 native-amd64 Docker Desktop VM，gateway/backend/client CPU 为 0–5/6–11/12–23，完整 1×/2×/4× 混合矩阵仍失败。198 个原始样本零错误，双方等负载完成率通过；大文件吞吐比为 0.677/0.584/0.765，其余吞吐通过。CDN p99 比为 2.988/2.486/1.789，静态小文件 p99 为 3.117/2.316/1.578；4× WebSocket p50/p95/p99 为 1.081/1.193/1.190，普通 TCP p50/p95 为 1.143/1.012。不能用部分尺度的大文件比值提高宣称跨场景优化成功，也不能从不同轮次推断精确因果差值。
+
+4× cgroup current/peak：proxysss 87699456/282824704、nginx 209354752/375361536 bytes。18 秒活跃、163 秒矩阵 wall、336 秒总耗时（含 2m17s release 构建）。候选已由 a53d848 完整撤回，保留 34d42d0 的严格配置和官方示例修复。工件 .benchmark/direct-ubuntu24-amd64/goal-http-affinity/；固定候选二进制 SHA256 为 299cf1f10e25b4f2b90dfa36c1e09129159879dcccf5afd81f91ec77f6a02005。本轮不是发布通过证据。
 ## 2026-09-21：balanced 每连接独立任务与直接 sendfile，未接受
 
 候选 49b4782 为每条明文 TCP/WebSocket 连接建立独立 Tokio 就绪任务，留在接收连接的 HTTP 分片；每方向至多 16 个 I/O 步骤，线程共享 16 KiB 临时缓冲，背压时才保留独立缓冲。balanced 下载直接 sendfile，每 2 MiB 让出同一队列。339 项 Linux 测试连续两轮、Clippy、格式、文档与配置检查通过，覆盖半关闭、背压、取消和 WebSocket 交接。
