@@ -2,6 +2,16 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：balanced native relay 与 sendfile 作为 HTTP 分片任务，未接受
+
+候选 35afe39 将 balanced 每核 native relay 和 sendfile 的子 epoll 交给同核 HTTP Tokio runtime 的 AsyncFd 驱动。relay 每轮至多 64 个事件和 64 个接入，sendfile 每轮一个作业、2 MiB；处理后让出 Tokio。保留半关闭、背压、取消清理与 fd 复用顺序，336 项 Linux 测试两轮、fmt、Clippy 与场景配置检查全部通过，但功能通过不能证明调度公平。
+
+Ubuntu 24.04 amd64 Docker Desktop VM，gateway/backend/client 分别使用 0–5/6–11/12–23 CPU，标准 1×/2×/4× 全混合矩阵失败。198 个原始样本全部零错误；大文件吞吐比为 0.377/0.209/0.165，静态小文件为 0.812/0.615/0.539，CDN 为 0.837/0.679/0.580，反代为 0.880/0.661/0.527，SSE 为 0.786/0.579/0.482。1× 游戏 TCP 与 WebSocket 分别约为 nginx 的 5.78 倍和 5.32 倍，不能抵消 HTTP 与下载退步。4× TCP 等负载完成率 0.976，低于 0.980；多个延迟门槛亦未通过。
+
+4× cgroup current/peak：proxysss 82624512/202162176、nginx 209272832/380526592 bytes。18 秒活跃测量、163 秒矩阵 wall、202 秒总耗时。候选已撤回到此前数据路径，保留用户确认的验收约束和完整工件 `.benchmark/direct-ubuntu24-amd64/goal-cooperative-shards/`。不能将实时吞吐改善作为全场景优化，也不能通过忽略静态场景或降低门槛接纳该架构。
+
+此前同一标准资源配置的 perf 诊断位于 `.benchmark/goal-perf-standard/`，使用 7681946 二进制；观察器与客户端共享 CPU，仅用于定位。等负载 proxysss 采样 CPU 总量低于 nginx，但这不足以证明线程调度是唯一根因；候选失败也不能证明所有协同调度架构都不可行。下一次改动必须解释工作分配与事件公平性，不能只再次修改一个轮询预算。
+
 ## 不可重复的已知回归
 
 - 不把 balanced 的 H2 放回共享实时运行时，不恢复 32-stream H2 批处理；这些实验曾压低其他协议吞吐、增加尾延迟。

@@ -55,7 +55,6 @@ struct ReactorWorker {
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
-    shard_cpus: Vec<usize>,
     next: AtomicUsize,
 }
 
@@ -140,11 +139,6 @@ fn quiet_reply_spin_polls(pair_count: usize) -> usize {
 }
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
-
-pub(crate) fn warm_cooperative(runtimes: &[tokio::runtime::Handle]) {
-    assert!(!runtimes.is_empty());
-    let _ = REACTORS.get_or_init(|| Reactors::start_on_runtimes(runtimes.len(), 0, Some(runtimes)));
-}
 static PENDING_BUFFERS: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
 fn pending_buffer_pool() -> &'static ArrayQueue<Vec<u8>> {
     PENDING_BUFFERS.get_or_init(|| ArrayQueue::new(PENDING_BUFFER_POOL_CAPACITY))
@@ -215,12 +209,7 @@ fn dispatch_inner(
         upstream,
         completion,
     };
-    let current_cpu = unsafe { libc::sched_getcpu() };
-    let index = reactors
-        .shard_cpus
-        .iter()
-        .position(|&cpu| current_cpu >= 0 && cpu == current_cpu as usize)
-        .unwrap_or_else(|| reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len());
+    let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
     let worker = &reactors.workers[index];
     worker
         .registrations
@@ -232,14 +221,6 @@ fn dispatch_inner(
 
 impl Reactors {
     fn start(requested_workers: usize, scheduler_nice: i32) -> Self {
-        Self::start_on_runtimes(requested_workers, scheduler_nice, None)
-    }
-
-    fn start_on_runtimes(
-        requested_workers: usize,
-        scheduler_nice: i32,
-        runtimes: Option<&[tokio::runtime::Handle]>,
-    ) -> Self {
         let worker_count = requested_workers.max(1);
         let allowed_cpus = crate::linux_cpu::allowed_cpu_ids();
         let mut workers = Vec::with_capacity(worker_count);
@@ -251,62 +232,17 @@ impl Reactors {
                 wake_fd,
             });
             let reactor_worker = worker.clone();
-            if let Some(runtimes) = runtimes {
-                let runtime = &runtimes[index];
-                let epoll = crate::cooperative_epoll::CooperativeEpoll::new(
-                    runtime, wake_fd, WAKE_TOKEN, 64,
-                )
-                .expect("failed registering cooperative stream reactor");
-                std::mem::drop(runtime.spawn(run_cooperative_reactor(reactor_worker, epoll)));
-            } else {
-                let cpu = reactor_worker_cpu(index, worker_count, allowed_cpus);
-                thread::Builder::new()
-                    .name(format!("proxysss-ws-epoll-{index}"))
-                    .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice, allowed_cpus))
-                    .expect("failed spawning WebSocket epoll reactor");
-            }
+            let cpu = reactor_worker_cpu(index, worker_count, allowed_cpus);
+            thread::Builder::new()
+                .name(format!("proxysss-ws-epoll-{index}"))
+                .spawn(move || run_reactor(reactor_worker, cpu, scheduler_nice, allowed_cpus))
+                .expect("failed spawning WebSocket epoll reactor");
             workers.push(worker);
         }
         Self {
             workers,
-            shard_cpus: if runtimes.is_some() {
-                allowed_cpus.to_vec()
-            } else {
-                Vec::new()
-            },
             next: AtomicUsize::new(0),
         }
-    }
-}
-
-async fn run_cooperative_reactor(
-    worker: Arc<ReactorWorker>,
-    mut epoll: crate::cooperative_epoll::CooperativeEpoll,
-) {
-    let epoll_fd = epoll.as_raw_fd();
-    let mut sockets = SocketTable::default();
-    let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
-    loop {
-        let events = match epoll.next().await {
-            Ok(events) => events,
-            Err(error) => {
-                tracing::error!(?error, "cooperative stream reactor failed");
-                return;
-            }
-        };
-        // The shared shard schedules HTTP and relay work between bounded
-        // batches. It must not spin or perform an OS-thread yield while
-        // sibling protocol futures are waiting on this same Tokio worker.
-        process_event_batch_with_admission_limit(
-            epoll_fd,
-            &mut sockets,
-            events,
-            &worker,
-            &mut relay_buffer,
-            false,
-            64,
-        );
-        tokio::task::yield_now().await;
     }
 }
 
@@ -422,26 +358,6 @@ fn process_event_batch(
     relay_buffer: &mut [u8],
     blocked_wait: bool,
 ) -> usize {
-    process_event_batch_with_admission_limit(
-        epoll_fd,
-        sockets,
-        events,
-        worker,
-        relay_buffer,
-        blocked_wait,
-        REGISTRATION_BATCH,
-    )
-}
-
-fn process_event_batch_with_admission_limit(
-    epoll_fd: RawFd,
-    sockets: &mut SocketTable,
-    events: &[libc::epoll_event],
-    worker: &ReactorWorker,
-    relay_buffer: &mut [u8],
-    blocked_wait: bool,
-    registration_limit: usize,
-) -> usize {
     let mut active_spin_polls = 0;
     let mut registrations_ready = false;
     for event in events {
@@ -520,18 +436,13 @@ fn process_event_batch_with_admission_limit(
     // but install its replacement only after all cached events are gone.
     // Bound admission work so reconnect floods cannot starve live relays.
     if registrations_ready {
-        register_pending_pairs(epoll_fd, sockets, worker, registration_limit);
+        register_pending_pairs(epoll_fd, sockets, worker);
     }
     active_spin_polls
 }
 
-fn register_pending_pairs(
-    epoll_fd: RawFd,
-    sockets: &mut SocketTable,
-    worker: &ReactorWorker,
-    limit: usize,
-) {
-    for _ in 0..limit {
+fn register_pending_pairs(epoll_fd: RawFd, sockets: &mut SocketTable, worker: &ReactorWorker) {
+    for _ in 0..REGISTRATION_BATCH {
         let Some(pair) = worker.registrations.pop() else {
             break;
         };
@@ -995,15 +906,6 @@ mod tests {
 
     #[test]
     fn reactor_drains_backpressure_before_half_close_and_completion() {
-        exercise_backpressure_and_half_close(false);
-    }
-
-    #[test]
-    fn cooperative_reactor_drains_backpressure_before_half_close_and_completion() {
-        exercise_backpressure_and_half_close(true);
-    }
-
-    fn exercise_backpressure_and_half_close(cooperative: bool) {
         let downstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(downstream_listener.local_addr().unwrap()).unwrap();
         let (downstream, _) = downstream_listener.accept().unwrap();
@@ -1023,47 +925,8 @@ mod tests {
         socket2::SockRef::from(&upstream)
             .set_send_buffer_size(8192)
             .unwrap();
-        let runtime = cooperative.then(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .unwrap()
-        });
-        let wake_owner = cooperative.then(|| {
-            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            assert!(fd >= 0);
-            unsafe { OwnedFd::from_raw_fd(fd) }
-        });
-        let mut reactor_task = None;
-        let mut completion = if let Some(runtime) = runtime.as_ref() {
-            let wake_fd = wake_owner.as_ref().unwrap().as_raw_fd();
-            let worker = Arc::new(ReactorWorker {
-                registrations: ArrayQueue::new(1),
-                wake_fd,
-            });
-            let epoll = crate::cooperative_epoll::CooperativeEpoll::new(
-                runtime.handle(),
-                wake_fd,
-                WAKE_TOKEN,
-                64,
-            )
-            .unwrap();
-            let (sender, receiver) = oneshot::channel();
-            assert!(worker
-                .registrations
-                .push(SocketPair {
-                    downstream: duplicate_stream(downstream.as_raw_fd()).unwrap(),
-                    upstream: duplicate_stream(upstream.as_raw_fd()).unwrap(),
-                    completion: Some(sender),
-                })
-                .is_ok());
-            reactor_task = Some(runtime.spawn(run_cooperative_reactor(worker, epoll)));
-            wake(wake_fd);
-            receiver
-        } else {
-            dispatch_with_completion(downstream.as_raw_fd(), upstream.as_raw_fd(), 1, 0).unwrap()
-        };
+        let mut completion =
+            dispatch_with_completion(downstream.as_raw_fd(), upstream.as_raw_fd(), 1, 0).unwrap();
         drop(downstream);
         drop(upstream);
         let payload: Vec<u8> = (0..2 * 1024 * 1024 + 37).map(|i| (i % 251) as u8).collect();
@@ -1092,12 +955,5 @@ mod tests {
                 other => panic!("relay completion missing after both halves closed: {other:?}"),
             }
         }
-        if let Some(task) = reactor_task {
-            task.abort();
-        }
-        // The runtime owns the readiness registration; shut it down before
-        // releasing the eventfd which the task still references.
-        drop(runtime);
-        drop(wake_owner);
     }
 }
