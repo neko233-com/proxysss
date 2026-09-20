@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- balanced 大文件与实时流按同一 epoll 就绪集合逐连接调度，每个就绪下载获得独立的有界发送轮次；注册阶段不发送，保留取消、背压、半关闭和文件版本所有权。增加多下载并行、慢客户端与实时流共同运行的回归。
+
 - 修复缓存静态/sendfile、原始反代、SSE、WS/WSS 快速路径漏记 HTTP 请求，以及分发异常重复累加错误的问题；握手在长连接存活期间即可观测，消息不计作 HTTP 请求。JSON/Prometheus 统一对网关生成和上游返回的 4xx/5xx 响应计数，真实 HTTP/1、TLS/H2/H3、WebSocket 收发与回退纳入回归。
 
 - Linux 数据面统一记录启动 affinity 与 quota 预算，不再用 cgroup CPU 列表覆盖 taskset 限制；HTTP/TCP/UDP、TLS 与 native owner 共享预算。动态亲和位图支持 CPU ID 超过 1023，诊断输出区分控制运行时和数据核预算；真实受限进程的 HTTP/TCP/UDP 收发、线程范围与 owner 数量纳入 Docker 功能验证。

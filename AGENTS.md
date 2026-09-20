@@ -69,6 +69,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Linux data-plane concurrency must adapt automatically to detected CPU cores. Do not hard-code small worker caps for HTTP accept loops, TCP stream accept loops, UDP datagram workers, or stream runtimes; higher-core hosts should get proportionally more accept/runtime parallelism without operator config.
 - Linux CPU 资源在数据线程绑核前记录：保留启动 taskset/cpuset 范围，并按可检测的 cgroup quota 限制数据核预算；所有协议共用该快照，不能从已绑核 worker 重算或扩展到外层 cgroup。具体预算与检查输出维护在架构页。
 - Linux 调度、sendfile、H2 与实时 relay 的当前职责见 [架构](docs/ARCHITECTURE.md)；修改前阅读 [性能决策记录](docs/decisions/linux-performance.md)。历史已拒绝实验不得恢复为默认值；任何替代方案须重新证明完整混合负载无回归。
+- 共享 reactor 必须按就绪连接分配有界工作机会，不把整个协议事件批次当作另一类连接的单次配额；新增连接与下载只能在缓存事件消费后注册，取消、半关闭和背压必须一起验证。
 - UDP 会话清理必须按实例身份删除，不能让旧 reader/发送失败误删同地址的新 association；本地 TTL 缓存必须尊重共享刷新。混合性能逐轮原始输出不得互相覆盖，错误分类与网络计数器用于诊断，不能从汇总错误数猜测原因，详见架构与验证指南。
 - 性能发生器必须逐块消费大下载并校验响应状态/长度，HTTP/1 声明的预连接数必须实际建立；错过共同绝对开始时间必须失败，不允许各进程自行后移窗口。双方每轮均须完成等负载目标，不能把参考 nginx 未达标降为警告。发生器修正后的成绩必须重建双方数据，不能宣称是网关性能收益。
 - Hot-path proxy data structures must avoid global locks. Use per-connection state, per-listener/per-worker sharding, atomics, DashMap sharding, or lock-free queues for data-plane pooling. Mutex/RwLock synchronization is acceptable for control plane, configuration reload, certificate management, and one-time static-cache fill coordination, but not as a shared bottleneck in ordinary HTTP/TCP/UDP forwarding.

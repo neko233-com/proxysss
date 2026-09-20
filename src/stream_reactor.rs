@@ -6,6 +6,9 @@
 //! and relay them with one level-triggered epoll loop per allowed CPU. Small
 //! game frames therefore pay one batched epoll wake plus recv/send, without a
 //! generic async-future state machine on every direction and every frame.
+//! Balanced downloads and relays share one level-triggered ready set. Each
+//! returned descriptor gets one bounded turn in kernel order, so adding relay
+//! connections cannot reduce all downloads to a single turn per event batch.
 
 use std::io;
 use std::mem::{self, MaybeUninit};
@@ -51,11 +54,13 @@ struct SocketPair {
 struct ReactorWorker {
     registrations: ArrayQueue<SocketPair>,
     wake_fd: RawFd,
+    downloads: Arc<crate::sendfile_reactor::ReactorWorker>,
 }
 
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
     next: AtomicUsize,
+    next_download: AtomicUsize,
 }
 
 struct SocketState {
@@ -139,6 +144,28 @@ fn quiet_reply_spin_polls(pair_count: usize) -> usize {
 }
 
 static REACTORS: OnceLock<Reactors> = OnceLock::new();
+pub(crate) fn warm(requested_workers: usize, scheduler_nice: i32) {
+    let _ = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+}
+
+pub(crate) fn dispatch_sendfile(
+    socket_fd: RawFd,
+    file_fd: RawFd,
+    len: u64,
+    requested_workers: usize,
+    scheduler_nice: i32,
+) -> io::Result<crate::sendfile_reactor::PendingSendfile> {
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
+    let index = reactors.next_download.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
+    crate::sendfile_reactor::dispatch_to_worker(
+        &reactors.workers[index].downloads,
+        socket_fd,
+        file_fd,
+        0,
+        len,
+        crate::sendfile_reactor::SHARED_SEND_BYTES,
+    )
+}
 static PENDING_BUFFERS: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
 fn pending_buffer_pool() -> &'static ArrayQueue<Vec<u8>> {
     PENDING_BUFFERS.get_or_init(|| ArrayQueue::new(PENDING_BUFFER_POOL_CAPACITY))
@@ -230,6 +257,7 @@ impl Reactors {
             let worker = Arc::new(ReactorWorker {
                 registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
                 wake_fd,
+                downloads: crate::sendfile_reactor::ReactorWorker::shared(wake_fd),
             });
             let reactor_worker = worker.clone();
             let cpu = reactor_worker_cpu(index, worker_count, allowed_cpus);
@@ -242,6 +270,7 @@ impl Reactors {
         Self {
             workers,
             next: AtomicUsize::new(0),
+            next_download: AtomicUsize::new(0),
         }
     }
 }
@@ -299,6 +328,7 @@ fn run_reactor(
     assert_eq!(add_wake, 0, "failed registering WebSocket reactor eventfd");
 
     let mut sockets = SocketTable::default();
+    let mut downloads = crate::sendfile_reactor::SharedDownloads::default();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
     let mut relay_buffer = [0_u8; RELAY_BUFFER_BYTES];
     let mut active_spin_polls = 0_usize;
@@ -314,6 +344,7 @@ fn run_reactor(
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            downloads.fail(epoll_fd, &worker.downloads);
             break;
         }
         if ready == 0 {
@@ -327,13 +358,15 @@ fn run_reactor(
         } else {
             continuous_batches = continuous_batches.saturating_add(1);
         }
+        let batch = &events[..ready as usize];
         active_spin_polls = process_event_batch(
             epoll_fd,
             &mut sockets,
-            &events[..ready as usize],
+            batch,
             &worker,
             &mut relay_buffer,
             blocked_wait,
+            &mut downloads,
         );
         if sockets.len() / 2 > ACTIVE_SPIN_MAX_PAIRS_PER_WORKER
             && continuous_batches >= CONTINUOUS_BATCH_YIELD_AFTER
@@ -357,6 +390,7 @@ fn process_event_batch(
     worker: &ReactorWorker,
     relay_buffer: &mut [u8],
     blocked_wait: bool,
+    downloads: &mut crate::sendfile_reactor::SharedDownloads,
 ) -> usize {
     let mut active_spin_polls = 0;
     let mut registrations_ready = false;
@@ -369,6 +403,12 @@ fn process_event_batch(
         }
 
         let fd = token as RawFd;
+        // Preserve the shared epoll ready order. A ready download gets its own
+        // bounded turn here, just like a ready relay endpoint; neither class
+        // waits behind an entire batch of the other class.
+        if downloads.on_event(epoll_fd, event) {
+            continue;
+        }
         let Some((peer_fd, downstream, read_enabled)) = sockets
             .get(&fd)
             .map(|state| (state.peer_fd, state.downstream, state.read_enabled))
@@ -437,6 +477,7 @@ fn process_event_batch(
     // Bound admission work so reconnect floods cannot starve live relays.
     if registrations_ready {
         register_pending_pairs(epoll_fd, sockets, worker);
+        downloads.on_wake(epoll_fd, &worker.downloads);
     }
     active_spin_polls
 }
@@ -757,6 +798,158 @@ mod tests {
     use std::os::fd::OwnedFd;
 
     #[test]
+    fn shared_owner_preserves_relay_half_close_during_download_backpressure_and_cancel() {
+        use std::ffi::CString;
+        use std::fs::File;
+        let reactors = Reactors::start(1, 0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let worker = &reactors.workers[0];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let pair = || {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (server, _) = listener.accept().unwrap();
+            server.set_nonblocking(true).unwrap();
+            (client, server)
+        };
+        let (mut download, download_socket) = pair();
+        socket2::SockRef::from(&download_socket)
+            .set_send_buffer_size(16 * 1024)
+            .unwrap();
+        let name = CString::new("proxysss-shared-owner-test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let pending = crate::sendfile_reactor::dispatch_to_worker(
+            &worker.downloads,
+            download_socket.as_raw_fd(),
+            file.as_raw_fd(),
+            0,
+            64 * 1024 * 1024,
+            crate::sendfile_reactor::SHARED_SEND_BYTES,
+        )
+        .unwrap();
+        drop(download_socket);
+        assert_eq!(download.peek(&mut [0; 1]).unwrap(), 1);
+
+        // Other writable downloads must complete on this same owner while the
+        // first client applies backpressure and a realtime pair exchanges data.
+        let mut active_downloads = Vec::new();
+        for _ in 0..3 {
+            let (mut client, server) = pair();
+            let pending = crate::sendfile_reactor::dispatch_to_worker(
+                &worker.downloads,
+                server.as_raw_fd(),
+                file.as_raw_fd(),
+                0,
+                4 * 1024 * 1024,
+                crate::sendfile_reactor::SHARED_SEND_BYTES,
+            )
+            .unwrap();
+            drop(server);
+            let reader = thread::spawn(move || {
+                let mut body = Vec::new();
+                client.read_to_end(&mut body).unwrap();
+                assert_eq!(body.len(), 4 * 1024 * 1024);
+                assert!(body.iter().all(|byte| *byte == 0));
+            });
+            active_downloads.push((pending, reader));
+        }
+
+        let (mut client, downstream) = pair();
+        let (mut backend, upstream) = pair();
+        let (completion, receiver) = oneshot::channel();
+        assert!(worker
+            .registrations
+            .push(SocketPair {
+                downstream,
+                upstream,
+                completion: Some(completion)
+            })
+            .is_ok());
+        wake(worker.wake_fd);
+        for sequence in 0..32_u32 {
+            let payload = sequence.to_le_bytes();
+            client.write_all(&payload).unwrap();
+            let mut forwarded = [0; 4];
+            backend.read_exact(&mut forwarded).unwrap();
+            assert_eq!(forwarded, payload);
+            backend.write_all(&forwarded).unwrap();
+            client.read_exact(&mut forwarded).unwrap();
+            assert_eq!(forwarded, payload);
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(backend.read(&mut [0; 1]).unwrap(), 0);
+        backend.write_all(b"tail-after-half-close").unwrap();
+        backend.shutdown(Shutdown::Write).unwrap();
+        let mut tail = Vec::new();
+        client.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, b"tail-after-half-close");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), receiver)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        for (pending, reader) in active_downloads {
+            let completion = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(completion.bytes, 4 * 1024 * 1024);
+            reader.join().unwrap();
+        }
+
+        drop(pending);
+        let mut partial = Vec::new();
+        download.read_to_end(&mut partial).unwrap();
+        assert!(!partial.is_empty() && partial.len() < 64 * 1024 * 1024);
+        assert!(partial.iter().all(|byte| *byte == 0));
+
+        // The same owner accepts a complete new download after cancellation.
+        let payload = vec![0x5a; 256 * 1024];
+        file.set_len(0).unwrap();
+        file.write_all(&payload).unwrap();
+        let (mut client, server) = pair();
+        let pending = crate::sendfile_reactor::dispatch_to_worker(
+            &worker.downloads,
+            server.as_raw_fd(),
+            file.as_raw_fd(),
+            0,
+            payload.len() as u64,
+            crate::sendfile_reactor::SHARED_SEND_BYTES,
+        )
+        .unwrap();
+        drop(server);
+        let reader = thread::spawn(move || {
+            let mut body = Vec::new();
+            client.read_to_end(&mut body).unwrap();
+            body
+        });
+        let completed = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(completed.bytes, payload.len() as u64);
+        assert_eq!(reader.join().unwrap(), payload);
+    }
+
+    #[test]
     fn admission_waits_for_cached_events_and_yields_between_reconnect_batches() {
         let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(wake_fd >= 0);
@@ -766,6 +959,7 @@ mod tests {
         let _epoll_owner = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
         let worker = ReactorWorker {
             registrations: ArrayQueue::new(REGISTRATION_BATCH + 1),
+            downloads: crate::sendfile_reactor::ReactorWorker::shared(wake_fd),
             wake_fd,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -799,7 +993,16 @@ mod tests {
         ];
         let mut sockets = SocketTable::default();
         let mut buffer = [0; RELAY_BUFFER_BYTES];
-        process_event_batch(epoll_fd, &mut sockets, &events, &worker, &mut buffer, false);
+        let mut downloads = crate::sendfile_reactor::SharedDownloads::default();
+        process_event_batch(
+            epoll_fd,
+            &mut sockets,
+            &events,
+            &worker,
+            &mut buffer,
+            false,
+            &mut downloads,
+        );
         assert_eq!(sockets.len(), 2 * REGISTRATION_BATCH);
         assert!(
             sockets.get(&first_fd).is_some(),
@@ -823,6 +1026,7 @@ mod tests {
             &worker,
             &mut buffer,
             false,
+            &mut downloads,
         );
         assert_eq!(sockets.len(), 2 * (REGISTRATION_BATCH + 1));
         assert!(worker.registrations.is_empty());
