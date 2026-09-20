@@ -828,7 +828,7 @@ udp:
           <div class="section-head">
             <div>
               <div class="kicker">Reload + warm-up</div>
-              <h2>热重载与启动预热</h2>
+              <h2>热重载与启动预热</h2><p>配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。</p>
             </div>
               <p class="subtle">proxysss 在配置加载和热重载后会重新计算路由，读取 service_discovery 映射，预热静态文件缓存或 sendfile 描述符，并为 reverse proxy / AI proxy 预拨 keepalive 池。</p>
           </div>

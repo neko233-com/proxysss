@@ -5,6 +5,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimePerformanceConfig {
     /// Default-on adaptive OS/runtime tuning. This never writes sysctl files;
     /// persistent host tuning stays explicit through `proxysss tune linux --apply`.

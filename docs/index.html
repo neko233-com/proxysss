@@ -451,30 +451,35 @@
               <span class="tag beginner">5 分钟可用</span>
               <h3>第一个反向代理</h3>
               <p class="subtle">你只有一个站点，要把 <code>app.example.com</code> 代理到本机 9000 端口。</p>
-              <pre><code>http:
+              <pre><code class="language-yaml">http:
   plain_bind: 0.0.0.0:80
 
 services:
   reverse_proxy:
     routes:
       - name: app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:9000"</code></pre>
+        hosts: [app.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:9000</code></pre>
             </article>
 
             <article class="path">
               <span class="tag beginner">正式上线</span>
               <h3>只填域名就给 WebSocket 加 WSS</h3>
               <p class="subtle">A/AAAA 指向网关且公网 443 可达时，只填写域名即可通过默认 TLS-ALPN-01 + ECDSA P-256 免费签正式证书；不需要证书脚本、DNS API 或邮箱。极老旧客户端可选 RSA-2048；HTTP-01 仍可显式启用。</p>
-              <pre><code>http:
+              <pre><code class="language-yaml">http:
   plain_bind: 0.0.0.0:80
   tls_bind: 0.0.0.0:443
   tls:
     auto_https:
-      domains: [wss.example.com]</code></pre>
+      domains: [app.example.com]
+
+services:
+  domain_routes:
+    - name: game-wss
+      domains: [app.example.com]
+      path_prefix: /ws
+      upstream: ws://127.0.0.1:9000</code></pre>
             </article>
           </div>
         </section>
@@ -493,21 +498,24 @@ services:
               <span class="tag beginner">Static + API</span>
               <h3>官网静态站点 + API 反向代理</h3>
               <p class="subtle">官网直接从磁盘分发，HTML/CSS/JS/图片/字体/音视频支持缓存、大文件流式发送和 Range 断点续传；API 单独走后端服务，便于缓存和排障。</p>
-              <pre><code>services:
+              <pre><code class="language-yaml">http:
+  plain_bind: 0.0.0.0:80
+
+services:
   static_sites:
     - name: homepage
-      hosts: ["www.example.com"]
-      root_dir: "./www"
-      index_files: ["index.html"]
+      hosts: [www.example.com]
+      path_prefix: /assets
+      root: ./www
+      index_files: [&quot;index.html&quot;]
 
   reverse_proxy:
     routes:
       - name: api
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:8080"</code></pre>
+        hosts: [api.example.com]
+        path_prefix: /api
+        upstream: http://127.0.0.1:8080
+        strip_prefix: true</code></pre>
             </article>
 
             <article class="recipe">
@@ -524,107 +532,131 @@ scripts/verify-docker-scenarios.sh
               <span class="tag beginner">AI / SSE</span>
               <h3>给 LLM 流式输出做网关</h3>
               <p class="subtle">面向 OpenAI-compatible / New API / SSE 长响应，强调小包 flush 和无副作用性能优化。</p>
-              <pre><code>runtime:
+              <pre><code class="language-yaml">http:
+  plain_bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+
+runtime:
   performance:
     enabled: true
     traffic_profile: small
 
 services:
   ai_proxy:
+    enabled: true
     routes:
       - name: llm-edge
-        match:
-          hosts: ["ai.example.com"]
-          path_prefix: "/v1"
-        upstreams:
-          - url: "https://api.openai.com"
-        transport:
-          flush_interval_ms: 0
-          tcp_nodelay: true</code></pre>
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+        forward_headers: true
+        emit_metadata_headers: true</code></pre>
             </article>
 
             <article class="recipe">
               <span class="tag expert">Weighted cluster</span>
               <h3>权重 + 健康检查 + 缓存 + 限流</h3>
               <p class="subtle">给正式 API 集群用的骨架，不是演示配置。适合上线前进一步叠加观察和压测。</p>
-              <pre><code>services:
+              <pre><code class="language-yaml">load_balance:
+  algorithm: weighted
+  active_health:
+    enabled: true
+    interval_secs: 5
+    timeout_ms: 1200
+    path: /healthz
+
+services:
   reverse_proxy:
     routes:
       - name: api-cluster
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://10.0.0.11:8080"
-            weight: 3
-          - url: "http://10.0.0.12:8080"
-            weight: 2
-        load_balance:
-          strategy: weighted_round_robin
-          active_health:
-            path: "/healthz"
-            interval_secs: 5
-            timeout_ms: 1200</code></pre>
+        hosts: [api.example.com]
+        path_prefix: /
+        upstream: http://10.0.0.11:8080
+        upstreams: [http://10.0.0.11:8080, http://10.0.0.12:8080]
+        upstream_weights:
+          &quot;http://10.0.0.11:8080&quot;: 3
+          &quot;http://10.0.0.12:8080&quot;: 2
+        cache:
+          enabled: true
+          behavior: respect_origin
+          ttl_secs: 30
+          stale_while_revalidate_secs: 30
+          stale_if_error_secs: 120
+        rate_limit:
+          enabled: true
+          requests: 200
+          window_ms: 1000
+          burst: 400</code></pre>
             </article>
 
             <article class="recipe">
               <span class="tag expert">Game / Realtime</span>
               <h3>游戏 TCP、UDP、KCP、QCP</h3>
               <p class="subtle">HTTP 以外的边缘网关能力也要明确可配，不需要把实时服务硬塞进反向代理语义里。</p>
-              <pre><code>tcp:
+              <pre><code class="language-yaml">tcp:
   listeners:
     - name: game-tcp
       bind: 0.0.0.0:7000
       nodelay: true
-      routes:
-        - name: zone-a
-          upstreams:
-            - addr: "10.0.1.10:7000"
+      connect_timeout_ms: 1500
+      upstream: 10.0.1.10:7000
 
 udp:
   listeners:
     - name: game-udp
       bind: 0.0.0.0:7001
       session_ttl_secs: 45
-      max_associations: 150000</code></pre>
+      max_associations: 150000
+      upstream: 10.0.1.10:7001</code></pre>
             </article>
 
             <article class="recipe">
               <span class="tag expert">MQTT / IoT</span>
               <h3>MQTT TCP、MQTT over WebSocket、CoAP-style UDP</h3>
               <p class="subtle">proxysss 是设备和 broker 前面的边缘网关，不是假装自己是 broker。</p>
-              <pre><code>services:
+              <pre><code class="language-yaml">services:
   reverse_proxy:
     routes:
       - name: mqtt-ws
-        match:
-          hosts: ["iot.example.com"]
-          path_prefix: "/mqtt"
-        upstreams:
-          - url: "http://127.0.0.1:8083"
+        hosts: [iot.example.com]
+        path_prefix: /mqtt
+        upstream: http://127.0.0.1:8083
 
 tcp:
   listeners:
     - name: mqtt-tcp
-      bind: 0.0.0.0:1883</code></pre>
+      bind: 0.0.0.0:1883
+      nodelay: true
+      upstream: 10.0.0.30:1883
+
+udp:
+  listeners:
+    - name: coap
+      bind: 0.0.0.0:5683
+      session_ttl_secs: 30
+      max_associations: 50000
+      upstream: 10.0.0.31:5683</code></pre>
             </article>
 
             <article class="recipe">
               <span class="tag expert">Wildcard TLS</span>
               <h3>泛域名证书 + DNS-01</h3>
               <p class="subtle">做 <code>*.example.com</code> 或多节点证书管理时，直接走内建 <code>acme_managed</code> 的 DNS provider 工厂。</p>
-              <pre><code>http:
+              <pre><code class="language-yaml">http:
+  tls_bind: 0.0.0.0:443
   tls:
     mode: acme_managed
     acme:
-      enabled: true
-      email: "ops@example.com"
+      domains: [example.com, &quot;*.example.com&quot;]
+      email: &quot;ops@example.com&quot;
       challenge: dns01
-      key_algorithm: ecdsa_p256
+      key_algorithm: ecdsa_p256 # 推荐默认；兼容极老旧客户端时改 rsa2048
       dns:
         provider: cloudflare
         credentials:
-          api_token: "REDACTED"</code></pre>
+          api_token: &quot;REDACTED&quot;</code></pre>
             </article>
           </div>
         </section>
@@ -759,7 +791,7 @@ proxysss token show</code></pre>
     </div>
 
     <footer class="footer">
-      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP/QCP 作为 proxysss 独立 UDP listener 能力保留，但不进入当前性能 benchmark 矩阵。
+      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP 专用封装不进入 nginx 对照矩阵；严格 Ubuntu Docker 矩阵包含透明 QCP，不能据此声称 QCP 帧终止。
     </footer>
   </div>
 

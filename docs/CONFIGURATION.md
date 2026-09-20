@@ -9,6 +9,8 @@ proxysss 的配置目标不是“把 nginx 指令重新拼一遍”，而是让�
 
 以下片段按需合并到同一个 `proxysss.yaml`，合并同名映射而不是重复声明 `services`、`http` 等顶层键。Markdown 与 HTML 的 18 个示例使用真实配置类型校验并逐字段回读，避免无效字段静默失效；占位域名、地址、目录和凭据仍需按部署环境替换。
 
+配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。
+
 所有例子都基于产品默认值：
 
 - 公网 HTTP 默认端口 `80`

@@ -15,6 +15,7 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "root";
 pub const DEFAULT_ADMIN_BEARER_TOKEN: &str = "neko233";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
@@ -55,6 +56,7 @@ pub struct GatewayConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct IncludeConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -71,6 +73,7 @@ impl IncludeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub format: LogFormat,
@@ -111,6 +114,7 @@ pub enum LogLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     #[serde(default)]
     pub plain_bind: String,
@@ -133,6 +137,7 @@ pub struct HttpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpErrorPagesConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -143,6 +148,7 @@ pub struct HttpErrorPagesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpErrorPageConfig {
     pub status: u16,
     #[serde(default)]
@@ -154,6 +160,7 @@ pub struct HttpErrorPageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OnDemandTlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -169,6 +176,7 @@ pub struct OnDemandTlsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
@@ -191,6 +199,7 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoHttpsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -222,6 +231,7 @@ pub enum TlsMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeExternalConfig {
     #[serde(default = "default_acme_client")]
     pub client: String,
@@ -246,6 +256,7 @@ pub struct AcmeExternalConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeDnsExternalConfig {
     #[serde(default)]
     pub provider: String,
@@ -254,6 +265,7 @@ pub struct AcmeDnsExternalConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsCertificateConfig {
     #[serde(default)]
     pub domains: Vec<String>,
@@ -279,6 +291,7 @@ pub enum AcmeKeyAlgorithm {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TcpConfig {
     #[serde(default = "default_tcp_listeners")]
     pub listeners: Vec<TcpListenerConfig>,
@@ -288,6 +301,7 @@ pub struct TcpConfig {
 
 /// Domain-aware TCP/TLS stream proxy routes (Redis, MySQL, PostgreSQL, MongoDB, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamRouteConfig {
     pub name: String,
     #[serde(default)]
@@ -320,6 +334,7 @@ pub enum StreamTlsMode {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamAccessControlConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -330,6 +345,7 @@ pub struct StreamAccessControlConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpListenerConfig {
     pub name: String,
     pub bind: String,
@@ -350,12 +366,14 @@ pub struct TcpListenerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     #[serde(default = "default_udp_listeners")]
     pub listeners: Vec<UdpListenerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpListenerConfig {
     pub name: String,
     pub bind: String,
@@ -377,6 +395,7 @@ pub struct UdpListenerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -398,6 +417,7 @@ pub struct ScriptConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -410,6 +430,7 @@ pub struct PluginsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LoadBalanceConfig {
     #[serde(default)]
     pub algorithm: LoadBalanceAlgorithm,
@@ -433,6 +454,7 @@ pub enum LoadBalanceAlgorithm {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryPolicyConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -441,6 +463,7 @@ pub struct RetryPolicyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PassiveHealthConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -451,6 +474,7 @@ pub struct PassiveHealthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveHealthConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -483,6 +507,7 @@ pub struct ActiveHealthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveHealthOverrideConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -503,6 +528,7 @@ pub struct ActiveHealthOverrideConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AffinityConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -517,6 +543,7 @@ pub struct AffinityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpAffinityConfig {
     #[serde(default = "default_http_affinity_query_keys")]
     pub query_keys: Vec<String>,
@@ -527,6 +554,7 @@ pub struct HttpAffinityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamAffinityConfig {
     #[serde(default = "default_stream_affinity_prefixes")]
     pub probe_prefixes: Vec<String>,
@@ -539,6 +567,7 @@ pub struct StreamAffinityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminAuthRateLimitConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -551,6 +580,7 @@ pub struct AdminAuthRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminHttpsConfig {
     /// Expose the full admin API on the main gateway HTTPS listener at `path_prefix`.
     #[serde(default)]
@@ -563,6 +593,7 @@ pub struct AdminHttpsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminMonitorConfig {
     /// Enable the public HTTPS read-only monitor API for mobile and desktop clients.
     #[serde(default)]
@@ -581,6 +612,7 @@ pub struct AdminMonitorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -610,6 +642,7 @@ pub struct AdminConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DdosProtectionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -624,6 +657,7 @@ pub struct DdosProtectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DynamicBlacklistConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -632,6 +666,7 @@ pub struct DynamicBlacklistConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default = "default_true")]
     pub validate_admin_mutations: bool,
@@ -653,6 +688,7 @@ pub struct SecurityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KubernetesConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -665,6 +701,7 @@ pub struct KubernetesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KubernetesServiceMapping {
     pub name: String,
     pub service: String,
@@ -687,6 +724,7 @@ pub enum MonitoringFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MonitoringConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -697,6 +735,7 @@ pub struct MonitoringConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub hot_reload: HotReloadConfig,
@@ -715,6 +754,7 @@ pub use performance::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchdogConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -727,6 +767,7 @@ pub struct WatchdogConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HotReloadConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -735,6 +776,7 @@ pub struct HotReloadConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceStateConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -743,6 +785,7 @@ pub struct MaintenanceStateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServicesConfig {
     #[serde(default)]
     pub reverse_proxy: ReverseProxyConfig,
@@ -777,6 +820,7 @@ pub struct ServicesConfig {
 /// resolved upstreams back into the single YAML file or admin API, and let the
 /// hot reload path publish a fresh in-memory routing table.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceDiscoveryConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -793,6 +837,7 @@ pub struct ServiceDiscoveryConfig {
 /// Credentials stay on this control-plane object so general config display
 /// paths can redact them consistently with other secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceRegistryConfig {
     pub name: String,
     #[serde(default)]
@@ -826,6 +871,7 @@ pub enum ServiceRegistryProvider {
 /// forwarding depend on the registry. That keeps HTTP/TCP/UDP hot paths
 /// deterministic and free of registry network I/O.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceDiscoveryMappingConfig {
     pub name: String,
     pub registry: String,
@@ -853,6 +899,7 @@ pub enum ServiceDiscoveryTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     #[serde(default)]
     pub http: HttpRateLimitConfig,
@@ -861,6 +908,7 @@ pub struct RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamRateLimitConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -877,6 +925,7 @@ pub struct StreamRateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessControlConfig {
     #[serde(default)]
     pub http: HttpAccessControlConfig,
@@ -885,6 +934,7 @@ pub struct AccessControlConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpAccessControlConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -906,6 +956,7 @@ pub enum RateLimitAlgorithm {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpRateLimitConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -937,12 +988,14 @@ pub enum RateLimitKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ReverseProxyConfig {
     #[serde(default)]
     pub routes: Vec<ReverseProxyRouteConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HttpResponsePolicyConfig {
     #[serde(default)]
     pub compression: ResponseCompressionConfig,
@@ -951,6 +1004,7 @@ pub struct HttpResponsePolicyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReverseProxyRouteConfig {
     pub name: String,
     #[serde(default = "default_route_path_prefix")]
@@ -981,6 +1035,7 @@ pub struct ReverseProxyRouteConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainRouteConfig {
     pub name: String,
     #[serde(default)]
@@ -1013,6 +1068,7 @@ pub struct DomainRouteConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseCompressionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1048,6 +1104,7 @@ pub enum CacheBehavior {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseCacheConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1079,6 +1136,7 @@ pub struct ResponseCacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheZoneConfig {
     pub name: String,
     #[serde(default = "default_cache_zone_max_entries")]
@@ -1088,6 +1146,7 @@ pub struct CacheZoneConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainTlsConfig {
     #[serde(default, rename = "type")]
     pub mode: DomainTlsMode,
@@ -1112,6 +1171,7 @@ pub enum DomainTlsMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StaticSiteConfig {
     pub name: String,
     #[serde(default)]
@@ -1193,6 +1253,7 @@ fn default_autoindex_max_entries() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebDavConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1207,6 +1268,7 @@ pub struct WebDavConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WebDavAuthConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1217,6 +1279,7 @@ pub struct WebDavAuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileCloudConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1247,6 +1310,7 @@ pub struct FileCloudConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FtpConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1299,6 +1363,7 @@ pub struct FtpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FtpUserPolicy {
     pub user: String,
     #[serde(default)]
@@ -1315,7 +1380,7 @@ impl GatewayConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let value = load_config_value(path)?;
         let mut config: GatewayConfig = serde_yaml::from_value(value)
-            .with_context(|| format!("failed to decode merged config {}", path.display()))?;
+            .map_err(|error| anyhow!("failed to decode config {}: {error}", path.display()))?;
 
         config.normalize(path.parent().unwrap_or_else(|| Path::new(".")));
         config.validate()?;
@@ -4087,131 +4152,6 @@ mod tests {
             .contains("admin.monitor.path_prefix cannot equal admin.https.path_prefix"));
     }
 
-    fn assert_documented_fields_preserved(
-        source: &serde_yaml::Value,
-        effective: &serde_yaml::Value,
-        path: &str,
-    ) {
-        match source {
-            serde_yaml::Value::Mapping(fields) => {
-                for (key, value) in fields {
-                    let name = key.as_str().expect("configuration field name");
-                    let child = format!("{path}.{name}");
-                    let actual = effective.get(key).unwrap_or_else(|| {
-                        panic!("{child}: documented field is silently ignored or noncanonical")
-                    });
-                    assert_documented_fields_preserved(value, actual, &child);
-                }
-            }
-            serde_yaml::Value::Sequence(items) => {
-                let actual = effective.as_sequence().expect("configuration sequence");
-                assert_eq!(items.len(), actual.len(), "{path}");
-                for (index, value) in items.iter().enumerate() {
-                    assert_documented_fields_preserved(
-                        value,
-                        &actual[index],
-                        &format!("{path}[{index}]"),
-                    );
-                }
-            }
-            _ => assert_eq!(
-                source, effective,
-                "{path}: example value changed during parsing"
-            ),
-        }
-    }
-
-    fn assert_documented_example_pair(
-        markdown: &str,
-        html: &str,
-        markdown_name: &str,
-        html_name: &str,
-        minimum_examples: usize,
-    ) {
-        let markdown_examples = markdown
-            .split("```yaml")
-            .skip(1)
-            .map(|part| part.split("```").next().unwrap().trim().to_owned());
-        let html_examples = html.split("<pre><code>").skip(1).filter_map(|part| {
-            let code = part.split("</code></pre>").next().unwrap().trim();
-            [
-                "http:",
-                "services:",
-                "runtime:",
-                "admin:",
-                "tcp:",
-                "udp:",
-                "load_balance:",
-                "script:",
-                "plugins:",
-            ]
-            .iter()
-            .any(|root| code.starts_with(root))
-            .then(|| {
-                code.replace("&quot;", "\"")
-                    .replace("&lt;", "<")
-                    .replace("&gt;", ">")
-                    .replace("&amp;", "&")
-            })
-        });
-        let documents = [
-            (markdown_name, markdown_examples.collect::<Vec<_>>()),
-            (html_name, html_examples.collect::<Vec<_>>()),
-        ];
-        let mut parsed_examples = [Vec::new(), Vec::new()];
-        for (document_index, (document, examples)) in documents.iter().enumerate() {
-            assert!(
-                examples.len() >= minimum_examples,
-                "missing examples in {document}"
-            );
-            for (index, yaml) in examples.iter().enumerate() {
-                let label = format!("{document} YAML #{}", index + 1);
-                let config: GatewayConfig =
-                    serde_yaml::from_str(yaml).unwrap_or_else(|error| panic!("{label}: {error}"));
-                config
-                    .validate()
-                    .unwrap_or_else(|error| panic!("{label}: {error}"));
-                let source: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-                let effective = serde_yaml::to_value(config).unwrap();
-                assert_documented_fields_preserved(&source, &effective, &label);
-                parsed_examples[document_index].push(source);
-            }
-        }
-        assert_eq!(
-            parsed_examples[0].len(),
-            parsed_examples[1].len(),
-            "MD/HTML example count"
-        );
-        for example in &parsed_examples[0] {
-            assert!(
-                parsed_examples[1].contains(example),
-                "MD example missing or different in HTML: {example:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn configuration_guide_examples_are_executable_and_keep_every_field() {
-        assert_documented_example_pair(
-            include_str!("../docs/CONFIGURATION.md"),
-            include_str!("../docs/configuration.html"),
-            "CONFIGURATION.md",
-            "configuration.html",
-            9,
-        );
-    }
-
-    #[test]
-    fn architecture_examples_are_executable_and_keep_every_field() {
-        assert_documented_example_pair(
-            include_str!("../docs/ARCHITECTURE.md"),
-            include_str!("../docs/architecture.html"),
-            "ARCHITECTURE.md",
-            "architecture.html",
-            6,
-        );
-    }
-
     #[test]
     fn documented_ai_streaming_example_uses_supported_route_fields() {
         let section = include_str!("../docs/CONFIGURATION.md")
@@ -5063,3 +5003,11 @@ udp:
         assert_eq!(normalize_stream_listen("6379"), "0.0.0.0:6379");
     }
 }
+
+#[cfg(test)]
+#[path = "config/documentation_tests.rs"]
+mod documentation_tests;
+
+#[cfg(test)]
+#[path = "config/decoding_tests.rs"]
+mod decoding_tests;

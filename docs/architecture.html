@@ -800,7 +800,7 @@ plugins:
           <div class="section-head">
             <div>
               <div class="kicker">Reload boundaries</div>
-              <h2>哪些东西能热重载，哪些一定要重启</h2>
+              <h2>哪些东西能热重载，哪些一定要重启</h2><p>单 YAML 先严格解码全部配置对象，再校验语义。未知字段连同配置文件名返回给 CLI/管理调用者，禁用的服务也不能携带未实现字段；请求头、脚本 env、DNS credentials 和 upstream_weights 等开放映射保留自定义键，已有显式别名继续有效。解码失败发生在新状态构建/发布之前，错误重载保留当前路由、缓存和 warm 状态。</p>
             </div>
             <p class="subtle">这是架构页必须讲明白的运维边界，否则文档再漂亮也不适合真实生产。</p>
           </div>

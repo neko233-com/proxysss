@@ -60,7 +60,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - 官方文档统一 `中文 first`，只在必要术语、协议名、配置面名、命令名处保留 `English`。不要把官方文档写成英文营销页，也不要写成只给熟手看的参数堆。
 - `docs/*.html` 是给人看的官方文档入口，公共站点和内建 docs 导航必须只链接 HTML，不要把用户从 HTML 页面跳到 `.md`；`.md` 文档主要给 agent / 机器 / 仓库检索使用，`README.md` 和性能对比文档除外。
 - 官方文档中的重要主题应同时维护 `.md` 与 `docs/*.html` 两个入口，尤其是 `docs/index.html`、`docs/configuration.html`、`docs/architecture.html`、`docs/ts-how-to-use.html`、`docs/nginx-to-proxysss.html`、`docs/caddy-to-proxysss.html` 及其对应 Markdown 文档，并保持内容口径一致。
-- 配置指南与架构页的 YAML 必须通过真实类型解析、校验与逐字段回读，防止未知字段静默失效；各组 MD/HTML 示例集合保持一致，规则见 `docs/AGENTS.md`。
+- 主配置及嵌套配置拒绝未知字段，加载错误不能发布到正在服务的配置；合法别名和开放键值映射保留。公开/内置 HTML、配置与迁移指南、架构页及随包 YAML 必须参加真实解析、校验和逐字段回读；MD/HTML 示例集合保持一致，生成与维护规则见 `docs/AGENTS.md`。
 - TCP listener 的 nodelay 同时作用于接入、直接上游与策略上游 socket；显式 false 不能被 Linux 自动调优重新打开，必须以真实 socket 选项与收发测试保护。
 - **Agents MUST update `docs/architecture.html`** whenever proxysss architecture or request/data-path behavior changes (new listeners, policy chains, reload boundaries, extension hooks, etc.).
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.

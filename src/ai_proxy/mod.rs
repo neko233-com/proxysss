@@ -7,6 +7,7 @@ use http::Uri;
 use crate::script::RouteDecision;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiProxyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -17,6 +18,7 @@ pub struct AiProxyConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiProxyRouteConfig {
     pub name: String,
     #[serde(default)]

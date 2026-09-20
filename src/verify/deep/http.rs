@@ -334,8 +334,7 @@ services:
   response_policy:
     compression:
       enabled: true
-      brotli: true
-      gzip: true
+      algorithms: [brotli, gzip]
       min_length: 128
   static_sites:
     - name: compress-static
@@ -351,17 +350,38 @@ services:
 
     let url = format!("http://127.0.0.1:{gateway_port}/big/big.txt");
     wait_http_ok(&url).await?;
-    let response = reqwest::Client::new()
-        .get(&url)
-        .header("accept-encoding", "br, gzip")
-        .send()
-        .await?;
-    let encoding = response
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(encoding == "br" || encoding == "gzip", "got {encoding}");
+    for (accept, expected_encoding) in [("br, gzip", "br"), ("gzip", "gzip"), ("identity", "")] {
+        let response = reqwest::Client::new()
+            .get(&url)
+            .header("accept-encoding", accept)
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let encoding = response
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(encoding, expected_encoding);
+        let body = response.bytes().await?;
+        let mut decoded = Vec::new();
+        match expected_encoding {
+            "br" => {
+                std::io::Read::read_to_end(
+                    &mut brotli::Decompressor::new(body.as_ref(), 4096),
+                    &mut decoded,
+                )?;
+            }
+            "gzip" => {
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(body.as_ref()),
+                    &mut decoded,
+                )?;
+            }
+            _ => decoded.extend_from_slice(&body),
+        }
+        assert_eq!(decoded, vec![b'a'; 4096], "{accept}");
+    }
 
     cleanup(&root);
     Ok(())

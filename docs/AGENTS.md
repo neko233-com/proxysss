@@ -21,9 +21,10 @@
 1. 确认事实来自当前源码、命令输出或有提交标识的实测工件。
 2. 在所属主题中描述行为、限制、失败情况和资源释放；架构页只概述并链接，不放实验过程。
 3. 同步 HTML、内置文档和受影响的配置示例、CLI 能力输出；脚本 API 变化还要同步声明与脚本指南。
-4. 运行 `go run scripts/verify-docs.go` 检查文档配对、导航链接和架构入口。页面视觉/交互验证仍只用应用内 Browser。
+4. nginx/Caddy 迁移教程先编辑根目录 Markdown，再用 PowerShell 7.2+ 执行 `pwsh -File scripts/render-migration-docs.ps1` 生成对应 HTML 正文；页面外壳、导航与样式单独维护。生成器记录源文档与正文摘要，禁止直接手改生成区。
+5. 运行 `go run scripts/verify-docs.go` 检查文档配对、生成内容摘要、导航链接和架构入口。Docker 功能验证同时运行检查器的修改/缺失/重复摘要测试。页面视觉/交互验证仍只用应用内 Browser。
 
-配置教程与架构页的 YAML 必须通过实际 `GatewayConfig` 解析、`validate` 和逐字段序列化回读测试（`configuration_guide_examples_are_executable_and_keep_every_field`、`architecture_examples_are_executable_and_keep_every_field`）。只运行 `check-config` 不足以发现被 serde 忽略的未知字段。每组 Markdown/HTML 保持相同示例集合；包括 script/plugins 在内的配置根节点都须参加检查。不要声称不存在的 host 匹配、认证、缓存或路由字段已生效。主配置字段按当前 Rust 类型书写，别名在专门参考中说明。
+配置、架构、CDN 和 nginx/Caddy 迁移教程的 YAML 通过实际 `GatewayConfig` 解析、`validate` 和逐字段序列化回读；每组 Markdown/HTML 保持相同示例多重集合。`src/config/documentation_tests.rs` 还遍历全部公开 HTML、渲染后的内置 /docs，以及 examples/templates 的网关 YAML（排除插件元数据）。未知字段现在会导致配置加载失败，逐字段回读继续检查写错值、非规范别名和示例不一致。script/plugins 等根节点也须参加检查，不能声称不存在的认证、缓存或路由字段已生效。主配置使用当前规范字段，支持的别名由专门解码测试保护。CDN 的 CHANGE_ME 是明确要求替换的密钥占位符：测试先确认原配置被拒绝，再仅替换站点 origin_token/signed_url.secret 为本次随机测试值进行校验；不得删除部署者必须填写密钥的保护。
 
 教程按读者实际操作顺序组织；参考页按查询主题组织。不要把旧参数旁追加“当前修订”当成同步维护，应替换过期叙述，把原有取舍移到决策记录。文档不能把“目标”“支持能力”“本次验证通过”写成同一件事。
 

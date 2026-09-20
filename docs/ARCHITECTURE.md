@@ -28,7 +28,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 
 ## HTTP 请求路径
 
-配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。`static_sites` 同时匹配可选 `hosts` 与路径；单个 `webdav` 按路径匹配，可通过 `auth.enabled/username/password` 开启内建 Basic 认证，认证先于路径检查和任何文件操作。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
+配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。`static_sites` 同时匹配可选 `hosts` 与路径；单个 `webdav` 按路径匹配，可通过 `auth.enabled/username/password` 开启内建 Basic 认证，认证先于路径检查和任何文件操作。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，未知字段在配置解码阶段拒绝，不能用未实现字段声明能力。
 
 1. 公共 HTTP 默认监听 80，TLS/H2/H3 默认使用 443。accept 与握手由监听运行时负责，H2/H3 分别管理多路复用流。
 2. 判断协议与配置路由，处理内建服务、ACME challenge、管理 HTTPS/monitor。用户公共路由优先于欢迎页兜底；默认 `/` 仅显示 `Welcome to proxysss`、GitHub 与 GitHub Docs 链接。
@@ -100,7 +100,7 @@ balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且�
 
 ## 启动、预热和重载
 
-启动加载一个 YAML（默认 proxysss.yaml，支持 -config/--config/-c），校验后探测系统/socket 能力，记录启用与跳过原因。Ubuntu 24.x 使用支持的极限参数，旧/未知系统明确降级；持久 sysctl 修改只由显式 `proxysss tune linux --apply` 执行，保留 SSH 安全、备份与失败回滚。
+启动加载一个 YAML（默认 proxysss.yaml，支持 -config/--config/-c），先严格解码全部配置对象，再校验语义；未知字段连同配置文件名返回给 CLI/管理调用者，禁用的服务也不能携带未实现字段。请求头、脚本 env、DNS credentials 和 upstream_weights 等开放映射继续接受自定义键，已有显式别名保留。解码失败发生在构建/发布新动态状态之前，重载保留当前路由、缓存与 warm 状态。校验后探测系统/socket 能力，记录启用与跳过原因。Ubuntu 24.x 使用支持的极限参数，旧/未知系统明确降级；持久 sysctl 修改只由显式 `proxysss tune linux --apply` 执行，保留 SSH 安全、备份与失败回滚。
 
 监听前预热 hot index/顶层静态对象、小对象完整响应和 sendfile 描述符；每个去重反代/AI 上游池仅预拨一对连接，数字 IP 在池创建时解析。Tokio socket 归创建 reactor 所有，不把启动 runtime 大批 socket 作为其他 runtime 长期 lane。`/healthz` 暴露 warm 状态，重载重新预热。
 

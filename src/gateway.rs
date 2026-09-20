@@ -22679,6 +22679,43 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn unknown_config_field_rejects_reload_without_changing_live_service() {
+        use crate::verify::harness;
+
+        let root = harness::temp_root("strict-config-reload");
+        let port = harness::reserve_port().await.unwrap();
+        let yaml = harness::base_gateway_yaml(port);
+        let path = harness::write_config(&root, &yaml).unwrap();
+        let (gateway, task) = harness::spawn_gateway(path.clone()).await.unwrap();
+        let original = gateway.current_state().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/");
+        let before = client.get(&url).send().await.unwrap();
+        assert!(before.status().is_success());
+        let body = before.text().await.unwrap();
+        assert!(body.contains("Welcome to proxysss"));
+        fs::write(
+            &path,
+            format!("{yaml}\nservices:\n  reverse_proxy:\n    enabeld: true\n"),
+        )
+        .unwrap();
+        let error = gateway.reload_from_disk().await.unwrap_err();
+        assert!(error.to_string().contains("enabeld"), "{error:#}");
+        assert!(Arc::ptr_eq(&original, &gateway.current_state().await));
+        assert!(gateway.stats.warm.load(Ordering::Acquire));
+        let after = client.get(&url).send().await.unwrap();
+        assert!(after.status().is_success());
+        assert_eq!(after.text().await.unwrap(), body);
+        task.abort();
+        let _ = task.await;
+        drop(gateway);
+        harness::cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn tcp_listener_nodelay_applies_to_accepted_and_connected_sockets() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut connected = TcpStream::connect(listener.local_addr().unwrap())

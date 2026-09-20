@@ -25,13 +25,18 @@
 <p><code>allowed_peers</code> 检查 TCP 对端 IP，不信任 <code>X-Forwarded-For</code>、<code>X-Real-IP</code>。IPv4、IPv6、IPv4-mapped IPv6 均可处理。源站的 <code>remote_addr</code> 限流会把同一 CDN 出口合并计数，额度应按出口设置；访客防盗刷、限速和费用封顶还需在 CDN 边缘执行。下载内容已缓存在 CDN 时，请求不会抵达源站。</p>
 <p>公开文件支持 <code>GET</code> / <code>HEAD</code>、MIME、大文件流式发送、单段及多段 <code>Range</code>、<code>206</code> / <code>416</code>、弱 <code>ETag</code>、<code>Last-Modified</code>、<code>If-None-Match</code>、<code>If-Modified-Since</code>。<code>If-Range</code> 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 <code>200</code>。配置 <code>cache_control</code> 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。</p>
 <h2>私有资源与短期签名 URL</h2>
-<p>在同一站点增加：</p>
-<pre><code>security:
-  origin_token: CHANGE_ME
-  signed_url:
-    enabled: true
-    secret: CHANGE_ME
-    max_ttl_secs: 300</code></pre>
+<p>同一站点增加签名配置，完整层级如下；security 位于站点内：</p>
+<pre><code>services:
+  static_sites:
+    - name: cdn
+      path_prefix: /assets
+      root: ./public
+      security:
+        origin_token: CHANGE_ME
+        signed_url:
+          enabled: true
+          secret: CHANGE_ME
+          max_ttl_secs: 300</code></pre>
 <p>两种密钥都至少 32 字节，分别生成；仅保存在服务端 YAML，配置展示和管理 API 会脱敏。<code>max_ttl_secs</code> 范围为 1–86400 秒，默认 300。签名 URL 与源站令牌同时配置时必须全部通过。独立私有下载服务器可以只配置 <code>signed_url</code>；此时不要给客户端源站令牌。</p>
 <pre><code>proxysss -c proxysss.yaml static-sign --site cdn --path /assets/bundle.bin --ttl-secs 120</code></pre>
 <p>输出相对 URL：<code>/assets/bundle.bin?expires=…&amp;signature=…</code>。<code>--path</code> 使用 URL 编码后的绝对路径，不带 query/fragment；中文、空格、<code>#</code>、<code>?</code> 等应先编码。CLI 从配置读取密钥，密钥不会出现在命令参数中。签发算法供后端实现：</p>

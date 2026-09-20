@@ -44,7 +44,7 @@
 
         <div class="note"><strong>首次运行</strong><p>在工作目录执行下面的命令，生成配置并检查。启动后访问 <code>http://127.0.0.1/</code> 查看欢迎页，访问 <code>http://127.0.0.1:7777/</code> 打开管理后台。</p><pre><code>proxysss init
 proxysss check-config
-proxysss run</code></pre><p>需要后台运行和登录自启动时，执行 <code>proxysss service install</code>。Windows 使用隐藏启动器；Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent。管理后台默认只读。启用 runtime.hot_reload 后，修改配置文件会自动重载支持的项目。</p></div><div class="paths">
+proxysss run</code></pre><p>需要后台运行和登录自启动时，执行 <code>proxysss service install</code>。Windows 使用隐藏启动器；Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent。管理后台默认只读。启用 runtime.hot_reload 后，修改配置文件会自动重载支持的项目。未知配置字段会明确报错，错误配置不替换正在服务的有效配置；先运行 proxysss -c proxysss.yaml check-config 检查。</p></div><div class="paths">
           <article class="path">
             <span class="tag beginner">5 分钟可用</span>
             <h3>第一个反向代理</h3>

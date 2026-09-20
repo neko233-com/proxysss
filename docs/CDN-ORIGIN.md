@@ -43,15 +43,20 @@ services:
 
 ## 私有资源与短期签名 URL
 
-在同一站点增加：
+同一站点增加签名配置，完整层级如下；security 位于站点内：
 
 ```yaml
-security:
-  origin_token: CHANGE_ME
-  signed_url:
-    enabled: true
-    secret: CHANGE_ME
-    max_ttl_secs: 300
+services:
+  static_sites:
+    - name: cdn
+      path_prefix: /assets
+      root: ./public
+      security:
+        origin_token: CHANGE_ME
+        signed_url:
+          enabled: true
+          secret: CHANGE_ME
+          max_ttl_secs: 300
 ```
 
 两种密钥都至少 32 字节，分别生成；仅保存在服务端 YAML，配置展示和管理 API 会脱敏。`max_ttl_secs` 范围为 1–86400 秒，默认 300。签名 URL 与源站令牌同时配置时必须全部通过。独立私有下载服务器可以只配置 `signed_url`；此时不要给客户端源站令牌。

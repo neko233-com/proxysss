@@ -1,244 +1,87 @@
 # nginx 迁移到 proxysss
 
-这份文档只回答一个实际问题：
+本教程把 nginx 的网站、静态下载与 stream 配置迁到单个 proxysss.yaml。先确认路径和请求头语义，再接入证书、集群与长连接，最后使用实际流量验收。
 
-`nginx` 里常见的配置，在 `proxysss` 里应该怎么表达？
+## 1. 迁移前确认
 
-它不是功能总表，而是迁移手册。写法也按两条路线组织：
+先列出域名、路径、源站、TLS 证书、请求头改写和 TCP/UDP 端口，再选择配置项。示例中的域名、源站、目录和凭据需要替换为自己的值。每个 YAML 块可单独解析；组合时合并同一个根节点，不要重复声明 services 或 http。
 
-- `新手路线`：先迁一条能跑的链路
-- `高手路线`：快速确认该把配置落在哪个能力面
+| 迁移需求 | proxysss 配置 |
+| --- | --- |
+| 整站、API 前缀、WebSocket、普通 SSE | services.reverse_proxy.routes |
+| 静态站点和游戏资源下载 | services.static_sites |
+| 域名代理与独立证书策略 | services.domain_routes |
+| 加权上游、健康检查与重试 | 路由 upstreams/upstream_weights 与根 load_balance |
+| 游戏、数据库、MQTT、设备流量 | tcp.listeners / udp.listeners |
+| 可选业务路由和插件 | script.entry 与 plugins.auto_load_dir |
 
-文档规范说明：
+HTTP 默认监听 80，HTTPS/H2/H3 使用 443，管理端默认 127.0.0.1:7777 且只读。TLS 监听地址不等于已经获得公开可信证书。未命中用户路由的根路径返回只含 GitHub 和 GitHub Docs 链接的欢迎页。
 
-- 这份文档是 `中文 first`
-- 术语保留 `English`
-- 它有对应 HTML 子页：`docs/nginx-to-proxysss.html`
+未知配置字段会被拒绝。反代使用 hosts/path_prefix/upstream；domain_routes 使用 domains/path_prefix/upstream；listener 直接指定 upstream 或字符串数组 upstreams。不支持嵌套 match、service 引用或 listener.routes。
 
-## 1. 先建立迁移心智
+## 2. 网站、API 和资源下载
 
-### 1.1 nginx 的 `server` / `location`，在 proxysss 里怎么想
+### 2.1 整站与 API 前缀
 
-| nginx 思路 | proxysss 更常用的落点 | 什么时候用 |
-| --- | --- | --- |
-| `server_name + location /` | `services.reverse_proxy.routes` | 普通整站反代 |
-| `location /api/` + `proxy_pass` | `match.path_prefix` + `strip_prefix` | API 前缀代理 |
-| 同一域名下多个路径组装一个站点 | `services.domain_routes` | 站点级编排 |
-| `upstream` 权重和健康管理 | `upstreams` + `load_balance` | 集群反代 |
-| `stream {}` | `tcp.listeners` / `udp.listeners` | 非 HTTP 协议 |
-
-一个很实用的判断方法：
-
-- 你只是做 `HTTP -> HTTP`：优先看 `reverse_proxy.routes`
-- 你想按“整站结构”组织配置：优先看 `domain_routes`
-- 你在做数据库、游戏、MQTT、UDP：直接看 `tcp.listeners` / `udp.listeners`
-- 没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；迁移业务首页时应显式声明 route/static site
-
-## 2. 新手先迁最常见的 6 类 nginx 配置
-
-### 2.1 反代某个 API 前缀
-
-nginx：
-
-```nginx
-server {
-    listen 80;
-    server_name api.example.com;
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:8080/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-```
-
-proxysss：
-
-```yaml
-http:
-  plain_bind: 0.0.0.0:80
-
-services:
-  reverse_proxy:
-    routes:
-      - name: api
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/api"
-        strip_prefix: true
-        upstreams:
-          - url: "http://127.0.0.1:8080"
-```
-
-怎么理解：
-
-- `strip_prefix: true` 对应 nginx `location /api/` + `proxy_pass .../`
-- 常见 `Host` / `X-Real-IP` / `X-Forwarded-*` 会自动补齐
-- 这类场景优先用 `reverse_proxy.routes`，不要先上脚本
-
-### 2.2 反代整个域名到一台后端
-
-nginx：
-
-```nginx
-server {
-    listen 80;
-    server_name app.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:9000;
-    }
-}
-```
-
-proxysss：
-
-```yaml
-services:
-  reverse_proxy:
-    routes:
-      - name: app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:9000"
-```
-
-这代表：
-
-- `/` 和所有子路径都交给后端
-- 后端自己决定 `/dashboard`、`/assets/app.js`、`/api/*` 等路径如何处理
-
-### 2.3 同一域名下前后端分离
-
-例如：
-
-- `/` 走前端 SSR 或静态服务
-- `/api` 走后端 API
-
-nginx：
+在 nginx 中，带 URI 的 proxy_pass 会替换 location 匹配到的前缀，例如：
 
 ```nginx
 location /api/ {
     proxy_pass http://127.0.0.1:8080/;
 }
-
 location / {
     proxy_pass http://127.0.0.1:3000;
 }
 ```
 
-proxysss：
+不同 proxy_pass URI、正则 location 与 rewrite 的组合需要分别核对，参见 [nginx 官方代理文档](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass)。
+
+对应的 proxysss 配置把较长的 /api 前缀交给 API，其余路径交给前端：
 
 ```yaml
 services:
   reverse_proxy:
     routes:
       - name: backend-api
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/api"
+        hosts: [app.example.com]
+        path_prefix: /api
         strip_prefix: true
-        upstreams:
-          - url: "http://127.0.0.1:8080"
-
-      - name: frontend-app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:3000"
+        upstream: http://127.0.0.1:8080
+        set_headers:
+          x-environment: production
+        strip_headers: [x-debug-token]
+      - name: frontend
+        hosts: [app.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:3000
 ```
 
-为什么这样迁比较直观：
+/api/orders?limit=10 转成 /orders?limit=10；/api 本身也匹配并转成 /，/apix 不匹配。proxysss 使用路径段前缀和最长匹配，不能机械照搬原网关的正则、通配或自动重定向规则。只有整站反代时保留 frontend 一条即可。
 
-- `/api/*` 会优先命中更长前缀
-- 你不用在一个 `server` 块里堆很多 `location`
-- 路由优先级从规则本身就能读出来
+set_headers/strip_headers 修改发往上游的请求头，不是响应头指令。默认 forward_headers 补充转发头，迁移后应在源站核对 Host、客户端地址与实际路径。WebSocket 和普通 SSE 可沿用反代路由。
 
-### 2.4 静态站点
-
-nginx：
-
-```nginx
-server {
-    listen 80;
-    server_name www.example.com;
-
-    root /srv/www;
-    index index.html;
-}
-```
-
-proxysss：
+### 2.2 静态站点和游戏资源
 
 ```yaml
 services:
   static_sites:
-    - name: homepage
-      hosts: ["www.example.com"]
-      path_prefix: /
-      root: "/srv/www"
-      index_files: ["index.html"]
+    - name: game-assets
+      hosts: [cdn.example.com]
+      path_prefix: /assets
+      root: /srv/game-assets
+      index_files: [index.html]
+      autoindex: false
+      hide_dotfiles: true
+      cache_control: public, max-age=300
 ```
 
-适合：
+/assets/client.zip 对应 /srv/game-assets/client.zip。多站点按 YAML 首个 hosts/path 匹配项选站；不同根目录的相同 URL 缓存隔离。根站点把 path_prefix 设为 /。目录字段为 root。
 
-- 官网
-- 文档站
-- 小型下载站
+完整下载流式发送并保留背压；GET 支持单段和最多 16 段 Range，HEAD 与条件请求按 HTTP 语义处理。发布采用写新文件后原子替换，避免就地覆盖正在发送的资源。目录浏览默认关闭；回源令牌、签名 URL、授权和缓存规则见 [CDN 下载指南](docs/CDN-ORIGIN.md)。
 
-与 nginx 迁移时要注意：
+### 2.3 自动 HTTPS 与 WSS
 
-- proxysss 会把静态文件纳入 warm-up 和 `traffic_profile`
-- 如果你同时还有 API，不需要再拆第二套配置格式
-
-### 2.5 自定义 `header`
-
-nginx：
-
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8080/;
-    proxy_set_header X-Tenant-Id tenant-a;
-    proxy_set_header X-Env production;
-}
-```
-
-proxysss：
-
-```yaml
-services:
-  reverse_proxy:
-    routes:
-      - name: api
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/api"
-        strip_prefix: true
-        upstreams:
-          - url: "http://127.0.0.1:8080"
-        set_headers:
-          x-tenant-id: tenant-a
-          x-env: production
-```
-
-如果要删 `header`：
-
-```yaml
-        strip_headers:
-          - x-legacy-header
-          - x-debug-token
-```
-
-### 2.6 自动 HTTPS
-
-nginx 常见做法通常是外部申请证书或自己管理 `certbot`。
-
-proxysss 推荐：
+先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。
 
 ```yaml
 http:
@@ -249,201 +92,157 @@ http:
       domains: [wss.example.com]
 ```
 
-只给域名就会启用免费的内建 managed ACME，默认正式环境 TLS-ALPN-01 与 ECDSA P-256；无需 `certbot`、`acme.sh`、DNS API 或邮箱。域名必须解析到本机且公网 443 可达。`email` 是可选通知地址；极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`，显式 `challenge: http01`（需 80）、`tls_alpn01` 和 DNS-01 配置仍完全支持。
-
-如果你做的是泛域名：
+内建 managed ACME 默认使用正式 TLS-ALPN-01 和 ECDSA P-256，不依赖 certbot/acme.sh，也不要求邮箱。显式 HTTP-01 需要公网 80；旧客户端可选择 rsa2048。泛域名改用 DNS-01：
 
 ```yaml
 http:
+  tls_bind: 0.0.0.0:443
   tls:
     mode: acme_managed
     acme:
-      enabled: true
-      email: "ops@example.com"
+      domains: [example.com, "*.example.com"]
       challenge: dns01
       key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:
-          api_token: "REDACTED"
+          api_token: REPLACE-WITH-DNS-API-TOKEN
 ```
 
-## 3. 高手迁移：不只是普通 HTTP
+credentials 的键由 provider 决定，示例占位符不能申请真实证书。保护本地配置权限；普通配置显示会脱敏。证书申请、续期和外部 provider 的边界见 [配置指南](docs/CONFIGURATION.md)。
 
-### 3.1 用 `domain_routes` 组织整站
+## 3. 集群、游戏长连接与文件协作
 
-当你的 nginx 已经变成“一个域名下混静态、API、下载、管理后台”的结构，可以切成站点级编排：
+### 3.1 域名代理
 
 ```yaml
 services:
   domain_routes:
-    - domain: "example.com"
-      routes:
-        - path_prefix: "/"
-          service: static:homepage
-        - path_prefix: "/api"
-          service: reverse_proxy:api
-
-  static_sites:
-    - name: homepage
-      hosts: ["example.com"]
-      root_dir: "./www"
-
-  reverse_proxy:
-    routes:
-      - name: api
-        match:
-          hosts: ["example.com"]
-          path_prefix: "/api"
-        upstreams:
-          - url: "http://127.0.0.1:8080"
+    - name: api-domain
+      domains: [api.example.com]
+      path_prefix: /api
+      strip_prefix: true
+      upstream: http://127.0.0.1:8080
 ```
 
-### 3.2 upstream 集群迁移
+domain_routes 直接代理到上游，并支持路由证书策略；它不把 static:homepage 或 reverse_proxy:api 作为服务引用。静态站点仍独立放在 static_sites。
+
+### 3.2 权重、健康检查、缓存和限流
 
 ```yaml
+load_balance:
+  algorithm: weighted
+  active_health:
+    enabled: true
+    path: /healthz
+    interval_secs: 5
+    timeout_ms: 1200
 services:
   reverse_proxy:
     routes:
       - name: api-cluster
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://10.0.0.11:8080"
-            weight: 3
-          - url: "http://10.0.0.12:8080"
-            weight: 2
-        load_balance:
-          strategy: weighted_round_robin
-          active_health:
-            path: "/healthz"
-            interval_secs: 5
-            timeout_ms: 1200
+        hosts: [api.example.com]
+        path_prefix: /
+        upstream: http://10.0.0.11:8080
+        upstreams: [http://10.0.0.11:8080, http://10.0.0.12:8080]
+        upstream_weights:
+          "http://10.0.0.11:8080": 3
+          "http://10.0.0.12:8080": 2
+        cache:
+          enabled: true
+          behavior: respect_origin
+          ttl_secs: 30
+        rate_limit:
+          enabled: true
+          requests: 200
+          window_ms: 1000
+          burst: 400
 ```
 
-这对应 nginx 中的 `upstream` + 健康管理诉求，但 proxysss 把它放在单条路由旁边，更适合人读。
+权重是流量倾斜，不是绝对配额。根 load_balance 管理算法、主动/被动健康和重试；单条路由可用 active_health 覆盖检查参数。只为可共享响应开启缓存；respect_origin 判断源站是否允许存储，边缘存储时间仍使用 ttl_secs。限流不代替鉴权。
 
-### 3.3 `stream` 迁到 TCP / UDP
-
-TCP：
+### 3.3 游戏、数据库、MQTT 与 UDP
 
 ```yaml
 tcp:
   listeners:
-    - name: postgres
-      bind: 0.0.0.0:5432
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
       nodelay: true
       connect_timeout_ms: 2000
-      routes:
-        - name: main
-          upstreams:
-            - addr: "10.0.0.12:5432"
-```
-
-UDP：
-
-```yaml
+      upstream: 10.0.1.10:9000
 udp:
   listeners:
-    - name: realtime
+    - name: realtime-udp
       bind: 0.0.0.0:7001
       session_ttl_secs: 45
       max_associations: 150000
-      routes:
-        - name: zone-a
-          upstreams:
-            - addr: "10.0.1.10:7001"
+      upstream: 10.0.1.10:9001
 ```
 
-### 3.4 SSE / AI 代理迁移
+nodelay 同时控制接入与上游 socket，显式 false 不被自动系统调优覆盖。TCP 半关闭先冲刷待发送数据，再传播写关闭；UDP 按客户端维护有上限的 association。MQTT TCP/TLS 透传、MQTT over WebSocket、CoAP、KCP 风格和透明 QCP 使用相应 TCP/UDP/HTTP 路径；网关不充当 MQTT broker，也不终止 QCP 帧。
 
-如果你在 nginx 上已经做了 `OpenAI-compatible` / `New API` / `SSE` 代理，建议切到 `services.ai_proxy`：
+### 3.4 AI 与 SSE
 
 ```yaml
 runtime:
   performance:
     enabled: true
     traffic_profile: small
-
 services:
   ai_proxy:
+    enabled: true
     routes:
       - name: llm-edge
-        match:
-          hosts: ["ai.example.com"]
-          path_prefix: "/v1"
-        upstreams:
-          - url: "https://api.openai.com"
-        transport:
-          flush_interval_ms: 0
-          tcp_nodelay: true
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+        forward_headers: true
+        emit_metadata_headers: true
 ```
 
-原因很直接：
+上游是实际 New API/sub2api 或兼容 API 服务。持续 SSE 按下游消费转发，上游正文以空闲期限计时，不使用整个流的总时长超时。AI route 没有 transport.flush_interval_ms、tcp_nodelay 或 upstreams 字段。通用集群选择使用普通反代配置，模型与账号逻辑由上游或可选脚本处理。
 
-- 流式输出对 flush、`tcp_nodelay`、keepalive 更敏感
-- 后续性能优化必须看 mixed-load，而不是单独挑一条 SSE 压测图；涉及公网/NIC 延迟时再用 `scripts/benchmark-cross-host-wss.sh` 在独立 client/gateway/backend 主机保存原始证据
+### 3.5 WebDAV
 
-## 4. 迁移时最容易踩的坑
+```yaml
+services:
+  webdav:
+    enabled: true
+    path_prefix: /dav
+    root: /srv/shared
+    allow_write: true
+    auth:
+      enabled: true
+      username: operator
+      password: REPLACE-WITH-A-PRIVATE-PASSWORD
+```
 
-### 4.1 把 `domain_routes` 和 `reverse_proxy.routes` 当成互斥关系
+公网使用 HTTPS。Basic 认证先于文件操作，目录与复制/移动受 root 边界约束；大文件下载和 Range 有界流式发送。目录深度、覆盖和错误语义不等于完整 WebDAV 扩展，不支持 LOCK/UNLOCK/PROPPATCH。FTP 使用 services.ftp，FileCloud 使用 services.filecloud；详细配置见 [文件服务说明](docs/CONFIGURATION.md)。
 
-它们不是二选一：
+## 4. 验收与切换
 
-- 简单代理用 `reverse_proxy.routes`
-- 站点级编排再用 `domain_routes`
-
-### 4.2 只迁 YAML 语法，不迁验证流程
-
-真正的迁移不是“配置能启动就算结束”，而是：
+先用自己的路径、认证、上传、断点续传和长连接流量验证行为，再切换生产入口。check-config 检查配置，不能证明源站可达、证书申请成功或性能通过。
 
 ```bash
-proxysss tune linux --apply
-proxysss config explain
-proxysss config routes
-proxysss config nginx-parity --format yaml
-scripts/benchmark-ubuntu24-amd64-docker.sh
+proxysss -config proxysss.yaml check-config
+proxysss -config proxysss.yaml config explain
+proxysss -config proxysss.yaml config routes
+proxysss -config proxysss.yaml config reload-plan
+proxysss -config proxysss.yaml config nginx-parity --format yaml
 ```
 
-### 4.3 只挑最强单场景 benchmark
+Linux 验证使用 scripts/verify-docker-scenarios.sh 与 scripts/benchmark-ubuntu24-amd64-docker.sh。后者在 Ubuntu 24.04 amd64 中隔离网关、后端和客户端资源，同时运行静态/CDN、反代、SSE、WebSocket、TCP、UDP 与透明 QCP 的 1×/2×/4× 负载。记录错误、目标完成率、吞吐、延迟和双方内存；单项成功不代表全场景通过，Docker 数据不能冒充独立物理主机证据。GitHub Actions 只打包，测试与性能验证在本地完成。
 
-proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy、generic SSE、WebSocket、TCP、UDP 与透明 QCP 同时跑，而不是 cherry-pick 一条最漂亮的图。New API provider 和 KCP 专用封装不放进 nginx 公平对标矩阵。
+Linux 通过后，本机 Windows 快速运行 cargo test --locked。正式发布仍须同提交的功能、性能和发布证据；不要根据本文示例或能力清单声称已胜过其他网关。操作流程见 [验证指南](docs/VALIDATION.md)。
 
-## 5. 一句迁移建议
+## 5. 后续阅读
 
-如果你今天就要从 `nginx` 迁到 `proxysss`：
-
-1. 先把一条 `reverse_proxy.routes` 跑通
-2. 再拆静态站点、API、AI proxy、TCP/UDP
-3. 最后补健康检查、缓存、TLS 和 benchmark
-
-这样最稳，也最容易发现有没有副作用回归。
-
-## CDN 回源、安全下载与幂等验证
-
-`autoindex on/off` 对应 `static_sites[].autoindex`，`index` 对应 `index_files`，`root` 对应 `root`；目录索引仅提供 HTML。源站令牌和 HMAC 签名用 `security` 配置，不兼容 nginx secure_link 的签名格式。
-
-完整说明：[CDN 回源与安全下载](docs/CDN-ORIGIN.md)；面向人的入口：[HTML 文档](docs/cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
-
-`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
-
-
-## 安全开关与跨系统性能适配
-
-`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。
-
-
-## 管理界面与内置文档
-
-管理后台默认位于 `http://127.0.0.1:7777/`，使用中文导航、状态概览、表格与表单；原始 JSON 放在可折叠的诊断区。登录、会话、配置脱敏和默认只读限制仍由 Rust 管理 API 执行。管理监听器也提供 `/docs` 与 `/docs.html`，与公共监听器使用同一个内置文档模板。模板和 CSS/JavaScript 编译进单个二进制，不依赖外部前端运行时。公开 HTML 文档与内置文档共用排版与复制按钮。
-
-`README.md` 为英文入口，`README-CN.md` 为对应中文入口。Windows 后台安装使用隐藏启动器与登录自启动；本机管理界面仅监听 loopback，公共 80 首页保持简洁的欢迎文字和 GitHub / GitHub Docs 两个链接。
-
-## 原生复杂下载
-
-静态服务支持单段/多段 Range（最多 16 段）、重叠合并、有界流式读取、HEAD 与条件请求优先级，无需脚本钩子；反代下载由上游决定表示语义。详见 [CDN 下载说明](docs/CDN-ORIGIN.md)。
-
-静态 server_name 对应 services.static_sites[].hosts，目录使用 root。通配子域不包含裸域；按 YAML 首个 hosts/path 匹配项选站，缓存按站点隔离。见 [CDN 下载](docs/CDN-ORIGIN.md)。
-
-WebDAV 支持可选 Basic 认证和有界 Range 下载，FileCloud 保留一次文件名解码与认证下载私有缓存；HTTP 流和上传大小、空闲期限及文件服务限制见 [配置指南](docs/CONFIGURATION.md)。
+- [完整配置与默认值](docs/CONFIGURATION.md)：配置字段、服务组合和管理 API。
+- [CDN 下载与发布](docs/CDN-ORIGIN.md)：源站鉴权、文件版本、Range 和缓存。
+- [架构与重载边界](docs/ARCHITECTURE.md)：运行时所有权、数据路径和脚本扩展。
+- [系统适配与安全开关](docs/SECURITY-PERFORMANCE.md)：Linux/Windows/macOS 的实际调优范围。
+- [TypeScript 脚本](ts-how-to-use.md)：进程内脚本与插件，不依赖外部 Node/Deno。

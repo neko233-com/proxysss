@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"os"
@@ -19,7 +20,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println("documentation pairs, UTF-8, local links and HTML navigation verified")
+	fmt.Println("documentation pairs, generated migration content, UTF-8, local links and HTML navigation verified")
 }
 
 func verifyDocs(root string) error {
@@ -36,6 +37,11 @@ func verifyDocs(root string) error {
 	files := []string{"AGENTS.md", "docs/AGENTS.md", "docs/index.html", "templates/docs.html"}
 	for _, pair := range pairs {
 		files = append(files, pair[:]...)
+	}
+	for _, name := range []string{"nginx-to-proxysss", "caddy-to-proxysss"} {
+		if err := verifyMigrationContent(root, name); err != nil {
+			return err
+		}
 	}
 	if err := filepath.WalkDir(filepath.Join(root, "docs"), func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -76,6 +82,34 @@ func verifyDocs(root string) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// Check both inputs and generated content so hand-edited HTML cannot silently
+// diverge while its source marker remains unchanged. CRLF checkout is supported.
+func normalizedDocHash(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\r\n", "\n"))
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+}
+
+func verifyMigrationContent(root, name string) error {
+	source, err := os.ReadFile(filepath.Join(root, name+".md"))
+	if err != nil {
+		return err
+	}
+	page, err := os.ReadFile(filepath.Join(root, "docs", name+".html"))
+	if err != nil {
+		return err
+	}
+	marker := regexp.MustCompile(`(?s)<!-- migration-source: ` + regexp.QuoteMeta(name) + `\.md sha256=([0-9a-f]{64}) body-sha256=([0-9a-f]{64}) -->(.*?)<!-- /migration-source -->`)
+	matches := marker.FindAllStringSubmatch(string(page), -1)
+	if len(matches) != 1 {
+		return fmt.Errorf("docs/%s.html: expected one generated migration body; run pwsh -File scripts/render-migration-docs.ps1", name)
+	}
+	match := matches[0]
+	if normalizedDocHash(string(source)) != match[1] || normalizedDocHash(match[3]) != match[2] {
+		return fmt.Errorf("docs/%s.html: migration source or generated content changed; run pwsh -File scripts/render-migration-docs.ps1", name)
 	}
 	return nil
 }

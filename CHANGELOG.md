@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 主配置与嵌套对象严格拒绝未知字段，错误信息包含文件与字段；合法别名和自定义键值映射保留，错误重载不替换有效服务状态。修复首页、nginx/Caddy 迁移指南失效配置；迁移 HTML 正文从 Markdown 生成并校验源/正文摘要，全部公开和内置文档及随包 YAML 纳入可执行配置验证。
+
 - 修复 Linux 自动 socket 调优覆盖 TCP listener 显式 nodelay=false 的问题；接入、直接上游与策略上游统一应用配置。接入循环读取当前 listener 的 nodelay、连接超时和协议提示，热更新后新连接生效，已有连接保持；真实 socket 开关与收发行为纳入回归。架构页的反代、游戏、AI 和脚本示例改为可执行配置，纳入 Markdown/HTML 配对与逐字段回读验证。
 - 修复 Linux 原子发布的文件版本混用：sendfile 池按已打开版本扩容/预热，缓存和弱 ETag 识别保留长度/mtime 的替换；完整/Range 下载打开后核对版本，完整流式与非 Linux 复制严格限制 Content-Length，提前截断作为正文错误处理。
 - 新增静态站点 hosts 匹配（精确、通配子域、IPv4/IPv6）与多站点缓存隔离；同路径按 YAML 首个匹配站点解析，预热、HTTP/1 keep-alive、H2 快照、Range 与 Linux sendfile 不跨站复用资源，支持热重载撤销域名。

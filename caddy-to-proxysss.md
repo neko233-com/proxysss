@@ -1,154 +1,87 @@
-# caddy 迁移到 proxysss
+# Caddy 迁移到 proxysss
 
-这份文档回答的是另一个很常见的问题：
+本教程把 Caddyfile 中的网站、路径代理和文件服务迁到单个 proxysss.yaml。自动 HTTPS、请求头方向和路径匹配需要单独核对；TCP/UDP 使用原生 listener。
 
-`Caddyfile` 里的常见写法，在 `proxysss` 里怎么落地？
+## 1. 迁移前确认
 
-它同样遵循官方文档规范：
+先列出域名、路径、源站、TLS 证书、请求头改写和 TCP/UDP 端口，再选择配置项。示例中的域名、源站、目录和凭据需要替换为自己的值。每个 YAML 块可单独解析；组合时合并同一个根节点，不要重复声明 services 或 http。
 
-- `中文 first`
-- 必要术语保留 `English`
-- 对应 HTML 子页：`docs/caddy-to-proxysss.html`
+| 迁移需求 | proxysss 配置 |
+| --- | --- |
+| 整站、API 前缀、WebSocket、普通 SSE | services.reverse_proxy.routes |
+| 静态站点和游戏资源下载 | services.static_sites |
+| 域名代理与独立证书策略 | services.domain_routes |
+| 加权上游、健康检查与重试 | 路由 upstreams/upstream_weights 与根 load_balance |
+| 游戏、数据库、MQTT、设备流量 | tcp.listeners / udp.listeners |
+| 可选业务路由和插件 | script.entry 与 plugins.auto_load_dir |
 
-## 1. 先建立迁移心智
+HTTP 默认监听 80，HTTPS/H2/H3 使用 443，管理端默认 127.0.0.1:7777 且只读。TLS 监听地址不等于已经获得公开可信证书。未命中用户路由的根路径返回只含 GitHub 和 GitHub Docs 链接的欢迎页。
 
-### 1.1 Caddy 和 proxysss 的思路差别
+未知配置字段会被拒绝。反代使用 hosts/path_prefix/upstream；domain_routes 使用 domains/path_prefix/upstream；listener 直接指定 upstream 或字符串数组 upstreams。不支持嵌套 match、service 引用或 listener.routes。
 
-`Caddy` 的体验很强在于：
+## 2. 网站、API 和资源下载
 
-- 上手快
-- `Caddyfile` 简洁
-- 自动 HTTPS 默认很好用
+### 2.1 整站与 API 前缀
 
-`proxysss` 的目标不是复制 `Caddyfile`，而是提供更完整的 nginx 级网关能力，并把这些能力统一在单个 YAML 中：
-
-- HTTP / HTTPS / HTTP2 / HTTP3
-- static files
-- reverse proxy
-- AI / SSE
-- WebDAV
-- TCP / UDP
-- MQTT / IoT
-- 热重载、watchdog、metrics、admin API
-
-一句话理解：
-
-- `Caddy` 迁移更像从“简洁站点代理”迁到“更完整的通用网关”
-- 没有用户路由命中 `/` 时，proxysss 才返回只含 GitHub 和 GitHub Docs 的内建欢迎页；迁移 `file_server` 或站点首页时应显式声明 static site/route
-
-### 1.2 Caddyfile 常见能力，对应到哪里
-
-| Caddy 思路 | proxysss 更常用的落点 | 什么时候用 |
-| --- | --- | --- |
-| `example.com { reverse_proxy ... }` | `services.reverse_proxy.routes` | 普通站点反代 |
-| `handle_path /api/*` | `match.path_prefix` + `strip_prefix` | API 前缀改写 |
-| `file_server` | `services.static_sites` | 静态站点 |
-| 自动 HTTPS | `http.tls.mode: acme_managed` | 默认推荐 |
-| `header` | `set_headers` / `strip_headers` | 请求头操作 |
-| `reverse_proxy` + LB | `upstreams` + `load_balance` | 集群代理 |
-| `layer4` 场景 | `tcp.listeners` / `udp.listeners` | 原生 TCP / UDP |
-
-## 2. 新手先迁最常见的 6 类 Caddy 配置
-
-### 2.1 反代整个站点
-
-Caddy：
-
-```caddy
-app.example.com {
-    reverse_proxy 127.0.0.1:9000
-}
-```
-
-proxysss：
-
-```yaml
-http:
-  plain_bind: 0.0.0.0:80
-  tls_bind: 0.0.0.0:443
-
-services:
-  reverse_proxy:
-    routes:
-      - name: app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:9000"
-```
-
-这表示：
-
-- 根路径和全部子路径都转给后端
-- 80/443 是默认公网入口
-
-### 2.2 `handle_path /api/*`
-
-Caddy：
+Caddy 的 handle_path 会剥离匹配路径前缀，例如：
 
 ```caddy
 app.example.com {
     handle_path /api/* {
         reverse_proxy 127.0.0.1:8080
     }
+    reverse_proxy 127.0.0.1:3000
 }
 ```
 
-proxysss：
+参见 [Caddy handle_path](https://caddyserver.com/docs/caddyfile/directives/handle_path)。请求头修改对应 reverse_proxy 的 header_up；站点 header 或 header_down 属于响应方向，不能直接迁成 proxysss 的 set_headers。参见 [Caddy 请求与响应头](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers)。
+
+对应的 proxysss 配置把较长的 /api 前缀交给 API，其余路径交给前端：
 
 ```yaml
 services:
   reverse_proxy:
     routes:
-      - name: api
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/api"
+      - name: backend-api
+        hosts: [app.example.com]
+        path_prefix: /api
         strip_prefix: true
-        upstreams:
-          - url: "http://127.0.0.1:8080"
+        upstream: http://127.0.0.1:8080
+        set_headers:
+          x-environment: production
+        strip_headers: [x-debug-token]
+      - name: frontend
+        hosts: [app.example.com]
+        path_prefix: /
+        upstream: http://127.0.0.1:3000
 ```
 
-为什么这里要特别注意：
+/api/orders?limit=10 转成 /orders?limit=10；/api 本身也匹配并转成 /，/apix 不匹配。proxysss 使用路径段前缀和最长匹配，不能机械照搬原网关的正则、通配或自动重定向规则。只有整站反代时保留 frontend 一条即可。
 
-- `handle_path` 的核心语义是去掉前缀再转发
-- 在 proxysss 里对应 `strip_prefix: true`
+set_headers/strip_headers 修改发往上游的请求头，不是响应头指令。默认 forward_headers 补充转发头，迁移后应在源站核对 Host、客户端地址与实际路径。WebSocket 和普通 SSE 可沿用反代路由。
 
-### 2.3 静态站点 `file_server`
-
-Caddy：
-
-```caddy
-www.example.com {
-    root * /srv/www
-    file_server
-}
-```
-
-proxysss：
+### 2.2 静态站点和游戏资源
 
 ```yaml
 services:
   static_sites:
-    - name: homepage
-      hosts: ["www.example.com"]
-      path_prefix: /
-      root: "/srv/www"
-      index_files: ["index.html"]
+    - name: game-assets
+      hosts: [cdn.example.com]
+      path_prefix: /assets
+      root: /srv/game-assets
+      index_files: [index.html]
+      autoindex: false
+      hide_dotfiles: true
+      cache_control: public, max-age=300
 ```
 
-适合：
+/assets/client.zip 对应 /srv/game-assets/client.zip。多站点按 YAML 首个 hosts/path 匹配项选站；不同根目录的相同 URL 缓存隔离。根站点把 path_prefix 设为 /。目录字段为 root。
 
-- 官网
-- 文档站
-- 纯静态前端
+完整下载流式发送并保留背压；GET 支持单段和最多 16 段 Range，HEAD 与条件请求按 HTTP 语义处理。发布采用写新文件后原子替换，避免就地覆盖正在发送的资源。目录浏览默认关闭；回源令牌、签名 URL、授权和缓存规则见 [CDN 下载指南](docs/CDN-ORIGIN.md)。
 
-### 2.4 自动 HTTPS / WSS
+### 2.3 自动 HTTPS 与 WSS
 
-Caddy 很多人喜欢，就是因为自动 HTTPS 体验顺手。proxysss 的单域名 WSS 路径同样只需要给出域名。
-
-proxysss 里推荐这样写：
+先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。
 
 ```yaml
 http:
@@ -159,274 +92,157 @@ http:
       domains: [wss.example.com]
 ```
 
-这会使用免费的内建 managed ACME、正式 TLS-ALPN-01 与默认 ECDSA P-256，无需 certbot、acme.sh、DNS API 或邮箱；A/AAAA 必须指向网关，且公网 443 可达。邮箱仍可通过 `http.tls.auto_https.email` 选填；极老旧客户端可设 `http.tls.acme.key_algorithm: rsa2048`。旧的显式 HTTP-01（需 80）/ TLS-ALPN-01 / DNS-01 配置保持兼容。
-
-如果是泛域名：
+内建 managed ACME 默认使用正式 TLS-ALPN-01 和 ECDSA P-256，不依赖 certbot/acme.sh，也不要求邮箱。显式 HTTP-01 需要公网 80；旧客户端可选择 rsa2048。泛域名改用 DNS-01：
 
 ```yaml
 http:
+  tls_bind: 0.0.0.0:443
   tls:
     mode: acme_managed
     acme:
-      enabled: true
-      email: "ops@example.com"
+      domains: [example.com, "*.example.com"]
       challenge: dns01
       key_algorithm: ecdsa_p256
       dns:
         provider: cloudflare
         credentials:
-          api_token: "REDACTED"
+          api_token: REPLACE-WITH-DNS-API-TOKEN
 ```
 
-### 2.5 自定义 `header`
+credentials 的键由 provider 决定，示例占位符不能申请真实证书。保护本地配置权限；普通配置显示会脱敏。证书申请、续期和外部 provider 的边界见 [配置指南](docs/CONFIGURATION.md)。
 
-Caddy：
+## 3. 集群、游戏长连接与文件协作
 
-```caddy
-app.example.com {
-    reverse_proxy 127.0.0.1:8080 {
-        header_up X-Tenant-Id tenant-a
-        header_up X-Env production
-    }
-}
-```
-
-proxysss：
+### 3.1 域名代理
 
 ```yaml
 services:
-  reverse_proxy:
-    routes:
-      - name: api
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:8080"
-        set_headers:
-          x-tenant-id: tenant-a
-          x-env: production
+  domain_routes:
+    - name: api-domain
+      domains: [api.example.com]
+      path_prefix: /api
+      strip_prefix: true
+      upstream: http://127.0.0.1:8080
 ```
 
-### 2.6 同一域名下前后端分离
+domain_routes 直接代理到上游，并支持路由证书策略；它不把 static:homepage 或 reverse_proxy:api 作为服务引用。静态站点仍独立放在 static_sites。
 
-Caddy：
-
-```caddy
-app.example.com {
-    handle_path /api/* {
-        reverse_proxy 127.0.0.1:8080
-    }
-
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-proxysss：
+### 3.2 权重、健康检查、缓存和限流
 
 ```yaml
-services:
-  reverse_proxy:
-    routes:
-      - name: backend-api
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/api"
-        strip_prefix: true
-        upstreams:
-          - url: "http://127.0.0.1:8080"
-
-      - name: frontend-app
-        match:
-          hosts: ["app.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://127.0.0.1:3000"
-```
-
-## 3. 高手迁移：从站点代理走向完整网关
-
-### 3.1 负载均衡 + 健康检查
-
-Caddy：
-
-```caddy
-api.example.com {
-    reverse_proxy 10.0.0.11:8080 10.0.0.12:8080
-}
-```
-
-proxysss：
-
-```yaml
+load_balance:
+  algorithm: weighted
+  active_health:
+    enabled: true
+    path: /healthz
+    interval_secs: 5
+    timeout_ms: 1200
 services:
   reverse_proxy:
     routes:
       - name: api-cluster
-        match:
-          hosts: ["api.example.com"]
-          path_prefix: "/"
-        upstreams:
-          - url: "http://10.0.0.11:8080"
-            weight: 3
-          - url: "http://10.0.0.12:8080"
-            weight: 2
-        load_balance:
-          strategy: weighted_round_robin
-          active_health:
-            path: "/healthz"
-            interval_secs: 5
-            timeout_ms: 1200
+        hosts: [api.example.com]
+        path_prefix: /
+        upstream: http://10.0.0.11:8080
+        upstreams: [http://10.0.0.11:8080, http://10.0.0.12:8080]
+        upstream_weights:
+          "http://10.0.0.11:8080": 3
+          "http://10.0.0.12:8080": 2
+        cache:
+          enabled: true
+          behavior: respect_origin
+          ttl_secs: 30
+        rate_limit:
+          enabled: true
+          requests: 200
+          window_ms: 1000
+          burst: 400
 ```
 
-### 3.2 SSE / AI 代理
+权重是流量倾斜，不是绝对配额。根 load_balance 管理算法、主动/被动健康和重试；单条路由可用 active_health 覆盖检查参数。只为可共享响应开启缓存；respect_origin 判断源站是否允许存储，边缘存储时间仍使用 ttl_secs。限流不代替鉴权。
 
-如果你之前只是把流式 AI 请求当成普通 `reverse_proxy` 用 `Caddy` 转发，迁到 proxysss 时建议改用 `services.ai_proxy`：
+### 3.3 游戏、数据库、MQTT 与 UDP
+
+```yaml
+tcp:
+  listeners:
+    - name: game-tcp
+      bind: 0.0.0.0:7000
+      protocol: game_tcp
+      nodelay: true
+      connect_timeout_ms: 2000
+      upstream: 10.0.1.10:9000
+udp:
+  listeners:
+    - name: realtime-udp
+      bind: 0.0.0.0:7001
+      session_ttl_secs: 45
+      max_associations: 150000
+      upstream: 10.0.1.10:9001
+```
+
+nodelay 同时控制接入与上游 socket，显式 false 不被自动系统调优覆盖。TCP 半关闭先冲刷待发送数据，再传播写关闭；UDP 按客户端维护有上限的 association。MQTT TCP/TLS 透传、MQTT over WebSocket、CoAP、KCP 风格和透明 QCP 使用相应 TCP/UDP/HTTP 路径；网关不充当 MQTT broker，也不终止 QCP 帧。
+
+### 3.4 AI 与 SSE
 
 ```yaml
 runtime:
   performance:
     enabled: true
     traffic_profile: small
-
 services:
   ai_proxy:
+    enabled: true
     routes:
       - name: llm-edge
-        match:
-          hosts: ["ai.example.com"]
-          path_prefix: "/v1"
-        upstreams:
-          - url: "https://api.openai.com"
-        transport:
-          flush_interval_ms: 0
-          tcp_nodelay: true
+        provider: new-api
+        match_host: ai.example.com
+        path_prefix: /v1
+        upstream: http://127.0.0.1:3000
+        rewrite_base_path: /v1
+        forward_headers: true
+        emit_metadata_headers: true
 ```
 
-这类配置更贴合：
+上游是实际 New API/sub2api 或兼容 API 服务。持续 SSE 按下游消费转发，上游正文以空闲期限计时，不使用整个流的总时长超时。AI route 没有 transport.flush_interval_ms、tcp_nodelay 或 upstreams 字段。通用集群选择使用普通反代配置，模型与账号逻辑由上游或可选脚本处理。
 
-- `OpenAI-compatible`
-- `New API`
-- `SSE`
-- 长响应 token 流
-
-### 3.3 Caddy `layer4` 思路迁到 TCP / UDP
-
-TCP：
-
-```yaml
-tcp:
-  listeners:
-    - name: mqtt-tcp
-      bind: 0.0.0.0:1883
-      nodelay: true
-      routes:
-        - name: broker
-          upstreams:
-            - addr: "10.0.0.30:1883"
-```
-
-UDP：
-
-```yaml
-udp:
-  listeners:
-    - name: coap
-      bind: 0.0.0.0:5683
-      session_ttl_secs: 30
-      max_associations: 50000
-      routes:
-        - name: coap-core
-          upstreams:
-            - addr: "10.0.0.31:5683"
-```
-
-这里的关键差别是：
-
-- proxysss 明确把 TCP / UDP 暴露成一等公民能力面
-- 不需要依赖额外插件体系才能表达这些流量
-
-### 3.4 WebDAV 与文件协作
-
-如果你过去在 `Caddy` 上只做简单静态文件，现在想加可控写入或协作入口，可以直接用 `WebDAV`：
+### 3.5 WebDAV
 
 ```yaml
 services:
   webdav:
-    - name: assets-dav
-      hosts: ["dav.example.com"]
-      path_prefix: "/"
-      root_dir: "./dav-data"
-      read_only: false
-      auth:
-        basic:
-          - username: "editor"
-            password: "change-me"
+    enabled: true
+    path_prefix: /dav
+    root: /srv/shared
+    allow_write: true
+    auth:
+      enabled: true
+      username: operator
+      password: REPLACE-WITH-A-PRIVATE-PASSWORD
 ```
 
-## 4. Caddy 用户迁移时最容易踩的坑
+公网使用 HTTPS。Basic 认证先于文件操作，目录与复制/移动受 root 边界约束；大文件下载和 Range 有界流式发送。目录深度、覆盖和错误语义不等于完整 WebDAV 扩展，不支持 LOCK/UNLOCK/PROPPATCH。FTP 使用 services.ftp，FileCloud 使用 services.filecloud；详细配置见 [文件服务说明](docs/CONFIGURATION.md)。
 
-### 4.1 以为 proxysss 只是另一个 `Caddyfile`
+## 4. 验收与切换
 
-不是。proxysss 的目标是更完整的通用网关，所以会有更明确的能力面划分。
+先用自己的路径、认证、上传、断点续传和长连接流量验证行为，再切换生产入口。check-config 检查配置，不能证明源站可达、证书申请成功或性能通过。
 
-### 4.2 以为所有事情都该塞进一条 `reverse_proxy`
+```bash
+proxysss -config proxysss.yaml check-config
+proxysss -config proxysss.yaml config explain
+proxysss -config proxysss.yaml config routes
+proxysss -config proxysss.yaml config reload-plan
+proxysss -config proxysss.yaml config nginx-parity --format yaml
+```
 
-不是。静态站点、AI 代理、TCP、UDP、WebDAV 都应该落到各自能力面。
+Linux 验证使用 scripts/verify-docker-scenarios.sh 与 scripts/benchmark-ubuntu24-amd64-docker.sh。后者在 Ubuntu 24.04 amd64 中隔离网关、后端和客户端资源，同时运行静态/CDN、反代、SSE、WebSocket、TCP、UDP 与透明 QCP 的 1×/2×/4× 负载。记录错误、目标完成率、吞吐、延迟和双方内存；单项成功不代表全场景通过，Docker 数据不能冒充独立物理主机证据。GitHub Actions 只打包，测试与性能验证在本地完成。
 
-### 4.3 自动 HTTPS 很顺手，就忽略了运维边界
+Linux 通过后，本机 Windows 快速运行 cargo test --locked。正式发布仍须同提交的功能、性能和发布证据；不要根据本文示例或能力清单声称已胜过其他网关。操作流程见 [验证指南](docs/VALIDATION.md)。
 
-迁到 proxysss 后，除了自动证书，你还应该一起看：
+## 5. 后续阅读
 
-- `reload-plan`
-- `capabilities`
-- `warm-up`
-- mixed-load benchmark
-
-### 4.4 只看单站点 HTTP 成绩，不看全局
-
-proxysss 的性能优化和迁移结论都要遵循同一条纪律：
-
-- 后续所有性能优化都要压测
-- 必须是无副作用优化
-- SSE、static、HTTP reverse proxy、TCP、UDP、KCP-style、QCP 要一起看
-- 本机或原生 Docker 用 `scripts/benchmark-ubuntu24-amd64-docker.sh`，硬校验 Ubuntu 24 x86_64 容器并严格同时放大通用场景与透明 QCP；arm64 daemon 的模拟结果不能冒充物理 x86，KCP 专用封装不拿 Caddy/nginx 做伪语义对标
-- 涉及公网/NIC 延迟时必须用 `scripts/benchmark-cross-host-wss.sh` 在独立 client/gateway/backend 主机复跑，Docker cpuset 数据不能冒充跨机结果
-
-## 5. 一句迁移建议
-
-如果你是从 `Caddy` 迁到 `proxysss`：
-
-1. 先迁最简单的站点 `reverse_proxy`
-2. 再拆 `static_sites`、`ai_proxy`、`tcp.listeners`、`udp.listeners`
-3. 最后补 TLS、health、cache、benchmark
-
-这样你会更快理解 proxysss 的能力面，而不是把它误用成另一个语法不同的 `Caddyfile`。
-
-## CDN 回源、安全下载与幂等验证
-
-`file_server browse` 对应 `static_sites[].autoindex: true`，默认 false；用 `hide_dotfiles`、`security` 和 `rate_limit` 组合公开目录、CDN 回源或私有下载。
-
-完整说明：[CDN 回源与安全下载](docs/CDN-ORIGIN.md)；面向人的入口：[HTML 文档](docs/cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
-
-`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
-
-
-## 安全开关与跨系统性能适配
-
-`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](docs/SECURITY-PERFORMANCE.md)。
-
-
-## 管理界面与内置文档
-
-管理后台默认位于 `http://127.0.0.1:7777/`，使用中文导航、状态概览、表格与表单；原始 JSON 放在可折叠的诊断区。登录、会话、配置脱敏和默认只读限制仍由 Rust 管理 API 执行。管理监听器也提供 `/docs` 与 `/docs.html`，与公共监听器使用同一个内置文档模板。模板和 CSS/JavaScript 编译进单个二进制，不依赖外部前端运行时。公开 HTML 文档与内置文档共用排版与复制按钮。
-
-`README.md` 为英文入口，`README-CN.md` 为对应中文入口。Windows 后台安装使用隐藏启动器与登录自启动；本机管理界面仅监听 loopback，公共 80 首页保持简洁的欢迎文字和 GitHub / GitHub Docs 两个链接。
-
-## 原生复杂下载
-
-静态服务支持单段/多段 Range（最多 16 段）、重叠合并、有界流式读取、HEAD 与条件请求优先级，无需脚本钩子；反代下载由上游决定表示语义。详见 [CDN 下载说明](docs/CDN-ORIGIN.md)。
-
-静态域名入口对应 services.static_sites[].hosts，目录字段为 root，根站点显式设置 path_prefix: /。多站点缓存按站点隔离，通配子域不包含裸域。见 [CDN 下载](docs/CDN-ORIGIN.md)。
-
-WebDAV 支持可选 Basic 认证和有界 Range 下载，FileCloud 保留一次文件名解码与认证下载私有缓存；HTTP 流和上传大小、空闲期限及文件服务限制见 [配置指南](docs/CONFIGURATION.md)。
+- [完整配置与默认值](docs/CONFIGURATION.md)：配置字段、服务组合和管理 API。
+- [CDN 下载与发布](docs/CDN-ORIGIN.md)：源站鉴权、文件版本、Range 和缓存。
+- [架构与重载边界](docs/ARCHITECTURE.md)：运行时所有权、数据路径和脚本扩展。
+- [系统适配与安全开关](docs/SECURITY-PERFORMANCE.md)：Linux/Windows/macOS 的实际调优范围。
+- [TypeScript 脚本](ts-how-to-use.md)：进程内脚本与插件，不依赖外部 Node/Deno。

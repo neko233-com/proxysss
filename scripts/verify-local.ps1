@@ -28,6 +28,7 @@ Push-Location $script:ProjectRoot
 try {
     & (Join-Path $PSScriptRoot 'verify-artifact-policy.ps1')
     Invoke-Checked 'docs' { go run scripts/verify-docs.go }
+    Invoke-Checked 'docs-tests' { go test scripts/verify-docs.go scripts/verify-docs_test.go }
     Invoke-Checked 'fmt' { cargo fmt --all -- --check }
     if (-not $SkipClippy) { Invoke-Checked 'clippy' { cargo clippy --workspace --all-targets --locked -- -D warnings } }
     $passes = @()
