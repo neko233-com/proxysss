@@ -199,3 +199,4 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 - `README.md` 使用英文，`README-CN.md` 使用中文，两者的配置示例和运维说明同步维护并随安装包分发。
 - 网页视觉和交互验收仅使用已安装的应用内 Browser 插件。
 - HTTP/2/3 请求正文不能因 GET 或缺少 Content-Length 被忽略；入站大小/空闲限制失败不得进入写入/反代。HTTP/3 每流独立驱动，正文失败重置流并保留正常 trailers。上游持续 SSE/下载按正文空闲期限计时，不使用整个响应总时长期限；对应语义与限制维护在配置和架构主题页。
+- Native epoll owners must consume each returned event batch before installing new registrations that may reuse descriptors. Admission work stays bounded per turn and re-wakes queued work; preserve CPU-adaptive owner counts and existing relay/sendfile backpressure budgets.

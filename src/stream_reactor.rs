@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 
 const REGISTRATION_QUEUE_CAPACITY: usize = 131_072;
 const EVENT_BATCH: usize = 1_024;
+const REGISTRATION_BATCH: usize = 256;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_READ_BATCH: usize = 8;
 const PENDING_BUFFER_POOL_CAPACITY: usize = 4_096;
@@ -320,86 +321,20 @@ fn run_reactor(
             std::hint::spin_loop();
             continue;
         }
-        active_spin_polls = 0;
         let blocked_wait = wait_started.elapsed() >= BLOCKED_WAIT_RESET;
         if blocked_wait {
             continuous_batches = 0;
         } else {
             continuous_batches = continuous_batches.saturating_add(1);
         }
-        for event in events.iter().take(ready as usize) {
-            let token = event.u64;
-            if token == WAKE_TOKEN {
-                drain_wake(worker.wake_fd);
-                while let Some(pair) = worker.registrations.pop() {
-                    register_pair(epoll_fd, &mut sockets, pair);
-                }
-                continue;
-            }
-
-            let fd = token as RawFd;
-            let Some((peer_fd, downstream, read_enabled)) = sockets
-                .get(&fd)
-                .map(|state| (state.peer_fd, state.downstream, state.read_enabled))
-            else {
-                continue;
-            };
-            let pair_count = sockets.len() / 2;
-            if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
-                active_spin_polls = active_spin_polls.max(ACTIVE_SPIN_POLLS);
-            } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
-                // Fixed-rate game/WebSocket ticks commonly block before the
-                // client request arrives. Sparse owners use one/two immediate
-                // probes. Dense owners return to blocking epoll instead of
-                // stealing CPU from sibling HTTP work.
-                active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
-            } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
-                // The zero-valued knob deliberately disables dense spinning.
-                #[allow(clippy::unnecessary_min_or_max)]
-                {
-                    active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
-                }
-            }
-            let flags = event.events as i32;
-            if flags & libc::EPOLLERR != 0 {
-                close_pair(epoll_fd, &mut sockets, fd);
-                continue;
-            }
-            if flags & libc::EPOLLOUT != 0 && !flush_pending(epoll_fd, &mut sockets, fd) {
-                close_pair(epoll_fd, &mut sockets, fd);
-                continue;
-            }
-            let mut read_closed_observed = false;
-            if flags & libc::EPOLLIN != 0 && read_enabled {
-                match relay_read(epoll_fd, &mut sockets, fd, peer_fd, &mut relay_buffer) {
-                    RelayReadOutcome::Open => {}
-                    RelayReadOutcome::ReadClosed => read_closed_observed = true,
-                    RelayReadOutcome::Failed => {
-                        close_pair(epoll_fd, &mut sockets, fd);
-                        continue;
-                    }
-                }
-            }
-            // HUP/RDHUP can arrive together with EPOLLIN while the peer's
-            // final bytes are still queued. Drain readable data before
-            // propagating half-close so tail frames cannot be discarded.
-            if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) != 0
-                && flags & libc::EPOLLIN == 0
-                && read_enabled
-            {
-                if !mark_read_closed(epoll_fd, &mut sockets, fd) {
-                    close_pair(epoll_fd, &mut sockets, fd);
-                    continue;
-                }
-                read_closed_observed = true;
-            }
-            // Both halves must be read-closed before a pair can finish. Avoid
-            // two extra hash lookups on every ordinary data event; only enter
-            // the full pair check after this side has actually observed EOF.
-            if read_closed_observed && pair_finished(&sockets, fd) {
-                close_pair(epoll_fd, &mut sockets, fd);
-            }
-        }
+        active_spin_polls = process_event_batch(
+            epoll_fd,
+            &mut sockets,
+            &events[..ready as usize],
+            &worker,
+            &mut relay_buffer,
+            blocked_wait,
+        );
         if sockets.len() / 2 > ACTIVE_SPIN_MAX_PAIRS_PER_WORKER
             && continuous_batches >= CONTINUOUS_BATCH_YIELD_AFTER
         {
@@ -412,6 +347,109 @@ fn run_reactor(
 
     unsafe {
         libc::close(epoll_fd);
+    }
+}
+
+fn process_event_batch(
+    epoll_fd: RawFd,
+    sockets: &mut SocketTable,
+    events: &[libc::epoll_event],
+    worker: &ReactorWorker,
+    relay_buffer: &mut [u8],
+    blocked_wait: bool,
+) -> usize {
+    let mut active_spin_polls = 0;
+    let mut registrations_ready = false;
+    for event in events {
+        let token = event.u64;
+        if token == WAKE_TOKEN {
+            drain_wake(worker.wake_fd);
+            registrations_ready = true;
+            continue;
+        }
+
+        let fd = token as RawFd;
+        let Some((peer_fd, downstream, read_enabled)) = sockets
+            .get(&fd)
+            .map(|state| (state.peer_fd, state.downstream, state.read_enabled))
+        else {
+            continue;
+        };
+        let pair_count = sockets.len() / 2;
+        if pair_count <= ACTIVE_SPIN_MAX_PAIRS_PER_WORKER {
+            active_spin_polls = active_spin_polls.max(ACTIVE_SPIN_POLLS);
+        } else if quiet_reply_spin_enabled(blocked_wait, downstream, pair_count) {
+            // Fixed-rate game/WebSocket ticks commonly block before the
+            // client request arrives. Sparse owners use one/two immediate
+            // probes. Dense owners return to blocking epoll instead of
+            // stealing CPU from sibling HTTP work.
+            active_spin_polls = active_spin_polls.max(quiet_reply_spin_polls(pair_count));
+        } else if pair_count <= DENSE_SPIN_MAX_PAIRS_PER_WORKER {
+            // The zero-valued knob deliberately disables dense spinning.
+            #[allow(clippy::unnecessary_min_or_max)]
+            {
+                active_spin_polls = active_spin_polls.max(DENSE_SPIN_POLLS);
+            }
+        }
+        let flags = event.events as i32;
+        if flags & libc::EPOLLERR != 0 {
+            close_pair(epoll_fd, sockets, fd);
+            continue;
+        }
+        if flags & libc::EPOLLOUT != 0 && !flush_pending(epoll_fd, sockets, fd) {
+            close_pair(epoll_fd, sockets, fd);
+            continue;
+        }
+        let mut read_closed_observed = false;
+        if flags & libc::EPOLLIN != 0 && read_enabled {
+            match relay_read(epoll_fd, sockets, fd, peer_fd, relay_buffer) {
+                RelayReadOutcome::Open => {}
+                RelayReadOutcome::ReadClosed => read_closed_observed = true,
+                RelayReadOutcome::Failed => {
+                    close_pair(epoll_fd, sockets, fd);
+                    continue;
+                }
+            }
+        }
+        // HUP/RDHUP can arrive together with EPOLLIN while the peer's
+        // final bytes are still queued. Drain readable data before
+        // propagating half-close so tail frames cannot be discarded.
+        if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) != 0
+            && flags & libc::EPOLLIN == 0
+            && read_enabled
+        {
+            if !mark_read_closed(epoll_fd, sockets, fd) {
+                close_pair(epoll_fd, sockets, fd);
+                continue;
+            }
+            read_closed_observed = true;
+        }
+        // Both halves must be read-closed before a pair can finish. Avoid
+        // two extra hash lookups on every ordinary data event; only enter
+        // the full pair check after this side has actually observed EOF.
+        if read_closed_observed && pair_finished(sockets, fd) {
+            close_pair(epoll_fd, sockets, fd);
+        }
+    }
+    // Every event in this batch belongs to the old descriptor table. A
+    // closed fd may already have been duplicated by an accepting thread,
+    // but install its replacement only after all cached events are gone.
+    // Bound admission work so reconnect floods cannot starve live relays.
+    if registrations_ready {
+        register_pending_pairs(epoll_fd, sockets, worker);
+    }
+    active_spin_polls
+}
+
+fn register_pending_pairs(epoll_fd: RawFd, sockets: &mut SocketTable, worker: &ReactorWorker) {
+    for _ in 0..REGISTRATION_BATCH {
+        let Some(pair) = worker.registrations.pop() else {
+            break;
+        };
+        register_pair(epoll_fd, sockets, pair);
+    }
+    if !worker.registrations.is_empty() {
+        wake(worker.wake_fd);
     }
 }
 
@@ -722,6 +760,79 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
+    use std::os::fd::OwnedFd;
+
+    #[test]
+    fn admission_waits_for_cached_events_and_yields_between_reconnect_batches() {
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(wake_fd >= 0);
+        let _wake_owner = unsafe { OwnedFd::from_raw_fd(wake_fd) };
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epoll_fd >= 0);
+        let _epoll_owner = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
+        let worker = ReactorWorker {
+            registrations: ArrayQueue::new(REGISTRATION_BATCH + 1),
+            wake_fd,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (downstream, _) = listener.accept().unwrap();
+        let _backend = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (upstream, _) = listener.accept().unwrap();
+        let mut first_fd = -1;
+        for index in 0..=REGISTRATION_BATCH {
+            let pair = SocketPair {
+                downstream: duplicate_stream(downstream.as_raw_fd()).unwrap(),
+                upstream: duplicate_stream(upstream.as_raw_fd()).unwrap(),
+                completion: None,
+            };
+            if index == 0 {
+                first_fd = pair.downstream.as_raw_fd();
+            }
+            assert!(worker.registrations.push(pair).is_ok());
+        }
+        // Legal cached trace: a wake precedes an error for a closed fd whose
+        // number has already been reused by a queued, not-yet-registered pair.
+        let events = [
+            libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: WAKE_TOKEN,
+            },
+            libc::epoll_event {
+                events: libc::EPOLLERR as u32,
+                u64: first_fd as u64,
+            },
+        ];
+        let mut sockets = SocketTable::default();
+        let mut buffer = [0; RELAY_BUFFER_BYTES];
+        process_event_batch(epoll_fd, &mut sockets, &events, &worker, &mut buffer, false);
+        assert_eq!(sockets.len(), 2 * REGISTRATION_BATCH);
+        assert!(
+            sockets.get(&first_fd).is_some(),
+            "stale error closed the new pair"
+        );
+        assert_eq!(
+            worker.registrations.len(),
+            1,
+            "admission monopolized the whole queue"
+        );
+        let mut counter = 0_u64;
+        assert_eq!(
+            unsafe { libc::read(wake_fd, (&mut counter as *mut u64).cast(), 8) },
+            8
+        );
+        assert!(counter > 0, "remaining admissions must wake the next turn");
+        process_event_batch(
+            epoll_fd,
+            &mut sockets,
+            &events[..1],
+            &worker,
+            &mut buffer,
+            false,
+        );
+        assert_eq!(sockets.len(), 2 * (REGISTRATION_BATCH + 1));
+        assert!(worker.registrations.is_empty());
+    }
     use std::time::Duration;
 
     #[test]

@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 // high-core hosts.
 const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
+const REGISTRATION_BATCH: usize = 256;
 const WAKE_TOKEN: u64 = u64::MAX;
 
 pub(crate) struct SendfileCompletion {
@@ -342,40 +343,65 @@ fn run_reactor(worker: Arc<ReactorWorker>, cpu: Option<usize>, scheduler_nice: i
             break;
         }
 
-        for event in events.iter().take(ready as usize) {
-            let token = event.u64;
-            if token == WAKE_TOKEN {
-                drain_wake(worker.wake_fd);
-                while let Some(job) = worker.registrations.pop() {
-                    register_job(epoll_fd, &mut jobs, job);
-                }
-                cancel_abandoned_jobs(epoll_fd, &mut jobs, &worker);
-                continue;
-            }
-
-            let fd = token as RawFd;
-            if !jobs.contains(fd) {
-                continue;
-            }
-            let flags = event.events as i32;
-            let result = if flags & (libc::EPOLLERR | libc::EPOLLHUP) != 0 {
-                DriveResult::Complete(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "sendfile client socket closed",
-                )))
-            } else if flags & libc::EPOLLOUT != 0 {
-                drive_job(&mut jobs, fd)
-            } else {
-                DriveResult::Pending
-            };
-            if let DriveResult::Complete(result) = result {
-                complete_job(epoll_fd, &mut jobs, fd, result);
-            }
-        }
+        process_event_batch(epoll_fd, &mut jobs, &events[..ready as usize], &worker);
     }
 
     unsafe {
         libc::close(epoll_fd);
+    }
+}
+
+fn process_event_batch(
+    epoll_fd: RawFd,
+    jobs: &mut SendfileTable,
+    events: &[libc::epoll_event],
+    worker: &ReactorWorker,
+) {
+    let mut registrations_ready = false;
+    for event in events {
+        let token = event.u64;
+        if token == WAKE_TOKEN {
+            drain_wake(worker.wake_fd);
+            registrations_ready = true;
+            continue;
+        }
+
+        let fd = token as RawFd;
+        if !jobs.contains(fd) {
+            continue;
+        }
+        let flags = event.events as i32;
+        let result = if flags & (libc::EPOLLERR | libc::EPOLLHUP) != 0 {
+            DriveResult::Complete(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sendfile client socket closed",
+            )))
+        } else if flags & libc::EPOLLOUT != 0 {
+            drive_job(jobs, fd)
+        } else {
+            DriveResult::Pending
+        };
+        if let DriveResult::Complete(result) = result {
+            complete_job(epoll_fd, jobs, fd, result);
+        }
+    }
+    // Do not reuse slots until every cached epoll event has been consumed.
+    // In particular, an old HUP must never fail a newly registered download.
+    if registrations_ready {
+        cancel_abandoned_jobs(epoll_fd, jobs, worker);
+        register_pending_jobs(epoll_fd, jobs, worker);
+    }
+}
+
+fn register_pending_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &ReactorWorker) {
+    for _ in 0..REGISTRATION_BATCH {
+        let Some(job) = worker.registrations.pop() else {
+            break;
+        };
+        register_job(epoll_fd, jobs, job);
+    }
+    if !worker.registrations.is_empty() {
+        wake(worker.wake_fd);
     }
 }
 
@@ -582,7 +608,106 @@ mod tests {
     use std::ffi::CString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::os::fd::OwnedFd;
     use std::time::Duration;
+
+    #[test]
+    fn admission_ignores_cached_hup_for_reused_descriptor_and_bounds_queued_work() {
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(wake_fd >= 0);
+        let _wake_owner = unsafe { OwnedFd::from_raw_fd(wake_fd) };
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epoll_fd >= 0);
+        let _epoll_owner = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
+        let worker = ReactorWorker {
+            registrations: ArrayQueue::new(REGISTRATION_BATCH + 1),
+            cancellations: ArrayQueue::new(1),
+            sweep_cancelled: AtomicBool::new(false),
+            wake_fd,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let name = CString::new("proxysss-sendfile-stale-event-test").unwrap();
+        let file_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file_fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(file_fd) };
+        file.write_all(b"ok").unwrap();
+        let fd = socket.as_raw_fd();
+        let (completion, mut receiver) = oneshot::channel();
+        assert!(worker
+            .registrations
+            .push(SendfileJob {
+                socket,
+                file,
+                offset: 0,
+                len: 2,
+                max_chunk_bytes: 1,
+                completion
+            })
+            .is_ok());
+        let events = [
+            libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: WAKE_TOKEN,
+            },
+            libc::epoll_event {
+                events: libc::EPOLLHUP as u32,
+                u64: fd as u64,
+            },
+        ];
+        let mut jobs = SendfileTable::default();
+        process_event_batch(epoll_fd, &mut jobs, &events, &worker);
+        assert!(jobs.contains(fd), "stale HUP failed a new download");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        process_event_batch(
+            epoll_fd,
+            &mut jobs,
+            &[libc::epoll_event {
+                events: libc::EPOLLOUT as u32,
+                u64: fd as u64,
+            }],
+            &worker,
+        );
+        assert_eq!(receiver.try_recv().unwrap().unwrap().bytes, 2);
+        let mut body = [0; 2];
+        client.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"ok");
+        assert!(jobs.active_fds().is_empty());
+
+        // Abandoned admissions still consume the same bounded processing
+        // budget, so cancellation storms cannot hide an unbounded drain loop.
+        for _ in 0..=REGISTRATION_BATCH {
+            let (completion, receiver) = oneshot::channel();
+            drop(receiver);
+            let job = SendfileJob {
+                socket: client.try_clone().unwrap(),
+                file: File::open("/dev/null").unwrap(),
+                offset: 0,
+                len: 1,
+                max_chunk_bytes: 1,
+                completion,
+            };
+            assert!(worker.registrations.push(job).is_ok());
+        }
+        process_event_batch(epoll_fd, &mut jobs, &events[..1], &worker);
+        assert_eq!(worker.registrations.len(), 1);
+        let mut counter = 0_u64;
+        assert_eq!(
+            unsafe { libc::read(wake_fd, (&mut counter as *mut u64).cast(), 8) },
+            8
+        );
+        assert!(counter > 0);
+        process_event_batch(epoll_fd, &mut jobs, &events[..1], &worker);
+        assert!(worker.registrations.is_empty());
+    }
 
     #[test]
     fn cancelled_queued_download_never_sends_a_body() {
