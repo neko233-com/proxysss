@@ -71,6 +71,11 @@ pub struct SseBenchArgs {
     pub duration_secs: u64,
     #[arg(long, default_value_t = 8)]
     pub max_chunks: usize,
+    /// Drain a finite response through its HTTP end before reusing the connection.
+    /// First-chunk latency is still reported; without this flag max_chunks stops
+    /// an open-ended SSE response early and can close its HTTP/1 connection.
+    #[arg(long, default_value_t = false)]
+    pub drain_response: bool,
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
     #[arg(long, default_value_t = false)]
@@ -439,10 +444,6 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
             preconnect_http1_pool(clients, url.clone(), args.expected_status).await?;
         }
     }
-    let warmup_client = worker_clients
-        .as_ref()
-        .map_or(&client, |clients| &clients[0]);
-
     // HTTPS saturation measures steady HTTP/2/TLS request processing, not a
     // race between the first QEMU-scheduled client handshake and the shared
     // measurement timestamp. A HEAD request creates the same pooled TLS/H2
@@ -459,14 +460,14 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     }
 
     // HEAD establishes transport capacity but intentionally skips the static
-    // GET cache and reverse-proxy response path. Exercise one real GET, allow
-    // stale-while-revalidate work to finish outside the active window, then
-    // confirm the refreshed path. This keeps one-second p99 from measuring a
-    // synchronized cache-expiry wave while applying the same warm-up to nginx.
+    // GET cache and reverse-proxy response path. Every measured connection must
+    // carry two real responses; warming only clients[0] leaves the other TCP
+    // windows and per-connection gateway state cold inside a one-second sample.
     if method == Method::GET {
-        prewarm_http_resource(warmup_client, url.as_str(), &args).await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        prewarm_http_resource(warmup_client, url.as_str(), &args).await?;
+        let clients = worker_clients
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(&client));
+        prewarm_http_pool(clients, url.as_str(), &args).await?;
     }
 
     let mut tasks = JoinSet::new();
@@ -485,23 +486,27 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
             let (deadline, mut ticker) = schedule.begin(worker_index).await;
             while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
-                match client
-                    .request(method.clone(), url.as_str())
-                    .body(payload.as_ref().clone())
-                    .send()
-                    .await
-                {
-                    Ok(response) => match drain_http_benchmark_response(
+                let exchange = async {
+                    let response = client
+                        .request(method.clone(), url.as_str())
+                        .body(payload.as_ref().clone())
+                        .send()
+                        .await?;
+                    drain_http_benchmark_response(
                         response,
                         args.expected_status,
                         args.expected_body_bytes,
                     )
                     .await
-                    {
-                        Ok(bytes) => local.record_success(started.elapsed(), bytes),
-                        Err(_) => local.record_error(),
-                    },
-                    Err(_) => local.record_error(),
+                };
+                match tokio::time::timeout_at(deadline, exchange).await {
+                    Ok(Ok(bytes)) if tokio::time::Instant::now() < deadline => {
+                        local.record_success(started.elapsed(), bytes);
+                    }
+                    Ok(Err(_)) | Err(_) if tokio::time::Instant::now() < deadline => {
+                        local.record_error();
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
             stats.add_task(&local);
@@ -589,6 +594,25 @@ async fn prewarm_http_resource(
     Ok(())
 }
 
+async fn prewarm_http_pool(
+    clients: &[reqwest::Client],
+    url: &str,
+    args: &HttpBenchArgs,
+) -> Result<()> {
+    for pass in 0..2 {
+        if pass != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        futures::future::try_join_all(
+            clients
+                .iter()
+                .map(|client| prewarm_http_resource(client, url, args)),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn preconnect_http1_pool(
     clients: &[reqwest::Client],
     url: Arc<String>,
@@ -631,34 +655,33 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
         true,
         args.start_at_unix_ms,
     ));
-    // SSE is a long-lived protocol. Keep a generous whole-exchange deadline
-    // even when a benchmark reads only the first chunk; a 10-second client
-    // deadline can misclassify a healthy stream during a saturated mixed wave.
+    // Allow slow streams within a long run, but never wait for their tail or
+    // count completions beyond this sample's measurement deadline.
     let request_timeout = Duration::from_secs(30);
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .danger_accept_invalid_certs(args.insecure)
-        .tcp_nodelay(true)
-        .http2_adaptive_window(true)
-        .http2_keep_alive_timeout(Duration::from_secs(90))
-        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-        .http2_keep_alive_while_idle(true)
-        .timeout(request_timeout);
-    if args.http1_only {
-        builder = builder.http1_only();
-    }
-    let client = builder.build().context("failed to build reqwest client")?;
+    let http1 = args.http1_only || args.url.starts_with("http://");
+    let clients = (0..if http1 { concurrency } else { 1 })
+        .map(|_| sse_benchmark_client(args.insecure, http1))
+        .collect::<Result<Vec<_>>>()?;
     let url = Arc::new(args.url);
     let max_chunks = args.max_chunks.max(1);
+    let drain_response = args.drain_response;
 
-    prewarm_sse_resource(&client, url.as_str()).await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    prewarm_sse_resource(&client, url.as_str()).await?;
+    for pass in 0..2 {
+        if pass != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        futures::future::try_join_all(
+            clients
+                .iter()
+                .map(|client| prewarm_sse_resource(client, url.as_str(), drain_response)),
+        )
+        .await?;
+    }
 
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
         let stats = stats.clone();
-        let client = client.clone();
+        let client = clients[worker_index % clients.len()].clone();
         let url = url.clone();
         let schedule = schedule.clone();
 
@@ -672,47 +695,20 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
                         .get(url.as_str())
                         .header(reqwest::header::ACCEPT, "text/event-stream")
                         .send()
+                        .await?;
+                    drain_sse_benchmark_response(response, max_chunks, drain_response, started)
                         .await
-                        .map_err(|_| ())?;
-
-                    if !response.status().is_success() {
-                        return Err(());
-                    }
-
-                    let mut stream = response.bytes_stream();
-                    let mut chunks = 0_usize;
-                    let mut bytes = 0_usize;
-                    let mut first_chunk_latency = None;
-                    while chunks < max_chunks {
-                        match stream.next().await {
-                            Some(Ok(chunk)) => {
-                                if first_chunk_latency.is_none() {
-                                    first_chunk_latency = Some(started.elapsed());
-                                }
-                                chunks += 1;
-                                bytes = bytes.saturating_add(chunk.len());
-                            }
-                            Some(Err(_)) => return Err(()),
-                            None => break,
-                        }
-                    }
-
-                    if chunks > 0 {
-                        Ok((
-                            first_chunk_latency.unwrap_or_else(|| started.elapsed()),
-                            bytes,
-                        ))
-                    } else {
-                        Err(())
-                    }
                 };
 
-                match tokio::time::timeout(request_timeout, exchange).await {
-                    Ok(Ok((latency, bytes))) => local.record_success(latency, bytes),
-                    Ok(Err(())) | Err(_) if tokio::time::Instant::now() < deadline => {
+                let request_deadline = deadline.min(tokio::time::Instant::now() + request_timeout);
+                match tokio::time::timeout_at(request_deadline, exchange).await {
+                    Ok(Ok((latency, bytes))) if tokio::time::Instant::now() < deadline => {
+                        local.record_success(latency, bytes);
+                    }
+                    Ok(Err(_)) | Err(_) if tokio::time::Instant::now() < deadline => {
                         local.record_error();
                     }
-                    Ok(Err(())) | Err(_) => {}
+                    Ok(_) | Err(_) => {}
                 }
             }
             stats.add_task(&local);
@@ -731,25 +727,72 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
     Ok(())
 }
 
-async fn prewarm_sse_resource(client: &reqwest::Client, url: &str) -> Result<()> {
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .send()
-        .await
-        .context("failed to warm SSE benchmark resource")?;
-    if !response.status().is_success() {
-        anyhow::bail!("SSE benchmark warm-up returned {}", response.status());
+fn sse_benchmark_client(insecure: bool, http1_only: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(insecure)
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true)
+        .http2_keep_alive_timeout(Duration::from_secs(90))
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_while_idle(true)
+        .timeout(Duration::from_secs(30));
+    if http1_only {
+        builder = builder.http1_only().pool_max_idle_per_host(1);
     }
+    builder
+        .build()
+        .context("failed to build SSE benchmark client")
+}
+
+async fn drain_sse_benchmark_response(
+    response: reqwest::Response,
+    max_chunks: usize,
+    drain_response: bool,
+    started: Instant,
+) -> Result<(Duration, usize)> {
+    anyhow::ensure!(
+        response.status().is_success(),
+        "SSE benchmark returned {}",
+        response.status()
+    );
     let mut stream = response.bytes_stream();
-    match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-        Ok(Some(Ok(_))) => Ok(()),
-        Ok(Some(Err(error))) => {
-            Err(anyhow::Error::new(error).context("failed reading SSE benchmark warm-up"))
-        }
-        Ok(None) => anyhow::bail!("SSE benchmark warm-up ended before the first chunk"),
-        Err(_) => anyhow::bail!("SSE benchmark warm-up timed out"),
+    let mut chunks = 0_usize;
+    let mut bytes = 0_usize;
+    let mut first_chunk_latency = None;
+    while drain_response || chunks < max_chunks.max(1) {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk.context("failed reading SSE benchmark body")?;
+        first_chunk_latency.get_or_insert_with(|| started.elapsed());
+        chunks = chunks.saturating_add(1);
+        bytes = bytes
+            .checked_add(chunk.len())
+            .context("SSE byte count overflow")?;
     }
+    let latency = first_chunk_latency.context("SSE benchmark ended before the first chunk")?;
+    Ok((latency, bytes))
+}
+
+async fn prewarm_sse_resource(
+    client: &reqwest::Client,
+    url: &str,
+    drain_response: bool,
+) -> Result<()> {
+    let warmup = async {
+        let response = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .context("failed to warm SSE benchmark resource")?;
+        drain_sse_benchmark_response(response, 1, drain_response, Instant::now()).await?;
+        Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(5), warmup)
+        .await
+        .context("SSE benchmark warm-up timed out")?
 }
 
 async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
@@ -1457,6 +1500,322 @@ mod tests {
             let result = drain_http_benchmark_response(response, status, bytes).await;
             assert_eq!(result.is_ok(), success, "{result:?}");
             if success { assert_eq!(result.unwrap(), 4); }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_warms_every_http_and_finite_sse_connection_before_measurement() {
+        for sse in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<(bool, Instant)>>::new()));
+            let observed = requests.clone();
+            let server = tokio::spawn(async move {
+                let mut handlers = JoinSet::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let index = {
+                        let mut requests = observed.lock().unwrap();
+                        requests.push(Vec::new());
+                        requests.len() - 1
+                    };
+                    let observed = observed.clone();
+                    handlers.spawn(async move {
+                        let body = vec![b'x'; 128 * 1024];
+                        loop {
+                            let mut head = Vec::new();
+                            while !head.ends_with(b"\r\n\r\n") {
+                                let Ok(byte) = socket.read_u8().await else { return; };
+                                head.push(byte);
+                            }
+                            let is_head = head.starts_with(b"HEAD ");
+                            observed.lock().unwrap()[index].push((is_head, Instant::now()));
+                            let result = if sse {
+                                // The terminator arrives later than the first event. A client
+                                // which drops after max_chunks cannot reuse this connection.
+                                if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n").await.is_err() { return; }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                socket.write_all(b"0\r\n\r\n").await
+                            } else {
+                                if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 131072\r\n\r\n").await.is_err() { return; }
+                                if is_head { Ok(()) } else { socket.write_all(&body).await }
+                            };
+                            if result.is_err() { return; }
+                        }
+                    });
+                }
+            });
+            let start_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 1000;
+            let measurement_start = Instant::now() + Duration::from_millis(1000);
+            let result = tokio::time::timeout(Duration::from_secs(4), async {
+                if sse {
+                    run_sse(SseBenchArgs {
+                        url,
+                        concurrency: 4,
+                        duration_secs: 1,
+                        max_chunks: 1,
+                        drain_response: true,
+                        insecure: false,
+                        http1_only: true,
+                        operation_interval_micros: 200_000,
+                        start_at_unix_ms,
+                    })
+                    .await
+                } else {
+                    run_http(HttpBenchArgs {
+                        url,
+                        concurrency: 4,
+                        duration_secs: 1,
+                        body_bytes: 0,
+                        method: "GET".to_string(),
+                        insecure: false,
+                        http1_only: true,
+                        expected_status: Some(200),
+                        expected_body_bytes: Some(131072),
+                        operation_interval_micros: 200_000,
+                        start_at_unix_ms,
+                    })
+                    .await
+                }
+            })
+            .await;
+            server.abort();
+            let _ = server.await;
+            result.unwrap().unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                4,
+                "SSE={sse}: measured connections must be reused"
+            );
+            for connection in requests.iter() {
+                let before = connection
+                    .iter()
+                    .filter(|(_, at)| *at < measurement_start)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    before.iter().filter(|(head, _)| !head).count(),
+                    2,
+                    "SSE={sse}"
+                );
+                assert_eq!(
+                    before.iter().filter(|(head, _)| *head).count(),
+                    usize::from(!sse)
+                );
+                assert!(connection.iter().any(|(_, at)| *at >= measurement_start));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finite_sse_drain_requires_terminator_and_preserves_first_chunk_latency() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (finish, allow_finish) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            allow_finish.await.unwrap();
+            socket
+                .write_all(b"9\r\ndata: y\n\n\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let response = sse_benchmark_client(false, true)
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let drain = drain_sse_benchmark_response(response, 1, true, started);
+        tokio::pin!(drain);
+        tokio::select! {
+            result = &mut drain => panic!("finite SSE completed without terminator: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        finish.send(()).unwrap();
+        let (first, bytes) = drain.await.unwrap();
+        assert_eq!(bytes, 18);
+        assert!(first < started.elapsed());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_measurement_deadline_cancels_stalled_headers_and_body() {
+        for stall_headers in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut gets = 0;
+                loop {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(socket.read_u8().await.unwrap());
+                    }
+                    if head.starts_with(b"HEAD ") {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    gets += 1;
+                    if gets == 3 && stall_headers {
+                        std::future::pending::<()>().await;
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nx")
+                        .await
+                        .unwrap();
+                    if gets == 3 {
+                        std::future::pending::<()>().await;
+                    }
+                    socket.write_all(b"xxxxxxxx").await.unwrap();
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                run_http(HttpBenchArgs {
+                    url,
+                    concurrency: 1,
+                    duration_secs: 1,
+                    body_bytes: 0,
+                    method: "GET".to_owned(),
+                    insecure: false,
+                    http1_only: true,
+                    expected_status: Some(200),
+                    expected_body_bytes: Some(9),
+                    operation_interval_micros: 0,
+                    start_at_unix_ms: 0,
+                }),
+            )
+            .await;
+            server.abort();
+            let _ = server.await;
+            result
+                .expect("HTTP must stop at measurement deadline, not the 10-second request timeout")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn finite_sse_measurement_deadline_cancels_a_stalled_tail() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for index in 0..3 {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n").await.unwrap();
+                if index != 2 {
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_sse(SseBenchArgs {
+                url,
+                concurrency: 1,
+                duration_secs: 1,
+                max_chunks: 1,
+                drain_response: true,
+                insecure: false,
+                http1_only: true,
+                operation_interval_micros: 0,
+                start_at_unix_ms: 0,
+            }),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("measurement must not wait for the 30-second request timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_ended_sse_still_returns_at_requested_chunk_count() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let response = sse_benchmark_client(false, true)
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_sse_benchmark_response(response, 1, false, Instant::now()),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(result.unwrap().unwrap().1, 9);
+    }
+
+    #[tokio::test]
+    async fn finite_sse_drain_rejects_empty_truncated_and_error_responses() {
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nshort",
+            b"HTTP/1.1 503 Unavailable\r\nContent-Length: 4\r\n\r\nfail",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                socket.write_all(wire).await.unwrap();
+            });
+            let response = sse_benchmark_client(false, true)
+                .unwrap()
+                .get(url)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                drain_sse_benchmark_response(response, 1, true, Instant::now())
+                    .await
+                    .is_err()
+            );
             server.await.unwrap();
         }
     }

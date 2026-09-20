@@ -487,9 +487,9 @@ run_sse_bench() {
   echo "=== $scenario / $gateway SSE c$SSE_CONCURRENCY d${DURATION_SECS}s ===" >&2
   local output
   if [[ "$url" == https://* ]]; then
-    output="$("$PROXY_BIN" bench sse --url "$url" --concurrency "$SSE_CONCURRENCY" --duration-secs "$DURATION_SECS" --max-chunks "$SSE_MAX_CHUNKS" --insecure 2>&1)"
+    output="$("$PROXY_BIN" bench sse --url "$url" --concurrency "$SSE_CONCURRENCY" --duration-secs "$DURATION_SECS" --max-chunks "$SSE_MAX_CHUNKS" --drain-response --insecure 2>&1)"
   else
-    output="$("$PROXY_BIN" bench sse --url "$url" --concurrency "$SSE_CONCURRENCY" --duration-secs "$DURATION_SECS" --max-chunks "$SSE_MAX_CHUNKS" 2>&1)"
+    output="$("$PROXY_BIN" bench sse --url "$url" --concurrency "$SSE_CONCURRENCY" --duration-secs "$DURATION_SECS" --max-chunks "$SSE_MAX_CHUNKS" --drain-response 2>&1)"
   fi
   echo "$output" >&2
   parse_bench_output "$scenario" "$gateway" "sse" "$url" "$SSE_CONCURRENCY" "$output"

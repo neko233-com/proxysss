@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 修正稳态压测预热：每条 HTTP/1 连接完整读取两次真实响应，避免其余连接仅完成 HEAD、在测量内才增长接收窗口。有限 SSE 夹具支持 keep-alive，发生器新增 `--drain-response` 完整消费正文、保留首块延迟并在测量截止取消等待；持续 SSE 默认仍支持按块数提前结束。HTTP 同样在测量截止取消响应头/正文等待，不计截止后完成。新增真实连接、复用、截断和截止时间回归；发生器修正不代表网关性能收益，双方成绩须重建。
+
 - 修正混合压测的发生器资源元数据：每波保留实际 taskset affinity、计划与真实 Tokio worker 数并严格核对，避免把整个 client 容器配额误报为单场景资源；不改变负载目标或 CPU 分配。
 
 - 修复 UDP 新会话绕过 stream allow/deny、连接限流、DDoS 与动态黑名单；连接配额按 association 扣取，与 TCP 共享 zone，既有数据报不重复扣取。统一流拒绝统计，修复 TCP DDoS 拒绝重复计数。listener supervisor 及 HTTP/TLS/TCP 跨 runtime 包装任务增加取消所有权，防止重载撤销监听后旧 accept 任务继续持有端口。

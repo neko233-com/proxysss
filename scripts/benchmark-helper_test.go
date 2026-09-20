@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,43 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func TestSSEFixtureFinishesAndReusesHTTP1Connection(t *testing.T) {
+	for _, chunks := range []int{1, 3} {
+		t.Run(fmt.Sprint(chunks), func(t *testing.T) {
+			var accepted atomic.Int32
+			server := httptest.NewUnstartedServer(benchmarkSSEHandler(chunks))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					accepted.Add(1)
+				}
+			}
+			server.Start()
+			defer server.Close()
+			client := server.Client()
+			for i := 0; i < 3; i++ {
+				response, err := client.Get(server.URL + "/sse")
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if response.Close || response.Header.Get("Content-Type") != "text/event-stream" || strings.Count(string(body), `"token-`) != chunks {
+					t.Fatalf("incomplete/nonreusable fixture: close=%v body=%s", response.Close, body)
+				}
+				if strings.Contains(string(body), "[DONE]") != (chunks > 1) {
+					t.Fatal("fixture end marker changed")
+				}
+			}
+			if accepted.Load() != 1 {
+				t.Fatalf("expected one reused connection, accepted=%d", accepted.Load())
+			}
+		})
+	}
+}
 
 func TestClientResourcesRejectFalseMetadata(t *testing.T) {
 	dir := t.TempDir()

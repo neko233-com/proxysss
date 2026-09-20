@@ -879,7 +879,16 @@ func runServeSSE(args []string) error {
 	if *chunks < 1 {
 		return errors.New("serve-sse: --chunks must be positive")
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := &http.Server{
+		Addr:              *listen,
+		Handler:           benchmarkSSEHandler(*chunks),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return server.ListenAndServe()
+}
+
+func benchmarkSSEHandler(chunks int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 			_, _ = io.Copy(io.Discard, r.Body)
 		}
@@ -891,9 +900,8 @@ func runServeSSE(args []string) error {
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "close")
 			w.WriteHeader(http.StatusOK)
-			for idx := 0; idx < *chunks; idx++ {
+			for idx := 0; idx < chunks; idx++ {
 				payload := map[string]any{
 					"id":     "chatcmpl-proxysss-bench",
 					"object": "chat.completion.chunk",
@@ -909,9 +917,11 @@ func runServeSSE(args []string) error {
 					return
 				}
 				flusher.Flush()
-				time.Sleep(2 * time.Millisecond)
+				if idx+1 < chunks {
+					time.Sleep(2 * time.Millisecond)
+				}
 			}
-			if *chunks > 1 {
+			if chunks > 1 {
 				_, _ = io.WriteString(w, "data: [DONE]\n\n")
 				flusher.Flush()
 			}
@@ -922,12 +932,6 @@ func runServeSSE(args []string) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	})
-	server := &http.Server{
-		Addr:              *listen,
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	return server.ListenAndServe()
 }
 
 func runParseBench(args []string) error {
