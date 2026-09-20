@@ -7,6 +7,9 @@ use file_io::{ExactReader, FileVersion};
 #[path = "http1_body.rs"]
 mod http1_body;
 #[cfg(test)]
+#[path = "http_metrics_tests.rs"]
+mod http_metrics_tests;
+#[cfg(test)]
 #[path = "http_stream_tests.rs"]
 mod http_stream_tests;
 #[path = "static_ranges.rs"]
@@ -5620,6 +5623,7 @@ impl Gateway {
                 // reqwest, browsers, and CDN probes commonly repeat the exact
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
+                self.stats.record_http_request();
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
@@ -5697,7 +5701,12 @@ impl Gateway {
                                 plain_downstream_fd: Some(plain_downstream_fd),
                             },
                         )
-                        .await?
+                        .await
+                        .inspect_err(|_| {
+                            if !downstream_started {
+                                self.stats.record_http_request();
+                            }
+                        })?
                     {
                         break 'fast_lane if downstream_detached {
                             PlainHttpFastLaneDecision::Detached
@@ -5817,6 +5826,7 @@ impl Gateway {
                 .as_ref()
                 .filter(|cached| cached.matches(&request))
             {
+                self.stats.record_http_request();
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
@@ -5875,6 +5885,7 @@ impl Gateway {
                 tracing::debug!(%remote_addr, path = %request.path, "plain http static fast path candidate miss");
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
+            self.stats.record_http_request();
             if let Some(cached) = static_response_cache.as_mut().filter(|cached| {
                 cached.identity_matches(&request) && cached.same_payload(&candidate)
             }) {
@@ -6217,10 +6228,10 @@ impl Gateway {
             } else {
                 &[]
             };
+            self.stats.record_http_request();
             write_static_response_vectored(downstream, header.as_bytes(), response_body)
                 .await
                 .context("failed writing TLS static fast-lane response")?;
-            self.stats.record_http_request();
             if config.logging.access_log {
                 tracing::info!(
                     target: "access",
@@ -6732,7 +6743,6 @@ impl Gateway {
                                 }
 
                                 let mut response = if let Some(error) = body_error {
-                                    gateway.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                                     stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
                                     GatewayHttpResponse::error(error.status, error.message)
                                 } else {
@@ -6751,10 +6761,6 @@ impl Gateway {
                                     {
                                         Ok(response) => response,
                                         Err(error) => {
-                                            gateway
-                                                .stats
-                                                .http_errors
-                                                .fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(?error, %remote_addr, "http3 request dispatch failed");
                                             GatewayHttpResponse::error(
                                                 StatusCode::BAD_GATEWAY,
@@ -8112,10 +8118,14 @@ impl Gateway {
             .try_http_static_success_fast_path(&request, scheme, h2_static_route_cache)
             .await
         {
-            Ok(Some(response)) => return Ok(response),
+            Ok(Some(response)) => {
+                self.stats.record_http_response_status(response.status());
+                return Ok(response);
+            }
             Ok(None) => {}
             Err(error) => {
-                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .record_http_response_status(StatusCode::BAD_GATEWAY);
                 tracing::warn!(?error, %remote_addr, scheme, "http static fast path failed");
                 return Ok(
                     GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
@@ -8141,6 +8151,7 @@ impl Gateway {
             .await
         {
             Ok(Some(HyperFastPathResponse::Direct(response))) => {
+                self.stats.record_http_response_status(response.status());
                 return Ok(response);
             }
             Ok(Some(HyperFastPathResponse::Gateway(response))) => {
@@ -8151,7 +8162,8 @@ impl Gateway {
             }
             Ok(None) => {}
             Err(error) => {
-                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .record_http_response_status(StatusCode::BAD_GATEWAY);
                 tracing::warn!(?error, %remote_addr, scheme, "http proxy fast path failed");
                 return Ok(
                     GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
@@ -8175,7 +8187,7 @@ impl Gateway {
         {
             Ok(body) => body,
             Err(error) => {
-                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_http_response_status(error.status);
                 tracing::warn!(?error, %remote_addr, "failed collecting request body");
                 return Ok(GatewayHttpResponse::error(error.status, error.message).into_hyper());
             }
@@ -8196,7 +8208,6 @@ impl Gateway {
         {
             Ok(response) => response,
             Err(error) => {
-                self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(?error, %remote_addr, scheme, "http request dispatch failed");
                 GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, error.to_string())
             }
@@ -8216,9 +8227,7 @@ impl Gateway {
         started: Instant,
     ) -> GatewayHttpResponse {
         let elapsed = started.elapsed();
-        if response.status.is_server_error() {
-            self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
-        }
+        self.stats.record_http_response_status(response.status);
 
         let mut response = response;
         if response.status.is_client_error() || response.status.is_server_error() {
@@ -9720,6 +9729,7 @@ impl Gateway {
         let Some((_, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
             return Ok(false);
         };
+        self.stats.record_http_request();
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
         let mut upstream_io = tokio::time::timeout(timeout, pool.checkout())
             .await
@@ -9797,6 +9807,7 @@ impl Gateway {
                 route.upstream
             )
         })?;
+        self.stats.record_http_response_status(response_head.status);
         let upstream_keep_alive = !response_head.connection_close;
         let content_length = response_head.content_length;
         let transfer_chunked = response_head.transfer_chunked;
@@ -9929,6 +9940,7 @@ impl Gateway {
         let pool_key = &prepared.pool_key;
         let pool = &prepared.pool;
         let upstream = &prepared.upstream;
+        self.stats.record_http_request();
         let mut upstream_io = if lane_upstream
             .as_ref()
             .map(|upstream| upstream.key.as_str() == pool_key.as_str())
@@ -9988,6 +10000,7 @@ impl Gateway {
         .await
         .context("raw reverse upstream response headers timed out")?
         .with_context(|| format!("failed reading plain raw reverse response from {upstream}"))?;
+        self.stats.record_http_response_status(response.status);
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
         if request.method == Method::HEAD || status_has_no_body(response.status) {
@@ -10171,6 +10184,10 @@ impl Gateway {
             )
         })?;
         *downstream_started = true;
+        // A failed WSS probe may fall back to Hyper before any response. Count
+        // only once this path commits; the fallback owns its own accounting.
+        self.stats.record_http_request();
+        self.stats.record_http_response_status(response_head.status);
         downstream
             .write_all(&response_head.raw_head)
             .await
@@ -13724,6 +13741,12 @@ fn raw_sse_streaming_body(
 }
 
 impl GatewayStats {
+    fn record_http_response_status(&self, status: StatusCode) {
+        if status.is_client_error() || status.is_server_error() {
+            self.http_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn record_http_request(&self) {
         let recorded = DATA_PLANE_STATS_SHARD.with(|shard| {
             let Some(index) = shard.get() else {
@@ -13786,7 +13809,7 @@ impl GatewayStats {
             ),
             (
                 "proxysss_http_errors_total",
-                "Total HTTP error responses emitted by the gateway",
+                "Total HTTP 4xx and 5xx responses handled by the gateway",
                 self.http_errors.load(Ordering::Relaxed),
             ),
             (

@@ -203,6 +203,7 @@ scripts/verify-docker-scenarios.sh
           </div>
           <p class="subtle">先检查生效路由和配置，再查看健康状态、日志与监听端口。</p>
         </div>
+        <p>HTTP 统计覆盖普通处理与快速路径，每个请求只计一次；WS/WSS 只计握手。<code>http_errors</code> / <code>proxysss_http_errors_total</code> 记录网关生成或上游返回的 4xx/5xx 响应，不能当成纯 5xx 或全部传输失败指标。<a href="https://neko233-com.github.io/proxysss/configuration.html">完整统计口径与监控配置</a>。</p>
 
         <div class="command-block">
           <pre><code>proxysss config explain

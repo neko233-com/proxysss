@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 修复缓存静态/sendfile、原始反代、SSE、WS/WSS 快速路径漏记 HTTP 请求，以及分发异常重复累加错误的问题；握手在长连接存活期间即可观测，消息不计作 HTTP 请求。JSON/Prometheus 统一对网关生成和上游返回的 4xx/5xx 响应计数，真实 HTTP/1、TLS/H2/H3、WebSocket 收发与回退纳入回归。
+
 - Linux 数据面统一记录启动 affinity 与 quota 预算，不再用 cgroup CPU 列表覆盖 taskset 限制；HTTP/TCP/UDP、TLS 与 native owner 共享预算。动态亲和位图支持 CPU ID 超过 1023，诊断输出区分控制运行时和数据核预算；真实受限进程的 HTTP/TCP/UDP 收发、线程范围与 owner 数量纳入 Docker 功能验证。
 
 - 主配置与嵌套对象严格拒绝未知字段，错误信息包含文件与字段；合法别名和自定义键值映射保留，错误重载不替换有效服务状态。修复首页、nginx/Caddy 迁移指南失效配置；迁移 HTML 正文从 Markdown 生成并校验源/正文摘要，全部公开和内置文档及随包 YAML 纳入可执行配置验证。

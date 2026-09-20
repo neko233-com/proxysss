@@ -726,7 +726,7 @@ udp:
     path_prefix: /_proxysss/monitor
     password: "至少 12 位的独立监控密码"
     session_ttl_secs: 43200
-    hosts: [monitor.example.com]</code></pre></article>
+    hosts: [monitor.example.com]</code></pre><p>管理、只读监控与 /metrics 使用相同 HTTP 统计源。JSON <code>http_requests</code> / Prometheus <code>proxysss_http_requests_total</code> 包含缓存、sendfile、反代、SSE 和 HTTP/1、HTTP/2、HTTP/3；WS/WSS 只计握手，后续消息不重复计数。</p><p>JSON <code>http_errors</code> / Prometheus <code>proxysss_http_errors_total</code> 对网关生成或上游返回的 <strong>4xx 与 5xx 响应</strong>各计一次，例如 404、413、上游 503 和网关 502。它不是纯 5xx 故障指标，也不涵盖所有 socket/正文传输异常；没有形成 HTTP 响应的失败和发送途中中断应结合错误日志检查。</p></article>
 </div></section>
         <section id="combos" class="panel">
           <div class="section-head">

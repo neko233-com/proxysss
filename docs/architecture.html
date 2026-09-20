@@ -637,6 +637,8 @@
               </div>
             </div>
           </div>
+          <p class="subtle">HTTP 请求由实际接管它的处理路径计数：普通 HTTP/TLS/H2/H3、缓存、sendfile、原始反代和 SSE 每个请求只计一次；快速路径回退由普通处理器负责。WS/WSS 在握手响应开始前计数，升级后消息不增加 HTTP 请求数。请求统计保留分片原子计数器，不引入数据面全局锁。</p>
+          <p class="subtle">HTTP 错误计数记录已确定状态的 4xx/5xx，包含网关生成和上游返回的响应。直接响应路径和统一完成器各计一次，异常转为 502 后不能重复累加；没有形成 HTTP 响应的连接失败、正文中断通过错误日志排查，不额外增加错误响应数。JSON 与 Prometheus 共用计数源，字段说明见<a href="configuration.html">配置指南</a>。</p>
         </section>
 
         <section id="http-flow" class="panel">

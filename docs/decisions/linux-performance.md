@@ -4,6 +4,8 @@
 
 ## 2026-09-21：balanced 下载与 realtime 共用 native owner，未接受
 
+后续仅用保留的候选二进制执行 epoll/sendfile 诊断，没有恢复生产代码。原生记录器自检验证正文、偏移、错误码和 epoll 返回值，完整标准三尺度矩阵记录 proxysss 360326 / nginx 176467 个工作区间，无溢出或未完成记录。饱和时 native owner 每轮平均 ready fd 为 13.1/25.2/53.0，每发送轮仍约 1 MiB，工作 CPU 约 1699/1646/1669 ms，其中 sendfile 为 706/486/311 ms，占比从 41.6% 降到 18.6%。HTTP owner 的工作 CPU 同时维持约 3.3 秒；nginx 每轮发送合计字节随密度增长。该证据支持重新分配每连接的处理机会，不证明只调整切片或 nice 可以达标。work wall−CPU 包含程序自身等待与 Tokio park，不能误称纯 runqueue wait，尤其不能等同 UDP 请求时延。仪器化结果不作发布证据，完整边界、源代码、自检与原始工件保存在 `.benchmark/goal-shared-reactor-calls/`。
+
 候选 a9f5c56 将 balanced 大文件交给已预热的 nice 3 realtime epoll owner，取消额外 sendfile 线程池和 HTTP owner 上的直接大段发送。每轮先消费整个实时事件批次，再从去重 FIFO 推进一个下载、最多 1 MiB；下载接收每轮 32 个，取消队列每轮 256 项，旧事件先于新注册处理。就绪节点内嵌在作业状态，完成/取消以 O(1) 摘除，保持文件版本、背压和完成通知语义。该形态不同于此前把 native relay 整批交给 HTTP Tokio runtime 的实验。
 
 Ubuntu 24.04 x86_64 功能入口通过两轮各 351 项测试、Clippy、格式、文档/Go 和 CLI 检查。新增真实 socket 测试覆盖同一 owner 上的下载背压、32 次双向转发、半关闭后的尾数据、取消及后续完整下载；另覆盖下载 FIFO 去重、轮转及取消后 fd 槽位复用。真实 taskset=0,23 网关使用 2 个 HTTP owner 与 2 个共享 owner，没有独立 sendfile owner，11 个线程均未越界，HTTP/TCP/UDP 正文验证通过。功能通过不构成性能准入。

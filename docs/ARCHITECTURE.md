@@ -120,6 +120,10 @@ admin 默认只监听 127.0.0.1:7777，enable_write_ops=false、expose_config=fa
 
 admin.monitor 是独立 HTTPS 只读入口，使用专用密码与 monitor:read 短期会话。登录后仅提供 health、summary、stats、SSL 状态，拒绝写接口，不暴露管理 token、私钥、DNS 凭据或配置写入能力。
 
+HTTP 请求计数由实际接管请求的处理路径负责。普通 HTTP/TLS/H2/H3、缓存命中、sendfile、原始反代和 SSE 都对同一请求只记录一次；快速路径探测后交还普通处理器时，由后者计数。WS/WSS 握手在响应开始前计数，升级后的消息不增加 HTTP 请求数，不能等长连接关闭才记录握手。请求计数保留分片原子计数器，不引入数据面全局锁。
+
+HTTP 错误计数只记录已确定响应状态的 4xx/5xx，包括网关生成和上游返回的响应；统一完成器与直接响应路径各自负责一次，异常转为 502 后不能再次累加。没有形成 HTTP 响应的连接失败不计作错误响应，正文中断也不把已经记录的响应再计一次，传输异常通过错误日志排查。JSON 与 Prometheus 使用相同计数源，字段与运维口径见[配置指南](CONFIGURATION.md)。
+
 QuickJS 与 swc_ts_fast_strip 内嵌进程，无外部 Node/Deno/tsc。routeHttp/routeTcp/routeUdp 与插件钩子负责可选业务扩展；核心边缘策略保持原生实现。主动健康覆盖 HTTP/TCP 和显式 UDP 探测，被动失败可隔离上游；watchdog 观察关键后台任务，metrics 暴露重启/失败计数。
 
 管理 HTML/CSS、内置文档和站点资源嵌入二进制。管理 `/docs` 与 `/docs.html` 经过管理传输检查；公开文档导航只链接 HTML。详细配置见 [配置指南](CONFIGURATION.md)，扩展见 [脚本指南](../ts-how-to-use.md)，交付顺序见 [验证与发布](VALIDATION.md)。

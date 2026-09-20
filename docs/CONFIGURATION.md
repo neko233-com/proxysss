@@ -497,6 +497,8 @@ GET /_proxysss/monitor/v1/ssl
 
 只读监控面拒绝所有非 GET 查询方法，不能使用管理员 bearer token，也不会返回配置文件路径、证书私钥路径或 DNS 凭据。生产环境必须使用真实 HTTPS 证书；不要把这个密码放进 Git、日志、剪贴板或 iCloud 普通数据。
 
+HTTP 统计口径在管理、只读监控与 `/metrics` 中保持一致：JSON `http_requests` / Prometheus `proxysss_http_requests_total` 记录处理的请求，包含缓存、sendfile、反代、SSE 与 HTTP/1、HTTP/2、HTTP/3。WS/WSS 每次握手计一个 HTTP 请求，后续消息不重复计数。JSON `http_errors` / Prometheus `proxysss_http_errors_total` 记录网关生成或上游返回的 **4xx 与 5xx 响应**，同一响应只计一次；404、413、上游 503 和网关 502 都属于该计数。它不是纯 5xx 故障指标，也不表示所有 socket/正文传输异常；尚未形成 HTTP 响应的失败和发送途中中断应结合错误日志检查。
+
 ### 3.5 游戏长连接 + UDP 同时接入
 
 ```yaml
