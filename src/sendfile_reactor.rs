@@ -1,9 +1,8 @@
 //! Linux static-file sendfile reactor.
 //!
 //! HTTP parsing and keep-alive ownership remain on the CPU-adaptive Tokio HTTP
-//! shards. Bulk response bodies are handed to a bounded set of native epoll
-//! workers; balanced sends directly in bounded turns on its HTTP shard. This
-//! separate bulk path prevents a writable socket monopolizing HTTP while
+//! shards. Large response bodies are handed to a bounded set of native epoll
+//! workers so a writable socket cannot monopolize the HTTP scheduler while
 //! repeatedly draining `sendfile(2)`. Each job owns duplicated descriptors and
 //! reports completion before the HTTP task reads the next request.
 

@@ -17,7 +17,6 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 | `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
 | `src/http1_body.rs` | 原始 SSE 转换为 Hyper 响应前的有界 HTTP/1 正文解码 |
 | `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
-| `src/plain_relay.rs` | balanced 明文 TCP/WebSocket 的每连接就绪任务、共享临时缓冲与背压存储 |
 | `src/runtime_tuning.rs`、`src/linux_cpu.rs`、`src/linux_tune/` | 系统能力、cgroup cpuset、运行时/socket 适配与显式主机调优 |
 | `src/script.rs`、`src/ts_transpile.rs` | 进程内 QuickJS、TypeScript 类型剥离、扩展调用与热重载 |
 | `src/security.rs`、`src/acme/`、`src/filecloud/` | 访问/限流/管理鉴权、证书与 DNS provider、文件服务 |
@@ -88,16 +87,12 @@ CPU 数从 cgroup effective cpuset 探测，不从已绑核线程误推全局资
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
 | small（默认） | HTTP/1、TLS/H2 共用每允许核心一个 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
-| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 明文 TCP/WebSocket 每连接一个就绪任务，与接收连接的 HTTP 分片共用队列；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 直接 sendfile，每 2 MiB 让出同一任务队列 |
+| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 每允许 CPU 一个 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
-balanced 不再为明文实时连接启用独立线程或整组事件任务，也不使用请求后短自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
+balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
 
-balanced 大于等于 8 MiB 的完整对象直接使用 sendfile，每 2 MiB 让出 HTTP 分片的任务队列，高密度时也保留该边界。长连接按各自读写就绪调度，每方向至多 16 个 I/O 步骤（最后一次读可追加一次写），不把整组连接作为一个任务连续处理。每个实际执行线程借用一个 16 KiB 临时池缓冲；只有未写出的字节才为该方向保留一个池缓冲，写完立即归还。暂时无流量的连接不占用正文缓冲；半关闭先冲刷待发送字节，再传播写关闭。
-
-TCP 直接留在接收连接的分片。明文 WebSocket 完成升级和首批字节转发后，在当前分片注册 socket 副本并创建独立 relay 任务，原 HTTP 解析状态随之释放；失败则使用已有异步回退，TLS/WSS 不使用该明文路径。取消 relay 任务会释放 socket、待发送缓冲和就绪注册。这里只描述候选实现的资源归属，性能准入仍须完整混合实测。
-
-bulk 仍使用独立 native sendfile/stream reactor。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。bulk reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
+balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 
 明文 HTTP I/O event interval 为 8，shared-small 为 16，global queue interval 为 31。H2 每连接用本地 FuturesUnordered 驱动流，每个完成流后让出。静态 freshness 为 2 秒，nice-10 控制运行时重验证并原子发布快照。改变策略前阅读 [性能决策](decisions/linux-performance.md)，验证方法见 [验证流程](VALIDATION.md)。
 
