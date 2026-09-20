@@ -1,5 +1,7 @@
 # proxysss
 
+Static downloads support bounded single and multipart byte ranges, coalescing up to 16 ranges without loading the whole source file. See the [CDN download guide](https://neko233-com.github.io/proxysss/cdn-origin.html) and [Linux-first validation process](https://neko233-com.github.io/proxysss/validation.html) for semantics and evidence requirements.
+
 **English** · [简体中文](README-CN.md) · [Documentation](https://neko233-com.github.io/proxysss/) · [Downloads](https://github.com/neko233-com/proxysss/releases/latest)
 
 One Rust binary and one YAML file for websites, APIs, and realtime connections. proxysss is a general-purpose gateway designed to replace nginx. Optional embedded TypeScript scripts and plugins handle application-specific extensions.

@@ -203,6 +203,8 @@ fn protected_sites_and_reload_never_take_unauthenticated_fast_lanes() {
     assert!(!plain_static_fast_path_allowed(&config));
     assert!(!hyper_static_success_fast_path_globally_allowed(&config));
     for header in [
+        "If-Match: missing",
+        "If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT",
         "If-None-Match: *",
         "If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT",
         "If-Range: stale",

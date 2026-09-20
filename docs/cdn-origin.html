@@ -23,7 +23,7 @@
         burst: 100</code></pre>
 <p><code>CHANGE_ME</code> 故意不满足校验：启动前必须替换成至少 32 字节的随机令牌。示例 IP 是文档地址，必须替换成你的 CDN 回源 IP/CIDR。CDN 回源时<strong>覆盖</strong> <code>X-Proxysss-Origin-Token</code>，不要把访客提交的同名 header 透传；回源使用 HTTPS。令牌用于鉴别回源方，不代表访客已获资源权限。</p>
 <p><code>allowed_peers</code> 检查 TCP 对端 IP，不信任 <code>X-Forwarded-For</code>、<code>X-Real-IP</code>。IPv4、IPv6、IPv4-mapped IPv6 均可处理。源站的 <code>remote_addr</code> 限流会把同一 CDN 出口合并计数，额度应按出口设置；访客防盗刷、限速和费用封顶还需在 CDN 边缘执行。下载内容已缓存在 CDN 时，请求不会抵达源站。</p>
-<p>公开文件支持 <code>GET</code> / <code>HEAD</code>、MIME、大文件流式发送、单段 <code>Range</code>、<code>206</code> / <code>416</code>、弱 <code>ETag</code>、<code>Last-Modified</code>、<code>If-None-Match</code>、<code>If-Modified-Since</code>。<code>If-Range</code> 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 <code>200</code>。配置 <code>cache_control</code> 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。</p>
+<p>公开文件支持 <code>GET</code> / <code>HEAD</code>、MIME、大文件流式发送、单段及多段 <code>Range</code>、<code>206</code> / <code>416</code>、弱 <code>ETag</code>、<code>Last-Modified</code>、<code>If-None-Match</code>、<code>If-Modified-Since</code>。<code>If-Range</code> 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 <code>200</code>。配置 <code>cache_control</code> 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。</p>
 <h2>私有资源与短期签名 URL</h2>
 <p>在同一站点增加：</p>
 <pre><code>security:
@@ -61,5 +61,12 @@ signature = base64url_no_padding(HMAC_SHA256(secret_utf8, message_utf8))</code><
 <p>构建缓存使用 <code>target/</code>、依赖缓存使用 <code>.cache/</code>，编译临时文件位于 <code>.tmp/toolchain/</code>。<code>scripts/package-local.ps1</code> 固定输出 <code>dist/proxysss-local.zip</code>，打包 staging 位于 <code>.tmp/package-local/</code> 并在完成或失败时清理。只打包明确列出的二进制、文档和示例，不带本地 YAML、令牌、证书、日志、Git、缓存和测试数据。验证/打包有进程锁，清理前检查绝对路径和链接边界。</p>
 <p>这些是功能与幂等性检查，不是 Linux 性能发布证据；Linux 混合矩阵和跨主机性能门禁仍按项目原有要求执行。</p>
 <p>参考：<a href="https://nginx.org/en/docs/http/ngx_http_autoindex_module.html">nginx autoindex</a>、<a href="https://developers.cloudflare.com/cache/how-to/cache-rules/settings/">Cloudflare 缓存规则</a>、<a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html">CloudFront 签名 URL</a>。</p>
-</main><script src="site.js?v=a6853f3b77dd" defer></script>
+<section id="complex-downloads"><h2 id="section">多段下载与条件请求</h2>
+<p>静态下载支持最多 16 个 Range 区间，合并重复、相邻和重叠部分；多个剩余区间返回 <code>multipart/byteranges</code>，每段带 Content-Range，总 Content-Length 精确计算。有效集合中的越界段被跳过，全部不可满足返回 416；未知单位、格式错误或超限集合忽略 Range，返回完整表示。HEAD 忽略 Range，不读取正文。普通 GET 快路径可能省略可选验证头；显式条件请求进入元数据验证路径。</p>
+<p>If-Match / If-Unmodified-Since 优先于缓存验证和 Range，失败返回 412。元数据 ETag 是弱验证器，不能通过 If-Match 强比较，已存在文件可用 <code>*</code>；If-Range 保持精确日期且文件已稳定 60 秒的规则。单段按偏移读取，小范围不会整文件载入；多段持有一个文件描述符，按下游需求读取 64 KiB 有界池缓冲，空闲池最多 8 MiB。中途截断终止响应，取消释放文件与缓冲。部署资源推荐写新文件后原子替换。</p>
+<pre><code class="language-bash">curl -i -H 'Range: bytes=0-15,1048576-1048591' http://127.0.0.1/assets/game.pak
+curl -I -H 'Range: bytes=0-15' http://127.0.0.1/assets/game.pak
+</code></pre>
+<p>这些下载行为由原生静态服务实现，无需脚本 API。反向代理下载保留上游响应语义。Linux 混合负载、Windows 功能与发布验收见 <a href="validation.html">验证指南</a>。</p>
+</section></main><script src="site.js?v=a6853f3b77dd" defer></script>
 </body></html>

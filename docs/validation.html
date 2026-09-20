@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证与发布 · proxysss</title><link rel="stylesheet" href="site.css?v=dd4c9e6ec34a"></head><body><div class="shell"><nav class="topbar"><a href="index.html">文档首页</a><a href="architecture.html">架构</a><a href="cdn-origin.html">CDN 下载</a></nav><main class="panel"><h1 id="section">验证与发布流程</h1>
+<p>本页定义验证顺序与证据边界。产品能力是否存在，以代码、配置和功能测试为准；性能是否胜出，以相同提交、相同资源的实测为准。不能承诺在任意硬件与负载下始终最优。</p>
+<h2 id="ubuntu-24-lts">1. Ubuntu 24 LTS 功能检查</h2>
+<p>Windows Docker Desktop 在 PowerShell 运行：</p>
+<pre><code class="language-powershell">.\scripts\verify-docker-scenarios.ps1
+</code></pre>
+<p>Linux/macOS 使用 <code>scripts/verify-docker-scenarios.sh</code>。脚本探测 Ubuntu 24.04 x86_64，检查格式、Clippy、两轮测试、全场景配置、CLI 能力和 nginx 对照声明。固定容器名 <code>proxysss-verify</code> 带项目所有者标记；不得清理其他任务的容器。最新报告位于 <code>.tmp/docker-scenarios/</code>，测试目录在结束或失败后清理。</p>
+<p>下载验收包括 GET/HEAD、单段/多段 Range、后缀与开放区间、重叠合并、越界、条件响应、鉴权顺序、超大文件局部读取和截断错误。协议测试应穿过真实监听器，覆盖 HTTP/1.1、HTTP/2 与 TLS。长连接检查双向背压、半关闭、断连清理、超时、重载和 UDP association 上限。现有套件不等于任意第三方客户端、真实云 DNS/ACME 或所有故障组合已验收。</p>
+<h2 id="linux">2. Linux 混合性能</h2>
+<p>在干净提交上执行；Windows 必须使用 Git Bash。保存原始工件，不能让默认清理删除证据或共享构建缓存：</p>
+<pre><code class="language-bash">KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
+  bash scripts/benchmark-ubuntu24-amd64-docker.sh
+</code></pre>
+<p>角色隔离入口将 gateway、backend、client 放入互不重叠的 cpuset/cgroup，检查 Ubuntu 24.04 x86_64。默认 <code>balanced</code>，静态大文件并发从每数据核两条开始；所有场景同时按 1×/2×/4× 放大。nginx 对照为 1.31.2、<code>-O3 -fno-plt</code>，双方使用相同 CPU、nofile、sysctl 和等价协议配置。</p>
+<p>测量包含小静态、大文件、CDN 热更新、HTTPS 静态、HTTP 反代、SSE、WebSocket、游戏 TCP、通用 TCP、UDP；本机严格入口还包含透明 QCP。QCP 只证明 UDP 转发，不证明解析或终止 QCP 帧。New API 供应商路由与 KCP 特殊封装不参与默认 nginx 对标。</p>
+<p>默认每尺度 1 次饱和、2 次顺序相反的等负载采样，共 18 秒活跃测量，上限 20 秒。等负载取较慢网关饱和速率的 25%，延迟使用两次样本中位数；双方完成至少 98% 可执行目标。HTTP/SSE 使用均匀错峰，UDP/QCP、TCP、WebSocket 分别预留 1/2/5 ms 完成时间。每波提前预留测量预算，进程宽限期不能无限延长。</p>
+<p>预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 <code>TOKIO_WORKER_THREADS</code>，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；饱和测试使用全部 client cpuset。官方 fixture、解析和验收工具使用 Go 或原生编译工具。</p>
+<p>严格入口要求零错误、每项吞吐与 p50/p95/p99 都胜出；单项通过不能覆盖混合回归。旧共享角色诊断 <code>benchmark-all-scenarios.sh</code> 的 <code>CRITICAL_RATIO=0.97</code> 和 <code>MIN_RATIO=0.50</code> 不等于严格发布通过。内存报告双方 cgroup current、peak、每连接成本，各项不得超过 nginx 的 2 倍；只在声明实际生产预算时设置 MemoryMax。4c/4096 active WSS/20k idle WSS 是参考负载，100k 容量为额外诊断。</p>
+<p>ARM Docker 上的 amd64 模拟必须记为 <code>emulated-amd64</code>；通过原生 Zig 交叉构建、在目标容器执行后测量。Docker Desktop 的 native-amd64 代表 Linux VM 中原生指令执行，不代表独立物理机。</p>
+<h2 id="windows">3. Windows 功能验收</h2>
+<p>Linux 功能与性能通过后，运行 <code>scripts/verify-local.ps1</code> 完成格式、Clippy、两轮本机测试及本地打包。需要时增加安装/升级/回滚与后台服务检查。Windows 要求功能正确，不以 Windows 桌面成绩代替 Linux 性能证据。</p>
+<h2 id="push">4. Push 与发布</h2>
+<p>使用 <code>skills/gh-cli/SKILL.md</code>，检查实际 Actions 状态。CI 只做六平台打包，禁止云端功能测试和性能 benchmark。Node.js action 使用 24 LTS 或更高，artifact action 至少 v6。</p>
+<p>正式版本必须匹配 Cargo.toml、CHANGELOG.md 与 性能证据清单（仓库 performance-evidence/README.md）。schema v2 要求同一 tag 提交上的角色隔离矩阵和三台不同 machine-id Linux 主机的 WSS 1×/2×/4× 复验、真实工件 URI/摘要、吞吐/延迟/容量/内存数据。运行 <code>go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit &lt;tag-commit&gt;</code> 后才能推 tag。v1.3.8 的一次性功能发布豁免不适用于其他版本。</p>
+<p>报告明确列出通过项、失败项、未执行项、提交和工件位置。缺少跨主机环境或严格性能未过时，保留修复和证据，不能生成虚假清单或宣称发布完成。</p>
+</main></div><script src="site.js?v=dd4c9e6ec34a" defer></script></body></html>

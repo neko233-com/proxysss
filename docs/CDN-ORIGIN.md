@@ -29,7 +29,7 @@ services:
 
 `allowed_peers` 检查 TCP 对端 IP，不信任 `X-Forwarded-For`、`X-Real-IP`。IPv4、IPv6、IPv4-mapped IPv6 均可处理。源站的 `remote_addr` 限流会把同一 CDN 出口合并计数，额度应按出口设置；访客防盗刷、限速和费用封顶还需在 CDN 边缘执行。下载内容已缓存在 CDN 时，请求不会抵达源站。
 
-公开文件支持 `GET` / `HEAD`、MIME、大文件流式发送、单段 `Range`、`206` / `416`、弱 `ETag`、`Last-Modified`、`If-None-Match`、`If-Modified-Since`。`If-Range` 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 `200`。配置 `cache_control` 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。
+公开文件支持 `GET` / `HEAD`、MIME、大文件流式发送、单段及多段 `Range`、`206` / `416`、弱 `ETag`、`Last-Modified`、`If-None-Match`、`If-Modified-Since`。`If-Range` 日期必须精确匹配，且文件已至少 60 秒未修改；近期修改、日期不匹配或弱 ETag 均退回完整 `200`。配置 `cache_control` 后可明确控制公开资源缓存。未配置时沿用默认响应行为，不自动承诺 CDN TTL。
 
 ## 私有资源与短期签名 URL
 
@@ -98,3 +98,16 @@ Windows 运行 `test.cmd`，等价于 `scripts/verify-local.ps1 -Repeat 2`：格
 这些是功能与幂等性检查，不是 Linux 性能发布证据；Linux 混合矩阵和跨主机性能门禁仍按项目原有要求执行。
 
 参考：[nginx autoindex](https://nginx.org/en/docs/http/ngx_http_autoindex_module.html)、[Cloudflare 缓存规则](https://developers.cloudflare.com/cache/how-to/cache-rules/settings/)、[CloudFront 签名 URL](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html)。
+
+## 多段下载与条件请求
+
+静态下载支持最多 16 个 Range 区间，合并重复、相邻和重叠部分；多个剩余区间返回 `multipart/byteranges`，每段带 Content-Range，总 Content-Length 精确计算。有效集合中的越界段被跳过，全部不可满足返回 416；未知单位、格式错误或超限集合忽略 Range，返回完整表示。HEAD 忽略 Range，不读取正文。普通 GET 快路径可能省略可选验证头；显式条件请求进入元数据验证路径。
+
+If-Match / If-Unmodified-Since 优先于缓存验证和 Range，失败返回 412。元数据 ETag 是弱验证器，不能通过 If-Match 强比较，已存在文件可用 `*`；If-Range 保持精确日期且文件已稳定 60 秒的规则。单段按偏移读取，小范围不会整文件载入；多段持有一个文件描述符，按下游需求读取 64 KiB 有界池缓冲，空闲池最多 8 MiB。中途截断终止响应，取消释放文件与缓冲。部署资源推荐写新文件后原子替换。
+
+```bash
+curl -i -H 'Range: bytes=0-15,1048576-1048591' http://127.0.0.1/assets/game.pak
+curl -I -H 'Range: bytes=0-15' http://127.0.0.1/assets/game.pak
+```
+
+这些下载行为由原生静态服务实现，无需脚本 API。反向代理下载保留上游响应语义。Linux 混合负载、Windows 功能与发布验收见 [验证指南](VALIDATION.md)。

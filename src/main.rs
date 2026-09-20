@@ -343,7 +343,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "large file range downloads",
-        "static sites advertise Accept-Ranges and serve byte ranges with 206/416 semantics for resumable HTML/CSS/JS/image/font/audio/video/download assets",
+        "static sites advertise Accept-Ranges; single/multipart byte ranges (up to 16, coalesced), bounded offset reads, HEAD and conditional 200/206/304/412/416 semantics for resumable assets",
     ),
     (
         "ftp",
@@ -535,7 +535,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "large file range downloads",
         status: ParityStatus::Supported,
-        evidence: "static file responses implement Range: bytes=... with 206 Partial Content, Content-Range, Accept-Ranges, and 416 for unsatisfiable ranges",
+        evidence: "static files support bounded single/multipart Range (up to 16 coalesced ranges), 206/416, HEAD ignoring Range, and conditional 304/412 without whole-file reads for partial downloads",
         next_gap: "",
     },
     NginxParityItem {

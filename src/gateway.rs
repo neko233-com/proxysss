@@ -1,11 +1,13 @@
 use std::borrow::Cow;
+#[path = "static_ranges.rs"]
+mod static_ranges;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::future::{ready, Future};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Cursor, IoSlice, SeekFrom};
+use std::io::{BufReader, Cursor, IoSlice};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -66,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
     BufReader as TokioBufReader, ReadBuf,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
@@ -85,13 +87,14 @@ use std::sync::OnceLock;
 use crate::acme::{acme_challenge_fqdn, DnsProvider};
 use crate::config::{
     on_demand_domain_allowed, AcmeChallengeType, AcmeKeyAlgorithm, ActiveHealthConfig,
-    ActiveHealthOverrideConfig, AdminConfig, AdminMonitorConfig, CacheBehavior, CompressionAlgorithm,
-    DomainRouteConfig, DomainTlsMode, FileCloudConfig, FtpUserPolicy, GatewayConfig,
-    HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig, LoadBalanceAlgorithm,
-    MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey, ResponseCacheConfig,
-    ResponseCompressionConfig, ReverseProxyRouteConfig, RuntimePerformanceTrafficProfile,
-    StaticSiteConfig, StreamAffinityConfig, StreamRateLimitConfig, StreamRouteConfig,
-    TcpListenerConfig, TlsCertificateConfig, TlsMode, UdpListenerConfig, WebDavConfig,
+    ActiveHealthOverrideConfig, AdminConfig, AdminMonitorConfig, CacheBehavior,
+    CompressionAlgorithm, DomainRouteConfig, DomainTlsMode, FileCloudConfig, FtpUserPolicy,
+    GatewayConfig, HttpAccessControlConfig, HttpAffinityConfig, HttpRateLimitConfig,
+    LoadBalanceAlgorithm, MonitoringFormat, OnDemandTlsConfig, RateLimitAlgorithm, RateLimitKey,
+    ResponseCacheConfig, ResponseCompressionConfig, ReverseProxyRouteConfig,
+    RuntimePerformanceTrafficProfile, StaticSiteConfig, StreamAffinityConfig,
+    StreamRateLimitConfig, StreamRouteConfig, TcpListenerConfig, TlsCertificateConfig, TlsMode,
+    UdpListenerConfig, WebDavConfig,
 };
 use crate::install;
 use crate::linux_tune;
@@ -11965,7 +11968,9 @@ struct RawReverseFastLaneOptions<'a> {
 }
 
 fn static_conditional_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key(http::header::IF_NONE_MATCH)
+    headers.contains_key(http::header::IF_MATCH)
+        || headers.contains_key(http::header::IF_UNMODIFIED_SINCE)
+        || headers.contains_key(http::header::IF_NONE_MATCH)
         || headers.contains_key(http::header::IF_MODIFIED_SINCE)
         || headers.contains_key(http::header::IF_RANGE)
 }
@@ -12046,6 +12051,8 @@ fn parse_static_fast_path_request(buffer: &[u8]) -> Option<StaticFastPathRequest
         let (name, value) = line.split_once(':')?;
         let name = name.trim();
         if name.eq_ignore_ascii_case("range")
+            || name.eq_ignore_ascii_case("if-match")
+            || name.eq_ignore_ascii_case("if-unmodified-since")
             || name.eq_ignore_ascii_case("if-none-match")
             || name.eq_ignore_ascii_case("if-modified-since")
             || name.eq_ignore_ascii_case("if-range")
@@ -19418,6 +19425,24 @@ async fn dispatch_static_site_authorized(
                         .as_secs()
             })
     };
+    // Preconditions precede cache validation and Range (RFC 9110 section 13.2.2).
+    // This resource has only a weak metadata ETag, so only '*' can satisfy
+    // If-Match's strong comparison. Ignore invalid If-Unmodified-Since dates.
+    let precondition_failed = if let Some(value) = headers.get(http::header::IF_MATCH) {
+        !value.to_str().is_ok_and(|value| value.trim() == "*")
+    } else {
+        headers
+            .get(http::header::IF_UNMODIFIED_SINCE)
+            .is_some_and(|value| {
+                modified.is_some()
+                    && value
+                        .to_str()
+                        .ok()
+                        .and_then(|v| httpdate::parse_http_date(v).ok())
+                        .is_some()
+                    && !unmodified_since(value)
+            })
+    };
     let not_modified = if let Some(value) = headers.get(http::header::IF_NONE_MATCH) {
         value.to_str().is_ok_and(|value| {
             value.split(',').any(|candidate| {
@@ -19431,7 +19456,14 @@ async fn dispatch_static_site_authorized(
             .get(http::header::IF_MODIFIED_SINCE)
             .is_some_and(unmodified_since)
     };
-    let mut response = if not_modified {
+    let mut response = if precondition_failed {
+        GatewayHttpResponse::bytes(
+            StatusCode::PRECONDITION_FAILED,
+            "text/plain; charset=utf-8",
+            Bytes::new(),
+            "proxysss://static",
+        )
+    } else if not_modified {
         GatewayHttpResponse::bytes(
             StatusCode::NOT_MODIFIED,
             static_content_type(&target),
@@ -19495,9 +19527,14 @@ async fn dispatch_static_file_content(
     static_file_cache_bytes: &AtomicU64,
     static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
 ) -> Result<GatewayHttpResponse> {
-    match parse_static_range_header(headers, Some(metadata.len())) {
-        StaticRangeDecision::NoRange => {}
-        StaticRangeDecision::Invalid | StaticRangeDecision::Unsatisfiable => {
+    let range = if method == Method::GET {
+        static_ranges::parse(headers, metadata.len())
+    } else {
+        static_ranges::RangeDecision::NoRange
+    };
+    match range {
+        static_ranges::RangeDecision::NoRange => {}
+        static_ranges::RangeDecision::Unsatisfiable => {
             let mut response = GatewayHttpResponse::bytes(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "text/plain; charset=utf-8",
@@ -19514,8 +19551,8 @@ async fn dispatch_static_file_content(
             ));
             return Ok(response);
         }
-        StaticRangeDecision::Range(range) => {
-            return static_range_response(target, metadata, method, range).await;
+        static_ranges::RangeDecision::Ranges(ranges) => {
+            return static_ranges::response(target, metadata.len(), ranges).await;
         }
     }
 
@@ -19531,7 +19568,10 @@ async fn dispatch_static_file_content(
         let file = tokio::fs::File::open(target)
             .await
             .context("failed opening static file")?;
-        (Bytes::new(), Some(file_streaming_body(file)))
+        (
+            Bytes::new(),
+            Some(file_streaming_body(file.take(metadata.len()))),
+        )
     } else {
         (
             cached_static_file_body(
@@ -19560,148 +19600,6 @@ async fn dispatch_static_file_content(
     response
         .headers
         .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
-    Ok(response)
-}
-
-/// Inclusive byte range selected from an HTTP `Range: bytes=...` header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StaticByteRange {
-    start: u64,
-    end: u64,
-}
-
-/// Parsed Range outcome for static file serving.
-///
-/// Unsupported units are treated as `NoRange` so normal GET semantics still
-/// work. Malformed byte ranges and valid-but-outside-file ranges both produce
-/// `416`, matching the behavior clients expect for resumable downloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaticRangeDecision {
-    NoRange,
-    Range(StaticByteRange),
-    Invalid,
-    Unsatisfiable,
-}
-
-/// Parse a single HTTP byte range for static assets.
-///
-/// proxysss intentionally supports one range per response. Multipart range
-/// bodies add substantial response-building complexity and are rarely needed
-/// for CDN origin, media seek, or interrupted-download resume paths.
-fn parse_static_range_header(headers: &HeaderMap, file_len: Option<u64>) -> StaticRangeDecision {
-    let Some(value) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
-        return StaticRangeDecision::NoRange;
-    };
-    let value = value.trim();
-    let Some(spec) = value.strip_prefix("bytes=") else {
-        return StaticRangeDecision::NoRange;
-    };
-    if spec.contains(',') {
-        return StaticRangeDecision::Invalid;
-    }
-    let Some(file_len) = file_len else {
-        return StaticRangeDecision::NoRange;
-    };
-    if file_len == 0 {
-        return StaticRangeDecision::Unsatisfiable;
-    }
-
-    let Some((start_raw, end_raw)) = spec.split_once('-') else {
-        return StaticRangeDecision::Invalid;
-    };
-    let start_raw = start_raw.trim();
-    let end_raw = end_raw.trim();
-    if start_raw.is_empty() && end_raw.is_empty() {
-        return StaticRangeDecision::Invalid;
-    }
-
-    let (start, end) = if start_raw.is_empty() {
-        let Ok(suffix_len) = end_raw.parse::<u64>() else {
-            return StaticRangeDecision::Invalid;
-        };
-        if suffix_len == 0 {
-            return StaticRangeDecision::Unsatisfiable;
-        }
-        let length = suffix_len.min(file_len);
-        (file_len - length, file_len - 1)
-    } else {
-        let Ok(start) = start_raw.parse::<u64>() else {
-            return StaticRangeDecision::Invalid;
-        };
-        if start >= file_len {
-            return StaticRangeDecision::Unsatisfiable;
-        }
-        let end = if end_raw.is_empty() {
-            file_len - 1
-        } else {
-            let Ok(end) = end_raw.parse::<u64>() else {
-                return StaticRangeDecision::Invalid;
-            };
-            end.min(file_len - 1)
-        };
-        (start, end)
-    };
-
-    if start > end {
-        return StaticRangeDecision::Unsatisfiable;
-    }
-    StaticRangeDecision::Range(StaticByteRange { start, end })
-}
-
-/// Build the `206 Partial Content` response for a static file range.
-///
-/// Small ranges are read into memory like other small static objects. Large
-/// ranges seek once and stream only the requested bytes, preserving
-/// backpressure and avoiding whole-file buffering for media/download traffic.
-async fn static_range_response(
-    target: &Path,
-    metadata: &std::fs::Metadata,
-    method: &Method,
-    range: StaticByteRange,
-) -> Result<GatewayHttpResponse> {
-    let len = range.end - range.start + 1;
-    let (body, stream_body) = if method == Method::HEAD {
-        (Bytes::new(), None)
-    } else if len >= STATIC_STREAM_THRESHOLD_BYTES {
-        let mut file = tokio::fs::File::open(target)
-            .await
-            .context("failed opening static range file")?;
-        file.seek(SeekFrom::Start(range.start))
-            .await
-            .context("failed seeking static range file")?;
-        (Bytes::new(), Some(file_streaming_body(file.take(len))))
-    } else {
-        let bytes = tokio::fs::read(target)
-            .await
-            .context("failed reading static range file")?;
-        let slice = bytes[range.start as usize..=range.end as usize].to_vec();
-        (Bytes::from(slice), None)
-    };
-
-    let mut response = GatewayHttpResponse::bytes(
-        StatusCode::PARTIAL_CONTENT,
-        static_content_type(target),
-        body,
-        "proxysss://static-range",
-    );
-    response.stream_body = stream_body;
-    response
-        .headers
-        .push((ACCEPT_RANGES, HeaderValue::from_static("bytes")));
-    response.headers.push((
-        CONTENT_RANGE,
-        HeaderValue::from_str(&format!(
-            "bytes {}-{}/{}",
-            range.start,
-            range.end,
-            metadata.len()
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
-    ));
-    response.headers.push((
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&len.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")),
-    ));
     Ok(response)
 }
 

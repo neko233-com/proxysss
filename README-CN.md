@@ -1,5 +1,7 @@
 # proxysss
 
+静态下载支持单段/多段 Range，最多 16 段并合并重叠区间，局部下载不整文件载入。行为边界见 [CDN 下载指南](https://neko233-com.github.io/proxysss/cdn-origin.html)，验证与发布要求见 [Linux 优先验证流程](https://neko233-com.github.io/proxysss/validation.html)。
+
 [English](README.md) · **简体中文** · [使用文档](https://neko233-com.github.io/proxysss/) · [下载安装包](https://github.com/neko233-com/proxysss/releases/latest)
 
 一个 Rust 二进制、一份 YAML，完成网站、API 与实时连接的网关工作。proxysss 面向 nginx 同级通用网关场景；需要业务逻辑时，再使用内置 TypeScript 脚本和插件扩展。

@@ -1,145 +1,88 @@
-# proxysss architecture
+# proxysss 架构
 
-proxysss is a single Rust binary that replaces nginx/Caddy-style edge duties: protocol termination, routing, load balancing, policy enforcement, and observability. It also covers transparent MQTT/IoT edge patterns while keeping protocol-specific broker logic upstream. Optional TypeScript plugins extend business logic without sitting on every hot-path byte.
+proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止、路由、静态文件、反向代理、流转发、安全策略、日志与管理。可选 TypeScript/JavaScript 扩展负责业务决策；普通网关请求无需脚本。面向用户的交互入口是 [架构 HTML](architecture.html)。
 
-## Layers
+## 模块职责
 
-```
-Clients ──► proxysss core (Rust/async)
-              ├─ HTTP/HTTPS/H2/H3 listeners
-              ├─ TCP/UDP stream listeners (games, MQTT/IoT, KCP, QCP, CoAP)
-              ├─ Route matcher + policy chain
-              ├─ Upstream pool + health state
-              └─ Admin API + metrics
-                    ▲
-                    │ hot reload
-              proxysss.yaml + scripts/plugins
-```
-
-| Component | Responsibility |
+| 模块 | 所有权与职责 |
 | --- | --- |
-| `gateway` | Listeners, protocol handling, proxy loops, cache, compression |
-| `config` | YAML schema, validation, defaults, reload fingerprint |
-| `script` | Embedded QuickJS + in-process TypeScript strip for hooks |
-| `install` | Background service, init layout, updater integration |
-| `admin` (in gateway) | Dashboard, stats, upstream drain, automation upserts |
-| `admin.monitor` (in gateway) | HTTPS-only password login and fixed read-only health/summary/stats/SSL API for iOS, iPad, macOS, and Android clients |
+| `src/main.rs` | CLI、命令运行时与能力检查 |
+| `src/config.rs`、`src/config/performance.rs` | 单 YAML 配置、默认值、校验、重载指纹和流量 profile |
+| `src/gateway.rs` | 监听器、HTTP 分发、上游池、缓存、健康状态、TCP/UDP 与管理 API |
+| `src/static_security.rs` | 静态源站令牌、真实路径边界、签名 URL 和目录规则 |
+| `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
+| `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
+| `src/runtime_tuning.rs`、`src/linux_cpu.rs`、`src/linux_tune/` | 系统能力、cgroup cpuset、运行时/socket 适配与显式主机调优 |
+| `src/script.rs`、`src/ts_transpile.rs` | 进程内 QuickJS、TypeScript 类型剥离、扩展调用与热重载 |
+| `src/security.rs`、`src/acme/`、`src/filecloud/` | 访问/限流/管理鉴权、证书与 DNS provider、文件服务 |
+| `src/install.rs` | 安装、升级、后台服务与平台集成 |
 
-## Request path (HTTP)
+普通转发使用连接私有状态、分片表、原子计数器和有界池，配置通过 ArcSwap 发布。共享 Mutex/RwLock 只用于控制面、证书操作和首次缓存填充协调，不放在普通 HTTP/TCP/UDP 转发路径上。
 
-1. Accept connection on plain/TLS/H3 bind.
-2. Optional automatic HTTP→HTTPS redirect for managed TLS domains.
-3. Serve `/metrics`, `/.well-known/acme-challenge/*`, built-in `/`, `/docs`, `/healthz`. The built-in `/` fallback is a zero-asset `Welcome to proxysss` page with only GitHub and GitHub Docs links; configured user routes still take precedence.
-4. Enforce `services.access_control` and `services.rate_limit`.
-5. Match static site, WebDAV, domain route, reverse-proxy route, or script hook.
+## HTTP 请求路径
 
-## Read-only mobile monitor path
+1. 公共 HTTP 默认监听 80，TLS/H2/H3 默认使用 443。accept 与握手由监听运行时负责，H2/H3 分别管理多路复用流。
+2. 判断协议与配置路由，处理内建服务、ACME challenge、管理 HTTPS/monitor。用户公共路由优先于欢迎页兜底；默认 `/` 仅显示 `Welcome to proxysss`、GitHub 与 GitHub Docs 链接。
+3. 执行配置的访问控制、限流和连接上限。静态源站额外检查真实 TCP 对端、令牌/签名及路径边界；HEAD、Range、缓存和条件响应不能绕过授权。
+4. 分发静态、WebDAV、域名/反代/AI 路由或脚本。静态条件按 If-Match / If-Unmodified-Since、If-None-Match / If-Modified-Since、If-Range 的优先级执行，再选择完整或部分内容。
+5. 代理路径查询缓存和内存上游池，结合负载均衡、主动健康、被动隔离和重试选点。Consul/etcd/Nacos 发现结果通过控制面更新上游池，普通请求不逐次查询注册中心。
+6. 发送正文；WebSocket upgrade 后保持双向转发，SSE/AI 响应保留背压，gRPC 使用 HTTP/2。动态压缩受类型/大小限制，206 不进行整对象压缩。
+7. 更新分片指标，按配置记录访问/错误日志；流式正文发送后遇到文件截断则终止传输，不补成成功短正文。
 
-The monitor is a separate control-plane path on the main HTTPS listener. It does not reuse the administrator bearer token or expose the administrator route table.
+快路径只在语义等价时启用。raw reverse/SSE 保留默认转发头并复用请求/响应缓冲与上游 lane。条件请求和 Range 进入完整静态处理。启用热重载/管理更新时不复用连接上的免策略静态响应；不可变无策略 H2 使用连接 OnceLock 和只读 ArcSwap/FxHashMap 响应快照。
 
-1. `POST /_proxysss/monitor/v1/login` accepts the dedicated `admin.monitor.password`.
-2. The server returns a short-lived `monitor:read` Bearer session signed from that password.
-3. Authenticated clients may call only `GET /v1/health`, `/v1/summary`, `/v1/stats`, and `/v1/ssl` below the configured prefix.
-4. Any non-GET method returns `403 monitor_read_only`; HTTP is rejected and the monitor is HTTPS-only.
-5. SSL output is server-redacted: it contains public domain/status information but no certificate/key paths, private keys, DNS credentials, or config mutation surface.
+## CDN 和复杂下载
 
-This protocol is intentionally platform-neutral so iOS/iPad/macOS and Android can share fixtures and acceptance tests. One proxysss process is one client location; multi-location grouping belongs to the clients or a later account service.
-6. Apply cache lookup, upstream selection (LB algorithm + health), retries, and passive quarantine.
-7. Proxy request/response (including WebSocket upgrade, generic SSE streaming, New API-compatible routes, and gRPC-over-h2), or serve static files with bounded memory cache, mmap-backed hot objects on supported builds, Range/206 resumable downloads, and a Linux plain-HTTP fast lane whose cache/sendfile behavior follows `runtime.performance.traffic_profile`.
-8. Optionally compress response and write access log entry. Successful requests on manual-reload deployments skip the extra post-dispatch config lock used only for error-page decoration or live logging changes.
+完整小对象使用有界缓存和预构建 HTTP/1 keep-alive 响应，大文件流式发送；Linux 合适的明文完整响应使用 sendfile。Range 按偏移读取所需字节，不读取整个原文件。HEAD 忽略 Range，只返回完整表示元数据。
 
-## Stream path (TCP, UDP, KCP, and QCP datagrams)
+Range 最多接受 16 个区间，合并重复/相邻/重叠区间，保留未合并部分的请求顺序。单段返回 206 和 Content-Range，多段使用 multipart/byteranges、分段 Content-Range 和精确总 Content-Length。有效集合的越界部分被跳过，全部不可满足返回 416；格式错误、未知单位或超限集合忽略 Range。
 
-1. 在配置的 `tcp.listeners[]` / `udp.listeners[]` bind 接收连接或数据报。Linux 性能模式从 cgroup effective cpuset（而非可能已被 pin 的当前线程）发现完整 CPU 集，并据此建立全核 `SO_REUSEPORT` listener fanout；flow placement 交给 Linux reuseport/RFS 自适应，避免 per-socket `SO_INCOMING_CPU` 强绑造成混合 HTTP 尾延迟。默认 `small` 把 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 放进同一个 CPU-sized Tokio runtime；`balanced` 把每个 plain HTTP accept loop 固定到独立单线程 Tokio runtime，TLS/H2 放到 nice 5 bounded runtime，UDP/QCP 放到 `ceil(cores/2)` nice 3 runtime，并在透明 TCP/plain WebSocket 完成 connect/upgrade 后交给 `ceil(cores/2)` nice 3 native epoll relay。plain HTTP runtime 每 8 次 task poll 检查 I/O，shared-small 保持 16 次；8 MiB 以上 balanced 静态响应从有界 lock-free pool 独占 file description，根据 active sendfile transfer 压力由连接所属 HTTP owner 或预热 native reactor 发送，完成后归还。配置通过 ArcSwap 原子发布。
-当前实现修订：`balanced` realtime relay 已改为每个允许 CPU 一个 soft-affinity owner；上段 `ceil(cores/2)` 是已拒绝的旧形态。
+多段响应只持有一个文件描述符，HTTP 消费正文才触发读取。大范围每次最多借用 64 KiB 池缓冲，Bytes 持有所有权直到下游释放，独立空闲池最多 8 MiB；取消释放文件与缓冲，无后台生产线程。弱元数据 ETag 不满足 If-Match 强比较，存在文件可用 `*`；If-Range 只接受精确匹配且稳定 60 秒的修改日期，否则退回完整 200。部署资源宜写新文件后原子替换，避免就地修改正在发送的内容。详细说明见 [CDN 下载](CDN-ORIGIN.md)。
 
-2. Enforce stream access control and shared-zone rate limits where configured.
-3. Select an upstream from `upstream` / `upstreams` using the active load-balancing and health state, or use the direct single-upstream TCP fast path when scripts, affinity, active health, passive health, and extra upstream candidates are all disabled.
-4. TCP 默认关闭 Nagle（`nodelay: true`）并应用 `connect_timeout_ms`。Linux 性能模式下，游戏、MQTT/tool 与通用实时流留在 CPU 自适应的 per-core Tokio I/O shard，直接使用 async backpressure；明确的 bulk/file 协议才使用带 `SPLICE_F_MORE` 的 Linux `splice` 零拷贝。
-5. UDP creates a transparent client association to the selected upstream; each datagram refreshes `session_ttl_secs`.
-6. Idle UDP associations are pruned with a throttled shared prune state, and `max_associations` caps churn-heavy KCP, QCP, game, and voice fleets so the listener cannot grow unbounded.
+## 游戏与 socket 长连接
 
-MQTT/IoT traffic uses the same stream path: MQTT TCP on `1883`, MQTT TLS passthrough/SNI on `8883`, MQTT over WebSocket through HTTP reverse proxy routes, and CoAP-style UDP through `udp.listeners`.
+TCP 接受连接后执行流访问/限流和路由，选择内存上游池；没有脚本、亲和、健康和额外候选时走单上游直接路径。默认 TCP_NODELAY，连接阶段受 connect_timeout_ms 限制。半关闭先冲刷未发送字节，再传播写关闭，保留反向数据。
 
-## Upstream health model
+UDP 按客户端建立上游 association；session_ttl_secs 管理空闲时间，max_associations 限制高频重连规模。创建去重使用分片 pending 集合，清理按时间、创建数和容量压力节流。已建 association 使用 worker 本地缓存，TTL 最多每秒刷新一次，数据报使用有界缓冲池。
 
-- **Active probes**: periodic HTTP `GET`, TCP connect, or opt-in UDP payload probes per `load_balance.active_health`.
-- **Passive quarantine**: consecutive proxy failures trip `quarantine_secs` cooldown.
-- **Manual drain**: admin API marks upstreams disabled; state can persist in `runtime.maintenance_state`.
-- **Runtime watchdog**: supervised background loops emit heartbeat metrics and can restart after unexpected task failure.
-- **Runtime performance plan**: startup reads `runtime.performance`, detects the OS/distro, logs the selected policy once per process start, applies Linux socket tuning on accepted HTTP/TLS/admin/stream sockets and stream upstream sockets, and preloads eligible static hot files/sendfile descriptors according to `traffic_profile`. `small` 预载不超过 1 MiB 的热正文；默认 `balanced` 预载低于 32 MiB 流式边界的可缓存热正文；两者共同受 256 MiB/256 项硬上限约束，`bulk` 则优先准备 sendfile 状态。
+MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与透明 QCP 都复用这些转发路径。proxysss 不实现 MQTT broker，QCP 透明转发不代表帧终止。FTP 控制与主动/被动数据连接执行各自策略，启用时默认控制端口为 21。
 
-## Configuration model
+## Linux 调度
 
-One YAML file is intentional: agents and humans can reason about the entire edge in one document. Cluster nodes self-register through bearer-token `POST /v1/domain-routes/upsert` (and sibling endpoints), which persists back to the same file and reloads in process. Manual reload through `POST /v1/reload` is the default operating model; background file watching is opt-in with `runtime.hot_reload.enabled: true`.
+CPU 数从 cgroup effective cpuset 探测，不从已绑核线程误推全局资源，也不硬编码小型 worker 上限。SO_REUSEPORT listener fanout 与数据核数成比例，socket 分配交给 Linux。
 
-普通公网 WSS 只需配置 `http.tls.auto_https.domains: [wss.example.com]`：非空域名列表会选择免费的内建 managed ACME、正式 Let's Encrypt、默认 TLS-ALPN-01 与 ECDSA P-256 证书密钥。无需外部证书客户端、DNS API 凭据或账号邮箱；公网 DNS 必须指向网关且 443 可达。网关负责临时 `acme-tls/1` 证书、证书持久化、续期与 reload；`email` 仅用于到期/安全通知。极老旧客户端可用 `http.tls.acme.key_algorithm: rsa2048`，显式 managed HTTP-01（需 80）、TLS-ALPN-01、DNS-01 与 legacy external ACME 仍受支持。
+| traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
+| --- | --- | --- | --- |
+| small（默认） | HTTP/1、TLS/H2 共用每允许核心一个 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
+| balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 每允许 CPU 一个 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
+| bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
-`services.service_discovery` is a control-plane declaration for Consul, etcd, and Nacos registries. Registry mappings identify which HTTP route, domain route, TCP listener, or UDP listener should receive discovered upstreams; automation/admin writes refresh the YAML upstream pools and then reload. The ordinary data plane still selects from in-memory upstream pools, so HTTP/1.1, HTTP/2/gRPC, WebSocket, TCP, and UDP forwarding do not perform per-request registry network calls.
+balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
 
-## Performance notes
+balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。临时发送队列在完成/取消时恢复，reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 
-- Async Tokio runtime with tuned keepalive connection pooling via `reqwest` for HTTPS/fallback upstreams and a Hyper HTTP/1 fast client for ordinary `http://` reverse proxy traffic. Server connections explicitly enable HTTP/1 vectored writes；HTTP/2 使用固定的大 stream/connection window，避免 small-object mixed load 为 adaptive-window 调节付出额外热路径成本。
-- The plain-HTTP raw reverse-proxy and raw SSE fast lanes preserve the default `X-Forwarded-*` / `Forwarded` chain and `proxysss-ai-*` metadata headers, so default `reverse_proxy` and `ai_proxy` routes can use the low-allocation path without disabling observability.
-- Linux `runtime.performance.enabled=true` 下，从 cgroup effective cpuset 发现完整 CPU 集；默认 `small` 的 HTTP/1.1、HTTP/2/TLS、WebSocket、TCP、UDP 与透明 QCP 共用一个 CPU-sized Tokio runtime，每个允许核心一个 nice 0 worker，并允许 ready connection 在这些 per-core shard 之间 work-steal。`balanced` 将每个 plain HTTP `SO_REUSEPORT` accept loop 映射到固定 CPU 的独立单线程 Tokio runtime，消除跨核 work stealing 和共享 LIFO slot 引起的明文 HTTP 尾延迟；这些 plain runtime 每 8 次 task poll 检查 I/O，shared-small runtime 保持 16 次。TLS/H2 使用 nice 5 bounded runtime；UDP/QCP 使用 `ceil(cpuset/2)` nice 3 runtime；policy-free realtime TCP 和 plain WebSocket 在 connect/upgrade 后进入 `ceil(cpuset/2)` nice 3 native epoll relay。blocked client-request tick 在每 owner 不超过 16/32/128 对时分别追加 1/2/32 次有界 nonblocking reply poll；reply event 不继续 spin，持续 ready 的 saturation 也不启用该路径。nice 5 realtime 实验降低吞吐且未改善 static-large，已回退。plain fast lane 与 raw plain-upstream response head 在注册 readiness 前先执行有界 `try_read_buf` / `try_write`，减少单请求 async trait/cooperative bookkeeping，但不会像已回退的整段 `unconstrained` 实验那样绕过整个 exchange 的公平性。8 MiB 以上 balanced 静态对象在 current active sendfile transfer 大于数据核数且不超过每核 4 条时交给预热的 nice-0 native reactor；稀疏/equal-load 与更高压力直接留在 HTTP owner。首批 sparse transfer cooperative yield 一次，让 sibling large response 完成登记；bulk 可始终使用 reactor。reactor handoff 优先选择当前 pinned HTTP CPU 对应 owner，无法匹配时才 round-robin；active jobs 使用 fd-indexed slot table，job 在 EPOLLOUT 注册前直接尝试 sendfile，adaptive balanced job 以完整 response 为 event budget，真实 `EAGAIN` 才是公平与背压边界。完成时 reactor 先清除 `TCP_CORK` 再唤醒 HTTP owner，末尾字节不等待下一轮 Tokio 调度。warm-up 在 live traffic 前启动 eligible reactor，并为每个热大文件注入有界 lock-free descriptor pool。并发响应独占 file description，完成后归还；池满时 surplus descriptor 自动关闭，避免共享 `struct file`、per-response synchronous open jitter 和无界 idle FD retention。direct sendfile 在注册 writable readiness 前先尝试推进，`EAGAIN` 后保留 partial progress。超过每数据核 4 条 active transfer 时，natural `EAGAIN`/readiness boundary 替代 chunk-edge cooperative yield，避免 dense wave 多一次 scheduler round。全局 active sendfile transfer 超过数据核一半时，balanced 才在当前 queue 较小时临时请求 1 MiB `SO_SNDBUF`，结束或取消时恢复原数值；equal-load/idle 保留 Linux autotuning。per-connection request timing 与 HTTP connection count 不能作为压力信号，因为 pooled client 可让多个 worker 共用更少的 keep-alive connection。2 MiB 与 8 MiB 深队列实验已造成 low-scale static-large 或混合尾延迟回归，不恢复。曾失败的全核 always-on balanced reactor 在 4× 造成 QCP 错误和跨协议尾延迟，因此 active-transfer pressure band 是必须约束。`ceil(cpuset/4)` nice 0 的 stream 实验在 1×/4× 将 TCP/WebSocket 压到 0.85-0.98x nginx，并恶化 p95/p99，已拒绝。统一 balanced TLS 的实测会产生 16-21 ms 跨协议尾峰并把 HTTPS saturation 压到最低 0.225x，因此不得重新合并。global injection queue 每 31 次 poll 检查。plain static 采用低密度 256 / 高密度 128 响应 fairness boundary；raw reverse/SSE 依靠有界 upstream/downstream readiness。balanced 专用 UDP 依靠 Tokio socket scheduling；shared-small UDP 保留 4 包边界。静态文件使用 2 秒 freshness window，metadata/body 重验证进入单独 nice-10 control runtime。freshness timestamp 与 in-flight claim 为共享原子状态，stale reader 不获取 DashMap 写锁；metadata 未变化时只刷新共享 freshness，不重建 H2 snapshot。small-profile WebSocket 使用 readiness-bounded 64-poll normal relay turn。HTTP 请求统计使用每 data worker 独占的 cache-line padded counter，采集时汇总；配置 hot reload 通过 ArcSwap 原子发布。
-- 上述 dense poll、timed-wait 与 8 MiB event round 都是已拒绝实验，不是当前实现。balanced realtime 为每个允许 CPU 建立一个 soft-affinity native owner；降低 pair density 后，1-16/17-32 对 owner 使用 1/2 次 immediate probe，超过 32 对完全依赖普通 epoll wakeup，不再抢占 HTTP CPU。adaptive sendfile 保留 full-response event budget；active transfer 不超过每数据核 2 条时，只选择均匀分布的一半预热 owner，避免全核同时争用且不增加 epoll round，更高压力恢复全部 owner。reactor 提前清除 `TCP_CORK` 后会把状态传回 HTTP owner，避免 owner 重复 syscall。
-- TCP listener 通过显式 socket 设置 `SO_REUSEADDR`、大 backlog 和 `TCP_NODELAY`。无 script/affinity/health/多 upstream 的单上游连接直接进入 fast path，不经过通用 upstream planner。实时 profile 保留 `QUICKACK/NODELAY/USER_TIMEOUT`，收发队列交给 Linux autotuning；深队列与 `TCP_NOTSENT_LOWAT` 只用于 HTTP/gateway profile。
-- `runtime.performance` is default-on. Linux hosts use portable socket tuning; Ubuntu 24.x additionally enables the extreme socket policy (`TCP_QUICKACK`, `TCP_NOTSENT_LOWAT`, `TCP_USER_TIMEOUT`). Older Ubuntu/Debian/unknown distros keep the portable path and log the downgrade reason at startup.
-- Hot-path shared state avoids one global lock: rate limits, cache zones, sticky affinity, and upstream runtime state use sharded maps; raw HTTP upstream keepalive uses a lock-free bounded queue，checkout 会先用 nonblocking read 丢弃已 EOF、报错或残留脏数据的 idle socket，预热也会同时持有目标数量后再归还，避免长启动屏障后的首个 SSE/reverse 请求命中 stale fd。默认 small 的 raw reverse/SSE upstream socket 使用 Linux autotuning 与 low-latency socket 选项，不强制 8 MiB bulk queue；the native single-upstream fast path skips upstream runtime lookups entirely when active and passive health are disabled. Mutex/RwLock usage is reserved for control-plane reload/certificate state and one-time static-cache fill coordination, not ordinary HTTP/TCP/UDP forwarding.
-- `forward_headers: false` on native HTTP routes disables automatic `X-Forwarded-*` / `Forwarded` insertion for nginx-parity and high-throughput deployments that do not need that metadata.
-- `services.ai_proxy.routes[*].emit_metadata_headers: false` skips `proxysss-ai-*` upstream metadata headers for nginx-parity SSE paths while preserving native path rewrite and provider routing.
-- Native HTTP route resolution borrows global and per-route compression/cache/rate-limit policy on the hot path; owned policy copies are only made for work that must outlive the request task.
-- Linux GNU builds use jemalloc as the global allocator to reduce header, routing, and cache bookkeeping overhead under highly concurrent edge workloads.
-- Direct TCP listeners, KCP UDP listeners, and QCP UDP listeners keep payloads transparent; protocol labels are observability hints, not hot-path parsers. A policy-free UDP worker keeps a local upstream/config snapshot and refreshes it once per second after reload, so ordinary datagrams do not acquire the dynamic configuration lock. QCP support is therefore an independent edge-forwarding listener for neko233-com/QCP services, not QCP frame termination inside proxysss.
-- TCP stream 有独立 relay profile。默认 `small` 的 realtime/game/TCP 与 plain WebSocket 留在统一多核 Tokio data runtime，每条连接使用单 future 双向 relay、显式 half-close 与有界 `ByteBufferPool`；`balanced` 在建连/升级后把 policy-free TCP 与 plain WebSocket 交给 sparse native epoll relay，fd-indexed state、bounded pending buffer pool 和显式 backpressure 避免长期 Tokio relay task 挤占 HTTP。bulk/file/backup profile 使用 `splice(socket -> pipe -> socket)`。
-- 原生 realtime relay 对一次 level-triggered readiness 最多连续 drain 8 个 16 KiB read batch，合并 WebSocket 小帧、游戏帧和普通 TCP 已排队数据的 epoll/hash dispatch；达到 batch 上限就交还 event loop，partial write 立即启用显式 pending/backpressure。owner 只有在 `epoll_wait` 确实阻塞后收到客户端请求时才追加 reply probe：不超过 16/32 对使用 1/2 次 immediate poll；超过 32 对不 spin。上游回包事件不再安排下一轮 spin，持续 ready 的 saturation 也不启用该路径。普通数据事件只在本端已观察到 EOF 后才执行完整 pair-finished 查找，避免每帧额外查询两端状态。
-- plain WebSocket 在 HTTP shard 完成握手后，Linux 性能模式默认 handoff 到 CPU 自适应分片的原生 `epoll` relay，失败时回退到多核 Tokio relay；WSS 使用有界 Tokio relay 加 rustls/AWS-LC。空闲长连接不会预占每方向固定大 buffer。4c 的生产参考包络默认验证 20k idle WSS，活跃消息规模验证到 4096，并分别报告握手与消息 p50/p95/p99、内存 current/peak 与每连接成本；它不是固定 RAM 准入门槛。
-- HTTP/2 在 ALPN 已确认后直接使用 Hyper H2 server builder；默认 `small` 的 TLS handshake、H2 与 plain HTTP 共用相同 per-core data shard，`balanced` 则进入独立低权重 TLS runtime。warm-up 从 bounded static cache 生成 immutable `Bytes` 响应表，并通过 ArcSwap 发布只读 FxHashMap；同路径 H2 请求不获取 DashMap shard。每条 H2 connection 使用一个本地 `FuturesUnordered` executor 驱动 stream future，避免每请求一次 Tokio spawn/global-queue hop，并在每个完成 stream 后 cooperative yield；32-stream dedicated batch 会在共享 cgroup 内抢占 CFS，已因 4× CDN/static/reverse 回归而移除。文件过期后继续 stale-while-revalidate，刷新工作在 nice-10 control runtime 完成后原子替换有界快照。
-- Plain HTTP reverse-proxy, generic SSE/New API-compatible streaming, and no-policy WebSocket requests enter raw data lanes when the route has no script/plugin/cache/compression/rate-limit/retry/health bookkeeping on the hot path. Plain/TLS fast-lane request readers receive socket bytes directly into persistent per-connection `BytesMut` spare capacity。warm-up 为小型静态对象预构建完整 HTTP/1 keep-alive 响应 bytes，首条连接无需重复格式化 header 和拷贝 body；同一 keep-alive connection 后续 exact static GET head 命中 connection response cache，一秒 revalidation clock 每 256 次 exact hit 检查一次。反向代理/AI 上游池每个去重 pool 只预拨一对 socket，避免从启动 runtime 大批创建、再跨 reactor 长期使用；数字 IP 在 pool 创建时预解析为 `SocketAddr`，冷连接不重复走字符串地址解析。低密度 tiny cached static/TLS connection 每 256 个响应显式 cooperative yield；高密度 plain HTTP 使用每 128 响应的 saturated fairness boundary。WebSocket relay 使用 64-poll normal budget。HTTP/2 使用固定大窗口与 warm-up immutable snapshot。raw reverse 每次请求本身都会经过 upstream/downstream readiness，因此不叠加周期性 yield；它复用 parsed request、serialized upstream request、per-downstream upstream lane、response buffer 与 4 KiB framing cache。只有尚未收全的 body 才进入 bounded `ByteBufferPool` relay。Raw SSE writes byte-level response heads, then relays the upstream body as connection-close byte passthrough。Raw WebSocket forwards the upgrade and tunnels bytes before the general Hyper upgrade path。
-- `scripts/benchmark-ubuntu24-amd64-docker.sh` 是禁止 GitHub Actions 性能压测后的本机/原生 Docker 入口：它硬校验 controller 与被测镜像为 Ubuntu 24.04 x86_64；Windows Docker Desktop 可从 Git Bash 使用本地 `npipe://`，Linux/macOS 使用 Unix socket。wrapper 会把 `TRAFFIC_PROFILE`、吞吐/延迟运行顺序、隔离 subnet 与角色 IP 原样传入并写入 fingerprint，便于复现默认 `small`、官方 `balanced` 及双向顺序检查。脚本在容器内构建当前 checkout，再把 gateway、backend、load client 分配到互不重叠的 cpuset/cgroup。每尺度只启动 1 个 backend 和两边 gateway；非被测 gateway 在共享 cpuset 上 pause。每个 wave 只启动 1 个 client 容器，内部保留 11 个独立协议进程，避免容器生命周期淹没 1 秒样本。这样 proxysss 更快的 closed-loop TCP/UDP 不会让 client/backend 多消耗 CPU、反向饿死同轮 HTTP。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 一起放大；每档同时判 mixed saturation 吞吐和 equal-offered-load p50/p95/p99，要求零错误、逐场景及聚合严格胜出。`.benchmark/` 下的构建、日志、原始样本默认在脚本结束时清理；需要保留审计证据时设置 `KEEP_BENCH_ARTIFACTS=1` 或显式 `BENCH_ROOT`。arm64 Docker daemon 使用 `linux/amd64` 模拟时会记录 `execution_mode=emulated-amd64`；两边承受相同模拟成本，但该结果不能冒充物理 x86 证据。arm64 daemon 的 release 构建必须使用 Zig + cargo-zigbuild 在宿主原生速度交叉编译，并在 Ubuntu 24 amd64 容器执行同一 ELF 后才开始测量，不能回退到 QEMU 内编译。
-- `scripts/benchmark-all-scenarios-isolated.sh` 默认每尺度运行 1 次 saturation、2 次反向 candidate order 的 equal-load：完整 1×/2×/4× active measurement 为 18 秒并硬限制在 20 秒内，latency report 使用两次样本的 median。inactive gateway 使用 Docker pause；每次 unpause 后双方都先经过默认 1000 ms、排除在 active measurement 外的 settle window，再安排 future start。plain HTTP/1 pool、HTTPS/H2 session、两次 GET/SSE 请求及每连接一次 WebSocket/TCP/UDP/QCP echo 都在 active window 前完成。双方使用相同端口、cpuset、nofile、somaxconn、共享 sysctl、协议面与场景 CPU 分区。equal-load 取较慢 saturation 的 25%；同步 UDP/QCP target 保留 1 ms completion guard，TCP 保留 2 ms，WebSocket 为 framing 与两次用户态协议转换保留 5 ms，要求至少完成 98% 可执行 target 且 proxysss 每个 percentile 严格更低。
-- 20 秒上限按 active measurement window 累加；每个 wave 启动前必须预留完整采样时长，并由 GNU `timeout` 另设 4 秒独立 process grace，卡死会停止容器内发生器并失败。默认 future-start lead 为 2000 ms，确保 4× 下 11 个独立发生器完成连接池与协议预热后再进入共享时间戳；plain HTTP/1 双方并发建立与测量 concurrency 相同的连接池，HTTPS/H2 继续预连单个 multiplexed session。预连与 lead 不计入 active measurement，UDP/QCP response timeout 为 500 ms，1 秒测量窗口不缩短。
-- nginx 对照矩阵不比较 KCP/QCP 协议专用封装；严格本机矩阵只把 `protocol: qcp` 的透明 UDP 转发加入同一 mixed wave，与 nginx 等价 UDP listener 比较并接受同一严格门禁。这个结果证明 edge forwarding，不代表 proxysss 在热路径解析或终止 QCP frame。
-- UDP association TTL and caps bound memory under large mobile/game reconnect churn; listener receive buffers are reused from the bounded UDP buffer pool so ordinary datagram forwarding does not allocate a full packet buffer per receive. New-session deduplication uses a sharded pending set instead of one global mutex, and global association pruning is throttled by time/create-count/cap-pressure so a reconnect storm does not scan the whole table for every new association. Once a client association exists, subsequent datagrams use a worker-local association cache and an in-loop fast path that refreshes the global TTL timestamp at most once per second while sending directly to the connected upstream socket, avoiding per-packet routing, request-id allocation, payload copying, task spawning, and global association-table lookups.
-- UDP active health is opt-in so opaque KCP/game protocols are not marked unhealthy unless operators configure the expected probe behavior.
-- Script hooks are optional and isolated; the default gateway path avoids script calls.
-- Compression and cache operate on response bodies with size guards.
-- `proxysss tune linux` includes explicit Ubuntu 22.04, 24.04, and 26.04 LTS profiles plus Debian profiles for backlog, BBR/fq, packet budget, and connection churn tuning.
+明文 HTTP I/O event interval 为 8，shared-small 为 16，global queue interval 为 31。H2 每连接用本地 FuturesUnordered 驱动流，每个完成流后让出。静态 freshness 为 2 秒，nice-10 控制运行时重验证并原子发布快照。改变策略前阅读 [性能决策](decisions/linux-performance.md)，验证方法见 [验证流程](VALIDATION.md)。
 
-## Extension points
+## 启动、预热和重载
 
-- `script.entry` main module: `routeHttp`, `routeTcp`, `routeUdp` hooks.
-- `plugins.auto_load_dir`: prioritized plugin modules with optional `<name>.plugin.yaml` sidecars.
-- Admin automation for dynamic route/listener upserts.
+启动加载一个 YAML（默认 proxysss.yaml，支持 -config/--config/-c），校验后探测系统/socket 能力，记录启用与跳过原因。Ubuntu 24.x 使用支持的极限参数，旧/未知系统明确降级；持久 sysctl 修改只由显式 `proxysss tune linux --apply` 执行，保留 SSH 安全、备份与失败回滚。
 
-## Interactive visualization
+监听前预热 hot index/顶层静态对象、小对象完整响应和 sendfile 描述符；每个去重反代/AI 上游池仅预拨一对连接，数字 IP 在池创建时解析。Tokio socket 归创建 reactor 所有，不把启动 runtime 大批 socket 作为其他 runtime 长期 lane。`/healthz` 暴露 warm 状态，重载重新预热。
 
-Open [architecture.html](./architecture.html) in a browser for an animated first-year-student protocol lab. It explains HTTP, TLS/ACME, WebSocket, gRPC, TCP, UDP, KCP, QCP, MQTT/IoT, FTP, AI API streaming, admin reload, listeners, policy chains, extension hooks, and reload boundaries without external JavaScript dependencies.
+默认手动 reload，文件监视需显式启用；主 YAML、主脚本与自动加载插件参与监视。指纹确定 reload/restart 范围，配置通过 ArcSwap 发布。
 
-## Related docs
+| 可热更新 | 需重启 |
+| --- | --- |
+| 路由/上游池、服务发现映射、静态站点、WebDAV、FTP upstream、脚本/插件与相应策略 | HTTP/TLS/H3 bind、admin bind/enabled、TCP/UDP listener 名称与 bind 集合、FTP bind/enabled、TLS mode、日志格式/级别/路径、runtime.performance |
 
-- [CONFIGURATION.md](./CONFIGURATION.md) — field-by-field tutorial
-- [PRODUCTION-HARDENING.md](./PRODUCTION-HARDENING.md) — release gates, benchmark baselines, HA, and watch points
-- [IMPROVEMENT-BACKLOG.md](./IMPROVEMENT-BACKLOG.md) — stability, performance, protocol, security, and operations backlog
-- [../nginx-to-proxysss.md](../nginx-to-proxysss.md) — migration mapping
-- [../ts-how-to-use.md](../ts-how-to-use.md) — scripting guide
+token 认证 API 可持久化允许的路由、listener、TLS、filecloud 和黑名单变更；实际应用边界仍由 reload-plan 决定。explain、capabilities、watched-scripts、routes、reload-plan、nginx-parity 是 agent 检查入口。
 
-## CDN 回源、安全下载与幂等验证
+## 管理、监控和扩展
 
-静态请求先经过当前配置的对端 ACL/限流和回源令牌/签名，再解析真实路径、index/目录、条件请求与 Range，最后读取有界缓存或流式文件。热重载清理静态路由映射并重新预热；启用热重载或管理更新时不复用连接免策略快路径。不可变无策略 H2 热路由保持连接 OnceLock 与 ArcSwap payload。
+admin 默认只监听 127.0.0.1:7777，enable_write_ops=false、expose_config=false。token 经 `proxysss token show/set` 检查和轮换，一般配置展示脱敏。loopback 管理面可引导 ACME/TLS，admin.https 在主 TLS listener 提供相同 `/v1/*` API。
 
-完整说明：[CDN 回源与安全下载](CDN-ORIGIN.md)；面向人的入口：[HTML 文档](cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
+admin.monitor 是独立 HTTPS 只读入口，使用专用密码与 monitor:read 短期会话。登录后仅提供 health、summary、stats、SSL 状态，拒绝写接口，不暴露管理 token、私钥、DNS 凭据或配置写入能力。
 
-`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
+QuickJS 与 swc_ts_fast_strip 内嵌进程，无外部 Node/Deno/tsc。routeHttp/routeTcp/routeUdp 与插件钩子负责可选业务扩展；核心边缘策略保持原生实现。主动健康覆盖 HTTP/TCP 和显式 UDP 探测，被动失败可隔离上游；watchdog 观察关键后台任务，metrics 暴露重启/失败计数。
 
-
-## 安全开关与跨系统性能适配
-
-`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](SECURITY-PERFORMANCE.md)。
-
-
-## 管理界面与内置文档
-
-管理后台默认位于 `http://127.0.0.1:7777/`，使用中文导航、状态概览、表格与表单；原始 JSON 放在可折叠的诊断区。登录、会话、配置脱敏和默认只读限制仍由 Rust 管理 API 执行。管理监听器也提供 `/docs` 与 `/docs.html`，与公共监听器使用同一个内置文档模板。模板和 CSS/JavaScript 编译进单个二进制，不依赖外部前端运行时。公开 HTML 文档与内置文档共用排版与复制按钮。
-
-`README.md` 为英文入口，`README-CN.md` 为对应中文入口。Windows 后台安装使用隐藏启动器与登录自启动；本机管理界面仅监听 loopback，公共 80 首页保持简洁的欢迎文字和 GitHub / GitHub Docs 两个链接。
+管理 HTML/CSS、内置文档和站点资源嵌入二进制。管理 `/docs` 与 `/docs.html` 经过管理传输检查；公开文档导航只链接 HTML。详细配置见 [配置指南](CONFIGURATION.md)，扩展见 [脚本指南](../ts-how-to-use.md)，交付顺序见 [验证与发布](VALIDATION.md)。

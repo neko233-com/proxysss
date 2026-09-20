@@ -29,7 +29,7 @@ go run scripts/verify-production-evidence.go \
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tag": "vX.Y.Z",
   "commit": "<full-tag-commit-sha>",
   "runs": [

@@ -27,6 +27,7 @@ function Invoke-Checked([string]$Name, [scriptblock]$Command) {
 Push-Location $script:ProjectRoot
 try {
     & (Join-Path $PSScriptRoot 'verify-artifact-policy.ps1')
+    Invoke-Checked 'docs' { go run scripts/verify-docs.go }
     Invoke-Checked 'fmt' { cargo fmt --all -- --check }
     if (-not $SkipClippy) { Invoke-Checked 'clippy' { cargo clippy --workspace --all-targets --locked -- -D warnings } }
     $passes = @()
