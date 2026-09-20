@@ -48,3 +48,11 @@ Ubuntu 24 amd64 Docker、6 核 gateway、角色隔离的 1×/2×/4× 全混合�
 候选 52fcfa8 仅将 balanced native TCP/WebSocket owner 从 nice 3 改为 0，保留每允许核心一个 owner、现有 epoll 批次和探测边界；这是全核 owner 实验，与历史被拒绝的四分之一核心 nice 0 池不同。287 项 Linux 测试、Clippy 与构建通过，但严格全混合矩阵未过。4× CDN/HTTPS/大文件吞吐比为 0.963/0.955/0.962，TCP 等负载完成率约 96%，低于 98% 门槛，WebSocket p99 为 nginx 的 1.177 倍。
 
 4× cgroup current/peak 为 proxysss 86335488/283049984、nginx 200294400/383815680 bytes；内存低于 2 倍不抵消性能失败。基线 b6b486a 的矩阵也未全过（4× nginx 透明 QCP 有 3 次错误），不能从单轮差异推断准确因果。候选已撤回为 nice 3，下一步应先区分线程调度等待和数据转发成本，不重复无证据地调整优先级。候选工件 .benchmark/direct-ubuntu24-amd64/goal-realtime-nice0（18 秒活跃、122 秒矩阵 wall），基线 goal-sendfile-cancel；均不是发布通过证据。
+
+## 2026-09-20：只读线程调度诊断，不修改默认参数
+
+运行时基线 e3e0d60（Linux 二进制 SHA256 `8317728fc3b972c6fa34e2426e720acc87c7d707ebfddfd43913a60999b233a1`），Ubuntu 24 amd64 Docker Desktop VM。网关/后端/客户端固定 0–3/4–9/10–21 CPU，两个只读 Go 观察器使用独立 22–23 CPU 与 cgroup，加入各网关 PID namespace；nginx 采 master 和全部 worker。每 50 ms 读取 `/proc/PID/task/TID/schedstat`，未修改宿主机 sysctl。先以单 CPU 双忙线程验证运行和等待计数实际增长，不能因为 `kernel.sched_schedstats=0` 就把可读计数当作无效或零等待。
+
+全部 11 个场景按 1×/2×/4× 混合运行，18 秒有效测量。按记录的绝对开始时间取前一采样点，实际计数窗口约 986–1037 ms，保留两端偏移。4× 等负载两轮 native realtime owner 累计运行 107/113 ms、运行队列等待 33/31 ms；nginx 全部 worker 累计等待约 5.5/2.3 ms。4× 饱和 native realtime owner 的累计等待约 2943 ms，多个线程同时等待，绝不能把这个和请求 p99 等同。该结果支持继续检查线程调度竞争，但不能确定每个长尾请求的根因，也不能据此恢复已拒绝的 nice 0 或密集自旋。
+
+本轮仍未全过：1× 大文件吞吐比 0.946，2× UDP p99 比 2.121，4× 反代 p99 比 1.437，部分其他百分位亦未过。4× current/peak：proxysss 71139328/207339520、nginx 142864384/275632128 bytes。观察器与不同 CPU 包络使它仅能作诊断，不能替代无观测干扰的正式矩阵或三主机发布证据。原始计数、网关数据、每窗口汇总及偏移保存在 `.benchmark/goal-scheduler-e3/`；采集、时间线与汇总源码为 `.tmp/observe-linux-scheduler.go`、`.tmp/benchmark-scheduler-diagnostic.sh`、`.tmp/report-scheduler-diagnostic.go`，应随最终工件归档。当前数据面参数保持不变。
