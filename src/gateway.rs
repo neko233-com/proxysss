@@ -1634,7 +1634,7 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
@@ -5559,6 +5559,8 @@ impl Gateway {
         let mut raw_reverse_request_cache: Option<RawReverseParsedRequestCache> = None;
         let mut raw_reverse_response_cache: Option<RawReverseResponseCache> = None;
         let mut raw_reverse_upstream_response_buffer = Vec::with_capacity(4096);
+        let mut balanced_sendfile_response_sequence =
+            balanced_sendfile_response_sequence_seed(remote_addr);
         let outcome = 'fast_lane: loop {
             let head_end = read_plain_fast_lane_http_prefix(&stream, &mut prefix)
                 .await
@@ -5587,7 +5589,11 @@ impl Gateway {
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached, force_yield).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5780,7 +5786,11 @@ impl Gateway {
                 .filter(|cached| cached.matches(&request))
             {
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached, force_yield).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5841,7 +5851,11 @@ impl Gateway {
                 // keep-alive connections rebuild it on the same TTL boundary.
                 cached.checked_at = Instant::now();
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, cached, force_yield).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, cached, mid_yield).await?;
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
                 served_since_yield = served_since_yield.saturating_add(1);
@@ -5898,7 +5912,11 @@ impl Gateway {
                     sendfile: candidate.sendfile.clone(),
                 };
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
-                send_connection_static_fast_path(&mut stream, &cached, force_yield).await?;
+                let mid_yield = balanced_sendfile_mid_yield_for_next_response(
+                    &mut balanced_sendfile_response_sequence,
+                    force_yield,
+                );
+                send_connection_static_fast_path(&mut stream, &cached, mid_yield).await?;
                 static_response_cache = Some(cached);
                 served_any = true;
                 discard_fast_lane_http_head(&mut prefix, head_end);
@@ -13069,18 +13087,7 @@ async fn sendfile_all_async(
 
     while sent < len {
         let chunk_start = sent;
-        // Sparse balanced downloads share the pinned HTTP owner with small
-        // responses. A writable sendfile can otherwise consume a whole large
-        // object without polling those siblings. Dense transfers already hit
-        // socket backpressure, so retain their larger syscall budget.
-        let dense_transfer_pressure =
-            ACTIVE_SENDFILE_TRANSFERS.load(Ordering::Relaxed) > data_plane_cores.saturating_mul(4);
-        let chunk_bytes = if cooperative_mid_yield && dense_transfer_pressure {
-            configured_chunk_bytes
-        } else {
-            max_chunk_bytes
-        };
-        let chunk_end = sent.saturating_add(chunk_bytes).min(len);
+        let chunk_end = sent.saturating_add(max_chunk_bytes).min(len);
         match sendfile_until_blocked(out_fd, in_fd, &mut offset, &mut sent, chunk_end) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -13104,7 +13111,7 @@ async fn sendfile_all_async(
                 cooperative_mid_yield,
                 dense_transfer_pressure,
                 sent.saturating_sub(chunk_start),
-                chunk_bytes,
+                max_chunk_bytes,
             ) {
                 // Keep small-file and realtime tasks runnable without paying
                 // Linux timer-wheel granularity after every sendfile chunk.
@@ -13464,6 +13471,21 @@ fn udp_runtime_nice_for(profile: RuntimePerformanceTrafficProfile) -> i32 {
         RuntimePerformanceTrafficProfile::Balanced => 3,
         RuntimePerformanceTrafficProfile::Bulk => 12,
     }
+}
+
+fn balanced_sendfile_mid_yield_for_next_response(sequence: &mut usize, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    *sequence = sequence.wrapping_add(1);
+    !sequence.is_multiple_of(3)
+}
+
+fn balanced_sendfile_response_sequence_seed(remote_addr: SocketAddr) -> usize {
+    // Linux ephemeral source ports advance across the accept fanout. Spread
+    // the three response phases across connections so large-file owners do
+    // not all hit the 8 MiB cooperative yield in the same scheduler wave.
+    usize::from(remote_addr.port()) % 3
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -24349,6 +24371,42 @@ mod tests {
         );
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Bulk;
         assert_eq!(static_sendfile_fast_path_threshold_bytes(&config), 0);
+        let mut sendfile_sequence = 0;
+        assert!(balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(!balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            true
+        ));
+        assert!(!balanced_sendfile_mid_yield_for_next_response(
+            &mut sendfile_sequence,
+            false
+        ));
+        assert_eq!(sendfile_sequence, 3);
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30000".parse().expect("phase zero address")
+            ),
+            0
+        );
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30001".parse().expect("phase one address")
+            ),
+            1
+        );
+        assert_eq!(
+            balanced_sendfile_response_sequence_seed(
+                "127.0.0.1:30002".parse().expect("phase two address")
+            ),
+            2
+        );
     }
 
     #[test]

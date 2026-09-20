@@ -56,3 +56,11 @@ Ubuntu 24 amd64 Docker、6 核 gateway、角色隔离的 1×/2×/4× 全混合�
 全部 11 个场景按 1×/2×/4× 混合运行，18 秒有效测量。按记录的绝对开始时间取前一采样点，实际计数窗口约 986–1037 ms，保留两端偏移。4× 等负载两轮 native realtime owner 累计运行 107/113 ms、运行队列等待 33/31 ms；nginx 全部 worker 累计等待约 5.5/2.3 ms。4× 饱和 native realtime owner 的累计等待约 2943 ms，多个线程同时等待，绝不能把这个和请求 p99 等同。该结果支持继续检查线程调度竞争，但不能确定每个长尾请求的根因，也不能据此恢复已拒绝的 nice 0 或密集自旋。
 
 本轮仍未全过：1× 大文件吞吐比 0.946，2× UDP p99 比 2.121，4× 反代 p99 比 1.437，部分其他百分位亦未过。4× current/peak：proxysss 71139328/207339520、nginx 142864384/275632128 bytes。观察器与不同 CPU 包络使它仅能作诊断，不能替代无观测干扰的正式矩阵或三主机发布证据。原始计数、网关数据、每窗口汇总及偏移保存在 `.benchmark/goal-scheduler-e3/`；采集、时间线与汇总源码为 `.tmp/observe-linux-scheduler.go`、`.tmp/benchmark-scheduler-diagnostic.sh`、`.tmp/report-scheduler-diagnostic.go`，应随最终工件归档。当前数据面参数保持不变。
+
+## 2026-09-20：稀疏 balanced direct sendfile 每 2 MiB 让出，未接受
+
+新发生器固定 7681946 的四角色 CPU 诊断完成 18 波、54 个角色窗口，198 个原始场景样本零错误；4/6/12 核与独立观察器 CPU 22–23 的资源配置只用于定位，不能替代标准 6 核网关门槛。等负载 sendfile reactor 未观察到运行增量，大文件在 HTTP owner 直接发送。源码原有 16 MiB 公平预算与夹具大小相同，中途让出条件无法约束这类完整响应。客户端大文件仍可能占满其单 CPU 分区，不能宣称发生器约束已全部排除。
+
+候选 cb5f4df 将非密集 direct sendfile 改为每 2 MiB 让出，移除按源端口及每三次响应选择让出的状态；超过每核四条活跃传输时保留 16 MiB 与 EAGAIN 边界，reactor 的完整响应事件预算不变。333 项 Linux 测试、格式与 Clippy 通过，但 Ubuntu 24 amd64 Docker 标准 6/6/12 核全混合 1×/2×/4× 验证失败（18 秒活跃、180 秒矩阵 wall）。198 条原始样本零错误；大文件吞吐比为 0.702/0.637/0.722，仍未胜出。静态 HTTP p99 改善，但 2× 游戏 TCP p50/p95 比为 1.191/1.137，WebSocket p95/p99 在 2× 为 1.119/1.018、4× 为 1.132/1.115，不能接受局部改善伴随长连接延迟退步。
+
+4× cgroup current/peak 为 proxysss 84430848/283869184、nginx 208941056/381706240 bytes；内存通过不能抵消性能失败。候选已撤回。基线自身也未全过，两次矩阵的参考吞吐与等负载目标有变化，不能把单轮比值变化当作精确因果证据；下一次应整批检查 HTTP/direct sendfile 与实时 owner 调度关系，不重复单独缩小直接发送切片。诊断工件 `.benchmark/goal-rolecpu-768/`，候选工件 `.benchmark/direct-ubuntu24-amd64/goal-direct-fair-2m/`。
