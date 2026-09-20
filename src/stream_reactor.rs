@@ -536,13 +536,6 @@ fn relay_read(
             Err(_) => return RelayReadOutcome::Failed,
         };
         if sent == read {
-            // A short nonblocking read drained the bytes available at this
-            // instant. Level-triggered epoll reports later data or EOF, so a
-            // second recv only to observe EAGAIN is unnecessary for small
-            // game/WebSocket frames. Full buffers retain bounded draining.
-            if read < buffer.len() {
-                return RelayReadOutcome::Open;
-            }
             continue;
         }
 
