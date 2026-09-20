@@ -2,6 +2,18 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：balanced 下载与 realtime 共用 native owner，未接受
+
+候选 a9f5c56 将 balanced 大文件交给已预热的 nice 3 realtime epoll owner，取消额外 sendfile 线程池和 HTTP owner 上的直接大段发送。每轮先消费整个实时事件批次，再从去重 FIFO 推进一个下载、最多 1 MiB；下载接收每轮 32 个，取消队列每轮 256 项，旧事件先于新注册处理。就绪节点内嵌在作业状态，完成/取消以 O(1) 摘除，保持文件版本、背压和完成通知语义。该形态不同于此前把 native relay 整批交给 HTTP Tokio runtime 的实验。
+
+Ubuntu 24.04 x86_64 功能入口通过两轮各 351 项测试、Clippy、格式、文档/Go 和 CLI 检查。新增真实 socket 测试覆盖同一 owner 上的下载背压、32 次双向转发、半关闭后的尾数据、取消及后续完整下载；另覆盖下载 FIFO 去重、轮转及取消后 fd 槽位复用。真实 taskset=0,23 网关使用 2 个 HTTP owner 与 2 个共享 owner，没有独立 sendfile owner，11 个线程均未越界，HTTP/TCP/UDP 正文验证通过。功能通过不构成性能准入。
+
+同提交的无记录器全混合 1×/2×/4× 矩阵失败：Ubuntu 24.04 native-amd64 Docker Desktop VM，标准 6/6/12 核。大文件吞吐分别只有 nginx 的 0.475/0.306/0.244 倍；1×/2× SSE p99 比为 1.412/1.907，2× UDP p99 为 2.341，4× TCP p50 为 1.280，WebSocket p50/p95/p99 为 1.105/1.159/1.108。18 份原始文件共 198 个样本零错误，132 个等负载样本最低完成率 0.998022412657。4× cgroup current/peak bytes：proxysss 88199168/228802560，nginx 209932288/373411840。
+
+4× 小静态 p99 比虽降为 0.649，但同轮大文件等负载仅 24 ops/s，前一基线矩阵为 73 ops/s；不能把较轻大文件竞争下的局部尾延迟当作已证明的网关收益。当前证据只否定这一共享资源分配，不证明所有共享 reactor 设计不可行；进一步设计应先量化实时批次与下载获得的处理机会，不直接重复调小切片、提高优先级或恢复被拒绝的独立线程池。
+
+候选已完整撤回，运行时代码恢复到 6b969df；此前 CPU 资源修复和功能覆盖保留。18 秒活跃、163 秒矩阵 wall、334 秒总耗时。原始工件 `.benchmark/direct-ubuntu24-amd64/goal-shared-native/`，功能日志与原始样本审计器 `.benchmark/shared-native-functional/`，固定二进制 `.benchmark/goal-wss/binaries/proxysss-a9f5c56`，SHA256 `51c76b5165349b158adfe8bbbf69397fa03f965e237ca4c63967c276eb324cf9`。这些是失败实验工件，未进入 Windows 验证、push 或发布。
+
 ## 2026-09-21：CPU 资源语义修复，性能门槛仍未通过
 
 提交 7dc3e82 修复 taskset 启动范围被外层 cpuset 扩大、数据面忽略 quota 预算的问题。349 项 Linux 测试连续两轮、Clippy/格式/文档/CLI 和真实网关 CPU 探针通过；额外 cpuset=0–3、taskset=0,3、quota=1.5/0.5 CPU 容器中，基础预算均为 1，HTTP/native relay/sendfile owner 各 1，所有线程范围和 HTTP/TCP/UDP 正文验证通过。功能证据保存在 `.benchmark/cpu-resources-verification/`。
