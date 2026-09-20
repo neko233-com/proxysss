@@ -36,3 +36,9 @@
 Ubuntu 24 的 MSS=1460 独立 socket 复现中，初始87040 bytes，自动调优可增长到4194304；旧增大/恢复序列后的缓冲始终87040。真实网关复验固定1 CPU、两条 MSS=1460 keep-alive 连接并发两轮64 MiB下载，使用 NETLINK_INET_DIAG 读取服务端缓冲且验证完整正文。旧网关 dbe1382 的一条连接始终87040，另一条由522240变为425984；修复版两条都从87040自然增长到478720并在复用时保留。此例证明跨请求状态修复，单项耗时不作为性能收益或发布证据。
 
 本地复现工件：.tmp/sndbuf-autotune-mtu1500-probe.go/.log、.tmp/sendfile-keepalive-probe.go、.tmp/goal-sendfile-autotune-{baseline,fixed}-probe.log。原始程序与所有数据应随最终证据归档；完整混合回归仍是保留修复并发布的必要检查。
+
+## 2026-09-20：balanced 临时 TCP_NOTSENT_LOWAT 256 KiB，未接受
+
+候选 1934bc4 在活跃传输超过半数数据核时临时限制未发送队列，完成/取消恢复原值（含 0 的命名空间继承语义），不改变 SO_SNDBUF。285 项 Linux 测试、Clippy 与两条 keep-alive 完整下载验证通过，但不能证明跨场景性能收益。
+
+Ubuntu 24 amd64 Docker、6 核 gateway、角色隔离的 1×/2×/4× 全混合矩阵共 18 秒有效测量、125 秒矩阵 wall time。各场景零错误，CDN 吞吐比为 0.994/0.946/0.963；4× 游戏 TCP p50、普通 TCP p95、WebSocket p99 的延迟比为 1.320/1.155/1.176（大于 1 更慢）。基线 1d776d0 也未全过，因此不能用单轮差异推断精确因果；候选没有获得准入证据，已撤回，保留移除 SO_SNDBUF 用户锁的正确性修复。工件：.benchmark/direct-ubuntu24-amd64/goal-sendfile-lowat256 与 goal-sendfile-autotune；这两次失败均不能作为发布成功证据。
