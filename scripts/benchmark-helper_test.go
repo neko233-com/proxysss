@@ -446,6 +446,32 @@ func TestEqualLoadPlanAllowsTargetBelowConnectionCount(t *testing.T) {
 	}
 }
 
+func TestEqualLoadPlanExcludesCenteredDeadlineSlot(t *testing.T) {
+	for _, protocol := range []string{"http", "sse"} {
+		dir := t.TempDir()
+		results, plan := filepath.Join(dir, "rows.json"), filepath.Join(dir, "plan.txt")
+		writeBenchRows(t, results, []BenchRow{
+			{Scenario: "static-large", Gateway: "nginx", Protocol: protocol, Concurrency: 48, OpsPerSec: 50},
+			{Scenario: "static-large", Gateway: "proxysss", Protocol: protocol, Concurrency: 48, OpsPerSec: 50},
+		})
+		if err := runWriteEqualLoadPlan([]string{"--results", results, "--out", plan, "--fraction", "0.25", "--duration-secs", "1"}); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// At 12.5 ops/s, centered slots are 0.04, 0.12, ..., 0.92, 1.00.
+		// Only the first twelve start strictly before the one-second deadline.
+		if string(raw) != "static-large|3840000|12.000000\n" {
+			t.Fatalf("impossible boundary request counted: %s", raw)
+		}
+		if err := runWriteEqualLoadPlan([]string{"--results", results, "--out", plan, "--fraction", "0.001", "--duration-secs", "1"}); err == nil {
+			t.Fatal("an empty schedule must not invent one mandatory request")
+		}
+	}
+}
+
 func TestAllScenariosEqualLoadGateRequiresTargetCompletion(t *testing.T) {
 	dir := t.TempDir()
 	results := filepath.Join(dir, "equal-load.json")

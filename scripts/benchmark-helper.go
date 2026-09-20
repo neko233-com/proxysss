@@ -1062,8 +1062,9 @@ func runWriteEqualLoadPlan(args []string) error {
 		if proxy.Protocol == "http" || proxy.Protocol == "sse" {
 			// HTTP/SSE workers use centered uniform phase offsets. Across all
 			// workers that produces one aggregate slot every interval/concurrency
-			// without a request exactly at the measurement boundary.
-			scheduledTotal = (durationMicros*int64(concurrency) + intervalMicros/2) / intervalMicros
+			// A half-integer aggregate puts the final centered slot exactly at
+			// the deadline. That slot cannot execute: break ties downward.
+			scheduledTotal = (durationMicros*int64(concurrency) + (intervalMicros-1)/2) / intervalMicros
 		} else {
 			// Realtime workers intentionally tick together. Their first operation
 			// is one full interval after measurement_start. Reserve one
@@ -1091,7 +1092,7 @@ func runWriteEqualLoadPlan(args []string) error {
 			scheduledTotal = ((executableMicros - 1) / intervalMicros) * int64(concurrency)
 		}
 		if scheduledTotal < 1 {
-			scheduledTotal = 1
+			return fmt.Errorf("equal-load plan %s has no executable operation; increase duration or offered rate", scenario)
 		}
 		actualTarget := float64(scheduledTotal) / float64(*durationSecs)
 		lines = append(lines, fmt.Sprintf("%s|%d|%.6f", scenario, intervalMicros, actualTarget))

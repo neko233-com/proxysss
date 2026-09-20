@@ -27,7 +27,7 @@ KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
 
 测量包含小静态、大文件、CDN 热更新、HTTPS 静态、HTTP 反代、SSE、WebSocket、游戏 TCP、通用 TCP、UDP；本机严格入口还包含透明 QCP。QCP 只证明 UDP 转发，不证明解析或终止 QCP 帧。New API 供应商路由与 KCP 特殊封装不参与默认 nginx 对标。
 
-默认每尺度 1 次饱和、2 次顺序相反的等负载采样，共 18 秒活跃测量，上限 20 秒。等负载取较慢网关饱和速率的 25%，延迟使用两次样本中位数；双方完成至少 98% 可执行目标。HTTP/SSE 使用均匀错峰，UDP/QCP、TCP、WebSocket 分别预留 1/2/5 ms 完成时间。每波提前预留测量预算，进程宽限期不能无限延长。
+默认每尺度 1 次饱和、2 次顺序相反的等负载采样，共 18 秒活跃测量，上限 20 秒。等负载取较慢网关饱和速率的 25%，延迟使用两次样本中位数；双方完成至少 98% 可执行目标。HTTP/SSE 均匀错峰计划只计严格早于截止点的请求；半整数总量不能把恰在截止点的请求向上计入，没有可执行请求的计划直接报错。HTTP/SSE 使用均匀错峰，UDP/QCP、TCP、WebSocket 分别预留 1/2/5 ms 完成时间。每波提前预留测量预算，进程宽限期不能无限延长。
 
 预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 `TOKIO_WORKER_THREADS`，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；饱和测试使用全部 client cpuset。官方 fixture、解析和验收工具使用 Go 或原生编译工具。
 
