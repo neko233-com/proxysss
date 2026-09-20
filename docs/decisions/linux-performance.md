@@ -28,3 +28,11 @@
 以 dbe1382 为基线，仅把 raw WSS TLS 转发单方向的连续 poll 上限缩为 8。Ubuntu 24 amd64 Docker，gateway/backend/client 使用独立 0-3/4-7/8-15 cpuset；4096 条 WSS，两个相反候选顺序、每网关每轮 5 秒。两版都通过 284 项 Linux 测试与 Clippy，压测双方错误为 0，但候选吞吐中位数 89993.5 ops/s，低于基线 95140.8；p95 从 264.914 增至 289.979 ms，p99 从 306.605 增至 331.665 ms。nginx p99 为 83.626/83.598 ms，基本稳定。proxysss 活跃 current/peak 约 187/190 MB，两版近似，不能以更小批次为名接受吞吐/延迟退化。
 
 候选已完整撤回，未进入发布或混合矩阵；这组单项失败足以拒绝候选，不证明根因已定位。基线与候选都有很低的 p50 和较高的 p95/p99，下一步应检查高并发调度与压测端分布，不重复降低同一转发预算。工件：.benchmark/goal-wss/sat-dbe1382-summary.{json,md}、sat-poll8-summary.{json,md}、runs/isolated-websocket/sat-{dbe1382,poll8}-r{1,2}；补丁和二进制 SHA 见 wss-poll8-provenance.json。
+
+## 2026-09-20：移除静态响应的临时 SO_SNDBUF，保留自动调优
+
+早期 balanced sendfile 曾在活跃传输超过半数核心时请求 1 MiB SO_SNDBUF，响应完成/取消再写回旧数字。该做法不能恢复 Linux 自动调优：设置 SO_SNDBUF 会保留用户锁，wmem_max 还可能令请求的增大被压低。这一发现取代本页历史原文中的 scoped 1 MiB 队列建议；当前静态路径不再修改 SO_SNDBUF，背压仍由 sendfile 的 EAGAIN/readiness、有限并行 owner 和有界缓存/描述符池提供。依据：[Linux tcp_wmem](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)。
+
+Ubuntu 24 的 MSS=1460 独立 socket 复现中，初始87040 bytes，自动调优可增长到4194304；旧增大/恢复序列后的缓冲始终87040。真实网关复验固定1 CPU、两条 MSS=1460 keep-alive 连接并发两轮64 MiB下载，使用 NETLINK_INET_DIAG 读取服务端缓冲且验证完整正文。旧网关 dbe1382 的一条连接始终87040，另一条由522240变为425984；修复版两条都从87040自然增长到478720并在复用时保留。此例证明跨请求状态修复，单项耗时不作为性能收益或发布证据。
+
+本地复现工件：.tmp/sndbuf-autotune-mtu1500-probe.go/.log、.tmp/sendfile-keepalive-probe.go、.tmp/goal-sendfile-autotune-{baseline,fixed}-probe.log。原始程序与所有数据应随最终证据归档；完整混合回归仍是保留修复并发布的必要检查。

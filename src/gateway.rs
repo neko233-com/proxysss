@@ -1543,8 +1543,6 @@ const STATIC_SENDFILE_BALANCED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
@@ -1624,8 +1622,6 @@ static STATIC_SENDFILE_REACTOR_CPU_DIVISOR: AtomicUsize = AtomicUsize::new(1);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_MAX_CHUNK_BYTES: AtomicU64 =
     AtomicU64::new(STATIC_SENDFILE_SMALL_CHUNK_BYTES);
-#[cfg(target_os = "linux")]
-static STATIC_SENDFILE_SCOPED_SNDBUF_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 static STATIC_SENDFILE_REACTOR_NICE: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "linux")]
@@ -1934,19 +1930,6 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
             RuntimePerformanceTrafficProfile::Bulk => STATIC_SENDFILE_BULK_CHUNK_BYTES,
         };
         STATIC_SENDFILE_MAX_CHUNK_BYTES.store(sendfile_chunk_bytes, Ordering::Relaxed);
-        STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.store(
-            if config.runtime.performance.enabled
-                && matches!(
-                    config.runtime.performance.traffic_profile,
-                    RuntimePerformanceTrafficProfile::Balanced
-                )
-            {
-                STATIC_SENDFILE_BALANCED_SNDBUF_BYTES
-            } else {
-                0
-            },
-            Ordering::Relaxed,
-        );
         STATIC_SENDFILE_REACTOR_NICE.store(
             sendfile_reactor_nice_for(config.runtime.performance.traffic_profile),
             Ordering::Relaxed,
@@ -12716,15 +12699,10 @@ async fn sendfile_all_async(
     let transfer_guard = ActiveSendfileTransferGuard::enter();
     let out_fd = stream.as_raw_fd();
     let data_plane_cores = adaptive_data_plane_workers(1);
-    let _send_buffer_guard =
-        sendfile_pressure_should_raise_buffer(transfer_guard.active, data_plane_cores)
-            .then(|| {
-                ScopedSendBuffer::apply(
-                    out_fd,
-                    STATIC_SENDFILE_SCOPED_SNDBUF_BYTES.load(Ordering::Relaxed),
-                )
-            })
-            .flatten();
+    // Keep Linux send-buffer autotuning intact across keep-alive downloads.
+    // SO_SNDBUF sets a persistent user lock; restoring its numeric value does
+    // not restore autotuning, and wmem_max can even turn a requested raise
+    // into a smaller queue. EAGAIN/readiness remain the backpressure boundary.
     let mut offset: libc::off_t = 0;
     let mut sent = 0_u64;
     let configured_chunk_bytes = STATIC_SENDFILE_MAX_CHUNK_BYTES.load(Ordering::Relaxed);
@@ -12857,11 +12835,6 @@ fn sendfile_until_blocked(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn sendfile_pressure_should_raise_buffer(active_transfers: usize, data_plane_cores: usize) -> bool {
-    active_transfers > data_plane_cores.max(1).div_ceil(2)
-}
-
-#[cfg(any(test, target_os = "linux"))]
 fn sendfile_should_cooperative_yield(
     qos_enabled: bool,
     cooperative_mid_yield: bool,
@@ -12905,74 +12878,6 @@ fn sendfile_reactor_active_workers(
         reactor_workers.max(1).div_ceil(2)
     } else {
         reactor_workers.max(1)
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct ScopedSendBuffer {
-    fd: std::os::fd::RawFd,
-    restore_request_bytes: libc::c_int,
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn scoped_send_buffer_should_raise(current_kernel_bytes: i32, request_bytes: i32) -> bool {
-    request_bytes > 0 && current_kernel_bytes < request_bytes.saturating_mul(2)
-}
-
-#[cfg(target_os = "linux")]
-impl ScopedSendBuffer {
-    fn apply(fd: std::os::fd::RawFd, request_bytes: usize) -> Option<Self> {
-        if request_bytes == 0 {
-            return None;
-        }
-        let mut current: libc::c_int = 0;
-        let mut current_len = std::mem::size_of_val(&current) as libc::socklen_t;
-        let read = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &mut current as *mut _ as *mut libc::c_void,
-                &mut current_len,
-            )
-        };
-        if read != 0 {
-            return None;
-        }
-        let request = libc::c_int::try_from(request_bytes).ok()?;
-        if !scoped_send_buffer_should_raise(current, request) {
-            return None;
-        }
-        let changed = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &request as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&request) as libc::socklen_t,
-            )
-        };
-        (changed == 0).then_some(Self {
-            fd,
-            // Linux reports the doubled kernel value from SO_SNDBUF. Passing
-            // half restores the original requested queue target.
-            restore_request_bytes: (current / 2).max(1),
-        })
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ScopedSendBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                &self.restore_request_bytes as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&self.restore_request_bytes) as libc::socklen_t,
-            );
-        }
     }
 }
 
@@ -23552,15 +23457,6 @@ mod tests {
 
     #[test]
     fn linux_http_and_realtime_shards_adapt_to_profile_and_detected_cores() {
-        assert!(scoped_send_buffer_should_raise(128 * 1024, 1024 * 1024));
-        assert!(!scoped_send_buffer_should_raise(
-            2 * 1024 * 1024,
-            1024 * 1024
-        ));
-        assert!(!sendfile_pressure_should_raise_buffer(4, 8));
-        assert!(sendfile_pressure_should_raise_buffer(5, 8));
-        assert!(!sendfile_pressure_should_raise_buffer(1, 1));
-        assert!(sendfile_pressure_should_raise_buffer(2, 1));
         assert!(sendfile_should_cooperative_yield(true, false, false, 1, 16));
         assert!(sendfile_should_cooperative_yield(
             false, true, false, 16, 16
