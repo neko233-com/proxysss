@@ -53,7 +53,122 @@ fn static_snapshot_survives_source_truncation_and_overwrite() {
                     .await
                     .is_err()
             );
+            drop(snapshot);
+            drop(updated);
+            // Isolated process: saturate accounting without allocating 320 MiB.
+            // Cold downloads must stream successfully, never wait or return 500.
+            let held = static_snapshot::global_budget()
+                .reserve(320 * 1024 * 1024)
+                .unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let cache = DashMap::new();
+            let cache_bytes = AtomicU64::new(0);
+            let locks = DashMap::new();
+            let response = dispatch_static_file_content(
+                &path,
+                &metadata,
+                &Method::GET,
+                &HeaderMap::new(),
+                &cache,
+                &cache_bytes,
+                &locks,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            assert!(response.body.is_empty());
+            assert_eq!(
+                response
+                    .stream_body
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .as_ref(),
+                original
+            );
+            assert!(cache.is_empty());
+            assert!(locks.is_empty());
+            assert_eq!(cache_bytes.load(Ordering::Relaxed), 0);
+            drop(held);
+            assert_eq!(
+                read_static_file_snapshot(&path, &metadata)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                original
+            );
         });
+}
+
+#[tokio::test]
+async fn concurrent_static_eviction_accounts_each_entry_once() {
+    let root = TestDir::new("static-cache-eviction-accounting");
+    let path = root.join("file.bin");
+    std::fs::write(&path, b"old-body").unwrap();
+    let cache = DashMap::new();
+    let used = AtomicU64::new(0);
+    cached_static_file_body(
+        &path,
+        &std::fs::metadata(&path).unwrap(),
+        &cache,
+        &used,
+        &DashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(used.load(Ordering::Relaxed), 8);
+    std::fs::write(&path, b"replacement-body").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let key = path.to_string_lossy().to_string();
+    let barrier = std::sync::Barrier::new(24);
+    std::thread::scope(|scope| {
+        for _ in 0..24 {
+            scope.spawn(|| {
+                barrier.wait();
+                evict_stale_static_cache_entry(
+                    &key,
+                    &metadata,
+                    metadata.modified().ok(),
+                    &cache,
+                    &used,
+                );
+            });
+        }
+    });
+    assert!(cache.is_empty());
+    assert_eq!(used.load(Ordering::Relaxed), 0);
+    cached_static_file_body(&path, &metadata, &cache, &used, &DashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(used.load(Ordering::Relaxed), metadata.len());
+    std::fs::write(&path, b"sendfile-replacement").unwrap();
+    cached_static_sendfile(&path, &std::fs::metadata(&path).unwrap(), &cache, &used).unwrap();
+    assert_eq!(used.load(Ordering::Relaxed), 0);
+    assert!(cache.get(&key).unwrap().body.is_empty());
+}
+
+#[test]
+fn static_fill_lock_retains_waiters_and_cleans_cancelled_fill() {
+    let registry = DashMap::new();
+    let lock = Arc::new(TokioMutex::new(()));
+    registry.insert("file".to_owned(), lock.clone());
+    let first = StaticFillLock {
+        key: "file".into(),
+        lock: lock.clone(),
+        registry: &registry,
+    };
+    let waiter = StaticFillLock {
+        key: "file".into(),
+        lock,
+        registry: &registry,
+    };
+    drop(first);
+    assert_eq!(registry.len(), 1);
+    drop(waiter);
+    assert!(registry.is_empty());
 }
 
 #[test]

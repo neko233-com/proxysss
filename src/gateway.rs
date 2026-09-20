@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 #[path = "static_ranges.rs"]
 mod static_ranges;
+#[path = "static_snapshot.rs"]
+mod static_snapshot;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -8450,7 +8452,13 @@ impl Gateway {
                         .get(&key)
                         .is_some_and(|entry| entry.sendfile.is_some() && entry.body.is_empty());
                     let result = if sendfile_entry {
-                        cached_static_sendfile(&target, &metadata, &static_file_cache).map(|_| ())
+                        cached_static_sendfile(
+                            &target,
+                            &metadata,
+                            &static_file_cache,
+                            &static_file_cache_bytes,
+                        )
+                        .map(|_| ())
                     } else {
                         cached_static_file_body(
                             &target,
@@ -12547,16 +12555,19 @@ async fn resolve_large_static_fast_path_candidate(
         && !use_sendfile
         && metadata.len() < STATIC_STREAM_THRESHOLD_BYTES
     {
-        Some(
-            cached_static_file_body(
-                &target,
-                &metadata,
-                static_file_cache,
-                static_file_cache_bytes,
-                static_file_load_locks,
-            )
-            .await?,
+        match cached_static_file_body(
+            &target,
+            &metadata,
+            static_file_cache,
+            static_file_cache_bytes,
+            static_file_load_locks,
         )
+        .await
+        {
+            Ok(body) => Some(body),
+            Err(error) if error.is::<static_snapshot::BudgetFull>() => None,
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -12565,6 +12576,7 @@ async fn resolve_large_static_fast_path_candidate(
             &target,
             &metadata,
             static_file_cache,
+            static_file_cache_bytes,
         )?)
     } else {
         None
@@ -19596,17 +19608,27 @@ async fn dispatch_static_file_content(
             Some(file_streaming_body(file.take(metadata.len()))),
         )
     } else {
-        (
-            cached_static_file_body(
-                target,
-                metadata,
-                static_file_cache,
-                static_file_cache_bytes,
-                static_file_load_locks,
-            )
-            .await?,
-            None,
+        match cached_static_file_body(
+            target,
+            metadata,
+            static_file_cache,
+            static_file_cache_bytes,
+            static_file_load_locks,
         )
+        .await
+        {
+            Ok(body) => (body, None),
+            Err(error) if error.is::<static_snapshot::BudgetFull>() => {
+                let file = tokio::fs::File::open(target)
+                    .await
+                    .context("failed opening streaming static fallback")?;
+                (
+                    Bytes::new(),
+                    Some(file_streaming_body(file.take(metadata.len()))),
+                )
+            }
+            Err(error) => return Err(error),
+        }
     };
     let mut response = GatewayHttpResponse::bytes(
         StatusCode::OK,
@@ -19649,6 +19671,22 @@ fn build_static_http1_keep_alive_response(
     Some(Bytes::from(response))
 }
 
+struct StaticFillLock<'a> {
+    key: String,
+    lock: Arc<TokioMutex<()>>,
+    registry: &'a DashMap<String, Arc<TokioMutex<()>>>,
+}
+
+impl Drop for StaticFillLock<'_> {
+    fn drop(&mut self) {
+        // Keep the same lock while another fill is waiting. Remove the final
+        // handle on success, error, or cancellation, without evicting a newer lock.
+        self.registry.remove_if(&self.key, |_, lock| {
+            Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(lock) == 2
+        });
+    }
+}
+
 async fn cached_static_file_body(
     target: &Path,
     metadata: &std::fs::Metadata,
@@ -19670,24 +19708,25 @@ async fn cached_static_file_body(
     );
 
     let load_lock = if metadata.len() <= STATIC_STREAM_THRESHOLD_BYTES {
-        Some(
-            static_file_load_locks
+        Some(StaticFillLock {
+            key: key.clone(),
+            registry: static_file_load_locks,
+            lock: static_file_load_locks
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(TokioMutex::new(())))
                 .clone(),
-        )
+        })
     } else {
         None
     };
     let guard = match &load_lock {
-        Some(lock) => Some(lock.lock().await),
+        Some(lock) => Some(lock.lock.lock().await),
         None => None,
     };
 
     if load_lock.is_some() {
         if let Some(body) = fresh_static_cache_body(&key, metadata, modified, static_file_cache) {
             drop(guard);
-            static_file_load_locks.remove(&key);
             return Ok(body);
         }
         evict_stale_static_cache_entry(
@@ -19703,38 +19742,39 @@ async fn cached_static_file_body(
     let body_len = body.len() as u64;
     if body_len <= STATIC_STREAM_THRESHOLD_BYTES
         && static_file_cache.len() < STATIC_FILE_CACHE_MAX_ENTRIES
+        && static_snapshot::try_reserve(
+            static_file_cache_bytes,
+            body_len,
+            STATIC_FILE_CACHE_MAX_BYTES,
+        )
     {
-        let current = static_file_cache_bytes.load(Ordering::Relaxed);
-        if current.saturating_add(body_len) <= STATIC_FILE_CACHE_MAX_BYTES {
-            let content_type_value = static_content_type(target);
-            let content_type = HeaderValue::from_static(content_type_value);
-            let content_length = HeaderValue::from_str(&metadata.len().to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("0"));
-            let http1_keep_alive_response =
-                build_static_http1_keep_alive_response(content_type_value, metadata.len(), &body);
-            let sendfile = static_file_cache
-                .get(&key)
-                .and_then(|entry| entry.sendfile.clone());
-            static_file_cache.insert(
-                key.clone(),
-                CachedStaticFile {
-                    len: metadata.len(),
-                    modified,
-                    body: body.clone(),
-                    sendfile,
-                    content_type,
-                    content_length,
-                    http1_keep_alive_response,
-                    freshness: Arc::new(StaticCacheFreshness::new()),
-                },
-            );
-            static_file_cache_bytes.fetch_add(body_len, Ordering::Relaxed);
+        let content_type_value = static_content_type(target);
+        let content_type = HeaderValue::from_static(content_type_value);
+        let content_length = HeaderValue::from_str(&metadata.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0"));
+        let http1_keep_alive_response =
+            build_static_http1_keep_alive_response(content_type_value, metadata.len(), &body);
+        let sendfile = static_file_cache
+            .get(&key)
+            .and_then(|entry| entry.sendfile.clone());
+        let replaced = static_file_cache.insert(
+            key.clone(),
+            CachedStaticFile {
+                len: metadata.len(),
+                modified,
+                body: body.clone(),
+                sendfile,
+                content_type,
+                content_length,
+                http1_keep_alive_response,
+                freshness: Arc::new(StaticCacheFreshness::new()),
+            },
+        );
+        if let Some(replaced) = replaced {
+            static_file_cache_bytes.fetch_sub(replaced.body.len() as u64, Ordering::Relaxed);
         }
     }
     drop(guard);
-    if load_lock.is_some() {
-        static_file_load_locks.remove(&key);
-    }
     Ok(body)
 }
 
@@ -19746,6 +19786,7 @@ async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) 
             "static file exceeds bounded snapshot size; use streaming"
         ));
     }
+    let reservation = static_snapshot::global_budget().reserve(expected_len)?;
     let target = target.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
@@ -19764,7 +19805,7 @@ async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) 
         if !unchanged(&file.metadata()?) {
             return Err(anyhow!("static file changed during snapshot read"));
         }
-        Ok(Bytes::from(data))
+        Ok(reservation.into_bytes(data))
     })
     .await
     .context("static snapshot task failed")?
@@ -19794,14 +19835,11 @@ fn evict_stale_static_cache_entry(
     static_file_cache: &DashMap<String, CachedStaticFile>,
     static_file_cache_bytes: &AtomicU64,
 ) {
-    let old_len = match static_file_cache.get(key) {
-        Some(entry) if entry.len != metadata.len() || entry.modified != modified => {
-            entry.body.len() as u64
-        }
-        _ => return,
-    };
-    static_file_cache.remove(key);
-    static_file_cache_bytes.fetch_sub(old_len, Ordering::Relaxed);
+    if let Some((_, stale)) = static_file_cache.remove_if(key, |_, entry| {
+        entry.len != metadata.len() || entry.modified != modified
+    }) {
+        static_file_cache_bytes.fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+    }
 }
 
 struct CachedStaticResponse {
@@ -20023,6 +20061,7 @@ fn cached_static_sendfile(
     target: &Path,
     metadata: &std::fs::Metadata,
     static_file_cache: &DashMap<String, CachedStaticFile>,
+    static_file_cache_bytes: &AtomicU64,
 ) -> Result<Arc<StaticSendfilePool>> {
     let key = target.to_string_lossy().to_string();
     let modified = metadata.modified().ok();
@@ -20052,7 +20091,7 @@ fn cached_static_sendfile(
     if static_file_cache.len() >= STATIC_FILE_CACHE_MAX_ENTRIES {
         return Ok(pool);
     }
-    static_file_cache.insert(
+    let replaced = static_file_cache.insert(
         key,
         CachedStaticFile {
             len: metadata.len(),
@@ -20066,6 +20105,9 @@ fn cached_static_sendfile(
             freshness: Arc::new(StaticCacheFreshness::new()),
         },
     );
+    if let Some(replaced) = replaced {
+        static_file_cache_bytes.fetch_sub(replaced.body.len() as u64, Ordering::Relaxed);
+    }
     Ok(pool)
 }
 
@@ -20150,14 +20192,19 @@ async fn preload_static_site_fast_lane_cache(
             && metadata.len() >= sendfile_threshold;
 
         if should_cache_body {
-            let body = cached_static_file_body(
+            let body = match cached_static_file_body(
                 &target,
                 &metadata,
                 static_file_cache,
                 static_file_cache_bytes,
                 static_file_load_locks,
             )
-            .await?;
+            .await
+            {
+                Ok(body) => body,
+                Err(error) if error.is::<static_snapshot::BudgetFull>() => continue,
+                Err(error) => return Err(error),
+            };
             h2_static_route_cache.insert(
                 request_path,
                 Arc::new(CachedH2StaticRoute {
@@ -20177,7 +20224,12 @@ async fn preload_static_site_fast_lane_cache(
                 preloaded = preloaded.saturating_add(1);
             }
         } else if should_cache_sendfile {
-            let pool = cached_static_sendfile(&target, &metadata, static_file_cache)?;
+            let pool = cached_static_sendfile(
+                &target,
+                &metadata,
+                static_file_cache,
+                static_file_cache_bytes,
+            )?;
             pool.prewarm(&target);
             preloaded = preloaded.saturating_add(1);
         }
@@ -22469,8 +22521,8 @@ mod tests {
             },
         );
 
-        let refreshed =
-            cached_static_sendfile(&path, &metadata, &cache).expect("revalidate sendfile entry");
+        let refreshed = cached_static_sendfile(&path, &metadata, &cache, &AtomicU64::new(0))
+            .expect("revalidate sendfile entry");
         assert!(Arc::ptr_eq(&pool, &refreshed));
         let entry = cache.get(&key).expect("cached sendfile entry");
         assert!(entry.body.is_empty());
