@@ -42,3 +42,9 @@ Ubuntu 24 的 MSS=1460 独立 socket 复现中，初始87040 bytes，自动调�
 候选 1934bc4 在活跃传输超过半数数据核时临时限制未发送队列，完成/取消恢复原值（含 0 的命名空间继承语义），不改变 SO_SNDBUF。285 项 Linux 测试、Clippy 与两条 keep-alive 完整下载验证通过，但不能证明跨场景性能收益。
 
 Ubuntu 24 amd64 Docker、6 核 gateway、角色隔离的 1×/2×/4× 全混合矩阵共 18 秒有效测量、125 秒矩阵 wall time。各场景零错误，CDN 吞吐比为 0.994/0.946/0.963；4× 游戏 TCP p50、普通 TCP p95、WebSocket p99 的延迟比为 1.320/1.155/1.176（大于 1 更慢）。基线 1d776d0 也未全过，因此不能用单轮差异推断精确因果；候选没有获得准入证据，已撤回，保留移除 SO_SNDBUF 用户锁的正确性修复。工件：.benchmark/direct-ubuntu24-amd64/goal-sendfile-lowat256 与 goal-sendfile-autotune；这两次失败均不能作为发布成功证据。
+
+## 2026-09-20：每核 realtime owner 提升到 nice 0，未接受
+
+候选 52fcfa8 仅将 balanced native TCP/WebSocket owner 从 nice 3 改为 0，保留每允许核心一个 owner、现有 epoll 批次和探测边界；这是全核 owner 实验，与历史被拒绝的四分之一核心 nice 0 池不同。287 项 Linux 测试、Clippy 与构建通过，但严格全混合矩阵未过。4× CDN/HTTPS/大文件吞吐比为 0.963/0.955/0.962，TCP 等负载完成率约 96%，低于 98% 门槛，WebSocket p99 为 nginx 的 1.177 倍。
+
+4× cgroup current/peak 为 proxysss 86335488/283049984、nginx 200294400/383815680 bytes；内存低于 2 倍不抵消性能失败。基线 b6b486a 的矩阵也未全过（4× nginx 透明 QCP 有 3 次错误），不能从单轮差异推断准确因果。候选已撤回为 nice 3，下一步应先区分线程调度等待和数据转发成本，不重复无证据地调整优先级。候选工件 .benchmark/direct-ubuntu24-amd64/goal-realtime-nice0（18 秒活跃、122 秒矩阵 wall），基线 goal-sendfile-cancel；均不是发布通过证据。
