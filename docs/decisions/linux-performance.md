@@ -22,3 +22,9 @@
 
 候选提交 cff1210 把短读且完整写出后的下一次 recv/EAGAIN 改为返回 epoll。Ubuntu 24 x86_64、6 核 gateway、三角色独立 cpuset 的完整 1×/2×/4× 混合矩阵均通过吞吐和零错误，但等负载延迟全部未过；2× UDP p99 比值 1.707，4× 反代 p99 1.097、大文件 p99 1.038。对照提交 1de0a8c 自身也未通过全部延迟门槛，因此这些单轮数据不能证明精确因果或稳定收益。按无跨场景退化的准入规则，恢复原先 recv 排空行为，仅保留背压/半关闭回归测试。原始本地工件：.benchmark/direct-ubuntu24-amd64/goal-native-short-read 与 goal-safe-static-snapshot；未作为发布证据上传。
 
+
+## 2026-09-20：raw WSS 连续就绪批次从 64 缩为 8，未接受
+
+以 dbe1382 为基线，仅把 raw WSS TLS 转发单方向的连续 poll 上限缩为 8。Ubuntu 24 amd64 Docker，gateway/backend/client 使用独立 0-3/4-7/8-15 cpuset；4096 条 WSS，两个相反候选顺序、每网关每轮 5 秒。两版都通过 284 项 Linux 测试与 Clippy，压测双方错误为 0，但候选吞吐中位数 89993.5 ops/s，低于基线 95140.8；p95 从 264.914 增至 289.979 ms，p99 从 306.605 增至 331.665 ms。nginx p99 为 83.626/83.598 ms，基本稳定。proxysss 活跃 current/peak 约 187/190 MB，两版近似，不能以更小批次为名接受吞吐/延迟退化。
+
+候选已完整撤回，未进入发布或混合矩阵；这组单项失败足以拒绝候选，不证明根因已定位。基线与候选都有很低的 p50 和较高的 p95/p99，下一步应检查高并发调度与压测端分布，不重复降低同一转发预算。工件：.benchmark/goal-wss/sat-dbe1382-summary.{json,md}、sat-poll8-summary.{json,md}、runs/isolated-websocket/sat-{dbe1382,poll8}-r{1,2}；补丁和二进制 SHA 见 wss-poll8-provenance.json。
