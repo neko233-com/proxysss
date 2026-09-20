@@ -1109,6 +1109,7 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
 
 async fn run_udp(args: UdpBenchArgs) -> Result<()> {
     let stats = Arc::new(BenchStats::default());
+    let diagnostic_count = Arc::new(AtomicU64::new(0));
     let payload = Arc::new(vec![b'x'; args.payload_bytes.max(1)]);
     let addr = Arc::new(args.addr);
     let timeout_ms = args.timeout_ms.max(1);
@@ -1124,6 +1125,7 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
     let mut tasks = JoinSet::new();
     for worker_index in 0..connection_count {
         let stats = stats.clone();
+        let diagnostic_count = diagnostic_count.clone();
         let payload = payload.clone();
         let addr = addr.clone();
         let schedule = schedule.clone();
@@ -1135,13 +1137,15 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
             } else {
                 "0.0.0.0:0"
             };
-            let socket = match UdpSocket::bind(bind_any).await {
-                Ok(socket) if socket.connect(addr.as_str()).await.is_ok() => Some(socket),
-                Ok(_) | Err(_) => None,
+            let setup = async {
+                let socket = UdpSocket::bind(bind_any).await?;
+                socket.connect(addr.as_str()).await?;
+                Ok::<_, std::io::Error>(socket)
             };
-            let socket = match socket {
-                Some(socket) => socket,
-                None => {
+            let socket = match setup.await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    report_udp_benchmark_error(&diagnostic_count, worker_index, "setup", &error);
                     let (deadline, _) = schedule.begin(worker_index).await;
                     let _ = deadline;
                     local.record_error();
@@ -1153,25 +1157,18 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
             let mut buffer = vec![0_u8; payload.len().max(65_536)];
             let warmup = async {
                 socket.send(&payload).await?;
-                match tokio::time::timeout(
+                receive_udp_benchmark_echo(
+                    &socket,
+                    &payload,
+                    &mut buffer,
                     Duration::from_millis(timeout_ms),
-                    socket.recv(&mut buffer),
                 )
                 .await
-                {
-                    Ok(result) => {
-                        result?;
-                        Ok::<(), std::io::Error>(())
-                    }
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "udp warm-up timeout",
-                    )),
-                }
             };
-            let warmup_ok = warmup.await.is_ok();
+            let warmup_result = warmup.await;
             let (deadline, mut ticker) = schedule.begin(worker_index).await;
-            if !warmup_ok {
+            if let Err(error) = warmup_result {
+                report_udp_benchmark_error(&diagnostic_count, worker_index, "warmup", &error);
                 local.record_error();
                 stats.add_task(&local);
                 return local.latencies_us;
@@ -1179,28 +1176,27 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
             while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
                 let result = async {
-                    socket.send(&payload).await?;
-                    let size = match tokio::time::timeout(
+                    socket
+                        .send(&payload)
+                        .await
+                        .map_err(|error| ("send", error))?;
+                    receive_udp_benchmark_echo(
+                        &socket,
+                        &payload,
+                        &mut buffer,
                         Duration::from_millis(timeout_ms),
-                        socket.recv(&mut buffer),
                     )
                     .await
-                    {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "udp recv timeout",
-                            ));
-                        }
-                    };
-                    Ok::<usize, std::io::Error>(size)
+                    .map_err(|error| ("receive", error))
                 }
                 .await;
 
                 match result {
                     Ok(size) => local.record_success(started.elapsed(), payload.len() + size),
-                    Err(_) if tokio::time::Instant::now() < deadline => local.record_error(),
+                    Err((stage, error)) if tokio::time::Instant::now() < deadline => {
+                        report_udp_benchmark_error(&diagnostic_count, worker_index, stage, &error);
+                        local.record_error();
+                    }
                     Err(_) => {}
                 }
             }
@@ -1217,6 +1213,38 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
     print_operation_target(connection_count, schedule.operation_interval);
     print_summary("udp", args.duration_secs, &stats, latencies);
     Ok(())
+}
+
+async fn receive_udp_benchmark_echo(
+    socket: &UdpSocket,
+    payload: &[u8],
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> std::io::Result<usize> {
+    let size = tokio::time::timeout(timeout, socket.recv(buffer))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "udp recv timeout"))??;
+    if &buffer[..size] != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "udp echo payload mismatch",
+        ));
+    }
+    Ok(size)
+}
+
+fn report_udp_benchmark_error(
+    count: &AtomicU64,
+    worker: usize,
+    stage: &str,
+    error: &std::io::Error,
+) {
+    let index = count.fetch_add(1, Ordering::Relaxed);
+    if index < 8 {
+        eprintln!("udp error diagnostic: worker={worker} stage={stage} kind={:?} os_code={:?} message={error}", error.kind(), error.raw_os_error());
+    } else if index == 8 {
+        eprintln!("udp error diagnostic: further details suppressed; errors remain counted");
+    }
 }
 
 fn print_summary(protocol: &str, duration_secs: u64, stats: &BenchStats, mut latencies: Vec<u64>) {
@@ -1299,6 +1327,40 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_benchmark_rejects_corrupt_and_missing_echoes() {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(backend.local_addr().unwrap()).await.unwrap();
+        let mut buffer = [0; 64];
+        for invalid in [b"bad".as_slice(), b"echo-trailing", b"ech"] {
+            backend
+                .send_to(invalid, client.local_addr().unwrap())
+                .await
+                .unwrap();
+            let error =
+                receive_udp_benchmark_echo(&client, b"echo", &mut buffer, Duration::from_secs(1))
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        backend
+            .send_to(b"echo", client.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_udp_benchmark_echo(&client, b"echo", &mut buffer, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            4
+        );
+        let error =
+            receive_udp_benchmark_echo(&client, b"echo", &mut buffer, Duration::from_millis(10))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn websocket_targets_count_only_executable_ticks() {

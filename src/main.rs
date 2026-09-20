@@ -2665,7 +2665,7 @@ mod tests {
         assert!(include_str!("bench.rs").contains("preconnect_http1_pool"));
         assert!(include_str!("bench.rs").contains("prewarm_http_resource"));
         assert!(include_str!("bench.rs").contains("prewarm_sse_resource"));
-        assert!(include_str!("bench.rs").contains("udp warm-up timeout"));
+        assert!(include_str!("bench.rs").contains("let warmup_result = warmup.await;"));
         assert!(wrapper.contains("validation_wall_elapsed_secs"));
         assert!(runner.contains("MATRIX_MEASUREMENT_USED_SECS"));
         assert!(runner.contains("required_active_measurement_secs"));

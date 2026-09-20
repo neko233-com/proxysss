@@ -67,6 +67,8 @@ TCP 接受连接后执行流访问/限流和路由，选择内存上游池；没
 
 UDP 按客户端建立上游 association；session_ttl_secs 管理空闲时间，max_associations 限制高频重连规模。创建去重使用分片 pending 集合，清理按时间、创建数和容量压力节流。已建 association 使用 worker 本地缓存，TTL 最多每秒刷新一次，数据报使用有界缓冲池。
 
+UDP 清理在同一分片操作内核对 association 的 Arc 身份，旧 reader、发送失败或容量清理不能误删同地址的新会话。替换会话会停用旧实例；reader 检查自身活跃状态和 TTL，观察到停用后退出并停止转发迟到回复，不借用新实例的活跃时间维持旧 socket。本地缓存判定过期前读取共享刷新时间，避免其他 worker 的活跃会话被旧缓存关闭；容量候选已刷新或替换时跳过本次淘汰。
+
 MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与透明 QCP 都复用这些转发路径。proxysss 不实现 MQTT broker，QCP 透明转发不代表帧终止。FTP 控制与主动/被动数据连接执行各自策略，启用时默认控制端口为 21。
 
 ## Linux 调度

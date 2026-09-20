@@ -748,7 +748,9 @@ launch_client() {
 }
 
 run_candidate() {
-  local phase="$1" kind="$2" only_scenario="${3:-}"
+  local phase="$1" kind="$2" only_scenario="${3:-}" sample="${4:-1}"
+  local wave_log_since
+  wave_log_since="$(date +%s)"
   : >"$RUN_DIR/clients.meta"
   activate_gateway "$kind"
   # A paused async gateway resumes with cold CPU caches and overdue timer/I/O
@@ -764,10 +766,11 @@ run_candidate() {
   if [[ -n "$only_scenario" ]]; then
     WAVE_CLIENT_NAME="$WAVE_CLIENT_NAME-$only_scenario"
   fi
+  WAVE_CLIENT_NAME="$WAVE_CLIENT_NAME-r$sample"
   WAVE_SCRIPT="$RUN_DIR/$WAVE_CLIENT_NAME.sh"
   WAVE_RESULTS_DIR="$RUN_DIR/$WAVE_CLIENT_NAME-results"
-  rm -rf "$WAVE_RESULTS_DIR"
-  mkdir -p "$WAVE_RESULTS_DIR"
+  # Fail rather than overwrite a prior repetition's raw evidence.
+  mkdir "$WAVE_RESULTS_DIR"
   cat >"$WAVE_SCRIPT" <<'CLIENT_WAVE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -795,8 +798,18 @@ done
 exit "$status"
 CLIENT_WAVE
 
+  local role container
+  for role in gateway backend client; do
+    case "$role" in
+      gateway) container="$PREFIX-gateway-$kind" ;;
+      backend) container="$PREFIX-backend" ;;
+      client) container="$CLIENT_CONTAINER" ;;
+    esac
+    docker exec "$container" sh -c 'cat /proc/net/snmp /proc/net/snmp6' \
+      >"$WAVE_RESULTS_DIR/$role-network-before.txt"
+  done
   WAVE_START_AT_UNIX_MS=$(( $("$HELPER" now-unix-ms) + CLIENT_START_LEAD_MS ))
-  local client_exec_log="$RUN_DIR/$phase-$kind-client-exec.log"
+  local client_exec_log="$RUN_DIR/$WAVE_CLIENT_NAME-exec.log"
   local wave_timeout_secs=2147483647
   if (( MAX_VALIDATION_SECS > 0 )); then
     if (( MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS > MAX_VALIDATION_SECS )); then
@@ -810,7 +823,7 @@ CLIENT_WAVE
     <"$WAVE_SCRIPT" >"$client_exec_log" 2>&1 &
   local client_exec_pid=$!
   local name row_scenario protocol target concurrency gateway result_phase runtime_workers
-  local stats_name="$phase-$kind"
+  local stats_name="$phase-$kind-r$sample"
   if [[ -n "$only_scenario" ]]; then stats_name="$stats_name-$only_scenario"; fi
   if [[ "$CAPTURE_DOCKER_STATS" == "1" ]]; then
     local sample_at_ms now_ms sample_wait_secs
@@ -845,8 +858,20 @@ THREAD_TICKS
   exit_code=$?
   set -e
   MATRIX_MEASUREMENT_USED_SECS=$((MATRIX_MEASUREMENT_USED_SECS + DURATION_SECS))
+  for role in gateway backend client; do
+    case "$role" in
+      gateway) container="$PREFIX-gateway-$kind" ;;
+      backend) container="$PREFIX-backend" ;;
+      client) container="$CLIENT_CONTAINER" ;;
+    esac
+    docker exec "$container" sh -c 'cat /proc/net/snmp /proc/net/snmp6' \
+      >"$WAVE_RESULTS_DIR/$role-network-after.txt" || true
+    docker logs --timestamps --since "$wave_log_since" "$container" \
+      >"$WAVE_RESULTS_DIR/$role-container.log" 2>&1 || true
+  done
   if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
     docker exec "$CLIENT_CONTAINER" sh -c 'pkill -TERM -x proxysss 2>/dev/null || true' >/dev/null 2>&1 || true
+    docker cp "$CLIENT_CONTAINER:/tmp/proxysss-bench-results/." "$WAVE_RESULTS_DIR" || true
     echo "client wave $WAVE_CLIENT_NAME exceeded its ${wave_timeout_secs}s process deadline" >&2
     return 124
   fi
@@ -876,6 +901,7 @@ THREAD_TICKS
       --scenario "$row_scenario" --gateway "$gateway" --protocol "$protocol" \
       --target "$target" --concurrency "$concurrency" --duration "$DURATION_SECS" \
       --target-ops-per-sec "$planned_target")"
+    printf '%s\n' "$row" >>"$WAVE_RESULTS_DIR/results.jsonl"
     if [[ "$result_phase" == "saturation" ]]; then
       SATURATION_ROWS+=("$row")
     elif [[ "$result_phase" == "isolated-saturation" ]]; then
@@ -1046,7 +1072,7 @@ run_scale() {
   if [[ "$RUN_MIXED_MATRIX" == "1" ]]; then
     for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate saturation "$kind" || return $?; done
+      for kind in $repetition_order; do run_candidate saturation "$kind" "" "$repetition" || return $?; done
     done
     printf '%s\n' "${SATURATION_ROWS[@]}" >"$SATURATION_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$SATURATION_RESULTS_JSONL" --out "$SATURATION_RESULTS_JSON"
@@ -1054,7 +1080,7 @@ run_scale() {
       --fraction "$EQUAL_LOAD_FRACTION" --duration-secs "$DURATION_SECS"
     for repetition in $(seq 1 "$LATENCY_REPETITIONS"); do
       repetition_order="$(order_for_repetition "$LATENCY_RUN_ORDER" "$repetition")"
-      for kind in $repetition_order; do run_candidate equal-load "$kind" || return $?; done
+      for kind in $repetition_order; do run_candidate equal-load "$kind" "" "$repetition" || return $?; done
     done
     printf '%s\n' "${LATENCY_ROWS[@]}" >"$LATENCY_RESULTS_JSONL"
     "$HELPER" aggregate-bench-medians --in "$LATENCY_RESULTS_JSONL" --out "$LATENCY_RESULTS_JSON"
@@ -1066,7 +1092,7 @@ run_scale() {
       for repetition in $(seq 1 "$ISOLATED_REPETITIONS"); do
         order_repetition=$((scenario_index + repetition))
         scenario_order="$(order_for_repetition "$RUN_ORDER" "$order_repetition")"
-        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario" || return $?; done
+        for kind in $scenario_order; do run_candidate isolated-saturation "$kind" "$scenario" "$repetition" || return $?; done
       done
       scenario_index=$((scenario_index + 1))
     done

@@ -7592,8 +7592,7 @@ impl Gateway {
             let now = cached_now_secs;
             if now >= next_local_prune_epoch {
                 local_associations.retain(|_, local| {
-                    let keep = local.association.active.load(Ordering::Relaxed)
-                        && now.saturating_sub(local.last_seen_epoch) <= session_ttl_secs;
+                    let keep = local_udp_association_is_live(local, session_ttl_secs, now);
                     if !keep {
                         local.association.active.store(false, Ordering::Relaxed);
                     }
@@ -7604,9 +7603,7 @@ impl Gateway {
             let mut existing_association = None;
             let mut remove_local_association = false;
             if let Some(local) = local_associations.get_mut(&client_addr) {
-                if local.association.active.load(Ordering::Relaxed)
-                    && now.saturating_sub(local.last_seen_epoch) <= session_ttl_secs
-                {
+                if local_udp_association_is_live(local, session_ttl_secs, now) {
                     if local.last_seen_epoch != now {
                         local.last_seen_epoch = now;
                         local
@@ -7621,8 +7618,9 @@ impl Gateway {
                 }
             }
             if remove_local_association {
-                local_associations.remove(&client_addr);
-                associations.remove(&client_addr);
+                if let Some(local) = local_associations.remove(&client_addr) {
+                    retire_udp_association(&associations, client_addr, &local.association);
+                }
             }
             if existing_association.is_none() {
                 if let Some(existing) = associations.get(&client_addr) {
@@ -7639,8 +7637,7 @@ impl Gateway {
                         );
                         existing_association = Some(association);
                     } else {
-                        association.active.store(false, Ordering::Relaxed);
-                        associations.remove(&client_addr);
+                        retire_udp_association(&associations, client_addr, &association);
                     }
                 }
             }
@@ -7656,9 +7653,8 @@ impl Gateway {
                         worker = worker_index,
                         "failed forwarding udp payload to existing upstream association"
                     );
-                    existing.active.store(false, Ordering::Relaxed);
                     local_associations.remove(&client_addr);
-                    associations.remove(&client_addr);
+                    retire_udp_association(&associations, client_addr, &existing);
                 } else if SHARED_UDP_DATA_RUNTIMES.load(Ordering::Relaxed) {
                     shared_udp_packets_since_yield =
                         shared_udp_packets_since_yield.saturating_add(1);
@@ -7718,8 +7714,7 @@ impl Gateway {
                                 worker = worker_index,
                                 "failed forwarding udp payload to direct upstream association"
                             );
-                            association.active.store(false, Ordering::Relaxed);
-                            associations.remove(&client_addr);
+                            retire_udp_association(&associations, client_addr, &association);
                         } else {
                             local_associations.insert(
                                 client_addr,
@@ -7766,8 +7761,7 @@ impl Gateway {
                             association.last_seen_epoch.store(now, Ordering::Relaxed);
                             association.socket.clone()
                         } else {
-                            association.active.store(false, Ordering::Relaxed);
-                            associations.remove(&client_addr);
+                            retire_udp_association(&associations, client_addr, &association);
                             Self::create_udp_upstream_association(UdpAssociationBuildContext {
                                 gateway: &gateway,
                                 state: &state,
@@ -7872,7 +7866,7 @@ impl Gateway {
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
         });
-        associations.insert(client_addr, association.clone());
+        install_udp_association(associations, client_addr, association.clone());
         spawn_udp_association_reader(
             listener_socket.clone(),
             socket,
@@ -8052,7 +8046,7 @@ impl Gateway {
             last_seen_epoch: AtomicU64::new(now_unix_secs()),
             active: AtomicBool::new(true),
         });
-        associations.insert(client_addr, association.clone());
+        install_udp_association(associations, client_addr, association.clone());
         spawn_udp_association_reader(
             listener_socket.clone(),
             socket.clone(),
@@ -16713,6 +16707,42 @@ fn udp_association_is_live(association: &UdpAssociation, session_ttl_secs: u64, 
             <= session_ttl_secs
 }
 
+fn local_udp_association_is_live(
+    local: &mut LocalUdpAssociation,
+    session_ttl_secs: u64,
+    now: u64,
+) -> bool {
+    if !local.association.active.load(Ordering::Relaxed) {
+        return false;
+    }
+    if now.saturating_sub(local.last_seen_epoch) > session_ttl_secs {
+        // Another reuseport worker may have refreshed the shared association.
+        local.last_seen_epoch = local.association.last_seen_epoch.load(Ordering::Relaxed);
+    }
+    now.saturating_sub(local.last_seen_epoch) <= session_ttl_secs
+}
+
+fn install_udp_association(
+    associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
+    client_addr: SocketAddr,
+    association: Arc<UdpAssociation>,
+) {
+    if let Some(previous) = associations.insert(client_addr, association) {
+        previous.active.store(false, Ordering::Relaxed);
+    }
+}
+
+fn retire_udp_association(
+    associations: &DashMap<SocketAddr, Arc<UdpAssociation>>,
+    client_addr: SocketAddr,
+    association: &Arc<UdpAssociation>,
+) {
+    association.active.store(false, Ordering::Relaxed);
+    // A reader or sender can finish after another worker replaces this address.
+    // Identity must be checked while holding the same shard lock as removal.
+    associations.remove_if(&client_addr, |_, current| Arc::ptr_eq(current, association));
+}
+
 const UDP_STATS_FLUSH_PACKETS: u64 = 1024;
 const BALANCED_UDP_FAIRNESS_PACKETS: usize = 4;
 const BALANCED_UDP_FAIRNESS_WINDOW: Duration = Duration::from_millis(8);
@@ -16729,35 +16759,33 @@ fn spawn_udp_association_reader(
     client_addr: SocketAddr,
     session_ttl_secs: u64,
     lease: UpstreamLease,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _lease = lease;
         let mut response = udp_buffer_pool().acquire();
         let check_interval = Duration::from_secs(session_ttl_secs.clamp(1, 30));
-        'reader: loop {
+        'reader: while association_for_reader.active.load(Ordering::Relaxed) {
             match tokio::time::timeout(check_interval, read_socket.recv(&mut response)).await {
                 Ok(Ok(size)) => {
+                    if !association_for_reader.active.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Err(error) =
                         send_udp_to(&send_socket, &response[..size], client_addr).await
                     {
                         tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
-                        association_for_reader
-                            .active
-                            .store(false, Ordering::Relaxed);
-                        associations_for_reader.remove(&client_addr);
                         break;
                     }
                     loop {
+                        if !association_for_reader.active.load(Ordering::Relaxed) {
+                            break 'reader;
+                        }
                         match read_socket.try_recv(&mut response) {
                             Ok(size) => {
                                 if let Err(error) =
                                     send_udp_to(&send_socket, &response[..size], client_addr).await
                                 {
                                     tracing::warn!(?error, %client_addr, "failed relaying udp response to client");
-                                    association_for_reader
-                                        .active
-                                        .store(false, Ordering::Relaxed);
-                                    associations_for_reader.remove(&client_addr);
                                     break 'reader;
                                 }
                             }
@@ -16766,10 +16794,6 @@ fn spawn_udp_association_reader(
                             }
                             Err(error) => {
                                 tracing::warn!(?error, %client_addr, "udp upstream association closed");
-                                association_for_reader
-                                    .active
-                                    .store(false, Ordering::Relaxed);
-                                associations_for_reader.remove(&client_addr);
                                 break 'reader;
                             }
                         }
@@ -16777,26 +16801,15 @@ fn spawn_udp_association_reader(
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(?error, %client_addr, "udp upstream association closed");
-                    association_for_reader
-                        .active
-                        .store(false, Ordering::Relaxed);
-                    associations_for_reader.remove(&client_addr);
                     break;
                 }
                 Err(_) => {
-                    let expired = associations_for_reader
-                        .get(&client_addr)
-                        .map(|entry| {
-                            now_unix_secs()
-                                .saturating_sub(entry.last_seen_epoch.load(Ordering::Relaxed))
-                                > session_ttl_secs
-                        })
-                        .unwrap_or(true);
+                    let expired = !udp_association_is_live(
+                        &association_for_reader,
+                        session_ttl_secs,
+                        now_unix_secs(),
+                    );
                     if expired {
-                        association_for_reader
-                            .active
-                            .store(false, Ordering::Relaxed);
-                        associations_for_reader.remove(&client_addr);
                         tracing::debug!(
                             %client_addr,
                             ttl_secs = session_ttl_secs,
@@ -16807,7 +16820,12 @@ fn spawn_udp_association_reader(
                 }
             }
         }
-    });
+        retire_udp_association(
+            &associations_for_reader,
+            client_addr,
+            &association_for_reader,
+        );
+    })
 }
 
 fn flush_udp_stats(stats: &GatewayStats, packets: &mut u64, bytes: &mut u64) {
@@ -16932,19 +16950,30 @@ fn prune_udp_associations(
 
     let mut oldest = associations
         .iter()
-        .map(|entry| (*entry.key(), entry.last_seen_epoch.load(Ordering::Relaxed)))
+        .map(|entry| {
+            (
+                *entry.key(),
+                entry.last_seen_epoch.load(Ordering::Relaxed),
+                entry.value().clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    oldest.sort_by_key(|(_, last_seen)| *last_seen);
+    oldest.sort_by_key(|(_, last_seen, _)| *last_seen);
 
     let remove_count = associations.len().saturating_sub(
         max_associations
             .saturating_sub(max_associations / 10)
             .max(1),
     );
-    for (addr, _) in oldest.into_iter().take(remove_count) {
-        if let Some((_, association)) = associations.remove(&addr) {
-            association.active.store(false, Ordering::Relaxed);
-        }
+    for (addr, last_seen, candidate) in oldest.into_iter().take(remove_count) {
+        associations.remove_if(&addr, |_, current| {
+            let remove = Arc::ptr_eq(current, &candidate)
+                && current.last_seen_epoch.load(Ordering::Relaxed) == last_seen;
+            if remove {
+                current.active.store(false, Ordering::Relaxed);
+            }
+            remove
+        });
     }
 }
 
@@ -25435,6 +25464,88 @@ mod tests {
         assert!(udp_targets
             .iter()
             .all(|target| target.settings.udp_payload == "proxysss-health"));
+    }
+
+    #[tokio::test]
+    async fn udp_replaced_reader_cannot_remove_or_reply_for_new_association() {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        old_socket
+            .connect(backend.local_addr().unwrap())
+            .await
+            .unwrap();
+        let old = Arc::new(UdpAssociation {
+            socket: old_socket.clone(),
+            last_seen_epoch: AtomicU64::new(now_unix_secs()),
+            active: AtomicBool::new(true),
+        });
+        let current = Arc::new(UdpAssociation {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            last_seen_epoch: AtomicU64::new(now_unix_secs()),
+            active: AtomicBool::new(true),
+        });
+        let associations = Arc::new(DashMap::new());
+        install_udp_association(&associations, client_addr, old.clone());
+        let reader = spawn_udp_association_reader(
+            listener,
+            old_socket.clone(),
+            associations.clone(),
+            old.clone(),
+            client_addr,
+            180,
+            UpstreamLease {
+                runtime: Arc::new(DashMap::new()),
+                key: "test".into(),
+            },
+        );
+        // Drive the old reader into its pending receive before replacing it.
+        tokio::task::yield_now().await;
+        install_udp_association(&associations, client_addr, current.clone());
+        backend
+            .send_to(b"late-old-reply", old_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!old.active.load(Ordering::Relaxed));
+        assert!(current.active.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            associations.get(&client_addr).unwrap().value(),
+            &current
+        ));
+        let mut buffer = [0; 64];
+        assert!(
+            matches!(client.try_recv(&mut buffer), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        // A delayed sender failure is subject to the same identity boundary.
+        retire_udp_association(&associations, client_addr, &old);
+        assert!(associations.contains_key(&client_addr));
+        retire_udp_association(&associations, client_addr, &current);
+        assert!(associations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_local_cache_honors_other_workers_shared_refresh() {
+        let association = Arc::new(UdpAssociation {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            last_seen_epoch: AtomicU64::new(200),
+            active: AtomicBool::new(true),
+        });
+        let mut local = LocalUdpAssociation {
+            association: association.clone(),
+            last_seen_epoch: 100,
+        };
+        assert!(local_udp_association_is_live(&mut local, 30, 210));
+        assert_eq!(local.last_seen_epoch, 200);
+        assert!(!local_udp_association_is_live(&mut local, 30, 231));
+        association.last_seen_epoch.store(231, Ordering::Relaxed);
+        association.active.store(false, Ordering::Relaxed);
+        assert!(!local_udp_association_is_live(&mut local, 30, 231));
     }
 
     #[tokio::test]

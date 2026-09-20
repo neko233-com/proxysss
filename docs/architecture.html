@@ -985,6 +985,8 @@ udp:
 </main>
     </div>
 
+    <section class="section"><h2>UDP 会话替换与清理</h2><p>UDP 清理在同一分片操作内核对 association 的 Arc 身份，旧 reader、发送失败或容量清理不能误删同地址的新会话。替换会话会停用旧实例；reader 检查自身活跃状态和 TTL，观察到停用后退出并停止转发迟到回复，不借用新实例的活跃时间维持旧 socket。本地缓存判定过期前读取共享刷新时间，避免其他 worker 的活跃会话被旧缓存关闭；容量候选已刷新或替换时跳过本次淘汰。</p></section>
+
     <footer class="footer">
       <strong>这页架构文档的落点只有一个：</strong> 让你知道 proxysss 的请求路径、扩展边界、热重载边界和性能纪律都在哪里，而不是把“架构”写成一页炫技海报。
     </footer>
