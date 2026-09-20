@@ -13026,7 +13026,7 @@ fn adaptive_data_plane_workers(min_workers: usize) -> usize {
 fn realtime_stream_reactor_workers_for(cores: usize, cpu_divisor: usize) -> usize {
     // Keep native relay ownership proportional to the allowed cpuset without
     // running a fixed worker cap. The profile-selected divisor scales with the
-    // full cpuset, and balanced mode uses a low-CFS-weight per-core lane to
+    // full cpuset, and balanced mode uses a default-priority per-core lane to
     // avoid queueing unrelated long connections behind one shared owner.
     cores.max(1).div_ceil(cpu_divisor.max(1))
 }
@@ -13045,9 +13045,9 @@ fn realtime_stream_reactor_nice_for(profile: RuntimePerformanceTrafficProfile) -
     match profile {
         RuntimePerformanceTrafficProfile::Small => 0,
         // One soft-affinity owner per allowed CPU keeps pair queues shallow.
-        // nice 3 leaves HTTP the primary CFS consumer during saturation while
-        // fixed-rate realtime work stays prompt on otherwise-idle cores.
-        RuntimePerformanceTrafficProfile::Balanced => 3,
+        // Give game/TCP/WebSocket work the same CFS weight as plain HTTP;
+        // bounded event batches remain the fairness boundary under saturation.
+        RuntimePerformanceTrafficProfile::Balanced => 0,
         RuntimePerformanceTrafficProfile::Bulk => 5,
     }
 }
@@ -23505,7 +23505,7 @@ mod tests {
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Balanced),
-            3
+            0
         );
         assert_eq!(
             realtime_stream_reactor_nice_for(RuntimePerformanceTrafficProfile::Bulk),
