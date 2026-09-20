@@ -2,11 +2,68 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCapacityRejectsMissingRetentionAndLostIdleConnections(t *testing.T) {
+	old := "requested=100 opened=100 failed=0 attempts=100 open_rate=1000 worst_p50_ms=1 worst_p95_ms=2 worst_p99_ms=3"
+	if _, err := parseIsolatedWSSCapacity(old); err == nil {
+		t.Fatal("legacy opened-only capacity must not prove idle retention")
+	}
+	dir := t.TempDir()
+	for _, gateway := range []string{"nginx", "proxysss"} {
+		line := "requested=100 opened=100 failed=0 retained=100 hold_failed=0 hold_secs=60 attempts=100 open_rate=1000 worst_p50_ms=1 worst_p95_ms=2 worst_p99_ms=3"
+		if gateway == "nginx" {
+			line = strings.Replace(line, "retained=100 hold_failed=0", "retained=0 hold_failed=100", 1)
+		}
+		if err := os.WriteFile(filepath.Join(dir, gateway+"-capacity-total.txt"), []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary, err := summarizeIsolatedWSSRuns([]string{dir}, IsolatedWSSGateOptions{RequireCapacity: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Passed || !strings.Contains(strings.Join(summary.Failures, " "), "nginx capacity incomplete") {
+		t.Fatalf("closed idle sockets must fail: %+v", summary)
+	}
+}
+
+func TestHeldMemoryRequiresAllConnectionsAndTwoTimesEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("run-metadata.txt", "active_connections=100\n")
+	write("nginx-active.txt", "success : 100\nerrors : 0\nops/sec : 1000\nlatency p50 : 2 ms\nlatency p95 : 3 ms\nlatency p99 : 4 ms\n")
+	write("proxysss-active.txt", "success : 200\nerrors : 0\nops/sec : 2000\nlatency p50 : 1 ms\nlatency p95 : 2 ms\nlatency p99 : 3 ms\n")
+	write("nginx-active-sample-gateway-memory.txt", "memory_current_bytes=1000\nmemory_peak_bytes=1500\nestablished_frontend_tcp=100\n")
+	options := IsolatedWSSGateOptions{RequireActive: true, GateActiveOps: true, GateActiveLatency: true, RequireMemory: true}
+	for _, sample := range []struct {
+		current, peak int
+		pass          bool
+	}{{2000, 3000, true}, {2001, 3000, false}, {2000, 3001, false}} {
+		write("proxysss-active-sample-gateway-memory.txt", fmt.Sprintf("memory_current_bytes=%d\nmemory_peak_bytes=%d\nestablished_frontend_tcp=100\n", sample.current, sample.peak))
+		summary, err := summarizeIsolatedWSSRuns([]string{dir}, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if summary.Passed != sample.pass {
+			t.Fatalf("2x boundary rejected/accepted incorrectly: %+v", summary)
+		}
+	}
+	write("proxysss-active-sample-gateway-memory.txt", "memory_current_bytes=500\nmemory_peak_bytes=1500\nestablished_frontend_tcp=0\n")
+	if _, err := summarizeIsolatedWSSRuns([]string{dir}, options); err == nil {
+		t.Fatal("post-disconnect memory cannot pass as held-connection memory")
+	}
+}
 
 func writeBenchRows(t *testing.T, path string, rows []BenchRow) {
 	t.Helper()
@@ -68,7 +125,7 @@ func TestAggregateBenchRowMediansRejectsPartialPercentiles(t *testing.T) {
 }
 
 func TestParseIsolatedWSSCapacity(t *testing.T) {
-	capacity, err := parseIsolatedWSSCapacity("requested=100000 opened=100000 failed=0 attempts=100001 open_rate=8123.5 worst_p50_ms=2.1 worst_p95_ms=4.2 worst_p99_ms=7.3\n")
+	capacity, err := parseIsolatedWSSCapacity("requested=100000 opened=100000 failed=0 retained=100000 hold_failed=0 hold_secs=60 attempts=100001 open_rate=8123.5 worst_p50_ms=2.1 worst_p95_ms=4.2 worst_p99_ms=7.3\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +135,7 @@ func TestParseIsolatedWSSCapacity(t *testing.T) {
 }
 
 func TestParseIsolatedWSSCapacityClient(t *testing.T) {
-	raw := "protocol : websocket-connections\nconnections requested : 20000\nconnections opened : 20000\nconnections failed : 0\nhandshake attempts : 20001\nopen rate : 4321.50 connections/s\nhandshake p50 : 12.3 ms\nhandshake p95 : 45.6 ms\nhandshake p99 : 78.9 ms\n"
+	raw := "protocol : websocket-connections\nconnections requested : 20000\nconnections opened : 20000\nconnections failed : 0\nconnections retained : 20000\nhold failures : 0\nhold duration : 60 s\nhandshake attempts : 20001\nopen rate : 4321.50 connections/s\nhandshake p50 : 12.3 ms\nhandshake p95 : 45.6 ms\nhandshake p99 : 78.9 ms\n"
 	sample, err := parseIsolatedWSSCapacityClient(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +148,7 @@ func TestParseIsolatedWSSCapacityClient(t *testing.T) {
 func TestIsolatedWSSMedianGateRejectsEqualTailLatency(t *testing.T) {
 	runDir := t.TempDir()
 	active := "success : 100\nerrors : 0\nops/sec : 1000\nlatency p50 : 1 ms\nlatency p95 : 2 ms\nlatency p99 : 3 ms\n"
-	capacity := "requested=100 opened=100 failed=0 attempts=100 open_rate=1000 worst_p50_ms=1 worst_p95_ms=2 worst_p99_ms=3\n"
+	capacity := "requested=100 opened=100 failed=0 retained=100 hold_failed=0 hold_secs=60 attempts=100 open_rate=1000 worst_p50_ms=1 worst_p95_ms=2 worst_p99_ms=3\n"
 	for _, gateway := range []string{"nginx", "proxysss"} {
 		if err := os.WriteFile(filepath.Join(runDir, gateway+"-active.txt"), []byte(active), 0o644); err != nil {
 			t.Fatal(err)

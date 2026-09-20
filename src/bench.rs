@@ -673,6 +673,7 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     let insecure_tls_config = insecure_wss_client_config(args.insecure);
     let connection_count = args.connections.max(1);
     let start_barrier = Arc::new(Barrier::new(connection_count));
+    let warmed_connections = Arc::new(AtomicU64::new(0));
     let scheduled_start = Arc::new(OnceLock::<tokio::time::Instant>::new());
     let connect_timeout = Duration::from_millis(args.connect_timeout_ms.max(1));
     let measurement_duration = Duration::from_secs(args.duration_secs.max(1));
@@ -688,11 +689,12 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
         let insecure_tls_config = insecure_tls_config.clone();
         let start_barrier = start_barrier.clone();
         let scheduled_start = scheduled_start.clone();
+        let warmed_connections = warmed_connections.clone();
 
         tasks.spawn(async move {
             let mut local = TaskStats::default();
             let connect_deadline = Instant::now() + connect_timeout;
-            let websocket = loop {
+            let mut websocket = loop {
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break None;
@@ -710,10 +712,20 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 }
             };
 
-            // Active-session latency must not include a staggered TLS/HTTP
-            // handshake ramp. Capacity mode measures handshake rate and
-            // percentiles separately; this barrier gives every established
-            // session the same steady-state measurement window.
+            // Every declared connection finishes a real echo before the common
+            // timestamp is published. A failed warm-up cannot silently turn
+            // into an unverified reconnect or skip the synchronization barrier.
+            if let Some(stream) = websocket.as_mut() {
+                if verify_websocket_echo(stream, &payload, connect_timeout)
+                    .await
+                    .is_err()
+                {
+                    local.record_error();
+                    websocket = None;
+                } else {
+                    warmed_connections.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let barrier_result = start_barrier.wait().await;
             if barrier_result.is_leader() {
                 // Give every connection task time to leave the barrier and
@@ -723,6 +735,10 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                     start_at_unix_ms,
                     Duration::from_millis(250),
                 ));
+                println!(
+                    "traffic ready         : connections={connection_count} warmed={}",
+                    warmed_connections.load(Ordering::Relaxed)
+                );
             }
             // Tokio barriers are reusable. The second generation publishes
             // the leader's timestamp to every task before any traffic starts.
@@ -731,38 +747,6 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 stats.add_task(&local);
                 return local.latencies_us;
             };
-            let warmup = async {
-                websocket
-                    .send(Message::Binary(payload.as_ref().clone().into()))
-                    .await?;
-                loop {
-                    match websocket.next().await {
-                        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Text(_))) => {
-                            return Ok::<(), tokio_tungstenite::tungstenite::Error>(());
-                        }
-                        Some(Ok(Message::Ping(payload))) => {
-                            websocket.send(Message::Pong(payload)).await?;
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            return Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => return Err(error),
-                    }
-                }
-            };
-            if !matches!(
-                tokio::time::timeout(Duration::from_millis(500), warmup).await,
-                Ok(Ok(()))
-            ) {
-                match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
-                    Ok((stream, _)) => websocket = stream,
-                    Err(_) => {
-                        stats.add_task(&local);
-                        return local.latencies_us;
-                    }
-                }
-            }
             let measurement_start = *scheduled_start
                 .get()
                 .expect("websocket benchmark start time initialized");
@@ -852,9 +836,35 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
 
 const MAX_CONNECTION_LATENCY_SAMPLES_PER_WORKER: usize = 2_048;
 
+async fn verify_websocket_echo(
+    stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        stream
+            .send(Message::Binary(payload.to_vec().into()))
+            .await?;
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Binary(bytes))) if bytes.as_ref() == payload => return Ok(()),
+                Some(Ok(Message::Text(text))) if text.as_bytes() == payload => return Ok(()),
+                Some(Ok(Message::Ping(bytes))) => stream.send(Message::Pong(bytes)).await?,
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Err(error)) => return Err(error.into()),
+                _ => anyhow::bail!("WebSocket echo missing, closed, or mismatched"),
+            }
+        }
+    })
+    .await
+    .context("WebSocket echo timed out")?
+}
+
 struct WebSocketConnectionCapacityTask {
     opened: u64,
     failed: u64,
+    retained: u64,
+    hold_failed: u64,
     attempts: u64,
     latencies_us: Vec<u64>,
 }
@@ -876,6 +886,9 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
     let connect_timeout = Duration::from_millis(args.connect_timeout_ms.max(1));
     let hold_duration = Duration::from_secs(args.duration_secs.max(1));
     let barrier = Arc::new(Barrier::new(worker_count));
+    let open_duration = Arc::new(OnceLock::<Duration>::new());
+    let ready_opened = Arc::new(AtomicU64::new(0));
+    let ready_failed = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
     let mut tasks = JoinSet::new();
 
@@ -884,6 +897,9 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
         let end = requested * (worker_index + 1) / worker_count;
         let url = url.clone();
         let barrier = barrier.clone();
+        let open_duration = open_duration.clone();
+        let ready_opened = ready_opened.clone();
+        let ready_failed = ready_failed.clone();
         let connect_retries = args.connect_retries;
         let insecure_tls_config = insecure_tls_config.clone();
 
@@ -892,6 +908,8 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
             let mut result = WebSocketConnectionCapacityTask {
                 opened: 0,
                 failed: 0,
+                retained: 0,
+                hold_failed: 0,
                 attempts: 0,
                 latencies_us: Vec::with_capacity(
                     (end - start).min(MAX_CONNECTION_LATENCY_SAMPLES_PER_WORKER),
@@ -933,12 +951,26 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
                 }
             }
 
+            ready_opened.fetch_add(result.opened, Ordering::Relaxed);
+            ready_failed.fetch_add(result.failed, Ordering::Relaxed);
+            if barrier.wait().await.is_leader() {
+                let _ = open_duration.set(started.elapsed());
+                println!("hold ready            : requested={requested} opened={} failed={} hold_secs={}",
+                    ready_opened.load(Ordering::Relaxed), ready_failed.load(Ordering::Relaxed), hold_duration.as_secs());
+            }
             barrier.wait().await;
             tokio::time::sleep(hold_duration).await;
-            // Keep the stream vector live through the hold interval. `len` is
-            // intentionally observed after the sleep so the optimizer cannot
-            // drop the WebSocket handles before this capacity sample ends.
-            let _held_open = sockets.len();
+            // A socket handle alone is not evidence of a live tunnel: a gateway
+            // may have closed every idle connection while the client slept.
+            let verification_deadline = tokio::time::Instant::now() + connect_timeout;
+            for mut socket in sockets {
+                let remaining = verification_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() && verify_websocket_echo(&mut socket, b"proxysss-capacity-probe", remaining).await.is_ok() {
+                    result.retained += 1;
+                } else {
+                    result.hold_failed += 1;
+                }
+            }
             result
         });
     }
@@ -946,12 +978,16 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
     let mut opened = 0_u64;
     let mut failed = 0_u64;
     let mut attempts = 0_u64;
+    let mut retained = 0_u64;
+    let mut hold_failed = 0_u64;
     let mut latencies_us = Vec::new();
     while let Some(task) = tasks.join_next().await {
         let task = task.context("websocket connection-capacity worker failed")?;
         opened = opened.saturating_add(task.opened);
         failed = failed.saturating_add(task.failed);
         attempts = attempts.saturating_add(task.attempts);
+        retained += task.retained;
+        hold_failed += task.hold_failed;
         latencies_us.extend(task.latencies_us);
     }
 
@@ -960,10 +996,14 @@ async fn run_websocket_connection_capacity(args: WebSocketBenchArgs) -> Result<(
         opened,
         failed,
         attempts,
-        started.elapsed(),
+        *open_duration
+            .get()
+            .context("capacity opening duration missing")?,
         args.duration_secs.max(1),
         latencies_us,
     );
+    println!("connections retained  : {retained}");
+    println!("hold failures         : {hold_failed}");
     Ok(())
 }
 
@@ -1207,15 +1247,12 @@ fn print_websocket_connection_capacity_summary(
     opened: u64,
     failed: u64,
     attempts: u64,
-    elapsed: Duration,
+    open_duration: Duration,
     hold_secs: u64,
     mut latencies_us: Vec<u64>,
 ) {
     latencies_us.sort_unstable();
-    let open_seconds = elapsed
-        .saturating_sub(Duration::from_secs(hold_secs))
-        .as_secs_f64()
-        .max(f64::EPSILON);
+    let open_seconds = open_duration.as_secs_f64().max(f64::EPSILON);
 
     println!("protocol              : websocket-connections");
     println!("connections requested : {requested}");
@@ -1253,6 +1290,36 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn websocket_hold_probe_rejects_closed_and_wrong_echo() {
+        for mode in ["echo", "close", "wrong"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if mode == "close" {
+                    socket.close(None).await.unwrap();
+                    return;
+                }
+                let message = socket.next().await.unwrap().unwrap();
+                let reply = if mode == "echo" {
+                    message
+                } else {
+                    Message::Binary(b"wrong".to_vec().into())
+                };
+                socket.send(reply).await.unwrap();
+            });
+            let (mut client, _) = connect_websocket(&format!("ws://{addr}/"), None)
+                .await
+                .unwrap();
+            let verified =
+                verify_websocket_echo(&mut client, b"probe", Duration::from_secs(1)).await;
+            assert_eq!(verified.is_ok(), mode == "echo");
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn fixed_rate_wait_stops_at_measurement_deadline() {

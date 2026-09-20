@@ -8,7 +8,13 @@
 > 架构原则：**性能 > 可维护性**。nginx 先跑、proxysss 同波次重放（`MIXED_MATRIX=1`）。
 > 本报告给出 **真机 Ubuntu 24.04 LTS（8.163.25.145）实测** 与本机 Docker `ubuntu:24.04` 验证两组数据，**真机为准**。
 
-## 1. 结论（先看这里）
+## 当前 WSS 验证口径（历史数据不构成当前证据）
+
+WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websocket --hold-connections 输出 hold ready 后，控制器才开始等待并采集连接存活期间的 cgroup current/peak；结束时逐条真实 echo，要求 retained 等于 requested 且 hold failures 为 0。只统计曾经 opened、只持有 socket 句柄或在客户端退出后采样，均不能证明容量。nginx 测试 idle timeout 必须长于持有期；活跃 WSS 的共同开始时间只能在所有连接完成 warm-up echo 后发布。Docker 客户端和后端显式按声明 CPU 配额设置 TOKIO_WORKER_THREADS；汇总拒绝缺少存活/内存字段的旧报告，且逐轮限制 current、peak、每连接成本不超过 nginx 的 2 倍。
+
+现行发布流程见 [验证指南](VALIDATION.md) / [HTML](validation.html)。性能清单是正式 tag 的必需证据，v1.3.8 的单次豁免不适用于新版本。
+
+## 1. 历史结论（v1.3.0）
 
 - **真机 Ubuntu 24.04 LTS 聚合 `1.287x`**，远超 nginx，满足“完全超过 nginx ratio 1.0、可接受 3% 内落差”的目标。
 - **游戏核心 TCP 长连接压倒性领先**：`game-long-connection` **2.732x**、`tcp-stream` **2.741x**，p95 延迟仅为 nginx 的 ~47%（7.8ms vs 16.7ms）。`websocket-long-connection` **1.319x**。

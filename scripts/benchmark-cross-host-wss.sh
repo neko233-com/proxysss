@@ -25,7 +25,7 @@ require_cmd() {
     exit 1
   }
 }
-for command in ssh scp go curl sha256sum awk; do require_cmd "$command"; done
+for command in ssh scp go curl sha256sum awk timeout; do require_cmd "$command"; done
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 GATEWAY_HOST="${GATEWAY_HOST:?set GATEWAY_HOST to the independent gateway SSH host}"
@@ -46,6 +46,10 @@ GATEWAY_CPUSET="${GATEWAY_CPUSET:-0-3}"
 # the release under test has an explicit memory budget.
 GATEWAY_MEMORY_MAX="${GATEWAY_MEMORY_MAX:-infinity}"
 RESOURCE_SAMPLE_AFTER_SECS="${RESOURCE_SAMPLE_AFTER_SECS:-5}"
+CLIENT_READY_TIMEOUT_SECS="${CLIENT_READY_TIMEOUT_SECS:-120}"
+CLIENT_TOKIO_WORKERS="${CLIENT_TOKIO_WORKERS:-$(nproc)}"
+BACKEND_TOKIO_WORKERS="${BACKEND_TOKIO_WORKERS:-}"
+WSS_IDLE_TIMEOUT_SECS=$((CAPACITY_HOLD_SECS + CLIENT_READY_TIMEOUT_SECS + 60))
 NGINX_WORKERS="${NGINX_WORKERS:-4}"
 NGINX_BIN="${NGINX_BIN:-/usr/local/nginx/sbin/nginx}"
 BUILD_PROFILE="${BUILD_PROFILE:-release-fast}"
@@ -70,9 +74,12 @@ BACKEND_PORT="${BACKEND_PORT:-18192}"
   echo "REPETITIONS must be an even integer >= 4 to balance gateway order" >&2
   exit 1
 }
-for value in CONNECTIONS CAPACITY_CONNECTIONS DURATION_SECS CAPACITY_HOLD_SECS CAPACITY_CONNECT_WORKERS NOFILE_LIMIT NGINX_WORKERS GATEWAY_PORT BACKEND_PORT RESOURCE_SAMPLE_AFTER_SECS; do
+for value in CONNECTIONS CAPACITY_CONNECTIONS DURATION_SECS CAPACITY_HOLD_SECS CAPACITY_CONNECT_WORKERS NOFILE_LIMIT NGINX_WORKERS GATEWAY_PORT BACKEND_PORT RESOURCE_SAMPLE_AFTER_SECS CLIENT_READY_TIMEOUT_SECS CLIENT_TOKIO_WORKERS; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || { echo "$value must be positive" >&2; exit 1; }
 done
+(( RESOURCE_SAMPLE_AFTER_SECS < CAPACITY_HOLD_SECS && RESOURCE_SAMPLE_AFTER_SECS < DURATION_SECS )) || {
+  echo "resource sample must be taken while clients are active/holding connections" >&2; exit 1;
+}
 if [[ "$BUILD_NATIVE" != "0" && "$BUILD_NATIVE" != "1" ]]; then
   echo "BUILD_NATIVE must be 0 or 1" >&2
   exit 1
@@ -116,6 +123,8 @@ machine_id_hash() { sha256sum /etc/machine-id | awk '{print $1}'; }
 for host in "$GATEWAY_HOST" "$BACKEND_HOST"; do
   ssh_run "$host" "test \"\$(uname -s)\" = Linux && command -v openssl >/dev/null && command -v sha256sum >/dev/null && test \"\$(ulimit -Hn)\" -ge '$NOFILE_LIMIT'"
 done
+BACKEND_TOKIO_WORKERS="${BACKEND_TOKIO_WORKERS:-$(ssh_run "$BACKEND_HOST" nproc)}"
+[[ "$BACKEND_TOKIO_WORKERS" =~ ^[1-9][0-9]*$ ]] || { echo "BACKEND_TOKIO_WORKERS must be positive" >&2; exit 1; }
 ssh_run "$GATEWAY_HOST" "command -v systemd-run >/dev/null && systemctl show-environment >/dev/null && test \"\$(nproc)\" -ge '$GATEWAY_CPU_COUNT'"
 CLIENT_MACHINE_ID_HASH="$(machine_id_hash)"
 GATEWAY_MACHINE_ID_HASH="$(ssh_run "$GATEWAY_HOST" "sha256sum /etc/machine-id | awk '{print \$1}'")"
@@ -213,6 +222,7 @@ http {
       proxy_set_header Connection "upgrade";
       proxy_set_header Host \$host;
       proxy_pass http://ws_echo;
+      proxy_read_timeout ${WSS_IDLE_TIMEOUT_SECS}s;
     }
   }
 }
@@ -230,7 +240,7 @@ stop_processes() {
 trap 'stop_processes; cleanup_benchmark_artifacts' EXIT
 
 start_backend() {
-  backend_pid="$(ssh_run "$BACKEND_HOST" "cd '$REMOTE_ROOT' && ulimit -n '$NOFILE_LIMIT' && nohup ./proxysss demo ws-echo --listen 0.0.0.0:$BACKEND_PORT >backend.log 2>&1 & echo \$!")"
+  backend_pid="$(ssh_run "$BACKEND_HOST" "cd '$REMOTE_ROOT' && ulimit -n '$NOFILE_LIMIT' && nohup env TOKIO_WORKER_THREADS='$BACKEND_TOKIO_WORKERS' ./proxysss demo ws-echo --listen 0.0.0.0:$BACKEND_PORT >backend.log 2>&1 & echo \$!")"
   [[ "$backend_pid" =~ ^[0-9]+$ ]] || { echo "backend failed to start" >&2; exit 1; }
 }
 start_gateway() {
@@ -270,16 +280,27 @@ sample_gateway_resources() {
 
 record_capacity_memory_cost() {
   local iteration="$1" kind="$2"
-  local sample="$RUN_DIR/capacity-r${iteration}-final-${kind}-cgroup.txt"
+  local sample="$RUN_DIR/capacity-r${iteration}-${kind}-cgroup.txt"
   local current peak measured
   current="$(awk -F= '$1 == "MemoryCurrent" {print $2}' "$sample")"
   peak="$(awk -F= '$1 == "MemoryPeak" {print $2}' "$sample")"
-  measured="$peak"
-  [[ "$measured" =~ ^[0-9]+$ ]] || measured="$current"
+  measured="$current"
   [[ "$measured" =~ ^[0-9]+$ ]] || return 0
-  printf 'repetition=%s gateway=%s memory_bytes=%s bytes_per_connection=%s requested_connections=%s\n' \
-    "$iteration" "$kind" "$measured" "$((measured / CAPACITY_CONNECTIONS))" "$CAPACITY_CONNECTIONS" \
+  printf 'repetition=%s gateway=%s memory_current_bytes=%s memory_peak_bytes=%s bytes_per_connection=%s requested_connections=%s\n' \
+    "$iteration" "$kind" "$current" "$peak" "$((measured / CAPACITY_CONNECTIONS))" "$CAPACITY_CONNECTIONS" \
     >>"$RUN_DIR/capacity-memory-per-connection.txt"
+}
+
+wait_client_ready() {
+  local pid="$1" output="$2" pattern="$3" deadline=$((SECONDS + CLIENT_READY_TIMEOUT_SECS))
+  until grep -Eq "$pattern" "$output"; do
+    if ! kill -0 "$pid" 2>/dev/null || (( SECONDS >= deadline )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      cat "$output" >&2; echo "client did not finish verified setup" >&2; return 1;
+    fi
+    sleep 0.2
+  done
 }
 
 run_active() {
@@ -288,8 +309,9 @@ run_active() {
   local output="$RUN_DIR/${phase}-${kind}.txt"
   local args=(bench websocket --url "wss://${GATEWAY_ADDR}:${GATEWAY_PORT}/ws/" --connections "$CONNECTIONS" --duration-secs "$DURATION_SECS" --payload-bytes 256 --insecure)
   [[ -z "$interval" ]] || args+=(--message-interval-micros "$interval")
-  "$PROXY_BIN" "${args[@]}" >"$output" 2>&1 &
+  timeout --foreground "$((CLIENT_READY_TIMEOUT_SECS + DURATION_SECS + 30))" env TOKIO_WORKER_THREADS="$CLIENT_TOKIO_WORKERS" "$PROXY_BIN" "${args[@]}" >"$output" 2>&1 &
   local client_pid=$!
+  wait_client_ready "$client_pid" "$output" "^traffic ready[[:space:]]*: connections=$CONNECTIONS warmed=$CONNECTIONS$"
   sleep "$RESOURCE_SAMPLE_AFTER_SECS"
   sample_gateway_resources "$phase" "$kind"
   wait "$client_pid"
@@ -301,8 +323,9 @@ run_capacity() {
   local kind="$1" iteration="$2"
   local output="$RUN_DIR/capacity-r${iteration}-${kind}.txt"
   start_gateway "$kind"
-  "$PROXY_BIN" bench websocket --url "wss://${GATEWAY_ADDR}:${GATEWAY_PORT}/ws/" --connections "$CAPACITY_CONNECTIONS" --hold-connections --connect-workers "$CAPACITY_CONNECT_WORKERS" --duration-secs "$CAPACITY_HOLD_SECS" --insecure >"$output" 2>&1 &
+  timeout --foreground "$((CLIENT_READY_TIMEOUT_SECS + CAPACITY_HOLD_SECS + 30))" env TOKIO_WORKER_THREADS="$CLIENT_TOKIO_WORKERS" "$PROXY_BIN" bench websocket --url "wss://${GATEWAY_ADDR}:${GATEWAY_PORT}/ws/" --connections "$CAPACITY_CONNECTIONS" --hold-connections --connect-workers "$CAPACITY_CONNECT_WORKERS" --duration-secs "$CAPACITY_HOLD_SECS" --insecure >"$output" 2>&1 &
   local client_pid=$!
+  wait_client_ready "$client_pid" "$output" "^hold ready[[:space:]]*: requested=$CAPACITY_CONNECTIONS opened=$CAPACITY_CONNECTIONS failed=0 hold_secs=$CAPACITY_HOLD_SECS$"
   sleep "$RESOURCE_SAMPLE_AFTER_SECS"
   sample_gateway_resources "capacity-r${iteration}" "$kind"
   wait "$client_pid"
@@ -310,12 +333,14 @@ run_capacity() {
   record_capacity_memory_cost "$iteration" "$kind"
   cat "$output"
   stop_gateway
-  local requested opened failed
+  local requested opened failed retained hold_failed
   requested="$(awk -F: '/connections requested/ {gsub(/ /, "", $2); print $2}' "$output")"
   opened="$(awk -F: '/connections opened/ {gsub(/ /, "", $2); print $2}' "$output")"
   failed="$(awk -F: '/connections failed/ {gsub(/ /, "", $2); print $2}' "$output")"
-  [[ "$requested" == "$CAPACITY_CONNECTIONS" && "$opened" == "$CAPACITY_CONNECTIONS" && "$failed" == "0" ]] || {
-    echo "$kind capacity failed: requested=$requested opened=$opened failed=$failed" >&2
+  retained="$(awk -F: '/connections retained/ {gsub(/ /, "", $2); print $2}' "$output")"
+  hold_failed="$(awk -F: '/hold failures/ {gsub(/ /, "", $2); print $2}' "$output")"
+  [[ "$requested" == "$CAPACITY_CONNECTIONS" && "$opened" == "$CAPACITY_CONNECTIONS" && "$failed" == "0" && "$retained" == "$CAPACITY_CONNECTIONS" && "$hold_failed" == "0" ]] || {
+    echo "$kind capacity failed: requested=$requested opened=$opened failed=$failed retained=$retained hold_failed=$hold_failed" >&2
     exit 1
   }
 }
@@ -398,6 +423,9 @@ nginx_bin=$NGINX_BIN
 connections=$CONNECTIONS
 capacity_connections=$CAPACITY_CONNECTIONS
 capacity_connect_workers=$CAPACITY_CONNECT_WORKERS
+client_tokio_workers=$CLIENT_TOKIO_WORKERS
+backend_tokio_workers=$BACKEND_TOKIO_WORKERS
+capacity_idle_timeout_secs=$WSS_IDLE_TIMEOUT_SECS
 nofile_limit=$NOFILE_LIMIT
 gateway_cpuset=$GATEWAY_CPUSET
 gateway_cpu_count=$GATEWAY_CPU_COUNT

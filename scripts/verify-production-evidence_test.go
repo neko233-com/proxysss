@@ -38,8 +38,8 @@ func validEvidenceRun(kind string, scale int) evidenceRun {
 		},
 		Scenarios: scenarios,
 		Capacity: capacityEvidence{
-			Proxysss: capacityMetrics{Opened: 20000, OpenRatePerSec: 200, HandshakeP50MS: 1, HandshakeP95MS: 2, HandshakeP99MS: 3},
-			Nginx:    capacityMetrics{Opened: 20000, OpenRatePerSec: 100, HandshakeP50MS: 2, HandshakeP95MS: 3, HandshakeP99MS: 4},
+			Proxysss: capacityMetrics{Opened: 20000, Retained: 20000, HoldSecs: 60, OpenRatePerSec: 200, HandshakeP50MS: 1, HandshakeP95MS: 2, HandshakeP99MS: 3},
+			Nginx:    capacityMetrics{Opened: 20000, Retained: 20000, HoldSecs: 60, OpenRatePerSec: 100, HandshakeP50MS: 2, HandshakeP95MS: 3, HandshakeP99MS: 4},
 		},
 		Artifacts: []evidenceArtifact{
 			{Name: "saturation", SHA256: testHashA, URI: "artifact://saturation"},
@@ -57,6 +57,21 @@ func validManifest() evidenceManifest {
 		}
 	}
 	return evidenceManifest{SchemaVersion: evidenceSchemaVersion, Tag: "v9.9.9", Commit: "deadbeef", Runs: runs}
+}
+
+func TestEvidenceRejectsDeadIdleCapacityAndUnequalHold(t *testing.T) {
+	for _, mutate := range []func(*capacityEvidence){
+		func(c *capacityEvidence) { c.Nginx.Retained = 0 },
+		func(c *capacityEvidence) { c.Proxysss.HoldFailed = 1 },
+		func(c *capacityEvidence) { c.Proxysss.HoldSecs = 0 },
+		func(c *capacityEvidence) { c.Proxysss.HoldSecs = 30 },
+	} {
+		manifest := validManifest()
+		mutate(&manifest.Runs[0].Capacity)
+		if err := validateEvidenceManifest(manifest, "v9.9.9", "deadbeef"); err == nil || !strings.Contains(err.Error(), "idle hold") {
+			t.Fatalf("invalid idle capacity accepted: %v", err)
+		}
+	}
 }
 
 func TestEvidenceManifestRequiresEveryKindAndScale(t *testing.T) {

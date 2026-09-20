@@ -19,7 +19,7 @@ go run scripts/verify-production-evidence.go \
 
 每轮都必须是严格胜出与零错误；`cross-host-wss` 的三个 machine-id hash 必须彼此不同。单机 `role-isolated-all-scenarios` 可以记录同一宿主机 hash，但 `role_isolation_proven` 必须为 `true`，表示 cpuset、cgroup 与网络命名空间预检通过。
 
-清单目前是 **schema v2**。不再接受 `strict_superiority: true` 这类只能表达结论的布尔字段：每个场景都必须逐项写入 proxysss/nginx 的 `ops_per_sec`、`p50_ms`、`p95_ms`、`p99_ms`、`errors`，验证器会要求吞吐严格更高、三个百分位严格更低、两边错误均为 0。`role-isolated-all-scenarios` 必须完整列出十个当前 nginx 公平对标场景；`cross-host-wss` 必须列出 `websocket-long-connection`。容量也必须同时记录两边的 opened/failed、open rate 与三项握手百分位，并要求在 **1k-50k** 的可复现包络内双边均完整建连、proxysss 严格胜出。
+清单目前是 **schema v3**。不再接受 `strict_superiority: true` 这类只能表达结论的布尔字段：每个场景都必须逐项写入 proxysss/nginx 的 `ops_per_sec`、`p50_ms`、`p95_ms`、`p99_ms`、`errors`，验证器会要求吞吐严格更高、三个百分位严格更低、两边错误均为 0。`role-isolated-all-scenarios` 必须完整列出十个当前 nginx 公平对标场景；`cross-host-wss` 必须列出 `websocket-long-connection`。容量也必须同时记录两边的 opened/failed、retained/hold_failed/hold_secs、open rate 与三项握手百分位，并要求在 **1k-50k** 的可复现包络内双边均完整建连并在相同且大于零的 idle hold 后逐连接 echo 验证存活、proxysss 严格胜出。schema v2 及仅记录 opened 的旧工件不能满足这项检查。
 
 内存不设固定绝对数字门槛，但不是无限制：每轮必须分别记录 proxysss/nginx 的实际 `current_bytes`、`peak_bytes`、`bytes_per_connection` 与无持续增长结论，且 proxysss 的任一项都不得超过 nginx 的 **2 倍**。若发布包络有明确预算，可另在 benchmark 命令传 `MemoryMax`/Docker `--memory`。默认 4c 参考工作负载是 4096 active WSS + 20k idle WSS，规模复验只把 active WSS 扩为 8192、16384，不用 100k 伪容量替代生产结论。
 
@@ -29,7 +29,7 @@ go run scripts/verify-production-evidence.go \
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "tag": "vX.Y.Z",
   "commit": "<full-tag-commit-sha>",
   "runs": [
@@ -58,8 +58,8 @@ go run scripts/verify-production-evidence.go \
         }
       ],
       "capacity": {
-        "proxysss": { "opened": 20000, "failed": 0, "open_rate_per_sec": 2000, "handshake_p50_ms": 1.0, "handshake_p95_ms": 2.0, "handshake_p99_ms": 3.0 },
-        "nginx": { "opened": 20000, "failed": 0, "open_rate_per_sec": 1900, "handshake_p50_ms": 1.1, "handshake_p95_ms": 2.2, "handshake_p99_ms": 3.3 }
+        "proxysss": { "opened": 20000, "failed": 0, "retained": 20000, "hold_failed": 0, "hold_secs": 60, "open_rate_per_sec": 2000, "handshake_p50_ms": 1.0, "handshake_p95_ms": 2.0, "handshake_p99_ms": 3.0 },
+        "nginx": { "opened": 20000, "failed": 0, "retained": 20000, "hold_failed": 0, "hold_secs": 60, "open_rate_per_sec": 1900, "handshake_p50_ms": 1.1, "handshake_p95_ms": 2.2, "handshake_p99_ms": 3.3 }
       },
       "artifacts": [
         { "name": "saturation", "sha256": "<sha256>", "uri": "artifact://..." },

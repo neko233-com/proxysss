@@ -18,7 +18,7 @@ import (
 	"strings"
 )
 
-const evidenceSchemaVersion = 2
+const evidenceSchemaVersion = 3
 
 var roleIsolatedScenarios = []string{
 	"static-small", "static-large", "cdn-hot-update", "https-static-small",
@@ -91,6 +91,9 @@ type capacityEvidence struct {
 type capacityMetrics struct {
 	Opened         int     `json:"opened"`
 	Failed         int     `json:"failed"`
+	Retained       int     `json:"retained"`
+	HoldFailed     int     `json:"hold_failed"`
+	HoldSecs       int     `json:"hold_secs"`
 	OpenRatePerSec float64 `json:"open_rate_per_sec"`
 	HandshakeP50MS float64 `json:"handshake_p50_ms"`
 	HandshakeP95MS float64 `json:"handshake_p95_ms"`
@@ -317,6 +320,9 @@ func validateScenarioMetrics(scenario scenarioEvidence) error {
 func validateCapacity(capacity capacityEvidence, requested int) error {
 	if capacity.Proxysss.Opened != requested || capacity.Nginx.Opened != requested || capacity.Proxysss.Failed != 0 || capacity.Nginx.Failed != 0 {
 		return errors.New("capacity requires both gateways to open every requested connection with zero failures")
+	}
+	if capacity.Proxysss.Retained != requested || capacity.Nginx.Retained != requested || capacity.Proxysss.HoldFailed != 0 || capacity.Nginx.HoldFailed != 0 || capacity.Proxysss.HoldSecs <= 0 || capacity.Proxysss.HoldSecs != capacity.Nginx.HoldSecs {
+		return errors.New("capacity requires every connection to survive the same positive idle hold and pass the final echo")
 	}
 	return validateScenarioMetrics(scenarioEvidence{
 		Name:     "capacity",

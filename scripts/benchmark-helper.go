@@ -118,6 +118,9 @@ func main() {
 var (
 	connectionRequestedPattern = regexp.MustCompile(`(?m)^connections requested\s+:\s+(\d+)`)
 	connectionOpenedPattern    = regexp.MustCompile(`(?m)^connections opened\s+:\s+(\d+)`)
+	connectionRetainedPattern  = regexp.MustCompile(`(?m)^connections retained\s+:\s+(\d+)`)
+	holdFailedPattern          = regexp.MustCompile(`(?m)^hold failures\s+:\s+(\d+)`)
+	holdSecsPattern            = regexp.MustCompile(`(?m)^hold duration\s+:\s+(\d+)`)
 	connectionFailedPattern    = regexp.MustCompile(`(?m)^connections failed\s+:\s+(\d+)`)
 	handshakeAttemptsPattern   = regexp.MustCompile(`(?m)^handshake attempts\s+:\s+(\d+)`)
 	openRatePattern            = regexp.MustCompile(`(?m)^open rate\s+:\s+([\d.]+)\s+connections/s`)
@@ -151,6 +154,14 @@ func runAggregateIsolatedWSSCapacity(args []string) error {
 		total.Requested += sample.Requested
 		total.Opened += sample.Opened
 		total.Failed += sample.Failed
+		total.Retained += sample.Retained
+		total.HoldFailed += sample.HoldFailed
+		if total.HoldSecs == 0 {
+			total.HoldSecs = sample.HoldSecs
+		}
+		if sample.HoldSecs <= 0 || total.HoldSecs != sample.HoldSecs {
+			return errors.New("capacity clients must use the same positive hold duration")
+		}
 		total.Attempts += sample.Attempts
 		total.OpenRate += sample.OpenRate
 		if sample.P50MS > total.P50MS {
@@ -163,11 +174,11 @@ func runAggregateIsolatedWSSCapacity(args []string) error {
 			total.P99MS = sample.P99MS
 		}
 	}
-	fmt.Printf("requested=%d opened=%d failed=%d attempts=%d open_rate=%.3f worst_p50_ms=%.3f worst_p95_ms=%.3f worst_p99_ms=%.3f\n",
-		total.Requested, total.Opened, total.Failed, total.Attempts, total.OpenRate,
+	fmt.Printf("requested=%d opened=%d failed=%d retained=%d hold_failed=%d hold_secs=%d attempts=%d open_rate=%.3f worst_p50_ms=%.3f worst_p95_ms=%.3f worst_p99_ms=%.3f\n",
+		total.Requested, total.Opened, total.Failed, total.Retained, total.HoldFailed, total.HoldSecs, total.Attempts, total.OpenRate,
 		total.P50MS, total.P95MS, total.P99MS)
-	if total.Requested != *expected || total.Opened != *expected || total.Failed != 0 {
-		return fmt.Errorf("capacity incomplete: expected=%d requested=%d opened=%d failed=%d", *expected, total.Requested, total.Opened, total.Failed)
+	if total.Requested != *expected || total.Opened != *expected || total.Retained != *expected || total.Failed != 0 || total.HoldFailed != 0 {
+		return fmt.Errorf("capacity incomplete: expected=%d requested=%d opened=%d failed=%d retained=%d hold_failed=%d", *expected, total.Requested, total.Opened, total.Failed, total.Retained, total.HoldFailed)
 	}
 	return nil
 }
@@ -196,6 +207,15 @@ func parseIsolatedWSSCapacityClient(raw string) (IsolatedWSSCapacity, error) {
 		return sample, err
 	}
 	if sample.Failed, err = valueInt("connections failed", connectionFailedPattern); err != nil {
+		return sample, err
+	}
+	if sample.Retained, err = valueInt("connections retained", connectionRetainedPattern); err != nil {
+		return sample, err
+	}
+	if sample.HoldFailed, err = valueInt("hold failures", holdFailedPattern); err != nil {
+		return sample, err
+	}
+	if sample.HoldSecs, err = valueInt("hold duration", holdSecsPattern); err != nil {
 		return sample, err
 	}
 	if sample.Attempts, err = valueInt("handshake attempts", handshakeAttemptsPattern); err != nil {
@@ -232,19 +252,30 @@ func (values *repeatedStringFlag) Set(value string) error {
 }
 
 type IsolatedWSSCapacity struct {
-	Requested int     `json:"requested"`
-	Opened    int     `json:"opened"`
-	Failed    int     `json:"failed"`
-	Attempts  int     `json:"attempts"`
-	OpenRate  float64 `json:"open_rate"`
-	P50MS     float64 `json:"handshake_p50_ms"`
-	P95MS     float64 `json:"handshake_p95_ms"`
-	P99MS     float64 `json:"handshake_p99_ms"`
+	Requested  int     `json:"requested"`
+	Opened     int     `json:"opened"`
+	Failed     int     `json:"failed"`
+	Retained   int     `json:"retained"`
+	HoldFailed int     `json:"hold_failed"`
+	HoldSecs   int     `json:"hold_secs"`
+	Attempts   int     `json:"attempts"`
+	OpenRate   float64 `json:"open_rate"`
+	P50MS      float64 `json:"handshake_p50_ms"`
+	P95MS      float64 `json:"handshake_p95_ms"`
+	P99MS      float64 `json:"handshake_p99_ms"`
 }
 
 type IsolatedWSSGatewaySample struct {
-	Active   BenchRow            `json:"active"`
-	Capacity IsolatedWSSCapacity `json:"capacity"`
+	Active   BenchRow                     `json:"active"`
+	Capacity IsolatedWSSCapacity          `json:"capacity"`
+	Memory   map[string]IsolatedWSSMemory `json:"memory,omitempty"`
+}
+
+type IsolatedWSSMemory struct {
+	CurrentBytes       uint64  `json:"current_bytes"`
+	PeakBytes          uint64  `json:"peak_bytes"`
+	Connections        uint64  `json:"connections"`
+	BytesPerConnection float64 `json:"bytes_per_connection"`
 }
 
 type IsolatedWSSRunSample struct {
@@ -282,6 +313,7 @@ type IsolatedWSSGateOptions struct {
 	GateActiveOps      bool
 	GateActiveLatency  bool
 	MinActiveOpsPerSec float64
+	RequireMemory      bool
 }
 
 func runSummarizeIsolatedWSS(args []string) error {
@@ -310,6 +342,7 @@ func runSummarizeIsolatedWSS(args []string) error {
 		GateActiveOps:      *gateActiveOps,
 		GateActiveLatency:  *gateActiveLatency,
 		MinActiveOpsPerSec: *minActiveOps,
+		RequireMemory:      true,
 	}
 	summary, err := summarizeIsolatedWSSRuns(runDirs, options)
 	if err != nil {
@@ -368,6 +401,38 @@ func summarizeIsolatedWSSRuns(
 					return summary, fmt.Errorf("parse %s capacity sample in %s: %w", gateway, runDir, err)
 				}
 			}
+			if options.RequireMemory {
+				target.Memory = map[string]IsolatedWSSMemory{}
+				phases := map[string]int{}
+				if options.RequireActive {
+					metadata, err := os.ReadFile(filepath.Join(runDir, "run-metadata.txt"))
+					if err != nil {
+						return summary, err
+					}
+					for _, field := range strings.Fields(string(metadata)) {
+						if value, ok := strings.CutPrefix(field, "active_connections="); ok {
+							count, err := strconv.Atoi(value)
+							if err != nil || count <= 0 {
+								return summary, errors.New("invalid active connection metadata")
+							}
+							phases["active-sample"] = count
+						}
+					}
+					if phases["active-sample"] == 0 {
+						return summary, errors.New("missing active connection metadata")
+					}
+				}
+				if options.RequireCapacity {
+					phases["capacity-held"] = target.Capacity.Requested
+				}
+				for phase, expected := range phases {
+					memory, err := readIsolatedWSSMemory(filepath.Join(runDir, gateway+"-"+phase+"-gateway-memory.txt"), expected)
+					if err != nil {
+						return summary, err
+					}
+					target.Memory[phase] = memory
+				}
+			}
 		}
 		summary.Runs = append(summary.Runs, sample)
 	}
@@ -406,9 +471,10 @@ func summarizeIsolatedWSSRuns(
 	}
 	if options.RequireCapacity {
 		for _, run := range summary.Runs {
-			fail(run.Nginx.Capacity.Failed != 0 || run.Nginx.Capacity.Opened != run.Nginx.Capacity.Requested,
+			fail(run.Proxysss.Capacity.HoldSecs <= 0 || run.Proxysss.Capacity.HoldSecs != run.Nginx.Capacity.HoldSecs, "capacity requires the same positive idle hold in "+run.RunDir)
+			fail(run.Nginx.Capacity.Failed != 0 || run.Nginx.Capacity.Opened != run.Nginx.Capacity.Requested || run.Nginx.Capacity.Retained != run.Nginx.Capacity.Requested || run.Nginx.Capacity.HoldFailed != 0,
 				fmt.Sprintf("nginx capacity incomplete in %s", run.RunDir))
-			fail(run.Proxysss.Capacity.Failed != 0 || run.Proxysss.Capacity.Opened != run.Proxysss.Capacity.Requested,
+			fail(run.Proxysss.Capacity.Failed != 0 || run.Proxysss.Capacity.Opened != run.Proxysss.Capacity.Requested || run.Proxysss.Capacity.Retained != run.Proxysss.Capacity.Requested || run.Proxysss.Capacity.HoldFailed != 0,
 				fmt.Sprintf("proxysss capacity incomplete in %s", run.RunDir))
 		}
 		fail(summary.Proxysss.CapacityRate <= summary.Nginx.CapacityRate,
@@ -420,7 +486,45 @@ func summarizeIsolatedWSSRuns(
 		fail(summary.Proxysss.HandshakeP99MS >= summary.Nginx.HandshakeP99MS,
 			fmt.Sprintf("handshake p99 proxysss=%.3f nginx=%.3f", summary.Proxysss.HandshakeP99MS, summary.Nginx.HandshakeP99MS))
 	}
+	if options.RequireMemory {
+		for _, run := range summary.Runs {
+			for phase, proxy := range run.Proxysss.Memory {
+				nginx := run.Nginx.Memory[phase]
+				for name, values := range map[string][2]float64{
+					"current":        {float64(proxy.CurrentBytes), float64(nginx.CurrentBytes)},
+					"peak":           {float64(proxy.PeakBytes), float64(nginx.PeakBytes)},
+					"per-connection": {proxy.BytesPerConnection, nginx.BytesPerConnection},
+				} {
+					fail(values[0] > 2*values[1], fmt.Sprintf("%s memory %s exceeds 2x nginx in %s", phase, name, run.RunDir))
+				}
+			}
+		}
+	}
 	return summary, nil
+}
+
+func readIsolatedWSSMemory(path string, expected int) (IsolatedWSSMemory, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return IsolatedWSSMemory{}, err
+	}
+	values := map[string]uint64{}
+	for _, field := range strings.Fields(string(raw)) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		number, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return IsolatedWSSMemory{}, fmt.Errorf("invalid memory sample %s: %w", path, err)
+		}
+		values[key] = number
+	}
+	current, peak, connections := values["memory_current_bytes"], values["memory_peak_bytes"], values["established_frontend_tcp"]
+	if expected <= 0 || current == 0 || peak < current || connections != uint64(expected) {
+		return IsolatedWSSMemory{}, fmt.Errorf("memory sample must cover every live connection: %s (current=%d peak=%d live=%d expected=%d)", path, current, peak, connections, expected)
+	}
+	return IsolatedWSSMemory{CurrentBytes: current, PeakBytes: peak, Connections: connections, BytesPerConnection: float64(current) / float64(connections)}, nil
 }
 
 func parseIsolatedWSSCapacity(raw string) (IsolatedWSSCapacity, error) {
@@ -448,6 +552,15 @@ func parseIsolatedWSSCapacity(raw string) (IsolatedWSSCapacity, error) {
 		return capacity, err
 	}
 	if capacity.Failed, err = parseInt("failed"); err != nil {
+		return capacity, err
+	}
+	if capacity.Retained, err = parseInt("retained"); err != nil {
+		return capacity, err
+	}
+	if capacity.HoldFailed, err = parseInt("hold_failed"); err != nil {
+		return capacity, err
+	}
+	if capacity.HoldSecs, err = parseInt("hold_secs"); err != nil {
 		return capacity, err
 	}
 	if capacity.Attempts, err = parseInt("attempts"); err != nil {
@@ -560,6 +673,27 @@ func renderIsolatedWSSMarkdown(summary IsolatedWSSSummary, active bool, capacity
 		fmt.Fprintf(&output, "| handshake p50 ms | %.3f | %.3f | %+.2f%% |\n", summary.Nginx.HandshakeP50MS, summary.Proxysss.HandshakeP50MS, advantage(summary.Proxysss.HandshakeP50MS, summary.Nginx.HandshakeP50MS, true))
 		fmt.Fprintf(&output, "| handshake p95 ms | %.3f | %.3f | %+.2f%% |\n", summary.Nginx.HandshakeP95MS, summary.Proxysss.HandshakeP95MS, advantage(summary.Proxysss.HandshakeP95MS, summary.Nginx.HandshakeP95MS, true))
 		fmt.Fprintf(&output, "| handshake p99 ms | %.3f | %.3f | %+.2f%% |\n\n", summary.Nginx.HandshakeP99MS, summary.Proxysss.HandshakeP99MS, advantage(summary.Proxysss.HandshakeP99MS, summary.Nginx.HandshakeP99MS, true))
+	}
+	for index, run := range summary.Runs {
+		if len(run.Proxysss.Memory) == 0 {
+			continue
+		}
+		fmt.Fprintf(&output, "Memory while connections are live, run %d:\n\n| phase | gateway | connections | current bytes | peak bytes | bytes/connection |\n| --- | --- | ---: | ---: | ---: | ---: |\n", index+1)
+		for _, phase := range []string{"active-sample", "capacity-held"} {
+			for _, gateway := range []string{"nginx", "proxysss"} {
+				sample := run.Nginx
+				if gateway == "proxysss" {
+					sample = run.Proxysss
+				}
+				if memory, ok := sample.Memory[phase]; ok {
+					fmt.Fprintf(&output, "| %s | %s | %d | %d | %d | %.2f |\n", phase, gateway, memory.Connections, memory.CurrentBytes, memory.PeakBytes, memory.BytesPerConnection)
+				}
+			}
+		}
+		if capacity {
+			fmt.Fprintf(&output, "\nVerified after idle hold: nginx %d/%d (verification failures %d), proxysss %d/%d (verification failures %d).\n", run.Nginx.Capacity.Retained, run.Nginx.Capacity.Requested, run.Nginx.Capacity.HoldFailed, run.Proxysss.Capacity.Retained, run.Proxysss.Capacity.Requested, run.Proxysss.Capacity.HoldFailed)
+		}
+		output.WriteString("\n")
 	}
 	if len(summary.Failures) > 0 {
 		output.WriteString("Failures:\n\n")

@@ -28,6 +28,7 @@ require_cmd() {
 
 require_cmd docker
 require_cmd grep
+require_cmd timeout
 
 cpuset_cpu_count() {
   local cpuset="$1" count=0 item first last
@@ -131,6 +132,13 @@ CAPACITY_HOLD_SECS="${CAPACITY_HOLD_SECS:-120}"
 CAPACITY_SETTLE_SECS="${CAPACITY_SETTLE_SECS:-90}"
 CAPACITY_SAMPLE_AFTER_SECS="${CAPACITY_SAMPLE_AFTER_SECS:-5}"
 CAPACITY_CONNECT_WORKERS="${CAPACITY_CONNECT_WORKERS:-256}"
+CLIENT_TOKIO_WORKERS="${CLIENT_TOKIO_WORKERS:-$(cpuset_cpu_count "$CLIENT_CPUSET")}"
+BACKEND_TOKIO_WORKERS="${BACKEND_TOKIO_WORKERS:-$((($(cpuset_cpu_count "$BACKEND_CPUSET") + 3) / 4))}"
+CAPACITY_CLIENT_TOKIO_WORKERS="${CAPACITY_CLIENT_TOKIO_WORKERS:-$((($(cpuset_cpu_count "$CAPACITY_CLIENT_CPUSET") + CAPACITY_CLIENTS - 1) / CAPACITY_CLIENTS))}"
+CLIENT_READY_TIMEOUT_SECS="${CLIENT_READY_TIMEOUT_SECS:-120}"
+CLIENT_FINISH_GRACE_SECS="${CLIENT_FINISH_GRACE_SECS:-30}"
+# Idle capacity means that the tunnels survive the entire declared hold.
+WSS_IDLE_TIMEOUT_SECS=$((CAPACITY_HOLD_SECS + CAPACITY_SETTLE_SECS + CLIENT_READY_TIMEOUT_SECS))
 STRICT_GATE="${STRICT_GATE:-1}"
 RUN_ACTIVE="${RUN_ACTIVE:-1}"
 RUN_CAPACITY="${RUN_CAPACITY:-1}"
@@ -194,6 +202,17 @@ if ! [[ "$NGINX_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 validate_role_cpusets
+for value in "$CLIENT_TOKIO_WORKERS" "$BACKEND_TOKIO_WORKERS" "$CAPACITY_CLIENT_TOKIO_WORKERS" "$CLIENT_READY_TIMEOUT_SECS" "$CLIENT_FINISH_GRACE_SECS"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "runtime workers and readiness timeout must be positive" >&2; exit 1; }
+done
+if [[ "$RUN_ACTIVE" == "1" ]] && (( ACTIVE_SAMPLE_AFTER_SECS >= ACTIVE_DURATION_SECS )); then
+  echo "active memory sample must occur inside the measurement window" >&2
+  exit 1
+fi
+if [[ "$RUN_CAPACITY" == "1" ]] && (( CAPACITY_SETTLE_SECS >= CAPACITY_HOLD_SECS )); then
+  echo "capacity settled sample must occur before the hold ends" >&2
+  exit 1
+fi
 
 if [[ "$FORCE_BUILD" == "1" || ! -x "$PROXY_BIN" ]]; then
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/target}" \
@@ -317,7 +336,7 @@ http {
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_connect_timeout 2s;
-            proxy_read_timeout 30s;
+            proxy_read_timeout ${WSS_IDLE_TIMEOUT_SECS}s;
             proxy_send_timeout 10s;
             proxy_next_upstream_tries 2;
             proxy_buffering off;
@@ -339,7 +358,7 @@ http {
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_connect_timeout 2s;
-            proxy_read_timeout 30s;
+            proxy_read_timeout ${WSS_IDLE_TIMEOUT_SECS}s;
             proxy_send_timeout 10s;
             proxy_next_upstream_tries 2;
             proxy_buffering off;
@@ -365,6 +384,7 @@ start_backends() {
     docker run -d --name "$PREFIX-backend-$index" \
       --network "$NETWORK" --ip "${backend_base}.${index}" \
       --cpuset-cpus "$BACKEND_CPUSET" "${memory_args[@]}" \
+      --env "TOKIO_WORKER_THREADS=$BACKEND_TOKIO_WORKERS" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       "$IMAGE" proxysss demo ws-echo --listen 0.0.0.0:18192 >/dev/null
   done
@@ -470,12 +490,29 @@ wait_wss() {
 # 2x-nginx release comparison has machine-readable, per-run inputs.
 capture_gateway_memory() {
   local kind="$1" phase="$2"
-  docker exec "$PREFIX-gateway-$kind" sh -ec '
-    test -r /sys/fs/cgroup/memory.current
-    test -r /sys/fs/cgroup/memory.peak
-    printf "memory_current_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.current)"
-    printf "memory_peak_bytes=%s\\n" "$(cat /sys/fs/cgroup/memory.peak)"
-  ' >"$RUN_DIR/${kind}-${phase}-gateway-memory.txt"
+  local port=18441
+  [[ "$kind" != "proxysss" ]] || port=18443
+  docker exec -i "$PREFIX-gateway-$kind" bash -c 'tr -d "\r" | bash -s -- "$1"' -- "$port" \
+    >"$RUN_DIR/${kind}-${phase}-gateway-memory.txt" <<'MEMORY_SAMPLE'
+set -eu
+printf 'sample_unix_secs=%s\n' "$(date +%s)"
+printf 'memory_current_bytes=%s\n' "$(cat /sys/fs/cgroup/memory.current)"
+printf 'memory_peak_bytes=%s\n' "$(cat /sys/fs/cgroup/memory.peak)"
+port_hex=$(printf '%04X' "$1")
+awk -v port="$port_hex" '$2 ~ ":" port "$" && $4 == "01" { count++ } END { print "established_frontend_tcp=" count+0 }' /proc/net/tcp /proc/net/tcp6
+MEMORY_SAMPLE
+}
+
+wait_client_ready() {
+  local name="$1" pattern="$2" deadline=$((SECONDS + CLIENT_READY_TIMEOUT_SECS))
+  while ! docker logs "$name" 2>&1 | grep -Eq "$pattern"; do
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$name")" != "true" ]] || (( SECONDS >= deadline )); then
+      docker logs "$name" >&2 || true
+      echo "client did not finish verified setup: $name" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
 }
 
 run_active() {
@@ -504,13 +541,15 @@ run_active() {
   fi
   docker run -d --name "$name" --network "$NETWORK" --ip "${client_base_ip}.10" \
     --cpuset-cpus "$CLIENT_CPUSET" "${memory_args[@]}" \
+    --env "TOKIO_WORKER_THREADS=$CLIENT_TOKIO_WORKERS" \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" proxysss bench websocket "${bench_args[@]}" >/dev/null
+  wait_client_ready "$name" "^traffic ready[[:space:]]*: connections=$ACTIVE_CONNECTIONS warmed=$ACTIVE_CONNECTIONS$"
   sleep "$ACTIVE_SAMPLE_AFTER_SECS"
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
     "$PREFIX-gateway-$kind" "$name" | tee "$RUN_DIR/${kind}-active-stats.txt" || true
   capture_gateway_memory "$kind" active-sample
-  docker wait "$name" >/dev/null
+  timeout "$((ACTIVE_DURATION_SECS + CLIENT_FINISH_GRACE_SECS))" docker wait "$name" >/dev/null
   docker logs "$name" | tee "$output"
   docker rm "$name" >/dev/null
   capture_gateway_memory "$kind" active-final
@@ -535,12 +574,17 @@ run_capacity() {
     ids+=("$name")
     docker run -d --name "$name" --network "$NETWORK" --ip "$client_ip" \
       --cpuset-cpus "$CAPACITY_CLIENT_CPUSET" "${memory_args[@]}" \
+      --env "TOKIO_WORKER_THREADS=$CAPACITY_CLIENT_TOKIO_WORKERS" \
       --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
       "$IMAGE" proxysss bench websocket \
         --url "wss://${gateway_ip}:${port}/ws/" \
         --connections "$per_client" --duration-secs "$CAPACITY_HOLD_SECS" \
         --hold-connections --connect-workers "$CAPACITY_CONNECT_WORKERS" \
         --connect-timeout-ms 10000 --connect-retries 2 --insecure >/dev/null
+  done
+
+  for name in "${ids[@]}"; do
+    wait_client_ready "$name" "^hold ready[[:space:]]*: requested=$per_client opened=$per_client failed=0 hold_secs=$CAPACITY_HOLD_SECS$"
   done
 
   local sample_after="$CAPACITY_SAMPLE_AFTER_SECS"
@@ -560,10 +604,15 @@ run_capacity() {
   fi
   docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' \
     "$PREFIX-gateway-$kind" | tee "$RUN_DIR/${kind}-capacity-gateway-stats.txt"
+  capture_gateway_memory "$kind" capacity-held
+  if ! grep -qx "established_frontend_tcp=$CAPACITY_CONNECTIONS" "$RUN_DIR/${kind}-capacity-held-gateway-memory.txt"; then
+    echo "idle capacity lost connections before the held-memory sample: $kind" >&2
+    return 1
+  fi
 
   local outputs=()
   for name in "${ids[@]}"; do
-    docker wait "$name" >/dev/null
+    timeout "$((CAPACITY_HOLD_SECS + CLIENT_FINISH_GRACE_SECS))" docker wait "$name" >/dev/null
     local output="$RUN_DIR/${name}.txt"
     docker logs "$name" | tee "$output"
     outputs+=("$output")
@@ -626,6 +675,10 @@ client_memory_each=${CLIENT_MEMORY:-unlimited}
 capacity_client_cpuset=$CAPACITY_CLIENT_CPUSET
 capacity_sample_after_secs=$CAPACITY_SAMPLE_AFTER_SECS
 capacity_clients=$CAPACITY_CLIENTS
+client_tokio_workers=$CLIENT_TOKIO_WORKERS
+capacity_client_tokio_workers=$CAPACITY_CLIENT_TOKIO_WORKERS
+backend_tokio_workers=$BACKEND_TOKIO_WORKERS
+capacity_idle_timeout_secs=$WSS_IDLE_TIMEOUT_SECS
 active_connections=$ACTIVE_CONNECTIONS
 active_payload_bytes=$ACTIVE_PAYLOAD_BYTES
 active_message_interval_micros=$ACTIVE_MESSAGE_INTERVAL_MICROS
