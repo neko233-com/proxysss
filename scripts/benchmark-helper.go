@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -79,6 +80,8 @@ func main() {
 		fmt.Println(time.Now().UnixMilli())
 	case "write-large-file":
 		err = runWriteLargeFile(os.Args[2:])
+	case "verify-http-body":
+		err = runVerifyHTTPBody(os.Args[2:])
 	case "serve-sse":
 		err = runServeSSE(os.Args[2:])
 	case "parse-bench":
@@ -735,6 +738,46 @@ func runWriteLargeFile(args []string) error {
 	return os.WriteFile(*path, payload, 0o644)
 }
 
+func runVerifyHTTPBody(args []string) error {
+	fs := flag.NewFlagSet("verify-http-body", flag.ContinueOnError)
+	url := fs.String("url", "", "fixture URL")
+	body := fs.String("body", "", "exact expected fixture body")
+	timeout := fs.Duration("timeout", 5*time.Second, "total verification deadline")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *url == "" || *timeout <= 0 || len(*body) > 65536 {
+		return errors.New("verify-http-body: URL, positive timeout and body <=64KiB required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	var lastError error
+	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, *url, nil)
+		if err != nil {
+			return err
+		}
+		response, err := client.Do(request)
+		if err == nil {
+			actual, readErr := io.ReadAll(io.LimitReader(response.Body, int64(len(*body)+1)))
+			response.Body.Close()
+			if readErr == nil && response.StatusCode == http.StatusOK && string(actual) == *body {
+				fmt.Printf("verified HTTP 200 and exact body: %s bytes=%d\n", *url, len(actual))
+				return nil
+			}
+			err = fmt.Errorf("status=%d body_bytes=%d read_error=%v", response.StatusCode, len(actual), readErr)
+		}
+		lastError = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("fixture verification failed: %w (last response: %v)", ctx.Err(), lastError)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func runServeSSE(args []string) error {
 	fs := flag.NewFlagSet("serve-sse", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:18191", "listen address")
@@ -1199,7 +1242,6 @@ func runWriteAllScenariosSummary(args []string) error {
 	}
 	var errorFailures []string
 	var targetFailures []string
-	var referenceTargetWarnings []string
 	scenarios := sortedKeys(byScenario)
 	for _, scenario := range scenarios {
 		gateways := byScenario[scenario]
@@ -1246,11 +1288,7 @@ func runWriteAllScenariosSummary(args []string) error {
 						"%s %s target achievement %.3f < %.3f (actual=%.2f target=%.2f)",
 						scenario, gateway, achievement, *minTargetAchievement, row.OpsPerSec, *row.TargetOpsPerSec,
 					)
-					if gateway == "proxysss" {
-						targetFailures = append(targetFailures, message)
-					} else {
-						referenceTargetWarnings = append(referenceTargetWarnings, message)
-					}
+					targetFailures = append(targetFailures, message)
 				}
 			}
 		}
@@ -1276,16 +1314,13 @@ func runWriteAllScenariosSummary(args []string) error {
 		fmt.Sprintf("- Saturation ops gate: `%t`", *gateOps),
 		fmt.Sprintf("- Equal-load latency gate: `%t`", *gateLatency),
 		fmt.Sprintf("- Minimum fixed-load completion: `%.3f`", *minTargetAchievement),
-		fmt.Sprintf("- Reference under-target policy: `report warning; candidate must still meet target and win latency`"),
+		"- Fixed-load completion policy: `both gateways must meet the minimum in every repetition`",
 		fmt.Sprintf("- Zero-error gate: `%t`", *requireZeroErrors),
 		fmt.Sprintf("- Result file: `%s`", *resultsPath),
 		"",
 		"| Scenario | proxysss ops/s | nginx ops/s | Ops ratio | Ops improvement | Target ops/s | proxy completion | nginx completion | p50 ratio | p50 improvement | p95 ratio | p95 improvement | p99 ratio | p99 improvement | Errors |",
 		"| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
 	)
-	if len(referenceTargetWarnings) > 0 {
-		lines = append(lines, fmt.Sprintf("- Reference under-target warnings: `%s`", strings.Join(referenceTargetWarnings, "; ")))
-	}
 
 	var ratioPairs []struct {
 		Scenario string

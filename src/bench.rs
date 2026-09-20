@@ -44,6 +44,12 @@ pub struct HttpBenchArgs {
     pub insecure: bool,
     #[arg(long, default_value_t = false)]
     pub http1_only: bool,
+    /// Require this exact response status. Otherwise any 2xx status is accepted.
+    #[arg(long)]
+    pub expected_status: Option<u16>,
+    /// Require this decoded response-body length, without buffering the body.
+    #[arg(long)]
+    pub expected_body_bytes: Option<u64>,
     /// Fixed delay between operations per worker, in microseconds. Zero keeps
     /// saturation mode; a positive value enables equal-offered-load latency
     /// measurement.
@@ -264,7 +270,7 @@ impl TaskStats {
 /// task-spawn and connection-ramp skew out of p50/p95/p99 comparisons.
 struct BenchmarkSchedule {
     barrier: Barrier,
-    scheduled_start: OnceLock<tokio::time::Instant>,
+    scheduled_start: OnceLock<Option<tokio::time::Instant>>,
     duration: Duration,
     operation_interval: Option<Duration>,
     start_at_unix_ms: u64,
@@ -305,10 +311,11 @@ impl BenchmarkSchedule {
             ));
         }
         self.barrier.wait().await;
-        let measurement_start = *self
+        let measurement_start = self
             .scheduled_start
             .get()
-            .expect("benchmark start time initialized");
+            .expect("benchmark start time initialized")
+            .unwrap_or_else(|| tokio::time::Instant::now() - self.duration);
         tokio::time::sleep_until(measurement_start).await;
         let ticker = self.operation_interval.map(|interval| {
             // Independent HTTP/SSE clients are phase-spread across one
@@ -333,24 +340,36 @@ impl BenchmarkSchedule {
         });
         (measurement_start + self.duration, ticker)
     }
+
+    fn ensure_started_on_time(&self) -> Result<()> {
+        ensure_benchmark_started_on_time(&self.scheduled_start)
+    }
+}
+
+fn ensure_benchmark_started_on_time(start: &OnceLock<Option<tokio::time::Instant>>) -> Result<()> {
+    anyhow::ensure!(
+        start.get().is_some_and(Option::is_some),
+        "benchmark warm-up missed the shared absolute start; this wave is invalid"
+    );
+    Ok(())
 }
 
 fn benchmark_start_instant(
     start_at_unix_ms: u64,
     fallback_delay: Duration,
-) -> tokio::time::Instant {
+) -> Option<tokio::time::Instant> {
     let now = tokio::time::Instant::now();
     if start_at_unix_ms == 0 {
-        return now + fallback_delay;
+        return Some(now + fallback_delay);
     }
     let current_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
     if start_at_unix_ms <= current_unix_ms {
-        return now + fallback_delay;
+        return None;
     }
-    now + Duration::from_millis(start_at_unix_ms - current_unix_ms)
+    Some(now + Duration::from_millis(start_at_unix_ms - current_unix_ms))
 }
 
 async fn wait_for_operation_slot(
@@ -398,38 +417,43 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
         true,
         args.start_at_unix_ms,
     ));
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .danger_accept_invalid_certs(args.insecure)
-        .http2_adaptive_window(true)
-        .timeout(Duration::from_secs(10));
-    if args.http1_only {
-        builder = builder.http1_only();
-    }
-    let client = builder.build().context("failed to build reqwest client")?;
-    let url = Arc::new(args.url);
+    let client = http_benchmark_client(args.insecure, args.http1_only)?;
+    let url = Arc::new(args.url.clone());
+    let worker_clients = if url.starts_with("http://") || args.http1_only {
+        Some(
+            (0..concurrency)
+                .map(|_| http_benchmark_client(args.insecure, true))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
 
     // Plain HTTP/1 measurements use many pooled connections, unlike HTTPS/H2
     // which multiplexes on one preconnected session below. Open the same
     // connection count for both gateways before the absolute measurement
     // timestamp so one-second p99 represents steady gateway work instead of
     // whichever candidate completed the initial TCP ramp first.
-    if url.starts_with("http://") {
-        preconnect_http1_pool(&client, url.clone(), concurrency).await?;
+    if let Some(clients) = &worker_clients {
+        if method == Method::GET || method == Method::HEAD {
+            preconnect_http1_pool(clients, url.clone(), args.expected_status).await?;
+        }
     }
+    let warmup_client = worker_clients
+        .as_ref()
+        .map_or(&client, |clients| &clients[0]);
 
     // HTTPS saturation measures steady HTTP/2/TLS request processing, not a
     // race between the first QEMU-scheduled client handshake and the shared
     // measurement timestamp. A HEAD request creates the same pooled TLS/H2
     // connection for both candidates without transferring a benchmark body.
-    if args.insecure {
+    if args.insecure && worker_clients.is_none() {
         let response = client
             .head(url.as_str())
             .send()
             .await
             .context("failed to preconnect HTTPS benchmark client")?;
-        response
-            .bytes()
+        drain_http_benchmark_response(response, args.expected_status, Some(0))
             .await
             .context("failed to drain HTTPS preconnect response")?;
     }
@@ -440,15 +464,17 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
     // confirm the refreshed path. This keeps one-second p99 from measuring a
     // synchronized cache-expiry wave while applying the same warm-up to nginx.
     if method == Method::GET {
-        prewarm_http_resource(&client, url.as_str()).await?;
+        prewarm_http_resource(warmup_client, url.as_str(), &args).await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        prewarm_http_resource(&client, url.as_str()).await?;
+        prewarm_http_resource(warmup_client, url.as_str(), &args).await?;
     }
 
     let mut tasks = JoinSet::new();
     for worker_index in 0..concurrency {
         let stats = stats.clone();
-        let client = client.clone();
+        let client = worker_clients
+            .as_ref()
+            .map_or_else(|| client.clone(), |clients| clients[worker_index].clone());
         let url = url.clone();
         let payload = payload.clone();
         let method = method.clone();
@@ -465,8 +491,14 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
                     .send()
                     .await
                 {
-                    Ok(response) => match response.bytes().await {
-                        Ok(bytes) => local.record_success(started.elapsed(), bytes.len()),
+                    Ok(response) => match drain_http_benchmark_response(
+                        response,
+                        args.expected_status,
+                        args.expected_body_bytes,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => local.record_success(started.elapsed(), bytes),
                         Err(_) => local.record_error(),
                     },
                     Err(_) => local.record_error(),
@@ -482,32 +514,90 @@ async fn run_http(args: HttpBenchArgs) -> Result<()> {
         latencies.extend(result.context("http benchmark task failed")?);
     }
 
+    schedule.ensure_started_on_time()?;
     print_operation_target(concurrency, schedule.operation_interval);
     print_summary("http", args.duration_secs, &stats, latencies);
     Ok(())
 }
 
-async fn prewarm_http_resource(client: &reqwest::Client, url: &str) -> Result<()> {
+fn http_benchmark_client(insecure: bool, http1_only: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(insecure)
+        .http2_adaptive_window(true)
+        .timeout(Duration::from_secs(10));
+    if http1_only {
+        builder = builder.http1_only().pool_max_idle_per_host(1);
+    }
+    builder
+        .build()
+        .context("failed to build HTTP benchmark client")
+}
+
+async fn drain_http_benchmark_response(
+    mut response: reqwest::Response,
+    expected_status: Option<u16>,
+    expected_body_bytes: Option<u64>,
+) -> Result<usize> {
+    let valid_status = expected_status.map_or_else(
+        || response.status().is_success(),
+        |status| response.status().as_u16() == status,
+    );
+    anyhow::ensure!(
+        valid_status,
+        "unexpected HTTP benchmark status {}",
+        response.status()
+    );
+    let mut received = 0_usize;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed reading HTTP benchmark body")?
+    {
+        received = received
+            .checked_add(chunk.len())
+            .context("HTTP benchmark byte count overflow")?;
+        if let Some(expected) = expected_body_bytes {
+            anyhow::ensure!(
+                received as u64 <= expected,
+                "HTTP benchmark body exceeds expected length"
+            );
+        }
+    }
+    if let Some(expected) = expected_body_bytes {
+        anyhow::ensure!(
+            received as u64 == expected,
+            "HTTP benchmark body length mismatch: expected {expected}, received {received}"
+        );
+    }
+    Ok(received)
+}
+
+async fn prewarm_http_resource(
+    client: &reqwest::Client,
+    url: &str,
+    args: &HttpBenchArgs,
+) -> Result<()> {
     let response = client
         .get(url)
         .send()
         .await
         .context("failed to warm HTTP benchmark resource")?;
-    response
-        .bytes()
+    drain_http_benchmark_response(response, args.expected_status, args.expected_body_bytes)
         .await
         .context("failed to drain HTTP benchmark resource warm-up")?;
     Ok(())
 }
 
 async fn preconnect_http1_pool(
-    client: &reqwest::Client,
+    clients: &[reqwest::Client],
     url: Arc<String>,
-    connections: usize,
+    expected_status: Option<u16>,
 ) -> Result<()> {
+    let connections = clients.len();
     let barrier = Arc::new(Barrier::new(connections.saturating_add(1)));
     let mut tasks = JoinSet::new();
-    for _ in 0..connections {
+    for client in clients {
         let client = client.clone();
         let url = url.clone();
         let barrier = barrier.clone();
@@ -518,8 +608,7 @@ async fn preconnect_http1_pool(
                 .send()
                 .await
                 .context("failed to preconnect HTTP/1 benchmark client")?;
-            response
-                .bytes()
+            drain_http_benchmark_response(response, expected_status, Some(0))
                 .await
                 .context("failed to drain HTTP/1 preconnect response")?;
             Result::<()>::Ok(())
@@ -636,6 +725,7 @@ async fn run_sse(args: SseBenchArgs) -> Result<()> {
         latencies.extend(result.context("sse benchmark task failed")?);
     }
 
+    schedule.ensure_started_on_time()?;
     print_operation_target(concurrency, schedule.operation_interval);
     print_summary("sse", args.duration_secs, &stats, latencies);
     Ok(())
@@ -674,7 +764,7 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     let connection_count = args.connections.max(1);
     let start_barrier = Arc::new(Barrier::new(connection_count));
     let warmed_connections = Arc::new(AtomicU64::new(0));
-    let scheduled_start = Arc::new(OnceLock::<tokio::time::Instant>::new());
+    let scheduled_start = Arc::new(OnceLock::<Option<tokio::time::Instant>>::new());
     let connect_timeout = Duration::from_millis(args.connect_timeout_ms.max(1));
     let measurement_duration = Duration::from_secs(args.duration_secs.max(1));
     let start_at_unix_ms = args.start_at_unix_ms;
@@ -747,9 +837,13 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 stats.add_task(&local);
                 return local.latencies_us;
             };
-            let measurement_start = *scheduled_start
+            let Some(measurement_start) = *scheduled_start
                 .get()
-                .expect("websocket benchmark start time initialized");
+                .expect("websocket benchmark start time initialized")
+            else {
+                stats.add_task(&local);
+                return local.latencies_us;
+            };
             tokio::time::sleep_until(measurement_start).await;
             let deadline = measurement_start + measurement_duration;
             let mut ticker = message_interval.map(|interval| {
@@ -824,6 +918,7 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
         latencies.extend(result.context("websocket benchmark task failed")?);
     }
 
+    ensure_benchmark_started_on_time(&scheduled_start)?;
     if let Some(interval) = message_interval {
         println!("message interval: {} us", interval.as_micros());
         println!(
@@ -1102,6 +1197,7 @@ async fn run_tcp(args: TcpBenchArgs) -> Result<()> {
         latencies.extend(result.context("tcp benchmark task failed")?);
     }
 
+    schedule.ensure_started_on_time()?;
     print_operation_target(connection_count, schedule.operation_interval);
     print_summary("tcp", args.duration_secs, &stats, latencies);
     Ok(())
@@ -1210,6 +1306,7 @@ async fn run_udp(args: UdpBenchArgs) -> Result<()> {
         latencies.extend(result.context("udp benchmark task failed")?);
     }
 
+    schedule.ensure_started_on_time()?;
     print_operation_target(connection_count, schedule.operation_interval);
     print_summary("udp", args.duration_secs, &stats, latencies);
     Ok(())
@@ -1327,6 +1424,100 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn benchmark_rejects_missed_absolute_start_instead_of_shifting_the_wave() {
+        let schedule = BenchmarkSchedule::new(1, 1, 0, false, 1);
+        let (deadline, mut ticker) = schedule.begin(0).await;
+        assert!(!wait_for_operation_slot(&mut ticker, deadline).await);
+        assert!(schedule.ensure_started_on_time().is_err());
+        assert!(benchmark_start_instant(0, Duration::from_millis(250)).is_some());
+    }
+
+    #[tokio::test]
+    async fn http_benchmark_checks_status_body_length_and_truncation() {
+        for (wire, status, bytes, success) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\necho".as_slice(), Some(200), Some(4), true),
+            (b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\necho", None, Some(4), false),
+            (b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\necho", Some(404), Some(4), true),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\necho", Some(200), None, false),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\necho", Some(200), Some(3), false),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\necho", Some(200), Some(5), false),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nec\r\n2\r\nho\r\n0\r\n\r\n", Some(200), Some(4), true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") { request.push(stream.read_u8().await.unwrap()); }
+                stream.write_all(wire).await.unwrap();
+            });
+            let response = http_benchmark_client(false, true).unwrap().get(format!("http://{address}/")).send().await.unwrap();
+            let result = drain_http_benchmark_response(response, status, bytes).await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            if success { assert_eq!(result.unwrap(), 4); }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_benchmark_preconnects_and_reuses_every_declared_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Arc::new(format!("http://{}/", listener.local_addr().unwrap()));
+        let accepted = Arc::new(AtomicU64::new(0));
+        let observed = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = JoinSet::new();
+            for _ in 0..8 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                observed.fetch_add(1, Ordering::Relaxed);
+                handlers.spawn(async move {
+                    for index in 0..3 {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            head.push(socket.read_u8().await.unwrap());
+                        }
+                        assert_eq!(head.starts_with(b"HEAD "), index == 0);
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                            .await
+                            .unwrap();
+                        if index != 0 {
+                            socket.write_all(b"echo").await.unwrap();
+                        }
+                    }
+                });
+            }
+            while let Some(handler) = handlers.join_next().await {
+                handler.unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let clients = (0..8)
+                .map(|_| http_benchmark_client(false, true).unwrap())
+                .collect::<Vec<_>>();
+            preconnect_http1_pool(&clients, url.clone(), Some(200))
+                .await
+                .unwrap();
+            assert_eq!(accepted.load(Ordering::Relaxed), 8);
+            for client in &clients {
+                for _ in 0..2 {
+                    let response = client.get(url.as_str()).send().await.unwrap();
+                    assert_eq!(
+                        drain_http_benchmark_response(response, Some(200), Some(4))
+                            .await
+                            .unwrap(),
+                        4
+                    );
+                }
+            }
+            server.await.unwrap();
+            assert_eq!(accepted.load(Ordering::Relaxed), 8);
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn udp_benchmark_rejects_corrupt_and_missing_echoes() {

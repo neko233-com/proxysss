@@ -1638,7 +1638,6 @@ const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
-const STATIC_FILE_CONNECTION_REVALIDATE_HITS: u16 = 256;
 const STATIC_PRELOAD_MAX_FILES_PER_SITE: usize = 64;
 const STATIC_PRELOAD_SMALL_PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 const RAW_REVERSE_RESPONSE_CACHE_MAX_HEAD_BYTES: usize = 4096;
@@ -5580,7 +5579,7 @@ impl Gateway {
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
             let static_cache_hit = static_response_cache
-                .as_mut()
+                .as_ref()
                 .is_some_and(|cached| cached.raw_request_matches(request_head));
             if static_cache_hit {
                 let cached = static_response_cache
@@ -5905,7 +5904,6 @@ impl Gateway {
                     target: request.target.to_string(),
                     host: request.host.map(str::to_string),
                     checked_at: Instant::now(),
-                    hits_until_revalidation_check: STATIC_FILE_CONNECTION_REVALIDATE_HITS,
                     header: Bytes::copy_from_slice(static_header.as_bytes()),
                     combined_response,
                     body: candidate.cached_body.clone(),
@@ -12117,7 +12115,6 @@ struct ConnectionStaticFastPathCache {
     target: String,
     host: Option<String>,
     checked_at: Instant,
-    hits_until_revalidation_check: u16,
     header: Bytes,
     combined_response: Option<Bytes>,
     body: Option<Bytes>,
@@ -12127,16 +12124,11 @@ struct ConnectionStaticFastPathCache {
 }
 
 impl ConnectionStaticFastPathCache {
-    fn raw_request_matches(&mut self, request_head: &[u8]) -> bool {
-        if self.request_head.as_ref() != request_head {
-            return false;
-        }
-        if self.hits_until_revalidation_check > 0 {
-            self.hits_until_revalidation_check -= 1;
-            return true;
-        }
-        self.hits_until_revalidation_check = STATIC_FILE_CONNECTION_REVALIDATE_HITS;
-        self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
+    fn raw_request_matches(&self, request_head: &[u8]) -> bool {
+        // Request count cannot bound age: sparse keep-alive clients may take
+        // minutes to reach a hit budget after an asset is replaced or removed.
+        self.request_head.as_ref() == request_head
+            && self.checked_at.elapsed() <= Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
     }
 
     fn identity_matches(&self, request: &StaticFastPathRequest<'_>) -> bool {
@@ -23019,10 +23011,6 @@ mod tests {
         assert_eq!(
             response.headers().get(ACCEPT_RANGES),
             Some(&HeaderValue::from_static("bytes"))
-        );
-        assert_ne!(
-            STATIC_FILE_CONNECTION_REVALIDATE_HITS as usize,
-            PLAIN_FAST_LANE_FAIRNESS_BATCH
         );
     }
 

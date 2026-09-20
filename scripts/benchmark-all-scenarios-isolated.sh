@@ -329,7 +329,7 @@ docker build --platform "$BENCH_PLATFORM" --build-arg NGINX_VERSION=1.31.2 -t "$
 cat >"$WWW_DIR/small.html" <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"><title>small bench</title></head><body><h1>proxysss isolated mixed benchmark</h1><p>same payload for both gateways.</p></body></html>
 HTML
-printf 'hot-update-v2\n' >"$WWW_DIR/hot.dat"
+printf 'hot-update-v1\n' >"$WWW_DIR/hot.dat"
 "$HELPER" write-large-file --path "$WWW_DIR/large.bin"
 
 cleanup() {
@@ -688,12 +688,41 @@ start_client_controller() {
     --cpuset-cpus "$CLIENT_CPUSET" ${memory_arg:+"$memory_arg"} \
     --ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}" \
     "$IMAGE" sleep infinity >/dev/null
+  docker cp "$LINUX_HELPER" "$CLIENT_CONTAINER:/usr/local/bin/benchmark-helper"
   docker start "$CLIENT_CONTAINER" >/dev/null
+}
+
+verify_cdn_publication() {
+  local kind gateway_ip
+  for kind in nginx proxysss; do
+    gateway_ip="$(gateway_ip_for "$kind")"
+    docker exec "$CLIENT_CONTAINER" /usr/local/bin/benchmark-helper verify-http-body \
+      --url "http://${gateway_ip}:18080/bench/hot.dat" --body $'hot-update-v1\n'
+  done
+  for kind in nginx proxysss; do
+    docker exec "$PREFIX-gateway-$kind" sh -ec \
+      'printf "hot-update-v2\n" > /work/www/hot.dat.next; mv /work/www/hot.dat.next /work/www/hot.dat'
+    gateway_ip="$(gateway_ip_for "$kind")"
+    docker exec "$CLIENT_CONTAINER" /usr/local/bin/benchmark-helper verify-http-body \
+      --url "http://${gateway_ip}:18080/bench/hot.dat" --body $'hot-update-v2\n'
+  done
 }
 
 launch_client() {
   local phase="$1" kind="$2" scenario="$3" protocol="$4" target="$5" concurrency="$6"
   shift 6
+  if [[ "$protocol" == "http" ]]; then
+    set -- "$@" --expected-status 200
+    local expected_file=""
+    case "$scenario" in
+      static-small | https-static-small) expected_file="$WWW_DIR/small.html" ;;
+      static-large) expected_file="$WWW_DIR/large.bin" ;;
+      cdn-hot-update) expected_file="$WWW_DIR/hot.dat" ;;
+    esac
+    if [[ -n "$expected_file" ]]; then
+      set -- "$@" --expected-body-bytes "$(wc -c < "$expected_file" | tr -d '[:space:]')"
+    fi
+  fi
   # Mixed waves pin each generator to a disjoint CPU partition. Otherwise a
   # faster TCP/UDP/WebSocket candidate consumes more client CPU and can make
   # its own HTTP sibling look slower. Serial isolated waves keep the full set.
@@ -1115,6 +1144,7 @@ start_gateway nginx
 wait_gateway nginx
 start_gateway proxysss
 wait_gateway proxysss
+verify_cdn_publication >"$BASE_RUN_DIR/cdn-publication-verification.txt"
 
 matrix_validation_start_secs="$(date +%s)"
 MATRIX_MEASUREMENT_USED_SECS=0

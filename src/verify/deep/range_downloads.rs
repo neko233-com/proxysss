@@ -5,6 +5,77 @@ use crate::test_support::TestDir;
 use crate::verify::harness::{base_gateway_yaml, reserve_port, spawn_gateway, write_config};
 
 #[tokio::test]
+async fn integration_deep_sparse_http1_keepalive_refreshes_and_removes_static_assets() -> Result<()>
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    async fn fetch(stream: &mut BufReader<TcpStream>) -> Result<(u16, Vec<u8>)> {
+        stream
+            .get_mut()
+            .write_all(b"GET /assets/asset.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        let mut status_line = String::new();
+        stream.read_line(&mut status_line).await?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()?;
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            anyhow::ensure!(stream.read_line(&mut line).await? > 0, "truncated response");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<usize>()?);
+                }
+            }
+        }
+        let length = length.ok_or_else(|| anyhow::anyhow!("missing response length"))?;
+        anyhow::ensure!(length <= 65536, "unexpected fixture body");
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await?;
+        Ok((status, body))
+    }
+    let root = TestDir::new("sparse-plain-static");
+    let public = root.join("public");
+    std::fs::create_dir_all(&public)?;
+    let path = public.join("asset.txt");
+    std::fs::write(&path, b"version-one")?;
+    let port = reserve_port().await?;
+    let yaml = format!("{}\nservices:\n  static_sites:\n    - name: downloads\n      path_prefix: /assets\n      root: '{}'\n", base_gateway_yaml(port), public.display().to_string().replace('\\', "/"));
+    let (_gateway, runner) = spawn_gateway(write_config(&root, &yaml)?).await?;
+    let mut stream = BufReader::new(TcpStream::connect(("127.0.0.1", port)).await?);
+    assert_eq!(fetch(&mut stream).await?, (200, b"version-one".to_vec()));
+    std::fs::write(&path, b"version-two")?;
+    for removed in [false, true] {
+        if removed {
+            std::fs::remove_file(&path)?;
+        }
+        let mut observed = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let (status, body) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), fetch(&mut stream))
+                    .await??;
+            if (removed && status == 404) || (!removed && status == 200 && body == b"version-two") {
+                observed = true;
+                break;
+            }
+        }
+        assert!(
+            observed,
+            "sparse identical requests must observe the time-based cache expiry; removed={removed}"
+        );
+    }
+    runner.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_deep_tls_static_snapshot_survives_publish_and_deletion() -> Result<()> {
     let root = TestDir::new("tls-static-publish");
     let public = root.join("public");

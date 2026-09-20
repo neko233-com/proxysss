@@ -31,6 +31,10 @@ KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
 
 预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 `TOKIO_WORKER_THREADS`，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；饱和测试使用全部 client cpuset。官方 fixture、解析和验收工具使用 Go 或原生编译工具。
 
+HTTP/1 每个并发 worker 使用独立、最多一个空闲连接的 client，并先完成 HEAD，确保声明的连接数真实建立且随后复用；HTTPS/H2 仍共享一个多路复用 client。HTTP 下载逐块消费并计数，不把完整大文件收进发生器内存。`bench http` 默认仅接受 2xx；`--expected-status` 可指定精确状态，`--expected-body-bytes` 校验正文长度。正式 HTTP 夹具要求 200，静态夹具还要求实际文件长度；错误页、短正文和意外长正文不能算吞吐成功。
+
+预热错过 `--start-at-unix-ms` 时整波失败，不能自行延后开始而把异步运行当作同时混合负载。双方每轮都必须完成至少 98% 的可执行目标，参考 nginx 不达标同样使比较无效。CDN 预检在测量前依次确认 v1 正文、原子发布 v2、确认双方确实返回 v2；其后测量的是更新生效后的读取吞吐，不声称是一秒内连续发布的性能。
+
 严格入口要求零错误、每项吞吐与 p50/p95/p99 都胜出；单项通过不能覆盖混合回归。旧共享角色诊断 `benchmark-all-scenarios.sh` 的 `CRITICAL_RATIO=0.97` 和 `MIN_RATIO=0.50` 不等于严格发布通过。内存报告双方 cgroup current、peak、每连接成本，各项不得超过 nginx 的 2 倍；只在声明实际生产预算时设置 MemoryMax。4c/4096 active WSS/20k idle WSS 是参考负载，100k 容量为额外诊断。
 
 每轮原始结果保存在带 `-r1`、`-r2` 等序号的目录，包含逐场景输出和 results.jsonl；后续轮次不得覆盖早期失败详情。无序号场景文件仅为最后一轮的便捷副本。网关、后端与客户端的逐轮容器日志和测量前后网络计数器在活跃窗口之外采集，便于区分 UDP 内核丢包、超时及连接错误。UDP/QCP echo 检查回复长度和内容，失败输出阶段、错误种类和系统错误码，每进程最多打印 8 条详情，额外错误仍计数。计数器或错误详情缺失时，不得从汇总的 errors 数字猜测根因。
@@ -50,3 +54,9 @@ Linux 功能与性能通过后，运行 `scripts/verify-local.ps1` 完成格式�
 正式版本必须匹配 Cargo.toml、CHANGELOG.md 与 [性能证据清单](../performance-evidence/README.md)。schema v3 要求同一 tag 提交上的角色隔离矩阵和三台不同 machine-id Linux 主机的 WSS 1×/2×/4× 复验、真实工件 URI/摘要、吞吐/延迟/容量/内存数据。运行 `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>` 后才能推 tag。v1.3.8 的一次性功能发布豁免不适用于其他版本。
 
 报告明确列出通过项、失败项、未执行项、提交和工件位置。缺少跨主机环境或严格性能未过时，保留修复和证据，不能生成虚假清单或宣称发布完成。
+
+## 诊断发生器瓶颈
+
+先区分网关与客户端资源，再解释接近 1.0 的比值。3efde31 的一次独立 CPU 观察器诊断固定网关/后端/客户端为 4/6/12 核，四个观察器另占 CPU 22–23。18 波全混合、54 个角色窗口的 25 ms 线程采样中，大文件客户端饱和运行时间约 964–993 ms/秒，接近其单核上限；CDN 约 780–941 ms/秒，仍不足以断定每种负载都受客户端限制。等负载 CDN 双 worker 累计调度等待约 212–245 ms/秒，网关 native realtime owner 约 21–28 ms/秒；多个线程等待可重叠，不能当作某次请求的延迟。
+
+该诊断使用固定旧发生器与二进制，窗口边界滞后最多 27.3 ms；退出线程保留最后可见样本，计数可能低估。完整计数、覆盖时间、源码和角色隔离信息保存在本地 `.benchmark/goal-rolecpu-3ef/`，不作为发布通过证据。发生器改为流式消费和独立连接池后必须重建双方数据，不能把发生器变化归为网关优化收益。

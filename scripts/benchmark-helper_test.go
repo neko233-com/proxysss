@@ -3,11 +3,43 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func TestVerifyHTTPBodyRequiresPublishedBytesAndSuccess(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/error" {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, "new\n")
+			return
+		}
+		if r.URL.Path == "/long" {
+			fmt.Fprint(w, "new\nextra")
+			return
+		}
+		if attempts.Add(1) == 1 {
+			fmt.Fprint(w, "old\n")
+			return
+		}
+		fmt.Fprint(w, "new\n")
+	}))
+	defer server.Close()
+	if err := runVerifyHTTPBody([]string{"--url", server.URL, "--body", "new\n", "--timeout", "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/error", "/long"} {
+		if err := runVerifyHTTPBody([]string{"--url", server.URL + path, "--body", "new\n", "--timeout", "50ms"}); err == nil {
+			t.Fatalf("invalid fixture accepted: %s", path)
+		}
+	}
+}
 
 func TestCapacityRejectsMissingRetentionAndLostIdleConnections(t *testing.T) {
 	old := "requested=100 opened=100 failed=0 attempts=100 open_rate=1000 worst_p50_ms=1 worst_p95_ms=2 worst_p99_ms=3"
@@ -501,8 +533,8 @@ func TestAllScenariosEqualLoadGateRequiresTargetCompletion(t *testing.T) {
 	}
 	rows[0].OpsPerSec = 97
 	writeBenchRows(t, results, rows)
-	if err := runWriteAllScenariosSummary(args); err != nil {
-		t.Fatalf("reference under-completion should remain a warning when candidate meets target: %v", err)
+	if err := runWriteAllScenariosSummary(args); err == nil || !strings.Contains(err.Error(), "nginx target achievement") {
+		t.Fatalf("reference under-completion invalidates the equal-load comparison: %v", err)
 	}
 	rows[0].OpsPerSec = 99
 	rows[1].OpsPerSec = 97

@@ -909,6 +909,7 @@ scripts/benchmark-websocket-production-gate.sh</code></pre>
 
           <p class="subtle"><code>benchmark-ubuntu24-amd64-docker.sh</code> 在 Ubuntu 24.04 x86_64 容器内构建当前 checkout，并把 gateway、backend、client 固定到互不重叠的 cpuset/cgroup。HTTP、HTTPS、static-large、SSE、WebSocket、TCP、UDP 与透明 QCP 按 1×/2×/4× 同时放大；逐档判定 saturation 吞吐和 equal-load p50/p95/p99。equal-load 取较慢 saturation 的 25%，双方须完成至少 98% 可执行 target。HTTP/SSE 使用 centered uniform phase 并对 aggregate slot 四舍五入；UDP/QCP 使用保留 1 ms completion guard 的同步 whole per-connection ticks，TCP 保留 2 ms，WebSocket 为 framing 和两次用户态协议转换保留 5 ms。nginx 1.31.2 mainline 使用 <code>-O3 -fno-plt</code>、相同 gateway cpuset、sysctl 与等价协议配置。完整矩阵 active measurement 最多 20 秒；Docker role isolation 不能冒充三台物理机。</p>
           <p class="subtle">20 秒上限按 active measurement window 累加。默认每尺度运行 1 次 saturation 和 2 次反向 candidate order 的 equal-load，共 18 秒 active measurement；latency report 使用两次样本 median。inactive gateway unpause 后双方都有相同的 1000 ms excluded settle，再安排 2000 ms future start，确保 overdue timer/I/O bookkeeping 已排空，并让 4× 下 11 个发生器完成连接池与协议预热；plain HTTP/1 建立完整连接池，HTTPS/H2 预连 multiplexed session，GET/SSE 完成两次请求，每条 WebSocket/TCP/UDP/QCP 连接完成一次 echo。预热不计入 active measurement，UDP/QCP response timeout 为 500 ms。</p>
+          <p class="subtle">性能验证的数据流独立于网关：HTTP/1 发生器每个 worker 持有独立的预连接 client，HTTP/2 使用共享多路复用 client；下载逐块消费和计数，检查响应状态及夹具长度，不聚合整个大文件。共同绝对开始时间不可由迟到进程自行后移，双方任一轮未完成等负载目标都会失败；CDN 发布预检位于测量前。完整边界与诊断方法见 <a href="validation.html">验证流程</a>。</p>
           <p class="subtle">严格矩阵中的 <code>protocol: qcp</code> 是透明 UDP edge forwarding：proxysss 与 nginx 等价 UDP listener 接受相同负载和门禁。该结果不代表 proxysss 在热路径解析或终止 QCP frame；KCP 专用封装仍不进入默认 nginx head-to-head 矩阵。</p>
         </section>
 
@@ -987,6 +988,7 @@ udp:
 
     <section class="section"><h2>UDP 会话替换与清理</h2><p>UDP 清理在同一分片操作内核对 association 的 Arc 身份，旧 reader、发送失败或容量清理不能误删同地址的新会话。替换会话会停用旧实例；reader 检查自身活跃状态和 TTL，观察到停用后退出并停止转发迟到回复，不借用新实例的活跃时间维持旧 socket。本地缓存判定过期前读取共享刷新时间，避免其他 worker 的活跃会话被旧缓存关闭；容量候选已刷新或替换时跳过本次淘汰。</p></section>
 
+    <section class="section"><h2>低频 HTTP/1 静态连接的时效</h2><p>明文 HTTP/1 连接缓存每次命中都检查单调时间上的 2 秒 freshness，不按请求次数推迟检查。低频复用同一连接仍会触发共享后台重验证，不能因尚未积累 256 次访问而长期保留旧版本；过期不等于每次同步 stat，文件刷新仍由现有控制运行时合并执行。</p></section>
     <footer class="footer">
       <strong>这页架构文档的落点只有一个：</strong> 让你知道 proxysss 的请求路径、扩展边界、热重载边界和性能纪律都在哪里，而不是把“架构”写成一页炫技海报。
     </footer>
