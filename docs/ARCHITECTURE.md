@@ -82,6 +82,8 @@ TCP 接受连接后读取当前 listener 配置，再执行流访问/限流和�
 
 UDP 按客户端建立上游 association。分片 pending 集合去重后，listener 私有原子计数器在首包复制、任务创建、脚本和 DNS 前预留容量；max_associations 覆盖在途创建及尚未释放的会话。许可随成功的 association 转移，失败、取消和最后一个所有者退出时自动释放；普通数据报不操作容量计数器。满额拒绝新会话，不按容量压力淘汰活跃玩家，过期扫描最多每秒一次。
 
+TCP 新连接与 UDP 新 association 统一经过 stream 连接限流、动态黑名单、DDoS 和 stream allow/deny。UDP 在 pending 去重后、容量预留及脚本/DNS 前执行准入检查；直接数字目标和扩展路由没有绕过入口。两种协议按客户端 IP 共用 stream zone，既有 UDP 数据报只转发，不重复消耗连接配额或执行准入策略。DDoS 辅助方法只记录封禁，拒绝由调用入口统一计数一次。配置与生效边界见 [配置指南](CONFIGURATION.md)。
+
 worker 本地缓存使用 Weak 引用，转发期间才取得 Arc，TTL 最多每秒刷新一次，数据报使用有界缓冲池。退休标记广播唤醒等待回复或可写事件的任务；reader 的释放守卫负责移除自身版本、归还缓冲与上游统计。listener 退出先禁止新发布，停止时同时取消独立运行时中的接收 worker 和 JoinSet 管理的在途创建，清空并退休已有会话；发布前后均检查关闭状态，避免停机期间重新插入孤儿会话。
 
 同名同 bind 的容量、TTL 和 protocol 更新由 worker 最多一秒的配置快照供新会话使用；既有会话保留其创建时的 TTL 和上游。降低容量不主动断开旧会话，旧会话仍占名额，直到总量低于新值才允许新建。0 明确表示不设容量上限。
@@ -121,6 +123,8 @@ balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且�
 | 可热更新 | 需重启 |
 | --- | --- |
 | 路由/上游池、服务发现映射、静态站点、WebDAV、FTP upstream、脚本/插件与相应策略 | HTTP/TLS/H3 bind、admin bind/enabled、TCP/UDP listener 名称与 bind 集合、FTP bind/enabled、TLS mode、日志格式/级别/路径、runtime.performance |
+
+listener supervisor 持有每个监听任务的取消守卫；移除监听、失败重试或 supervisor 退出时不会仅丢弃 JoinHandle 而分离后台任务。HTTP、TLS（含弹性 accept）、TCP、UDP 的跨 runtime 包装任务也持有取消守卫，包含尚未开始轮询即被取消的情况。撤销监听停止新 accept/recv；已建立的 TCP/HTTP 会话继续自行结束，UDP 会话由 listener 生命周期统一退休。进程退出仍由操作系统回收最终资源，不把撤销监听等同于强制中断全部 TCP 下载。
 
 token 认证 API 可持久化允许的路由、listener、TLS、filecloud 和黑名单变更；实际应用边界仍由 reload-plan 决定。explain、capabilities、watched-scripts、routes、reload-plan、nginx-parity 是 agent 检查入口。
 

@@ -2,6 +2,8 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 修复 UDP 新会话绕过 stream allow/deny、连接限流、DDoS 与动态黑名单；连接配额按 association 扣取，与 TCP 共享 zone，既有数据报不重复扣取。统一流拒绝统计，修复 TCP DDoS 拒绝重复计数。listener supervisor 及 HTTP/TLS/TCP 跨 runtime 包装任务增加取消所有权，防止重载撤销监听后旧 accept 任务继续持有端口。
+
 - 修复 UDP 并发建会话突破 max_associations 的问题：先预留容量，再复制首包、运行脚本或 DNS，失败和取消自动释放。退休会话唤醒等待任务，弱引用缓存不保留旧 socket；listener 停止会取消独立运行时 worker 和在途创建。满额保留活跃会话，清理扫描限频；同名同 bind 的容量/TTL/protocol 更新供新会话使用，既有会话保留原 TTL。
 
 - 统一 TCP/UDP、stream route、FTP 的上游地址校验，管理更新在落盘前拒绝无效地址，脚本流路由检查主目标、候选池和权重键。UDP 新会话支持域名，DNS 解析有并发上限与超时；UDP 健康探测按解析结果选择 IP 地址族，超时覆盖解析、发送和回复。

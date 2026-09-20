@@ -346,6 +346,8 @@ udp:
 
 同名同 bind 更新 `max_associations`、`session_ttl_secs`、`protocol` 后，新会话最多一秒内读取新值；已有会话保留原 TTL 和上游。降低容量不主动断开旧会话，它们仍占名额，低于新上限后才能继续新建。停用或移除 listener 会关闭其接收 worker、在途创建和上游会话，释放端口；它不是保留已有 UDP 会话的迁移操作。
 
+TCP 新连接和 UDP 新 association 都依次执行 `services.rate_limit.stream`、动态黑名单、`security.ddos` 与 `services.access_control.stream`。UDP 不产生 HTTP 错误响应，被拒绝的首包直接丢弃。`connections` 按新 association 计数，同一 IP 的 TCP/UDP 共用 stream zone；既有 UDP 会话的数据报不重复扣配额，也不重新执行准入检查。策略热更新与新增封禁作用于随后准入的会话，已有会话保留到过期、关闭或 listener 移除。数字上游、DNS、脚本路由遵守相同规则，拒绝发生在脚本和解析前；`blocked_requests_total` 每次拒绝只累加一次。
+
 ### 2.9 MQTT / IoT
 
 ```yaml

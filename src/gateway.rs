@@ -12,6 +12,9 @@ mod http_metrics_tests;
 #[cfg(test)]
 #[path = "http_stream_tests.rs"]
 mod http_stream_tests;
+#[cfg(test)]
+#[path = "listener_lifetime_tests.rs"]
+mod listener_lifetime_tests;
 #[path = "static_ranges.rs"]
 mod static_ranges;
 #[path = "static_snapshot.rs"]
@@ -1542,9 +1545,11 @@ impl Drop for UdpListenerLifetime {
     }
 }
 
-struct AbortUdpWorkerOnDrop(tokio::task::AbortHandle);
+// Dropping a JoinHandle alone detaches work on a process-lifetime runtime.
+// Capture this guard before spawning a wrapper, including unpolled wrappers.
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
-impl Drop for AbortUdpWorkerOnDrop {
+impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -3293,9 +3298,6 @@ impl Gateway {
             .is_some()
         {
             self.stats.ddos_bans_total.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .blocked_requests_total
-                .fetch_add(1, Ordering::Relaxed);
             self.dynamic_blacklist
                 .add(remote_addr.ip(), config.security.ddos.ban_secs.max(1));
             return true;
@@ -3321,7 +3323,7 @@ impl Gateway {
     }
 
     async fn run_listener_supervisor(self: Arc<Self>) -> Result<()> {
-        let mut active = BTreeMap::<String, JoinHandle<Result<()>>>::new();
+        let mut active = BTreeMap::<String, (JoinHandle<Result<()>>, AbortTaskOnDrop)>::new();
 
         loop {
             let state = self.current_state().await;
@@ -3337,7 +3339,7 @@ impl Gateway {
                 .cloned()
                 .collect::<Vec<_>>();
             for key in stale {
-                if let Some(handle) = active.remove(&key) {
+                if let Some((handle, _abort)) = active.remove(&key) {
                     handle.abort();
                     tracing::info!(listener = %key, "listener stopped after hot reload");
                 }
@@ -3359,17 +3361,18 @@ impl Gateway {
                 } else {
                     tokio::spawn(async move { gateway.run_listener_spec(spec).await })
                 };
-                active.insert(key, handle);
+                let abort = AbortTaskOnDrop(handle.abort_handle());
+                active.insert(key, (handle, abort));
                 tracing::info!(listener = %spawn_key, "listener started");
             }
 
             let finished = active
                 .iter()
-                .filter(|(_, handle)| handle.is_finished())
+                .filter(|(_, (handle, _))| handle.is_finished())
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             for key in finished {
-                let Some(handle) = active.remove(&key) else {
+                let Some((handle, _abort)) = active.remove(&key) else {
                     continue;
                 };
                 match handle.await {
@@ -5489,7 +5492,9 @@ impl Gateway {
                             .run_plain_http_accept_loop(listener, bind_addr, worker_index, true)
                             .await
                     });
+                let abort_worker = AbortTaskOnDrop(accept_task.abort_handle());
                 workers.spawn(async move {
+                    let _abort_worker = abort_worker;
                     accept_task
                         .await
                         .context("plain HTTP data-runtime accept task failed")?
@@ -6383,7 +6388,9 @@ impl Gateway {
                             )
                             .await
                     });
+                let abort_worker = AbortTaskOnDrop(accept_task.abort_handle());
                 workers.spawn(async move {
+                    let _abort_worker = abort_worker;
                     accept_task
                         .await
                         .context("TLS HTTP data-runtime accept task failed")?
@@ -6440,6 +6447,7 @@ impl Gateway {
                             .await
                     }
                 });
+                let _abort_worker = AbortTaskOnDrop(accept_task.abort_handle());
                 accept_task
                     .await
                     .context("elastic TLS data-runtime accept task failed")?
@@ -6975,7 +6983,9 @@ impl Gateway {
                         .run_tcp_listener_accept_loop(listener, listener_config, worker_index)
                         .await
                 });
+                let abort_worker = AbortTaskOnDrop(accept_task.abort_handle());
                 workers.spawn(async move {
+                    let _abort_worker = abort_worker;
                     accept_task
                         .await
                         .context("TCP stream runtime accept task failed")?
@@ -7618,7 +7628,7 @@ impl Gateway {
                         )
                         .await
                 });
-                let abort_worker = AbortUdpWorkerOnDrop(recv_task.abort_handle());
+                let abort_worker = AbortTaskOnDrop(recv_task.abort_handle());
                 workers.spawn(async move {
                     let _abort_worker = abort_worker;
                     recv_task
@@ -7809,6 +7819,19 @@ impl Gateway {
                 sessions: pending_sessions.clone(),
                 addr: client_addr,
             };
+            // A UDP association is the stream admission unit. Existing game
+            // packets neither repeat policy work nor consume connection tokens.
+            if !apply_stream_rate_limit(
+                &self.stream_rate_limits,
+                &direct_udp_state.config.services.rate_limit.stream,
+                client_addr,
+            ) || self.is_stream_connection_blocked(&direct_udp_state.config, client_addr)
+            {
+                self.stats
+                    .blocked_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             maybe_prune_udp_associations(&associations, &prune_state, max_associations);
             let Some(permit) = prune_state.try_reserve(max_associations) else {
                 self.stats

@@ -16,6 +16,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(mode: &str, cap: usize, ttl: u64) -> Result<Self> {
+        Self::configured(mode, cap, ttl, |_| {}).await
+    }
+
+    async fn configured(
+        mode: &str,
+        cap: usize,
+        ttl: u64,
+        configure: impl FnOnce(&mut GatewayConfig),
+    ) -> Result<Self> {
         ensure_rustls_crypto_provider();
         let root = temp_root("udp-admission");
         let backend_ip = tokio::net::lookup_host(("localhost", 1))
@@ -57,6 +66,7 @@ impl Fixture {
             fs::write(&config.script.entry, format!("export default {{ preread() {{ const until=Date.now()+30; while(Date.now()<until){{}}; return {{upstream:{target:?}}}; }} }};"))?;
         }
         config.udp.listeners.push(listener.clone());
+        configure(&mut config);
         let path = write_config(&root, &serde_yaml::to_string(&config)?)?;
         let gateway = Gateway::from_config(path, config.clone()).await?;
         let listener_gateway = gateway.clone();
@@ -387,5 +397,237 @@ async fn udp_pressure_preserves_live_entries_and_reader_abort_cleans_up() -> Res
         state.try_reserve(0).is_none(),
         "closed listener cannot admit even unlimited sessions"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_access_policy_applies_to_numeric_dns_and_script_admission_and_reload() -> Result<()> {
+    for mode in ["numeric", "dns", "script"] {
+        let mut fixture = Fixture::configured(mode, 8, 180, |config| {
+            config.services.access_control.stream.enabled = true;
+            config.services.access_control.stream.deny = vec!["127.0.0.0/8".into()];
+        })
+        .await?;
+        let blocked = fixture.client().await?;
+        assert!(!echo(&blocked, b"denied", 100).await, "{mode}");
+        assert_eq!(fixture.active(), 0);
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .blocked_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        fixture.config.services.access_control.stream.deny.clear();
+        fixture.config.services.access_control.stream.allow = vec!["192.0.2.0/24".into()];
+        fixture.reload().await?;
+        assert!(!echo(&blocked, b"not-allowed", 100).await, "{mode}");
+        assert_eq!(fixture.active(), 0);
+        fixture.config.services.access_control.stream.allow = vec!["127.0.0.0/8".into()];
+        fixture.reload().await?;
+        assert!(echo(&blocked, b"now-allowed", 500).await, "{mode}");
+        fixture.config.services.access_control.stream.deny = vec!["127.0.0.0/8".into()];
+        fixture.config.services.access_control.stream.allow.clear();
+        fixture.reload().await?;
+        assert!(echo(&blocked, b"established-survives", 500).await, "{mode}");
+        let newcomer = fixture.client().await?;
+        assert!(!echo(&newcomer, b"new-denied", 100).await, "{mode}");
+        assert_eq!(fixture.active(), 1);
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .blocked_requests_total
+                .load(Ordering::Relaxed),
+            3
+        );
+        fixture.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_stream_rate_limit_counts_sessions_and_shares_tcp_zone() -> Result<()> {
+    let tcp_backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_address = tcp_backend.local_addr()?;
+    let tcp_address = SocketAddr::from(([127, 0, 0, 1], reserve_port().await?));
+    let fixture = Fixture::configured("numeric", 8, 180, |config| {
+        let limit = &mut config.services.rate_limit.stream;
+        limit.enabled = true;
+        limit.connections = 1;
+        limit.window_ms = 60_000;
+        limit.burst = 0;
+        config.tcp.listeners.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"shared-zone", "bind":tcp_address.to_string(),
+                "upstream":backend_address.to_string()
+            }))
+            .unwrap(),
+        );
+    })
+    .await?;
+    let gateway = fixture.gateway.clone();
+    let config = fixture.config.tcp.listeners[0].clone();
+    let tcp = tokio::spawn(async move { gateway.run_tcp_listener(config).await });
+    let _abort_tcp = AbortTaskOnDrop(tcp.abort_handle());
+    let old = fixture.client().await?;
+    for _ in 0..5 {
+        assert!(echo(&old, b"existing-does-not-consume-token", 500).await);
+    }
+    let newcomer = fixture.client().await?;
+    assert!(!echo(&newcomer, b"new-session-denied", 100).await);
+    let mut inbound = TcpStream::connect(tcp_address).await?;
+    let _ = inbound.write_all(b"must-not-reach-backend").await;
+    let mut buffer = [0_u8; 64];
+    let reply = tokio::time::timeout(Duration::from_millis(500), inbound.read(&mut buffer)).await?;
+    assert!(!matches!(reply, Ok(size) if size > 0));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), tcp_backend.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .gateway
+            .stats
+            .blocked_requests_total
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert!(echo(&old, b"still-allowed", 500).await);
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_ddos_and_dynamic_blacklist_reject_new_sessions_and_count_once() -> Result<()> {
+    for mode in ["numeric", "script"] {
+        let fixture = Fixture::configured(mode, 8, 180, |config| {
+            config.security.ddos.enabled = true;
+            config.security.ddos.max_connections = 1;
+            config.security.ddos.window_secs = 60;
+            config.security.ddos.ban_secs = 60;
+            config.security.ddos.burst = 0;
+        })
+        .await?;
+        let old = fixture.client().await?;
+        assert!(echo(&old, b"admitted", 500).await);
+        let denied = fixture.client().await?;
+        assert!(!echo(&denied, b"ddos-trigger", 100).await);
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .ddos_bans_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .blocked_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(fixture
+            .gateway
+            .dynamic_blacklist
+            .is_blocked("127.0.0.1".parse()?));
+        let blacklisted = fixture.client().await?;
+        assert!(!echo(&blacklisted, b"blacklisted", 100).await);
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .ddos_bans_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .blocked_requests_total
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert!(echo(&old, b"existing-survives", 500).await);
+        fixture
+            .gateway
+            .dynamic_blacklist
+            .remove("127.0.0.1".parse()?);
+        fixture.gateway.ddos_guard.unban_ip("127.0.0.1".parse()?);
+        assert!(echo(&blacklisted, b"ban-removed", 500).await);
+        assert_eq!(fixture.active(), 2);
+        fixture.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_ddos_rejection_is_counted_once_at_admission() -> Result<()> {
+    let backend_port = reserve_port().await?;
+    let echo_task = crate::verify::harness::spawn_tcp_echo_upstream(backend_port).await;
+    let _abort_echo = AbortTaskOnDrop(echo_task.abort_handle());
+    let bind = format!("127.0.0.1:{}", reserve_port().await?);
+    let fixture = Fixture::configured("numeric", 8, 180, |config| {
+        config.security.ddos.enabled = true;
+        config.security.ddos.max_connections = 1;
+        config.security.ddos.window_secs = 60;
+        config.security.ddos.ban_secs = 60;
+        config.security.ddos.burst = 0;
+        config.tcp.listeners.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"ddos-tcp", "bind":bind,
+                "upstream":format!("127.0.0.1:{backend_port}")
+            }))
+            .unwrap(),
+        );
+    })
+    .await?;
+    let gateway = fixture.gateway.clone();
+    let config = fixture.config.tcp.listeners[0].clone();
+    let task = tokio::spawn(async move { gateway.run_tcp_listener(config).await });
+    let _abort_tcp = AbortTaskOnDrop(task.abort_handle());
+    let mut accepted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(stream) = TcpStream::connect(&bind).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    accepted.write_all(b"first").await?;
+    let mut response = [0_u8; 5];
+    tokio::time::timeout(Duration::from_secs(1), accepted.read_exact(&mut response)).await??;
+    assert_eq!(&response, b"first");
+    for expected in 1..=2 {
+        let mut denied = TcpStream::connect(&bind).await?;
+        let _ = denied.write_all(b"blocked").await;
+        let reply =
+            tokio::time::timeout(Duration::from_secs(1), denied.read(&mut response)).await?;
+        assert!(!matches!(reply, Ok(size) if size > 0));
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .ddos_bans_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            fixture
+                .gateway
+                .stats
+                .blocked_requests_total
+                .load(Ordering::Relaxed),
+            expected
+        );
+    }
+    drop(accepted);
+    fixture.stop().await?;
     Ok(())
 }
