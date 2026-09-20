@@ -56,8 +56,9 @@ CLIENT_CPUSET="${CLIENT_CPUSET:-8-15}"
 # Realtime protocols keep one I/O owner. HTTP/SSE use two so fast responses do
 # not create a single-worker cooperative scheduling cliff; static-large also
 # keeps two for response-body copying.
-# Saturation continues using the whole client cpuset so it cannot cap a faster
-# gateway before the gateway's own CPU is full.
+# Mixed saturation uses each scenario's disjoint CPU partition; only serial
+# isolated-saturation diagnostics use the whole client cpuset. Report client
+# CPU limits explicitly before attributing a plateau to the gateway.
 EQUAL_LOAD_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_CLIENT_TOKIO_WORKERS:-1}"
 EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_HTTP_CLIENT_TOKIO_WORKERS:-2}"
 EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS="${EQUAL_LOAD_STATIC_LARGE_CLIENT_TOKIO_WORKERS:-2}"

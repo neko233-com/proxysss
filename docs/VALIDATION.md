@@ -29,7 +29,7 @@ KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
 
 默认每尺度 1 次饱和、2 次顺序相反的等负载采样，共 18 秒活跃测量，上限 20 秒。等负载取较慢网关饱和速率的 25%，延迟使用两次样本中位数；双方完成至少 98% 可执行目标。HTTP/SSE 均匀错峰计划只计严格早于截止点的请求；半整数总量不能把恰在截止点的请求向上计入，没有可执行请求的计划直接报错。HTTP/SSE 使用均匀错峰，UDP/QCP、TCP、WebSocket 分别预留 1/2/5 ms 完成时间。每波提前预留测量预算，进程宽限期不能无限延长。
 
-预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 `TOKIO_WORKER_THREADS`，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；饱和测试使用全部 client cpuset。官方 fixture、解析和验收工具使用 Go 或原生编译工具。
+预连接、两次 GET/SSE 资源请求、每条实时连接的一次 echo、1000 ms 解暂停稳定期和 2000 ms future-start lead 均在活跃测量之外。构建、容器准备、预热和结果处理另记 wall time。客户端与后端进程遵守 `TOKIO_WORKER_THREADS`，等负载 HTTP/SSE 和大文件各使用两个 I/O worker，实时协议一个；混合负载按场景划分互不重叠的 client CPU，饱和时 worker 数等于该场景 CPU 数；只有串行 isolated-saturation 诊断使用全部 client cpuset。单场景 CPU 满载时只能说明当前发生器资源下的比较，不能断言网关容量上限。官方 fixture、解析和验收工具使用 Go 或原生编译工具。
 
 HTTP/1 每个并发 worker 使用独立、最多一个空闲连接的 client，并先完成 HEAD，确保声明的连接数真实建立且随后复用；HTTPS/H2 仍共享一个多路复用 client。HTTP 下载逐块消费并计数，不把完整大文件收进发生器内存。`bench http` 默认仅接受 2xx；`--expected-status` 可指定精确状态，`--expected-body-bytes` 校验正文长度。正式 HTTP 夹具要求 200，静态夹具还要求实际文件长度；错误页、短正文和意外长正文不能算吞吐成功。
 
