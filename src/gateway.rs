@@ -2332,6 +2332,8 @@ impl Default for GatewayStats {
             reload_failure_total: AtomicU64::new(0),
             admin_requests_total: AtomicU64::new(0),
             admin_auth_fail_total: AtomicU64::new(0),
+            monitor_requests_total: AtomicU64::new(0),
+            monitor_auth_fail_total: AtomicU64::new(0),
             script_fail_total: AtomicU64::new(0),
             blocked_requests_total: AtomicU64::new(0),
             ddos_bans_total: AtomicU64::new(0),
