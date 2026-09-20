@@ -2,6 +2,16 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-09-21：HTTP 统计正确性修复保留，混合门槛未通过
+
+提交 fd275ed 补齐静态缓存/sendfile、原始反代、SSE、WS/WSS 请求计数，统一 4xx/5xx 响应计数并消除异常路径重复累加。Ubuntu 24.04 x86_64 两轮各 354 项测试、Clippy、格式、文档/Go、实际 CPU 范围与 HTTP/TCP/UDP 探针、CLI 检查通过；真实 HTTP/1、TLS/H2/H3 与 WebSocket 测试确认快速路径、回退和升级期间的计数。该修复是监控正确性要求，不能通过漏记请求获得性能。
+
+无记录器标准 6/6/12 核、1×/2×/4× 矩阵仍失败。大文件吞吐比为 0.779/0.637/0.766；CDN p99 比 3.229/2.333/1.852，小静态 p99 为 3.334/2.246/1.913，反代 p99 为 2.177/1.801/1.267。4× WebSocket p50/p95/p99 为 1.142/1.185/1.079。不同轮次波动不能证明该计数修复造成或解决了既有调度问题。
+
+18 份原始文件共 198 个样本零错误，但 132 个等负载样本中有两个未达完成率门槛：4× 透明 QCP 第一轮 proxysss 为 960/1056（90.91%），nginx 为 1009/1056（95.55%），第二轮双方均为 1056/1056。不能只报告零错误或合并后的完成率来掩盖失败。实际间隔 90738 μs，第 11 个同步 tick 位于 998118 μs，距截止仅 1.882 ms；这是末轮定时敏感性的线索，尚未证实客户端定时器或网关是根因，不据此降低门槛。
+
+4× cgroup current/peak bytes：proxysss 89624576/282320896，nginx 202149888/370860032。18 秒活跃、163 秒矩阵 wall、331 秒总耗时。工件 `.benchmark/direct-ubuntu24-amd64/goal-http-metrics/`，功能日志、全量原始审计及 manifest 在 `.benchmark/http-metrics-functional/`；固定二进制 SHA256 `f51ef95c08b9682d87830b73d0c0f75264d8ca771ebd0bf9a8150e66ffb73eef`。Docker Desktop VM 数据不是独立三主机证据，未进入 Windows 验证、push 或发布。
+
 ## 2026-09-21：balanced 下载与 realtime 共用 native owner，未接受
 
 后续仅用保留的候选二进制执行 epoll/sendfile 诊断，没有恢复生产代码。原生记录器自检验证正文、偏移、错误码和 epoll 返回值，完整标准三尺度矩阵记录 proxysss 360326 / nginx 176467 个工作区间，无溢出或未完成记录。饱和时 native owner 每轮平均 ready fd 为 13.1/25.2/53.0，每发送轮仍约 1 MiB，工作 CPU 约 1699/1646/1669 ms，其中 sendfile 为 706/486/311 ms，占比从 41.6% 降到 18.6%。HTTP owner 的工作 CPU 同时维持约 3.3 秒；nginx 每轮发送合计字节随密度增长。该证据支持重新分配每连接的处理机会，不证明只调整切片或 nice 可以达标。work wall−CPU 包含程序自身等待与 Tokio park，不能误称纯 runqueue wait，尤其不能等同 UDP 请求时延。仪器化结果不作发布证据，完整边界、源代码、自检与原始工件保存在 `.benchmark/goal-shared-reactor-calls/`。
