@@ -35,7 +35,7 @@ KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
 
 ARM Docker 上的 amd64 模拟必须记为 `emulated-amd64`；通过原生 Zig 交叉构建、在目标容器执行后测量。Docker Desktop 的 native-amd64 代表 Linux VM 中原生指令执行，不代表独立物理机。
 
-WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websocket --hold-connections 输出 hold ready 后，控制器才开始等待并采集连接存活期间的 cgroup current/peak；结束时逐条真实 echo，要求 retained 等于 requested 且 hold failures 为 0。只统计曾经 opened、只持有 socket 句柄或在客户端退出后采样，均不能证明容量。nginx 测试 idle timeout 必须长于持有期；活跃 WSS 的共同开始时间只能在所有连接完成 warm-up echo 后发布。Docker 客户端和后端显式按声明 CPU 配额设置 TOKIO_WORKER_THREADS；汇总拒绝缺少存活/内存字段的旧报告，且逐轮限制 current、peak、每连接成本不超过 nginx 的 2 倍。
+WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websocket --hold-connections 输出 hold ready 后，控制器才开始等待并采集连接存活期间的 cgroup current/peak；结束时逐条真实 echo，要求 retained 等于 requested 且 hold failures 为 0。只统计曾经 opened、只持有 socket 句柄或在客户端退出后采样，均不能证明容量。nginx 测试 idle timeout 必须长于持有期；活跃 WSS 的共同开始时间只能在所有连接完成 warm-up echo 后发布。Docker 客户端和后端显式按声明 CPU 配额设置 TOKIO_WORKER_THREADS；汇总拒绝缺少存活/内存字段的旧报告，且逐轮限制 current、peak、每连接成本不超过 nginx 的 2 倍。WSS 等负载目标只统计测量窗口内、距结束至少 5 ms 的完整 tick；例如 4096 连接、5 秒、300000 us 间隔的目标是 65536 次，而非无限时长速率乘窗口。CLI 显示可执行 target ops/sec，汇总要求双方目标相同且每轮完成至少 98%；没有完整 tick 的计划不能作为延迟证据。等待 tick、收发及重连都在测量截止时间停止，不把超时后的完成计入吞吐。容量矩阵默认在持有期一半时采在线内存。
 
 ## 3. Windows 功能验收
 

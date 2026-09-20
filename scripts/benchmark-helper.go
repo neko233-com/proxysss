@@ -448,6 +448,19 @@ func summarizeIsolatedWSSRuns(
 	if options.RequireActive {
 		fail(summary.Nginx.ActiveErrorsMax != 0 || summary.Proxysss.ActiveErrorsMax != 0,
 			fmt.Sprintf("active errors nginx=%d proxysss=%d", summary.Nginx.ActiveErrorsMax, summary.Proxysss.ActiveErrorsMax))
+		if options.GateActiveLatency && !options.GateActiveOps {
+			for _, run := range summary.Runs {
+				nginxTarget, proxyTarget := run.Nginx.Active.TargetOpsPerSec, run.Proxysss.Active.TargetOpsPerSec
+				if nginxTarget == nil || proxyTarget == nil || *nginxTarget <= 0 || *proxyTarget <= 0 || *nginxTarget != *proxyTarget {
+					fail(true, "equal-load requires identical positive executable targets in "+run.RunDir)
+					continue
+				}
+				for gateway, row := range map[string]BenchRow{"nginx": run.Nginx.Active, "proxysss": run.Proxysss.Active} {
+					fail(row.OpsPerSec < *nginxTarget*0.98,
+						fmt.Sprintf("%s completed less than 98%% of executable target %.6f in %s", gateway, *nginxTarget, run.RunDir))
+				}
+			}
+		}
 		if options.MinActiveOpsPerSec > 0 {
 			for _, run := range summary.Runs {
 				fail(run.Nginx.Active.OpsPerSec < options.MinActiveOpsPerSec,

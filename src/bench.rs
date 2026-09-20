@@ -766,15 +766,9 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
             }
 
-            while tokio::time::Instant::now() < deadline {
-                if let Some(ticker) = ticker.as_mut() {
-                    ticker.tick().await;
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                }
+            while wait_for_operation_slot(&mut ticker, deadline).await {
                 let started = Instant::now();
-                let result = async {
+                let exchange = async {
                     websocket
                         .send(Message::Binary(payload.as_ref().clone().into()))
                         .await?;
@@ -798,19 +792,26 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
                             Some(Err(error)) => return Err(error),
                         }
                     }
-                }
-                .await;
+                };
+                let result = tokio::time::timeout_at(deadline, exchange).await;
 
                 match result {
-                    Ok(size) => local.record_success(started.elapsed(), payload.len() + size),
-                    Err(_) if tokio::time::Instant::now() < deadline => {
+                    Ok(Ok(size)) if tokio::time::Instant::now() < deadline => {
+                        local.record_success(started.elapsed(), payload.len() + size);
+                    }
+                    Ok(Err(_)) if tokio::time::Instant::now() < deadline => {
                         local.record_error();
-                        match connect_websocket(url.as_str(), insecure_tls_config.clone()).await {
-                            Ok((stream, _)) => websocket = stream,
-                            Err(_) => break,
+                        match tokio::time::timeout_at(
+                            deadline.min(tokio::time::Instant::now() + connect_timeout),
+                            connect_websocket(url.as_str(), insecure_tls_config.clone()),
+                        )
+                        .await
+                        {
+                            Ok(Ok((stream, _))) => websocket = stream,
+                            _ => break,
                         }
                     }
-                    Err(_) => {}
+                    _ => break,
                 }
             }
             stats.add_task(&local);
@@ -826,8 +827,9 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
     if let Some(interval) = message_interval {
         println!("message interval: {} us", interval.as_micros());
         println!(
-            "target ops/sec : {:.2}",
-            connection_count as f64 / interval.as_secs_f64()
+            "target ops/sec : {:.6}",
+            websocket_target_operations(connection_count, measurement_duration, interval) as f64
+                / measurement_duration.as_secs_f64()
         );
     }
     print_summary("websocket", args.duration_secs, &stats, latencies);
@@ -835,6 +837,13 @@ async fn run_websocket(args: WebSocketBenchArgs) -> Result<()> {
 }
 
 const MAX_CONNECTION_LATENCY_SAMPLES_PER_WORKER: usize = 2_048;
+
+fn websocket_target_operations(connections: usize, duration: Duration, interval: Duration) -> u128 {
+    // Match the mixed-matrix plan: only whole ticks strictly before the final
+    // 5 ms completion guard count toward the mandatory offered-load target.
+    let available = duration.as_micros().saturating_sub(5_001);
+    available / interval.as_micros().max(1) * connections as u128
+}
 
 async fn verify_websocket_echo(
     stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -1290,6 +1299,59 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_targets_count_only_executable_ticks() {
+        assert_eq!(
+            websocket_target_operations(4096, Duration::from_secs(5), Duration::from_millis(300)),
+            65536
+        );
+        assert_eq!(
+            websocket_target_operations(10, Duration::from_secs(1), Duration::from_millis(200)),
+            40
+        );
+        assert_eq!(
+            websocket_target_operations(10, Duration::from_secs(1), Duration::from_secs(2)),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_measurement_stops_when_peer_stalls_or_tick_is_distant() {
+        for interval in [0, 4_000_000] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let warmup = socket.next().await.unwrap().unwrap();
+                socket.send(warmup).await.unwrap();
+                // Keep the peer connected without completing a measured echo.
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_websocket(WebSocketBenchArgs {
+                    url: format!("ws://{addr}/"),
+                    connections: 1,
+                    duration_secs: 1,
+                    payload_bytes: 32,
+                    message_interval_micros: interval,
+                    hold_connections: false,
+                    connect_workers: 1,
+                    connect_timeout_ms: 500,
+                    connect_retries: 0,
+                    insecure: false,
+                    start_at_unix_ms: 0,
+                }),
+            )
+            .await;
+            server.abort();
+            result
+                .expect("measurement deadline must terminate stalled I/O and distant ticks")
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn websocket_hold_probe_rejects_closed_and_wrong_echo() {

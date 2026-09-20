@@ -34,7 +34,7 @@ LATENCY_LARGE_SCALE_MIN_CONNECTIONS="${LATENCY_LARGE_SCALE_MIN_CONNECTIONS:-4096
 LATENCY_LARGE_SCALE_TARGET_OPS="${LATENCY_LARGE_SCALE_TARGET_OPS:-30000}"
 LATENCY_MIN_ACHIEVEMENT_PERCENT="${LATENCY_MIN_ACHIEVEMENT_PERCENT:-98}"
 CAPACITY_HOLD_SECS="${CAPACITY_HOLD_SECS:-60}"
-CAPACITY_SETTLE_SECS="${CAPACITY_SETTLE_SECS:-60}"
+CAPACITY_SETTLE_SECS="${CAPACITY_SETTLE_SECS:-$((CAPACITY_HOLD_SECS / 2))}"
 CAPACITY_CONNECT_WORKERS="${CAPACITY_CONNECT_WORKERS:-256}"
 # Default to memory observation.  Set an explicit value only when the declared
 # production envelope includes a real cgroup budget for load generators.
@@ -200,7 +200,8 @@ for connections in $ACTIVE_SCALES; do
     # A finite benchmark window can contain only an integer number of fixed
     # ticks. Gate against the achievable scheduled rate, not the continuous
     # ideal, then require every run to complete at least the declared percent.
-    scheduled_ticks=$((ACTIVE_DURATION_SECS * 1000000 / interval_micros))
+    scheduled_ticks=$(((ACTIVE_DURATION_SECS * 1000000 - 5001) / interval_micros))
+    (( scheduled_ticks > 0 )) || { echo "WSS interval leaves no complete tick before the measurement deadline" >&2; exit 1; }
     scheduled_active_ops=$((scheduled_ticks * connections / ACTIVE_DURATION_SECS))
     min_active_ops=$((scheduled_active_ops * LATENCY_MIN_ACHIEVEMENT_PERCENT / 100))
     echo "==> equal-load WSS latency scale: $connections connections, continuous target ${latency_target_ops} ops/s, scheduled ${scheduled_active_ops} ops/s"

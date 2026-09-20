@@ -177,8 +177,8 @@ func TestIsolatedWSSMedianGateRejectsEqualTailLatency(t *testing.T) {
 
 func TestEqualLoadGateAllowsEqualOpsAndRequiresLatencyWin(t *testing.T) {
 	runDir := t.TempDir()
-	nginx := "target ops/sec : 99999\nsuccess : 100\nerrors : 0\nops/sec : 40000\nlatency p50 : 2 ms\nlatency p95 : 4 ms\nlatency p99 : 8 ms\n"
-	proxy := "target ops/sec : 99999\nsuccess : 100\nerrors : 0\nops/sec : 40000\nlatency p50 : 1 ms\nlatency p95 : 3 ms\nlatency p99 : 7 ms\n"
+	nginx := "target ops/sec : 40500\nsuccess : 100\nerrors : 0\nops/sec : 40000\nlatency p50 : 2 ms\nlatency p95 : 4 ms\nlatency p99 : 8 ms\n"
+	proxy := "target ops/sec : 40500\nsuccess : 100\nerrors : 0\nops/sec : 40000\nlatency p50 : 1 ms\nlatency p95 : 3 ms\nlatency p99 : 7 ms\n"
 	if err := os.WriteFile(filepath.Join(runDir, "nginx-active.txt"), []byte(nginx), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -230,6 +230,41 @@ func TestEqualLoadGateRequiresEveryRunToMeetOfferedLoad(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(summary.Failures, "\n"), "nginx active ops/sec 38000.000 below 39000.000") {
 		t.Fatalf("expected per-run offered-load failure, got %v", summary.Failures)
+	}
+}
+
+func TestEqualLoadGateAutomaticallyChecksExecutableTarget(t *testing.T) {
+	for _, test := range []struct {
+		name, nginxTarget, proxyTarget string
+		ops                            float64
+		pass                           bool
+	}{
+		{"boundary", "100", "100", 98, true},
+		{"below", "100", "100", 97.99, false},
+		{"mismatch", "100", "99", 100, false},
+		{"missing", "", "100", 100, false},
+		{"zero ticks", "0", "0", 100, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for gateway, target := range map[string]string{"nginx": test.nginxTarget, "proxysss": test.proxyTarget} {
+				latency := 2
+				if gateway == "proxysss" {
+					latency = 1
+				}
+				raw := fmt.Sprintf("target ops/sec : %s\nsuccess : 100\nerrors : 0\nops/sec : %.2f\nlatency p50 : %d ms\nlatency p95 : %d ms\nlatency p99 : %d ms\n", target, test.ops, latency, latency, latency)
+				if err := os.WriteFile(filepath.Join(dir, gateway+"-active.txt"), []byte(raw), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			summary, err := summarizeIsolatedWSSRuns([]string{dir}, IsolatedWSSGateOptions{RequireActive: true, GateActiveLatency: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.Passed != test.pass {
+				t.Fatalf("unexpected gate: %+v", summary)
+			}
+		})
 	}
 }
 
