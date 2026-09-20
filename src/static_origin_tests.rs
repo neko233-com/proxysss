@@ -2,6 +2,61 @@ use super::*;
 use crate::test_support::TestDir;
 
 #[test]
+fn static_snapshot_survives_source_truncation_and_overwrite() {
+    const CHILD: &str = "PROXYSSS_STATIC_SNAPSHOT_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gateway::static_origin_tests::static_snapshot_survives_source_truncation_and_overwrite", "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mutable file snapshot crashed its isolated test: {status}"
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let root = TestDir::new("static-snapshot-mutation");
+            let path = root.join("asset.bin");
+            let original = vec![b'x'; 2 * 1024 * 1024];
+            std::fs::write(&path, &original).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let snapshot = cached_static_file_body(
+                &path,
+                &metadata,
+                &DashMap::new(),
+                &AtomicU64::new(0),
+                &DashMap::new(),
+            )
+            .await
+            .unwrap();
+            std::fs::write(&path, b"replacement").unwrap();
+            // Reading mapped bytes here would raise SIGBUS on Linux. Existing
+            // responses must retain their immutable body after an in-place publish.
+            assert_eq!(snapshot.as_ref(), original);
+            let updated = read_static_file_snapshot(&path, &std::fs::metadata(&path).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(updated.as_ref(), b"replacement");
+            assert!(read_static_file_snapshot(&path, &metadata).await.is_err());
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(STATIC_STREAM_THRESHOLD_BYTES + 1)
+                .unwrap();
+            assert!(
+                read_static_file_snapshot(&path, &std::fs::metadata(&path).unwrap())
+                    .await
+                    .is_err()
+            );
+        });
+}
+
+#[test]
 fn ftp_switches_do_not_erase_or_accidentally_skip_sibling_policies() {
     let mut ftp = crate::config::FtpConfig {
         command_deny: vec!["DELE".into()],

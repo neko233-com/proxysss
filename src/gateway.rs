@@ -1543,7 +1543,6 @@ const STATIC_SENDFILE_BULK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const STATIC_SENDFILE_BALANCED_FAIR_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_BALANCED_SNDBUF_BYTES: usize = 1024 * 1024;
-const STATIC_MMAP_THRESHOLD_BYTES: u64 = 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const STATIC_FILE_CACHE_MAX_ENTRIES: usize = 256;
 const STATIC_FILE_CACHE_REVALIDATE_SECS: u64 = 2;
@@ -2196,6 +2195,7 @@ struct CachedH2StaticPayload {
     body: Bytes,
     content_length: HeaderValue,
     checked_at: Instant,
+    usable: bool,
 }
 
 struct CachedH2StaticRoute {
@@ -8352,7 +8352,7 @@ impl Gateway {
                 }
                 Some(route)
             })?;
-        let (response, revalidate) = cached_h2_static_response(&route);
+        let (response, revalidate) = cached_h2_static_response(&route)?;
         if revalidate {
             self.spawn_h2_static_cache_revalidation(route.clone());
         }
@@ -8363,7 +8363,10 @@ impl Gateway {
         let static_file_cache = self.static_file_cache.clone();
         let static_file_cache_bytes = self.static_file_cache_bytes.clone();
         let static_file_load_locks = self.static_file_load_locks.clone();
-        std::mem::drop(tokio::spawn(async move {
+        let static_route_cache = self.static_route_cache.clone();
+        let h2_static_response_cache = self.h2_static_response_cache.clone();
+        let refresh_lock = self.h2_static_response_refresh_lock.clone();
+        spawn_static_revalidation_task(async move {
             let result: Result<()> = async {
                 if !tokio::fs::canonicalize(&route.target)
                     .await
@@ -8390,15 +8393,32 @@ impl Gateway {
                         .unwrap_or_else(|_| HeaderValue::from_static("0")),
                     body,
                     checked_at: Instant::now(),
+                    usable: true,
                 }));
                 Ok(())
             }
             .await;
-            route.revalidating.store(false, Ordering::Release);
             if let Err(error) = result {
+                route.payload.store(Arc::new(CachedH2StaticPayload {
+                    body: Bytes::new(),
+                    content_length: HeaderValue::from_static("0"),
+                    checked_at: Instant::now(),
+                    usable: false,
+                }));
+                if let Some((_, stale)) =
+                    static_file_cache.remove(route.target.to_string_lossy().as_ref())
+                {
+                    static_file_cache_bytes.fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                }
+                let _guard = refresh_lock.lock().await;
+                h2_static_response_cache.store(Arc::new(build_prebuilt_h2_static_responses(
+                    &static_route_cache,
+                    &static_file_cache,
+                )));
                 tracing::debug!(?error, path = %route.target.display(), "H2 static cache revalidation failed");
             }
-        }));
+            route.revalidating.store(false, Ordering::Release);
+        });
     }
 
     fn spawn_static_cache_revalidation(&self, target: PathBuf) {
@@ -8443,9 +8463,12 @@ impl Gateway {
                         .map(|_| ())
                     };
                     if let Err(error) = result {
-                        refresh_h2_snapshot = false;
+                        if let Some((_, stale)) = static_file_cache.remove(&key) {
+                            static_file_cache_bytes
+                                .fetch_sub(stale.body.len() as u64, Ordering::Relaxed);
+                        }
+                        refresh_h2_snapshot = true;
                         tracing::debug!(?error, path = %target.display(), "background static cache revalidation failed");
-                        finish_failed_static_revalidation(&key, &static_file_cache);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -19676,18 +19699,7 @@ async fn cached_static_file_body(
         );
     }
 
-    let body = if metadata.len() >= STATIC_MMAP_THRESHOLD_BYTES {
-        let target = target.to_path_buf();
-        tokio::task::spawn_blocking(move || mmap_static_file_bytes(&target))
-            .await
-            .context("static mmap task failed")??
-    } else {
-        Bytes::from(
-            tokio::fs::read(target)
-                .await
-                .context("failed reading static file")?,
-        )
-    };
+    let body = read_static_file_snapshot(target, metadata).await?;
     let body_len = body.len() as u64;
     if body_len <= STATIC_STREAM_THRESHOLD_BYTES
         && static_file_cache.len() < STATIC_FILE_CACHE_MAX_ENTRIES
@@ -19726,15 +19738,36 @@ async fn cached_static_file_body(
     Ok(body)
 }
 
-fn mmap_static_file_bytes(target: &Path) -> Result<Bytes> {
-    let file = std::fs::File::open(target)
-        .with_context(|| format!("failed opening static file for mmap {}", target.display()))?;
-    let mmap = unsafe {
-        memmap2::MmapOptions::new()
-            .map(&file)
-            .with_context(|| format!("failed mmap static file {}", target.display()))?
-    };
-    Ok(Bytes::from_owner(mmap))
+async fn read_static_file_snapshot(target: &Path, metadata: &std::fs::Metadata) -> Result<Bytes> {
+    let expected_len = metadata.len();
+    let expected_modified = metadata.modified().ok();
+    if expected_len > STATIC_STREAM_THRESHOLD_BYTES {
+        return Err(anyhow!(
+            "static file exceeds bounded snapshot size; use streaming"
+        ));
+    }
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&target).context("open static snapshot")?;
+        let unchanged = |metadata: &std::fs::Metadata| {
+            metadata.len() == expected_len && metadata.modified().ok() == expected_modified
+        };
+        if !unchanged(&file.metadata()?) {
+            return Err(anyhow!("static file changed before snapshot read"));
+        }
+        // A mapped mutable file can SIGBUS inside TLS/compression after truncate.
+        // Own immutable bytes instead; read_exact bounds both growth and memory.
+        let mut data = vec![0_u8; expected_len as usize];
+        file.read_exact(&mut data)
+            .context("static snapshot truncated")?;
+        if !unchanged(&file.metadata()?) {
+            return Err(anyhow!("static file changed during snapshot read"));
+        }
+        Ok(Bytes::from(data))
+    })
+    .await
+    .context("static snapshot task failed")?
 }
 
 fn fresh_static_cache_body(
@@ -19784,8 +19817,11 @@ fn static_preload_body_max_bytes(profile: RuntimePerformanceTrafficProfile) -> u
     }
 }
 
-fn cached_h2_static_response(route: &CachedH2StaticRoute) -> (GatewayResponse, bool) {
+fn cached_h2_static_response(route: &CachedH2StaticRoute) -> Option<(GatewayResponse, bool)> {
     let payload = route.payload.load_full();
+    if !payload.usable {
+        return None;
+    }
     let revalidate = payload.checked_at.elapsed()
         > Duration::from_secs(STATIC_FILE_CACHE_REVALIDATE_SECS)
         && route
@@ -19803,7 +19839,7 @@ fn cached_h2_static_response(route: &CachedH2StaticRoute) -> (GatewayResponse, b
     response
         .headers_mut()
         .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    (response, revalidate)
+    Some((response, revalidate))
 }
 
 fn fresh_cached_static_file_response(
@@ -20132,6 +20168,7 @@ async fn preload_static_site_fast_lane_cache(
                             .unwrap_or_else(|_| HeaderValue::from_static("0")),
                         body: body.clone(),
                         checked_at: Instant::now(),
+                        usable: true,
                     }),
                     revalidating: AtomicBool::new(false),
                 }),
@@ -22319,11 +22356,12 @@ mod tests {
                 body: Bytes::from_static(b"test"),
                 content_length: HeaderValue::from_static("4"),
                 checked_at: Instant::now() - Duration::from_secs(2),
+                usable: true,
             }),
             revalidating: AtomicBool::new(false),
         };
 
-        let (response, revalidate) = cached_h2_static_response(&route);
+        let (response, revalidate) = cached_h2_static_response(&route).unwrap();
         assert!(revalidate);
         assert_eq!(
             response.headers().get(CONTENT_TYPE),
@@ -22344,7 +22382,7 @@ mod tests {
             _ => panic!("cached H2 route response must use the shared full body"),
         }
 
-        let (_, duplicate_revalidate) = cached_h2_static_response(&route);
+        let (_, duplicate_revalidate) = cached_h2_static_response(&route).unwrap();
         assert!(!duplicate_revalidate);
     }
 

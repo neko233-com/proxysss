@@ -5,6 +5,66 @@ use crate::test_support::TestDir;
 use crate::verify::harness::{base_gateway_yaml, reserve_port, spawn_gateway, write_config};
 
 #[tokio::test]
+async fn integration_deep_tls_static_snapshot_survives_publish_and_deletion() -> Result<()> {
+    let root = TestDir::new("tls-static-publish");
+    let public = root.join("public");
+    std::fs::create_dir_all(&public)?;
+    let path = public.join("asset.bin");
+    let original = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(&path, &original)?;
+    let port = reserve_port().await?;
+    let tls_port = reserve_port().await?;
+    let base = base_gateway_yaml(port)
+        .replace("tls_bind: ''", &format!("tls_bind: 127.0.0.1:{tls_port}"))
+        .replace("traffic_profile: small", "traffic_profile: balanced");
+    let yaml = format!("{base}\nservices:\n  static_sites:\n    - name: downloads\n      path_prefix: /assets\n      root: '{}'\n", public.display().to_string().replace('\\', "/"));
+    let (_gateway, runner) = spawn_gateway(write_config(&root, &yaml)?).await?;
+    let client = Client::builder()
+        .http2_prior_knowledge()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let url = format!("https://127.0.0.1:{tls_port}/assets/asset.bin");
+    assert_eq!(
+        client.get(&url).send().await?.bytes().await?.as_ref(),
+        original
+    );
+    std::fs::write(&path, b"replacement")?;
+    let immediate = client.get(&url).send().await?.bytes().await?;
+    assert!(immediate.as_ref() == original || immediate.as_ref() == b"replacement");
+    let mut updated = false;
+    for _ in 0..80 {
+        if client.get(&url).send().await?.bytes().await?.as_ref() == b"replacement" {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        updated,
+        "H2 snapshot must refresh after in-place publication"
+    );
+    std::fs::remove_file(&path)?;
+    let mut removed = false;
+    for _ in 0..80 {
+        let response = client.get(&url).send().await?;
+        let status = response.status();
+        let _ = response.bytes().await?;
+        if status == StatusCode::NOT_FOUND {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        removed,
+        "cached H2 connection must not serve a removed file forever"
+    );
+    runner.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_deep_complex_downloads_http1_h2_tls() -> Result<()> {
     let root = TestDir::new("complex-downloads");
     let public = root.join("public");

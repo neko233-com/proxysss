@@ -34,6 +34,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
 - Static asset serving must cover HTML, CSS, JS, images, fonts, audio/video, CDN-origin assets, large-file streaming, and byte `Range` resumable downloads.
+- 可变静态源文件不得作为跨请求的裸 mmap 正文交给 TLS/压缩；使用有界不可变快照。文件截断、删除、局部下载及 H2 连接缓存失效必须有回归覆盖，具体规则见 [CDN 下载](docs/CDN-ORIGIN.md)。
 - API gateway surfaces must cover HTTP/1.1, HTTP/2, gRPC-style requests, WebSocket reverse proxying, edge rate limiting, active/passive health, retry, weighted/canary upstreams, and circuit-breaker-style passive quarantine without making proxysss a business gateway.
 - WAF, anti-CC, hotlink, and crawler defenses must stay split correctly: generic edge primitives live in core config (`security`, `services.access_control`, `services.rate_limit`), while business-specific Referer/User-Agent/bot-score decisions belong in scripts/plugins.
 - Consul, etcd, and Nacos registry linkage uses `services.service_discovery` plus admin/automation-updated upstream pools; ordinary HTTP/TCP/UDP hot paths must select from in-memory pools and not do per-request registry network calls.
