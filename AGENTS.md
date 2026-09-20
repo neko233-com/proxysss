@@ -176,6 +176,9 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 
 ## CDN 源站与本地产物约束
 
+- WebDAV/FileCloud 的已有目标、新建父目录和递归复制子项必须检查真实 root 边界，悬空链接不能按不存在路径跳过。内部合法链接保持可用，COPY 到自身/子目录或循环应拒绝；目录展示隐藏越界子项。路径检查不是并发本地写入沙箱，完整行为与限制维护在 `docs/ARCHITECTURE.md` / `docs/architecture.html` 与配置指南。
+- WebDAV 可选 Basic 认证必须先于所有方法和文件操作；认证密码与 admin.monitor 密码在 CLI/管理配置中脱敏。WebDAV/FileCloud 复用有界流式下载与条件/Range 规则，认证下载不得使用公共缓存，PROPFIND 按消费进度生成 XML。文件服务协议、认证和资源边界作为一组维护并集中验证，不以逐项重跑整套矩阵代替统一回归。
+
 - 静态站点 `security.origin_token`、`allowed_peers`、`signed_url` 必须在缓存、HEAD、Range 和条件响应之前校验；源站只信任 TCP 对端，不信任访客提交的转发 IP。配置展示必须脱敏 origin_token 和 signed_url.secret。
 - `autoindex` 默认 false，`hide_dotfiles` 默认 true；预加载、index 和目录浏览都必须遵守真实路径边界，索引扫描有界，URL 编码和 HTML 转义分开处理。签名站点不能开启目录索引。
 - 签名响应与静态错误响应使用 no-store；不要声称源站能约束已命中的 CDN 缓存。Referer 与客户端防逆向属于业务/边缘层。
@@ -195,3 +198,4 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 - 管理监听器 `/docs` 和 `/docs.html` 在管理传输访问检查后提供静态使用文档，不暴露实际运行配置或凭据。后台中文默认，原始 JSON 诊断默认折叠，保持登录、会话与只读安全边界。
 - `README.md` 使用英文，`README-CN.md` 使用中文，两者的配置示例和运维说明同步维护并随安装包分发。
 - 网页视觉和交互验收仅使用已安装的应用内 Browser 插件。
+- HTTP/2/3 请求正文不能因 GET 或缺少 Content-Length 被忽略；入站大小/空闲限制失败不得进入写入/反代。HTTP/3 每流独立驱动，正文失败重置流并保留正常 trailers。上游持续 SSE/下载按正文空闲期限计时，不使用整个响应总时长期限；对应语义与限制维护在配置和架构主题页。

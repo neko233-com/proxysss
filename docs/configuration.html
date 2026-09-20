@@ -664,12 +664,18 @@ services:
       root: ./site
       index_files: ["index.html"]
       cache_control: "public, max-age=300"</code></pre></article>
-<article class="card"><h3>只读 WebDAV</h3><p>webdav 是单个配置对象，默认示例关闭写入。这个配置面没有 auth.basic；写入应放在可信网络、外部认证或明确的扩展认证之后。内建密码文件管理使用 services.filecloud。</p><pre><code>services:
+<article class="card"><h3>只读 WebDAV</h3><p>webdav 是单个配置对象，默认示例关闭写入。使用 auth.enabled、auth.username、auth.password 开启内建 Basic 认证，覆盖 OPTIONS、目录、下载和写操作，密码变更参与热重载，CLI/管理配置显示脱敏；公网使用 HTTPS，认证响应禁止共享缓存。图形化文件管理使用 services.filecloud。</p><p>源路径、COPY/MOVE 目标和递归 COPY 子项必须留在 root 内。有效内部链接可用，越界或悬空链接返回 403，PROPFIND 隐藏这些子项。复制到自身/子目录及循环链接会被拒绝；失败的递归 COPY 可能保留已完成的内部文件。FileCloud 同样检查已有目标与新建目标父目录，列表/搜索隐藏不符合边界的子项，上传和重命名 name 必须为单个文件名。两种服务都要求可信运维管理根目录和链接，路径检查不是抵御并发本地链接替换的原子沙箱。</p><pre><code>services:
   webdav:
     enabled: true
     path_prefix: /dav
     root: ./dav-data
-    allow_write: false</code></pre></article>
+    allow_write: false
+    auth:
+      enabled: true
+      username: builder
+      password: replace-with-a-random-password</code></pre>
+<p>WebDAV 与 FileCloud 支持 GET/HEAD、最多 16 段 Range、ETag/日期条件请求。大文件按消费进度读取，每次最多 64 KiB，取消释放资源；公开下载按 cdn_cache_secs 缓存，可覆盖文件不自动标记 immutable，认证下载禁止共享缓存。API/JSON 路径保留字面 + 和 %，下载 URL 只解码一次，中文文件名用 UTF-8 filename* 编码。</p>
+<p>PROPFIND 流式返回目录，支持 Depth 0/1；目录默认/infinity 深度返回 403。COPY 支持 0/infinity，MOVE 使用 infinity；Overwrite F 遇到已有目标返回 412。覆盖替换整个目标集合并返回 204，新建返回 201；父集合缺失返回 409，不自动补建。MKCOL 非空请求体返回 415，跨服务器 Destination 返回 502。锁与自定义属性不能由这些方法的支持推断。</p></article>
 <article class="card"><h3>TCP 直通</h3><p>listener 直接指定 upstream，或使用字符串数组 upstreams；不嵌套 routes。适合数据库、游戏和自定义 TCP 协议。SNI 策略另用 tcp.stream_routes。</p><pre><code>tcp:
   listeners:
     - name: postgres
@@ -952,6 +958,7 @@ proxysss token show</code></pre>
 <section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 <section class="panel" id="complex-downloads"><h2>游戏资源与复杂下载</h2><p>原生静态服务支持单段和最多 16 段 Range，合并重叠区间并流式发送 multipart/byteranges。HEAD 忽略 Range；条件失败返回 412，全部越界返回 416。大文件局部读取不载入整文件，取消释放资源。脚本 API 无需变化。</p><p><a href="cdn-origin.html#complex-downloads">下载语义与限制</a> · <a href="validation.html">Linux 优先验证与发布流程</a></p></section>
 <section class="panel" id="static-virtual-hosts"><h2>静态虚拟主机</h2><p>使用 services.static_sites[].hosts 与 path_prefix 按域名分发资源，多站点预热与连接缓存保持隔离。匹配语法、优先级、重载和鉴权边界统一见 <a href="cdn-origin.html#static-virtual-hosts">CDN 域名隔离指南</a>。</p></section>
+<section class="panel" id="http-stream-limits"><h2>HTTP 流与请求正文的资源边界</h2><p><code>http.request_timeout_ms</code> 默认 15000 ms，约束上游连接、响应头等待和响应正文每次无进展等待，不是整个下载或 SSE 的总时长。正文持续到达重新计时，下游暂停读取不计入上游空闲期限；WebSocket 完成 101 后不受 HTTP 正文期限限制。</p><p><code>http.request_body_timeout_ms</code> 默认 30000 ms，约束客户端正文空闲等待，HTTP/3 也用于请求头解析；<code>http.max_request_body_bytes</code> 默认 67108864。超限返回 413、空闲超时返回 408、损坏或长度不符返回 400，失败正文不会交给写入或反代。FileCloud 的 /api/upload 使用独立 max_upload_bytes 上限。值必须大于 0，重载后供新请求使用。入站正文仍按请求缓冲，单请求上限不是进程内存预算，大上传应结合并发和实际内存预算配置。</p><p>WebDAV OPTIONS 只列出实际方法，只读配置不列写方法。未提供 LOCK、UNLOCK、PROPPATCH 或完整 DAV class 1/2 合规声明，需要锁和自定义属性的协作客户端应先核对能力。</p></section>
 </main>
     </div>
 

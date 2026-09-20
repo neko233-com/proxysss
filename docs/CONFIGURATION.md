@@ -270,6 +270,10 @@ services:
     path_prefix: /dav
     root: ./dav-data
     allow_write: false
+    auth:
+      enabled: true
+      username: builder
+      password: replace-with-a-random-password
 ```
 
 适合：挂载设计资源、共享构建产物、轻量团队文件协作。
@@ -277,8 +281,14 @@ services:
 要点：
 
 - WebDAV 是文件协作入口，不等于对象存储。
-- 这个配置面没有 `auth.basic`。写操作需在可信网络、外部认证入口或明确的扩展认证之后开启；需要内建密码与文件管理时查看 `services.filecloud`。
+- WebDAV 的源路径、COPY/MOVE 目标及递归 COPY 子项必须留在 `root` 内。有效内部链接可用，越界或悬空链接返回 403；PROPFIND 隐藏这些子项。复制到自身/子目录及循环链接会被拒绝，失败的递归 COPY 可能保留已完成的内部文件。
+- FileCloud 也检查已有目标与新建目标父目录，隐藏不符合边界的列表/搜索子项；上传和重命名的 `name` 必须是单个文件名。两种文件服务都要求可信运维管理根目录和链接，路径检查不提供抵御并发本地链接替换的原子沙箱。
+- 使用 `auth.enabled: true`、`auth.username`、`auth.password` 启用内建 Basic 认证；它覆盖 OPTIONS、目录、下载和全部写操作，密码变更参与热重载，CLI/管理配置显示脱敏。公网使用 HTTPS，认证响应为 private, no-store。图形化密码文件管理使用 `services.filecloud`。
 - 如果你只想分发文件，不要默认启用写权限。
+
+WebDAV 与 FileCloud 支持 GET/HEAD、最多 16 段 Range、ETag/日期条件请求。大文件不会整文件载入内存；正文按客户端消费读取，单次最多 64 KiB，取消释放资源。FileCloud 的公开下载使用 `cdn_cache_secs`，认证下载禁止共享缓存；可覆盖资源不自动标记 immutable。API/JSON 路径中的 `+`、`%` 是字面文件名，下载 URL 只解码一次，中文和特殊字符文件名按 UTF-8 编码。
+
+目录客户端应发送 `Depth: 0` 或 `Depth: 1`；PROPFIND 默认/infinity 深度对目录返回 403。目录 XML 流式发送。COPY 支持 0/infinity，MOVE 使用 infinity；`Overwrite: F` 防止覆盖，已有目标返回 412。覆盖集合会替换原集合，返回 204；新建返回 201。父集合缺失返回 409，不自动补建路径；MKCOL 请求体非空返回 415。Destination 必须属于当前服务器，不能借此复制到其他域名。锁和自定义属性不是上述方法支持的推论。
 
 ### 2.7 TCP 直通
 
@@ -691,3 +701,11 @@ proxysss token show
 ## 原生复杂下载
 
 静态服务支持单段/多段 Range（最多 16 段）、重叠合并、有界流式读取、HEAD 与条件请求优先级，无需脚本钩子；反代下载由上游决定表示语义。详见 [CDN 下载说明](CDN-ORIGIN.md)。
+
+### HTTP 流与请求正文的资源边界
+
+`http.request_timeout_ms` 默认 15000 ms，约束上游连接、响应头等待和响应正文每次无进展等待；它不是整个下载或 SSE 会话的总时长。正文持续到达会重新计时，下游暂停读取的时间不计入该上游空闲期限；WebSocket 完成 101 握手后不受 HTTP 正文期限限制。
+
+`http.request_body_timeout_ms` 默认 30000 ms，约束客户端上传的每次正文空闲等待（HTTP/3 也用于解析请求头）；`http.max_request_body_bytes` 默认 67108864，超限返回 413、空闲超时返回 408、正文损坏或长度不符返回 400，失败正文不会交给文件写入或反代。FileCloud 的 `/api/upload` 使用其独立 `max_upload_bytes` 上限。上述值必须大于 0，配置重载后供新请求使用。请求正文目前按请求缓冲，这些是单请求上限，并非整个进程的内存预算；大上传应结合实际并发和内存预算配置。
+
+WebDAV 的 OPTIONS 仅列出实际支持的方法；只读配置不会列出写方法。不提供 LOCK、UNLOCK、PROPPATCH 或完整 DAV class 1/2 合规声明。使用需要锁与自定义属性协作的客户端前，应核对其能力要求。

@@ -4,6 +4,7 @@ mod bench;
 mod config;
 mod demo;
 mod filecloud;
+mod filesystem_boundary;
 mod gateway;
 mod install;
 #[cfg(target_os = "linux")]
@@ -352,7 +353,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "webdav",
-        "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE",
+        "built-in services.webdav runtime for OPTIONS/PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/COPY/MOVE, optional Basic auth and bounded Range downloads",
     ),
     (
         "filecloud",
@@ -1179,6 +1180,17 @@ fn set_admin_token(config: Option<PathBuf>, value: Option<String>) -> Result<()>
 fn render_redacted_config_yaml(config: &GatewayConfig) -> Result<String> {
     let mut value =
         serde_yaml::to_value(config).context("failed to serialize config for display")?;
+    for path in [
+        ["services", "webdav", "auth", "password"].as_slice(),
+        ["admin", "monitor", "password"].as_slice(),
+    ] {
+        if let Some(secret) = path
+            .iter()
+            .try_fold(&mut value, |value, key| value.get_mut(*key))
+        {
+            *secret = serde_yaml::Value::String("***".into());
+        }
+    }
     if let Some(admin) = value
         .get_mut("admin")
         .and_then(|item| item.as_mapping_mut())
@@ -1541,10 +1553,11 @@ fn print_config_explain(config_path: &std::path::Path, config: &GatewayConfig) {
     );
     println!("static sites      : {}", config.services.static_sites.len());
     println!(
-        "webdav            : enabled={}, prefix={}, root={}",
+        "webdav            : enabled={}, prefix={}, root={}, auth_enabled={}",
         config.services.webdav.enabled,
         config.services.webdav.path_prefix,
-        config.services.webdav.root.display()
+        config.services.webdav.root.display(),
+        config.services.webdav.auth.enabled
     );
     println!(
         "filecloud         : enabled={}, prefix={}, root={}, title={}",
@@ -1723,10 +1736,11 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     output.push_str("[webdav]\n");
     if config.services.webdav.enabled {
         output.push_str(&format!(
-            "path={} root={} allow_write={}\n",
+            "path={} root={} allow_write={} auth_enabled={}\n",
             config.services.webdav.path_prefix,
             config.services.webdav.root.display(),
-            config.services.webdav.allow_write
+            config.services.webdav.allow_write,
+            config.services.webdav.auth.enabled
         ));
     } else {
         output.push_str("disabled\n");
@@ -1903,7 +1917,7 @@ fn render_config_template(kind: ConfigTemplateKind) -> &'static str {
             "services:\n  static_sites:\n    - name: public\n      path_prefix: /assets\n      root: ./public\n      index_files: [index.html, index.htm]\n      autoindex: false\n"
         }
         ConfigTemplateKind::Webdav => {
-            "services:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: ./webdav\n    allow_write: true\n"
+            "services:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: ./webdav\n    allow_write: false\n    auth:\n      enabled: false\n      username: builder\n      password: ''\n"
         }
         ConfigTemplateKind::Script => {
             "script:\n  enabled: true\n  entry: gateway.ts\n  cwd: .\n  timeout_ms: 500\n  memory_limit_mb: 64\n  max_stack_size_kb: 512\nplugins:\n  enabled: false\n"
@@ -2957,6 +2971,8 @@ mod tests {
     fn render_redacted_config_yaml_masks_admin_secrets() {
         let mut config = GatewayConfig::default();
         config.admin.password = "super-secret".to_string();
+        config.admin.monitor.password = "monitor-private-secret".to_string();
+        config.services.webdav.auth.password = "webdav-private-secret".to_string();
         config.admin.bearer_token = "cluster-secret".to_string();
         config
             .http
@@ -2978,6 +2994,8 @@ mod tests {
                 || rendered.contains("bearer_token: ***")
         );
         assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("monitor-private-secret"));
+        assert!(!rendered.contains("webdav-private-secret"));
         assert!(!rendered.contains("cluster-secret"));
         assert!(!rendered.contains("cloudflare-secret"));
         assert!(rendered.contains("CF_Token"));

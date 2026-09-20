@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -35,21 +35,15 @@ pub fn relative_route(prefix: &str, request_path: &str) -> Option<String> {
 }
 
 pub fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    let decoded = percent_decode_path(relative.trim_start_matches('/'))?;
     let mut target = root.to_path_buf();
 
-    for part in decoded.split('/') {
+    // API query parameters have already been decoded by serde_urlencoded;
+    // JSON paths and directory names are literal filesystem names.
+    for part in relative.trim_start_matches('/').split('/') {
         if part.is_empty() || part == "." {
             continue;
         }
-        if part == ".." {
-            return Err(anyhow!("filecloud path escapes root"));
-        }
-        let component_path = Path::new(part);
-        if component_path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
+        if !crate::static_security::allowed_component(part, false) {
             return Err(anyhow!("filecloud path escapes root"));
         }
         target.push(part);
@@ -59,51 +53,17 @@ pub fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 pub fn ensure_within_root(root: &Path, target: &Path) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .map_err(|error| anyhow!("filecloud root is unavailable: {error}"))?;
-
-    let target = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        root.join(target)
-    };
-
-    if target.exists() {
-        let canonical = target
-            .canonicalize()
-            .map_err(|error| anyhow!("filecloud path is invalid: {error}"))?;
-        if !canonical.starts_with(&root) {
-            return Err(anyhow!("filecloud path escapes configured root"));
-        }
-        return Ok(());
-    }
-
-    let mut cursor = target.clone();
-    while !cursor.exists() {
-        if !cursor.pop() {
-            return Err(anyhow!("filecloud path escapes configured root"));
-        }
-    }
-    let canonical = cursor
-        .canonicalize()
-        .map_err(|error| anyhow!("filecloud path parent is invalid: {error}"))?;
-    if !canonical.starts_with(&root) {
-        return Err(anyhow!("filecloud path escapes configured root"));
-    }
+    crate::filesystem_boundary::confined_path(root, target)
+        .map_err(|error| anyhow!("filecloud path is invalid: {error}"))?;
     Ok(())
 }
 
-fn percent_decode_path(value: &str) -> Result<String> {
+pub fn percent_decode_path(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
             b'%' if index + 2 < bytes.len() => {
                 let hex = &bytes[index + 1..index + 3];
                 let decoded =
@@ -113,6 +73,7 @@ fn percent_decode_path(value: &str) -> Result<String> {
                 output.push(decoded);
                 index += 3;
             }
+            b'%' => return Err(anyhow!("invalid percent-encoding in filecloud path")),
             byte => {
                 output.push(byte);
                 index += 1;
@@ -154,5 +115,17 @@ mod tests {
         assert!(error.to_string().contains("escapes"));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_within_root_rejects_dangling_symlink_write_targets() {
+        let fixture = crate::test_support::TestDir::new("filecloud-boundary");
+        let root = fixture.join("served");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(fixture.join("new-outside-file"), root.join("dangling"))
+            .unwrap();
+        assert!(ensure_within_root(&root, &root.join("dangling")).is_err());
+        assert!(ensure_within_root(&root, &root.join("dangling/child")).is_err());
     }
 }

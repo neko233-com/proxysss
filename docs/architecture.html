@@ -643,7 +643,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">HTTP flow</div>
-              <h2>一条 HTTP 请求怎么走</h2><p>配置边界：reverse_proxy.routes 用 hosts，domain_routes 用 domains，每条路由直接指向 upstream；后者不引用静态或 WebDAV 服务。static_sites 同时匹配可选 hosts 与路径；单个 webdav 仍按路径匹配，没有内建 Basic auth 配置。<a href="configuration.html#protocol-examples">查看真实配置与限制</a>。</p>
+              <h2>一条 HTTP 请求怎么走</h2><p>配置边界：reverse_proxy.routes 用 hosts，domain_routes 用 domains，每条路由直接指向 upstream；后者不引用静态或 WebDAV 服务。static_sites 同时匹配可选 hosts 与路径；单个 webdav 按路径匹配，可通过 auth.enabled/username/password 开启 Basic 认证；认证先于路径检查和任何文件操作。<a href="configuration.html#protocol-examples">查看真实配置与限制</a>。</p>
             </div>
             <p class="subtle">这是大多数人最先要理解的路径，因为它串起了反向代理、AI SSE、静态站点和脚本扩展。</p>
           </div>
@@ -673,6 +673,10 @@
               <span class="tag expert">Step 5</span>
               <h3>发往上游或本地能力面</h3>
               <p class="subtle">最终不是去上游池，就是读静态文件、走 WebDAV、返回内建服务结果；没有用户路由命中 <code>/</code> 时才返回只含 GitHub 与 GitHub Docs 的零外部资源欢迎页。静态文件支持 Range/206 断点续传，大文件区间会流式发送。</p>
+              <p>WebDAV 与 FileCloud 通过 filesystem_boundary 检查已有目标的真实路径，以及新建目标最近存在的父目录；symlink_metadata 识别悬空链接，不能用 exists 跳过。WebDAV 在阻塞任务池检查源路径、COPY/MOVE 目标和递归 COPY 的每个子项；越界、悬空链接、复制到自身/子目录及内部循环返回 403。深度优先遍历只保存当前祖先，允许有效的内部链接；删除/移动使用原始路径，避免删除链接指向的文件。PROPFIND 和 FileCloud 列表/搜索隐藏不符合边界的子项。递归 COPY 不是事务，失败后根目录内已完成的部分可能保留。</p>
+              <p>根目录及链接须由可信运维管理。这是路径检查，不是目录描述符原子沙箱；检查与打开仍有时间窗口，不保证隔离不可信本地进程的并发链接修改。该检查不进入普通反代、静态缓存或 TCP/UDP 转发路径。<a href="configuration.html#protocol-examples">查看文件服务配置</a>。</p>
+              <p>file_download 共用静态服务的条件请求与 Range 实现。WebDAV/FileCloud 完整小文件最多预读 64 KiB，大文件及多段响应按消费进度读取，每次最多 64 KiB，空闲池总计最多 8 MiB；取消或截断释放资源。HEAD 不读正文且忽略 Range。FileCloud 只允许 GET/HEAD 下载，认证下载为 private, no-store，公开可覆盖资源不自动添加 immutable；下载 URL 只解码一次，API/JSON 保留字面 + 和 %，中文文件名用 filename* 编码。</p>
+              <p>PROPFIND 支持 Depth 0/1，XML 流式输出，不积累全部目录条目；目录默认/infinity 深度返回 403 propfind-finite-depth。COPY 支持 Depth 0/infinity，MOVE 要求 infinity，Overwrite F 遇到已有目标返回 412。覆盖替换整个集合，创建返回 201、覆盖返回 204，父集合缺失返回 409。MKCOL 非空请求体返回 415，跨服务器 Destination 返回 502。锁与自定义属性必须按实际实现声明。</p>
             </article>
           </div>
 
@@ -975,6 +979,7 @@ udp:
 <section class="panel" id="complex-downloads"><p>热正文缓存持有自有不可变 Bytes 快照，单对象读取最多 32 MiB，不直接 mmap 可变文件；源文件截断不会让 TLS/压缩访问失效映射。2 秒 freshness 与后台刷新期间可继续发送旧快照，H2 删除/重验证失败会使连接快照失效并回到正常分发。资源发布仍推荐原子替换。</p><p>正文缓存使用原子预留的 256 MiB 上限；进程内全部静态快照（含正在填充、已淘汰但响应仍引用的正文）另受 320 MiB 硬上限约束。最后一个 Bytes 引用释放时归还预算，预算耗尽的冷下载立即回退流式读取，预热跳过该对象。缓存淘汰只扣减一次，填充协调锁随成功、失败或取消清理；缓存命中不重新争用预算。此上限不包括 socket、TLS、压缩输出与其他网关内存。</p><h2>游戏资源与复杂下载</h2><p>原生静态服务支持单段和最多 16 段 Range，合并重叠区间并流式发送 multipart/byteranges。HEAD 忽略 Range；条件失败返回 412，全部越界返回 416。大文件局部读取不载入整文件，取消释放资源。脚本 API 无需变化。</p><p><a href="cdn-origin.html#complex-downloads">下载语义与限制</a> · <a href="validation.html">Linux 优先验证与发布流程</a></p></section>
 <section class="panel" id="sse-response-framing"><h2>SSE 消息边界与资源释放</h2><p><code>src/http1_body.rs</code> 在原始 SSE 转换为 TLS/HTTP2 响应前按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB。长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。</p><p>每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件；完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding，避免移除编码头后让客户端误读压缩字节。<a href="configuration.html#sse-framing">配置与使用边界</a></p></section>
 <section class="panel" id="static-virtual-hosts"><h2>静态站点与缓存所有权</h2><p>按 hosts/path 首个匹配项选站后执行授权。多站点或配置 hosts 时，预热路由键由站点序号与路径组成；H2 快照和连接缓存使用相同键，避免同路径覆盖。单个无 hosts 站点继续借用路径作为键。正文按真实文件路径共享有界快照，但站点授权、响应头与条件处理独立执行。重载清空路由/H2 映射后重新预热；可变配置不使用连接级免策略缓存。</p><p><a href="cdn-origin.html#static-virtual-hosts">域名配置与安全边界</a></p></section>
+<section class="panel" id="http-stream-boundaries"><h2>流式协议与入站正文边界</h2><p>HTTP/1 原始上游响应共享分帧校验：拒绝冲突 Content-Length、TE/CL 共存和不支持的 Transfer-Encoding；跳过有界信息响应后转发最终响应。chunked 先校验再发送有效前缀，不混入尾随响应。固定长度或 chunked 提前 EOF 作为失败关闭，异常连接不能回池。</p><p>上游等待分为连接、响应头期限与逐帧正文空闲期限，持续 SSE、下载不受总时长限制，下游背压不消耗上游空闲预算；WebSocket 非 101 响应仍完整转发正文。HTTP/2 快速路径仅处理已结束的入站正文，不凭 GET 或缺少 Content-Length 推断无正文。</p><p>HTTP/3 每个请求流独立驱动，慢上传/下载不串行阻塞其他请求；发送保持 QUIC 背压并保留 trailers，正文生产失败重置流，不发送正常 FIN。访问日志和错误装饰与其他 HTTP 路径一致。入站正文受单请求大小和空闲期限限制，失败不分发；当前仍按请求缓冲，不宣称大上传零拷贝。<a href="configuration.html#http-stream-limits">配置和限制</a>。</p></section>
 </main>
     </div>
 

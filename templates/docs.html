@@ -111,7 +111,7 @@ scripts/verify-docker-scenarios.sh
           <article class="card">
             <span class="tag beginner">WebDAV</span>
             <h3>文件协作入口</h3>
-            <p class="subtle">当你需要轻量文件写入、设计资产共享或受控协作时，用内建 WebDAV，而不是把所有文件需求都塞进静态站点。</p>
+            <p class="subtle">WebDAV 支持可选 Basic 认证与有界 Range 下载，适合轻量文件写入和资源共享；不提供 LOCK/UNLOCK/PROPPATCH。源路径、复制/移动目标和递归复制子项受 root 边界检查，拒绝越界或悬空链接；有效内部链接保留。根目录须由可信运维管理，递归复制失败可能留下已完成部分。<a href="https://neko233-com.github.io/proxysss/configuration.html#protocol-examples">文件服务配置与限制</a>；HTTP 上游正文按空闲计时，持续下载/SSE 不受会话总时长限制，上传具有独立大小与空闲期限。</p>
             <pre><code>{{WEBDAV}}</code></pre>
           </article>
 

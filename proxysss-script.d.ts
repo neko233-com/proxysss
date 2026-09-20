@@ -229,3 +229,7 @@ declare global {
    */
   const PROXYSSS_ENV: Record<string, string>;
 }
+
+// HTTP body size/idle limits and WebDAV/FileCloud authentication, path
+// confinement and Range downloads are native configuration behavior.
+// They add no script hook or declaration; see docs/CONFIGURATION.md.

@@ -73,7 +73,7 @@ pub fn report(config: &GatewayConfig) -> anyhow::Result<String> {
         (
             "http.request_timeout_ms",
             "必须大于 0；按毫秒设置",
-            "按 API/上传/SSE 场景设置；过短会中断合法长请求。",
+            "上游连接、响应头与正文空闲期限；持续数据流不会因会话总时长而中断。",
         ),
         (
             "security.ddos.max_connections",

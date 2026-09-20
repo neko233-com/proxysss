@@ -120,6 +120,10 @@ pub struct HttpConfig {
     pub h3_bind: String,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+    #[serde(default = "default_request_body_timeout_ms")]
+    pub request_body_timeout_ms: u64,
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: u64,
     #[serde(default)]
     pub allow_insecure_upstreams: bool,
     #[serde(default)]
@@ -1198,6 +1202,18 @@ pub struct WebDavConfig {
     pub root: PathBuf,
     #[serde(default = "default_true")]
     pub allow_write: bool,
+    #[serde(default)]
+    pub auth: WebDavAuthConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebDavAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1330,6 +1346,9 @@ impl GatewayConfig {
 
         if self.http.request_timeout_ms == 0 {
             errors.push("http.request_timeout_ms must be greater than 0".to_string());
+        }
+        if self.http.request_body_timeout_ms == 0 || self.http.max_request_body_bytes == 0 {
+            errors.push("http.request_body_timeout_ms and http.max_request_body_bytes must be greater than 0".to_string());
         }
 
         for (index, page) in self.http.error_pages.pages.iter().enumerate() {
@@ -1736,6 +1755,16 @@ impl GatewayConfig {
         }
 
         if self.services.webdav.enabled {
+            let auth = &self.services.webdav.auth;
+            if auth.enabled
+                && (auth.username.is_empty()
+                    || auth.username.contains(':')
+                    || auth.username.chars().any(char::is_control)
+                    || auth.password.is_empty()
+                    || auth.password.chars().any(char::is_control))
+            {
+                errors.push("services.webdav.auth requires a nonempty username without ':' and a nonempty password; control characters are forbidden".to_string());
+            }
             if self.services.webdav.path_prefix.trim().is_empty()
                 || !self.services.webdav.path_prefix.starts_with('/')
             {
@@ -2502,6 +2531,8 @@ impl Default for HttpConfig {
             tls_bind: default_tls_gateway_bind(),
             h3_bind: default_tls_gateway_bind(),
             request_timeout_ms: default_request_timeout_ms(),
+            request_body_timeout_ms: default_request_body_timeout_ms(),
+            max_request_body_bytes: default_max_request_body_bytes(),
             allow_insecure_upstreams: false,
             error_pages: HttpErrorPagesConfig::default(),
             tls: TlsConfig::default(),
@@ -2821,6 +2852,7 @@ impl Default for WebDavConfig {
             path_prefix: default_webdav_path_prefix(),
             root: default_webdav_root(),
             allow_write: default_true(),
+            auth: WebDavAuthConfig::default(),
         }
     }
 }
@@ -3229,6 +3261,13 @@ fn default_tls_gateway_bind() -> String {
 
 fn default_request_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_request_body_timeout_ms() -> u64 {
+    30_000
+}
+fn default_max_request_body_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_true() -> bool {

@@ -124,6 +124,78 @@ async fn integration_deep_webdav_put_get_delete() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn integration_deep_webdav_rejects_symlink_escape_over_http() -> Result<()> {
+    let fixture = crate::test_support::TestDir::new("webdav-http-boundary");
+    let root = fixture.join("served");
+    let sibling = fixture.join("sibling");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&sibling)?;
+    std::fs::write(sibling.join("secret"), b"sibling-only")?;
+    std::fs::write(root.join("source"), b"source")?;
+    std::os::unix::fs::symlink(&sibling, root.join("outside"))?;
+    std::os::unix::fs::symlink(sibling.join("missing"), root.join("dangling"))?;
+    let port = reserve_port().await?;
+    let yaml = format!("{}\nservices:\n  webdav:\n    enabled: true\n    path_prefix: /dav\n    root: '{}'\n    allow_write: true\n", base_gateway_yaml(port), root.display());
+    let (_gateway, _runner) = spawn_gateway(write_config(&fixture, &yaml)?).await?;
+    let base = format!("http://127.0.0.1:{port}");
+    wait_http_ok(&format!("{base}/healthz")).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    for method in [
+        "GET", "HEAD", "PROPFIND", "PUT", "DELETE", "MKCOL", "COPY", "MOVE",
+    ] {
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes())?,
+                format!("{base}/dav/outside/secret"),
+            )
+            .header("destination", "/dav/copy")
+            .body("overwrite")
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), 403, "{method}");
+        let _ = response.bytes().await?;
+    }
+    for method in ["COPY", "MOVE"] {
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes())?,
+                format!("{base}/dav/source"),
+            )
+            .header("destination", format!("{base}/dav/dangling"))
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), 403);
+        let _ = response.bytes().await?;
+    }
+    assert_eq!(
+        client
+            .put(format!("{base}/dav/dangling"))
+            .body("new")
+            .send()
+            .await?
+            .status()
+            .as_u16(),
+        403
+    );
+    assert!(!sibling.join("missing").exists());
+    assert_eq!(std::fs::read(sibling.join("secret"))?, b"sibling-only");
+    assert_eq!(
+        client
+            .get(format!("{base}/dav/source"))
+            .send()
+            .await?
+            .bytes()
+            .await?
+            .as_ref(),
+        b"source"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn integration_deep_reverse_proxy_strip_prefix_and_host() -> Result<()> {
     let root = temp_root("proxysss-deep-proxy");
@@ -345,5 +417,50 @@ services:
     assert_eq!(echoed, Message::Text("deep-verify".into()));
 
     cleanup(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_deep_http2_get_body_and_request_size_limits() -> Result<()> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let root = crate::test_support::TestDir::new("request-body-limits");
+    let gateway_port = reserve_port().await?;
+    let upstream_port = reserve_port().await?;
+    let upstream = spawn_json_echo_upstream(upstream_port).await?;
+    let base = base_gateway_yaml(gateway_port).replace(
+        "http:\n",
+        "http:\n  max_request_body_bytes: 5\n  request_body_timeout_ms: 1000\n",
+    );
+    let yaml = format!("{base}\nservices:\n  reverse_proxy:\n    routes:\n      - name: echo\n        path_prefix: /echo\n        upstream: http://127.0.0.1:{upstream_port}\n");
+    let (_, runner) = spawn_gateway(write_config(&root, &yaml)?).await?;
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", gateway_port)).await?;
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(socket)).await?;
+    let driver = tokio::spawn(connection);
+    for (payload, expected) in [
+        ("hello", http::StatusCode::OK),
+        ("sixsix", http::StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let frames = futures::stream::iter([Ok::<_, std::convert::Infallible>(Frame::data(
+            Bytes::copy_from_slice(payload.as_bytes()),
+        ))]);
+        let request = http::Request::get(format!("http://127.0.0.1:{gateway_port}/echo"))
+            .body(StreamBody::new(frames))?;
+        assert!(!request.headers().contains_key(http::header::CONTENT_LENGTH));
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), sender.send_request(request)).await??;
+        assert_eq!(response.status(), expected);
+        let body = response.into_body().collect().await?.to_bytes();
+        if expected.is_success() {
+            let result: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(result["body_len"], 5);
+        }
+    }
+    driver.abort();
+    runner.abort();
+    upstream.abort();
     Ok(())
 }

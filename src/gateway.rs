@@ -1,6 +1,11 @@
 use std::borrow::Cow;
+#[path = "file_download.rs"]
+pub(crate) mod file_download;
 #[path = "http1_body.rs"]
 mod http1_body;
+#[cfg(test)]
+#[path = "http_stream_tests.rs"]
+mod http_stream_tests;
 #[path = "static_ranges.rs"]
 mod static_ranges;
 #[path = "static_snapshot.rs"]
@@ -371,6 +376,7 @@ struct UpstreamHttpResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: UpstreamHttpBody,
+    idle_timeout: Duration,
 }
 
 enum UpstreamHttpBody {
@@ -393,29 +399,33 @@ impl DynamicState {
                 .body(Full::new(body))
                 .context("failed building upstream request")?;
             *request.headers_mut() = upstream_headers;
-            let response = self
-                .http_fast_client
-                .request(request)
+            let timeout = Duration::from_millis(self.config.http.request_timeout_ms);
+            let response = tokio::time::timeout(timeout, self.http_fast_client.request(request))
                 .await
+                .context("upstream response headers timed out")?
                 .context("upstream request failed")?;
             let (parts, body) = response.into_parts();
             return Ok(UpstreamHttpResponse {
                 status: parts.status,
                 headers: parts.headers,
                 body: UpstreamHttpBody::Hyper(body),
+                idle_timeout: timeout,
             });
         }
 
         let UpstreamHttpTarget::Reqwest(upstream_url) = upstream_target else {
             unreachable!("hyper upstream target handled above")
         };
-        let response = self
+        let request = self
             .http_client
             .request(method, upstream_url)
             .headers(upstream_headers)
             .body(body)
-            .send()
+            .send();
+        let timeout = Duration::from_millis(self.config.http.request_timeout_ms);
+        let response = tokio::time::timeout(timeout, request)
             .await
+            .context("upstream response headers timed out")?
             .context("upstream request failed")?;
         let status = response.status();
         let headers = response.headers().clone();
@@ -423,6 +433,7 @@ impl DynamicState {
             status,
             headers,
             body: UpstreamHttpBody::Reqwest(response),
+            idle_timeout: timeout,
         })
     }
 }
@@ -438,40 +449,100 @@ impl UpstreamHttpResponse {
     }
 
     async fn bytes(self) -> Result<Bytes> {
-        match self.body {
-            UpstreamHttpBody::Reqwest(response) => response
-                .bytes()
-                .await
-                .context("failed reading upstream response body"),
-            UpstreamHttpBody::Hyper(body) => body
-                .collect()
-                .await
-                .map(|collected| collected.to_bytes())
-                .context("failed reading upstream response body"),
-        }
+        self.into_stream_body()
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes())
+            .context("failed reading upstream response body")
     }
 
     fn into_stream_body(self) -> GatewayBody {
-        match self.body {
+        let body = match self.body {
             UpstreamHttpBody::Reqwest(response) => streaming_body(response.bytes_stream()),
             UpstreamHttpBody::Hyper(body) => GatewayBody::Stream(
                 body.map_err(|error| anyhow!("upstream response stream failed: {error}"))
                     .boxed_unsync(),
             ),
-        }
+        };
+        upstream_idle_body(body, self.idle_timeout)
     }
 }
 
-async fn collect_request_body_if_needed(
-    method: &Method,
-    headers: &HeaderMap,
-    body: &mut Incoming,
-) -> Result<Bytes, hyper::Error> {
-    if request_body_declared_empty(method, headers) {
-        return Ok(Bytes::new());
-    }
+#[derive(Debug)]
+struct RequestBodyError {
+    status: StatusCode,
+    message: &'static str,
+}
 
-    body.collect().await.map(|collected| collected.to_bytes())
+fn request_body_limit(config: &GatewayConfig, uri: &Uri) -> u64 {
+    let filecloud = &config.services.filecloud;
+    if filecloud.enabled
+        && crate::filecloud::path::relative_route(&filecloud.path_prefix, uri.path()).as_deref()
+            == Some("api/upload")
+    {
+        filecloud.max_upload_bytes
+    } else {
+        config.http.max_request_body_bytes
+    }
+}
+
+async fn collect_request_body_if_needed<B>(
+    _method: &Method,
+    headers: &HeaderMap,
+    body: &mut B,
+    limit: u64,
+    idle_timeout: Duration,
+) -> Result<Bytes, RequestBodyError>
+where
+    B: HyperBody<Data = Bytes> + Unpin,
+{
+    let (declared, _) = http1_body::response_framing(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .map_err(|_| RequestBodyError {
+        status: StatusCode::BAD_REQUEST,
+        message: "invalid request body framing",
+    })?;
+    if declared.is_some_and(|length| length > limit) {
+        return Err(RequestBodyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "request body exceeds configured limit",
+        });
+    }
+    let mut data = BytesMut::new();
+    loop {
+        let frame = tokio::time::timeout(idle_timeout, body.frame())
+            .await
+            .map_err(|_| RequestBodyError {
+                status: StatusCode::REQUEST_TIMEOUT,
+                message: "request body idle timeout",
+            })?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(|_| RequestBodyError {
+            status: StatusCode::BAD_REQUEST,
+            message: "invalid request body",
+        })?;
+        if let Ok(chunk) = frame.into_data() {
+            if (data.len() as u64).saturating_add(chunk.len() as u64) > limit {
+                return Err(RequestBodyError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    message: "request body exceeds configured limit",
+                });
+            }
+            data.extend_from_slice(&chunk);
+        }
+    }
+    if declared.is_some_and(|length| length != data.len() as u64) {
+        return Err(RequestBodyError {
+            status: StatusCode::BAD_REQUEST,
+            message: "request body length mismatch",
+        });
+    }
+    Ok(data.freeze())
 }
 
 fn request_body_declared_empty(method: &Method, headers: &HeaderMap) -> bool {
@@ -3246,17 +3317,22 @@ impl Gateway {
         let method = request.method().clone();
         let path = request.uri().path().to_string();
         let headers = request.headers().clone();
-        let body = if method == Method::GET || method == Method::HEAD {
-            Bytes::new()
-        } else {
-            match request.body_mut().collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(error) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        serde_json::json!({"ok": false, "error": format!("invalid body: {error}")}),
-                    ));
-                }
+        let body_config = self.current_state().await;
+        let body = match collect_request_body_if_needed(
+            &method,
+            &headers,
+            request.body_mut(),
+            body_config.config.http.max_request_body_bytes,
+            Duration::from_millis(body_config.config.http.request_body_timeout_ms),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                return Ok(json_response(
+                    error.status,
+                    serde_json::json!({"ok": false, "error": error.message}),
+                ));
             }
         };
         self.serve_admin_api(method, path, headers, body, remote_addr, transport)
@@ -6502,114 +6578,210 @@ impl Gateway {
                 loop {
                     match h3_connection.accept().await {
                         Ok(Some(request_resolver)) => {
-                            let (request, mut stream) = match request_resolver
-                                .resolve_request()
-                                .await
-                            {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    tracing::warn!(?error, %remote_addr, "failed resolving h3 request");
-                                    continue;
-                                }
-                            };
-
-                            let (parts, _) = request.into_parts();
-                            let mut body = BytesMut::new();
-
-                            loop {
-                                match stream.recv_data().await {
-                                    Ok(Some(mut chunk)) => {
-                                        while chunk.has_remaining() {
-                                            let data = chunk.chunk();
-                                            if data.is_empty() {
-                                                break;
-                                            }
-                                            body.extend_from_slice(data);
-                                            let advance = data.len();
-                                            chunk.advance(advance);
-                                        }
-                                    }
-                                    Ok(None) => break,
-                                    Err(error) => {
-                                        tracing::warn!(?error, %remote_addr, "failed reading h3 body");
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let mut response = match gateway
-                                .dispatch_http(
-                                    parts.method,
-                                    parts.uri,
-                                    parts.headers,
-                                    body.freeze(),
-                                    remote_addr,
-                                    "https",
-                                    "HTTP/3",
-                                    None,
+                            let gateway = gateway.clone();
+                            tokio::spawn(async move {
+                                let started = Instant::now();
+                                let body_config = gateway.current_state().await;
+                                let idle_timeout = Duration::from_millis(
+                                    body_config.config.http.request_body_timeout_ms,
+                                );
+                                let (request, mut stream) = match tokio::time::timeout(
+                                    idle_timeout,
+                                    request_resolver.resolve_request(),
                                 )
                                 .await
-                            {
-                                Ok(response) => response,
-                                Err(error) => {
-                                    gateway.stats.http_errors.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(?error, %remote_addr, "http3 request dispatch failed");
-                                    GatewayHttpResponse::error(
-                                        StatusCode::BAD_GATEWAY,
-                                        error.to_string(),
-                                    )
-                                }
-                            };
+                                {
+                                    Ok(Ok(value)) => value,
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(?error, %remote_addr, "failed resolving h3 request");
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(%remote_addr, "h3 request headers timed out");
+                                        return;
+                                    }
+                                };
 
-                            let mut builder = Response::builder().status(response.status);
-                            for (name, value) in &response.headers {
-                                builder = builder.header(name, value);
-                            }
-
-                            let response_head = match builder.body(()) {
-                                Ok(response) => response,
-                                Err(error) => {
-                                    tracing::warn!(?error, %remote_addr, "failed building h3 response head");
-                                    continue;
-                                }
-                            };
-
-                            if let Err(error) = stream.send_response(response_head).await {
-                                tracing::warn!(?error, %remote_addr, "failed sending h3 response head");
-                                continue;
-                            }
-
-                            if let Some(mut body) = response.stream_body.take() {
-                                while let Some(frame) = body.frame().await {
-                                    match frame {
-                                        Ok(frame) => {
-                                            if let Some(data) = frame.data_ref() {
-                                                if !data.is_empty() {
-                                                    if let Err(error) =
-                                                        stream.send_data(data.clone()).await
-                                                    {
-                                                        tracing::warn!(?error, %remote_addr, "failed sending h3 response stream");
+                                gateway.stats.record_http_request();
+                                let limit = request_body_limit(&body_config.config, request.uri());
+                                let framing = http1_body::response_framing(
+                                    request
+                                        .headers()
+                                        .iter()
+                                        .map(|(name, value)| (name.as_str(), value.as_bytes())),
+                                );
+                                let (declared, mut body_error) = match framing {
+                                    Ok((length, false)) => (
+                                        length,
+                                        length.filter(|length| *length > limit).map(|_| {
+                                            RequestBodyError {
+                                                status: StatusCode::PAYLOAD_TOO_LARGE,
+                                                message: "request body exceeds configured limit",
+                                            }
+                                        }),
+                                    ),
+                                    _ => (
+                                        None,
+                                        Some(RequestBodyError {
+                                            status: StatusCode::BAD_REQUEST,
+                                            message: "invalid HTTP/3 body framing",
+                                        }),
+                                    ),
+                                };
+                                let mut body = BytesMut::new();
+                                if body_error.is_none() {
+                                    'body: loop {
+                                        match tokio::time::timeout(idle_timeout, stream.recv_data())
+                                            .await
+                                        {
+                                            Ok(Ok(Some(mut chunk))) => {
+                                                while chunk.has_remaining() {
+                                                    let data = chunk.chunk();
+                                                    if data.is_empty() {
                                                         break;
+                                                    }
+                                                    if (body.len() as u64)
+                                                        .saturating_add(data.len() as u64)
+                                                        > limit
+                                                    {
+                                                        body_error = Some(RequestBodyError { status: StatusCode::PAYLOAD_TOO_LARGE, message: "request body exceeds configured limit" });
+                                                        break 'body;
+                                                    }
+                                                    body.extend_from_slice(data);
+                                                    let advance = data.len();
+                                                    chunk.advance(advance);
+                                                }
+                                            }
+                                            Ok(Ok(None)) => break,
+                                            Ok(Err(error)) => {
+                                                tracing::warn!(?error, %remote_addr, "failed reading h3 body");
+                                                body_error = Some(RequestBodyError {
+                                                    status: StatusCode::BAD_REQUEST,
+                                                    message: "invalid request body",
+                                                });
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                body_error = Some(RequestBodyError {
+                                                    status: StatusCode::REQUEST_TIMEOUT,
+                                                    message: "request body idle timeout",
+                                                });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if body_error.is_none()
+                                    && declared.is_some_and(|length| length != body.len() as u64)
+                                {
+                                    body_error = Some(RequestBodyError {
+                                        status: StatusCode::BAD_REQUEST,
+                                        message: "request body length mismatch",
+                                    });
+                                }
+
+                                let mut response = if let Some(error) = body_error {
+                                    gateway.stats.http_errors.fetch_add(1, Ordering::Relaxed);
+                                    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+                                    GatewayHttpResponse::error(error.status, error.message)
+                                } else {
+                                    match gateway
+                                        .dispatch_http(
+                                            request.method().clone(),
+                                            request.uri().clone(),
+                                            request.headers().clone(),
+                                            body.freeze(),
+                                            remote_addr,
+                                            "https",
+                                            "HTTP/3",
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => response,
+                                        Err(error) => {
+                                            gateway
+                                                .stats
+                                                .http_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            tracing::warn!(?error, %remote_addr, "http3 request dispatch failed");
+                                            GatewayHttpResponse::error(
+                                                StatusCode::BAD_GATEWAY,
+                                                error.to_string(),
+                                            )
+                                        }
+                                    }
+                                };
+                                response = gateway
+                                    .finish_hyper_http_response(
+                                        &request,
+                                        response,
+                                        remote_addr,
+                                        started,
+                                    )
+                                    .await;
+
+                                let mut builder = Response::builder().status(response.status);
+                                for (name, value) in &response.headers {
+                                    builder = builder.header(name, value);
+                                }
+
+                                let response_head = match builder.body(()) {
+                                    Ok(response) => response,
+                                    Err(error) => {
+                                        tracing::warn!(?error, %remote_addr, "failed building h3 response head");
+                                        return;
+                                    }
+                                };
+
+                                if let Err(error) = stream.send_response(response_head).await {
+                                    tracing::warn!(?error, %remote_addr, "failed sending h3 response head");
+                                    return;
+                                }
+
+                                if let Some(mut body) = response.stream_body.take() {
+                                    while let Some(frame) = body.frame().await {
+                                        match frame {
+                                            Ok(frame) => {
+                                                if let Some(data) = frame.data_ref() {
+                                                    if !data.is_empty() {
+                                                        if let Err(error) =
+                                                            stream.send_data(data.clone()).await
+                                                        {
+                                                            tracing::warn!(?error, %remote_addr, "failed sending h3 response stream");
+                                                            return;
+                                                        }
+                                                    }
+                                                } else if let Some(trailers) = frame.trailers_ref()
+                                                {
+                                                    if let Err(error) =
+                                                        stream.send_trailers(trailers.clone()).await
+                                                    {
+                                                        tracing::warn!(?error, %remote_addr, "failed sending h3 response trailers");
+                                                        return;
                                                     }
                                                 }
                                             }
-                                        }
-                                        Err(error) => {
-                                            tracing::warn!(?error, %remote_addr, "failed reading h3 response stream");
-                                            break;
+                                            Err(error) => {
+                                                tracing::warn!(?error, %remote_addr, "failed reading h3 response stream");
+                                                stream.stop_stream(
+                                                    h3::error::Code::H3_INTERNAL_ERROR,
+                                                );
+                                                return;
+                                            }
                                         }
                                     }
+                                } else if !response.body.is_empty() {
+                                    if let Err(error) = stream.send_data(response.body).await {
+                                        tracing::warn!(?error, %remote_addr, "failed sending h3 response body");
+                                        return;
+                                    }
                                 }
-                            } else if !response.body.is_empty() {
-                                if let Err(error) = stream.send_data(response.body).await {
-                                    tracing::warn!(?error, %remote_addr, "failed sending h3 response body");
-                                    continue;
-                                }
-                            }
 
-                            if let Err(error) = stream.finish().await {
-                                tracing::warn!(?error, %remote_addr, "failed finishing h3 stream");
-                            }
+                                if let Err(error) = stream.finish().await {
+                                    tracing::warn!(?error, %remote_addr, "failed finishing h3 stream");
+                                }
+                            });
                         }
                         Ok(None) => break,
                         Err(error) => {
@@ -7919,6 +8091,7 @@ impl Gateway {
                 &method,
                 &uri,
                 request.headers(),
+                request.body().is_end_stream(),
                 remote_addr,
                 scheme,
                 version,
@@ -7948,17 +8121,21 @@ impl Gateway {
         let on_upgrade = websocket_upgrade_requested(request.headers())
             .then(|| hyper::upgrade::on(&mut request));
         let headers = request.headers().clone();
-        let body = match collect_request_body_if_needed(&method, &headers, request.body_mut()).await
+        let body_config = self.current_state().await;
+        let body = match collect_request_body_if_needed(
+            &method,
+            &headers,
+            request.body_mut(),
+            request_body_limit(&body_config.config, &uri),
+            Duration::from_millis(body_config.config.http.request_body_timeout_ms),
+        )
+        .await
         {
             Ok(body) => body,
             Err(error) => {
                 self.stats.http_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(?error, %remote_addr, "failed collecting request body");
-                return Ok(GatewayHttpResponse::error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid request body",
-                )
-                .into_hyper());
+                return Ok(GatewayHttpResponse::error(error.status, error.message).into_hyper());
             }
         };
 
@@ -7989,9 +8166,9 @@ impl Gateway {
         Ok(response.into_hyper())
     }
 
-    async fn finish_hyper_http_response(
+    async fn finish_hyper_http_response<B>(
         &self,
-        request: &Request<Incoming>,
+        request: &Request<B>,
         response: GatewayHttpResponse,
         remote_addr: SocketAddr,
         started: Instant,
@@ -8016,16 +8193,19 @@ impl Gateway {
         response
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_hyper_simple_http_proxy_fast_path(
         &self,
         method: &Method,
         uri: &Uri,
         headers: &HeaderMap,
+        body_is_empty: bool,
         remote_addr: SocketAddr,
         scheme: &str,
         version: &str,
     ) -> Result<Option<HyperFastPathResponse>> {
-        if !request_body_declared_empty(method, headers)
+        if !body_is_empty
+            || !request_body_declared_empty(method, headers)
             || method.as_str() == "PURGE"
             || websocket_upgrade_requested(headers)
         {
@@ -8174,7 +8354,9 @@ impl Gateway {
             return Ok(Some(response));
         }
 
-        if !request_body_declared_empty(method, request.headers()) {
+        if !request.body().is_end_stream()
+            || !request_body_declared_empty(method, request.headers())
+        {
             return Ok(None);
         }
         if websocket_upgrade_requested(request.headers()) {
@@ -9303,7 +9485,13 @@ impl Gateway {
                 .context("failed building upstream request")?;
             *upstream_request.headers_mut() = upstream_headers.clone();
 
-            match state.http_fast_client.request(upstream_request).await {
+            match tokio::time::timeout(
+                Duration::from_millis(state.config.http.request_timeout_ms),
+                state.http_fast_client.request(upstream_request),
+            )
+            .await
+            .context("upstream response headers timed out")?
+            {
                 Ok(response) => break response,
                 Err(error) if retry_transport && attempt == 0 => {
                     attempt = 1;
@@ -9314,6 +9502,14 @@ impl Gateway {
             }
         };
         let (mut parts, upstream_body) = upstream_response.into_parts();
+        let upstream_body = upstream_idle_body(
+            GatewayBody::Stream(
+                upstream_body
+                    .map_err(|error| anyhow!("upstream response stream failed: {error}"))
+                    .boxed_unsync(),
+            ),
+            Duration::from_millis(state.config.http.request_timeout_ms),
+        );
         remove_hop_headers_from_map(&mut parts.headers);
 
         let status = parts.status;
@@ -9330,11 +9526,7 @@ impl Gateway {
                 apply_streaming_response_headers_map(&mut parts.headers)?;
             }
             let response_body = if stream_upstream_body {
-                GatewayBody::Stream(
-                    upstream_body
-                        .map_err(|error| anyhow!("upstream response stream failed: {error}"))
-                        .boxed_unsync(),
-                )
+                upstream_body
             } else {
                 let body_bytes = upstream_body
                     .collect()
@@ -9355,14 +9547,7 @@ impl Gateway {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         let (body, stream_body) = if stream_upstream_body {
-            (
-                Bytes::new(),
-                Some(GatewayBody::Stream(
-                    upstream_body
-                        .map_err(|error| anyhow!("upstream response stream failed: {error}"))
-                        .boxed_unsync(),
-                )),
-            )
+            (Bytes::new(), Some(upstream_body))
         } else {
             let body_bytes = upstream_body
                 .collect()
@@ -9422,19 +9607,25 @@ impl Gateway {
             );
         }
 
-        let mut upstream_io =
-            connect_upgrade_upstream(&upstream_url, config.http.allow_insecure_upstreams)
-                .await
-                .with_context(|| format!("failed connecting raw SSE upstream {upstream_url}"))?;
+        let timeout = Duration::from_millis(config.http.request_timeout_ms);
+        let mut upstream_io = tokio::time::timeout(
+            timeout,
+            connect_upgrade_upstream(&upstream_url, config.http.allow_insecure_upstreams),
+        )
+        .await
+        .context("raw SSE upstream connect timed out")?
+        .with_context(|| format!("failed connecting raw SSE upstream {upstream_url}"))?;
         let request_bytes = serialize_http_request(method, &upstream_url, &upstream_headers, body)?;
-        upstream_io
-            .write_all(&request_bytes)
+        tokio::time::timeout(timeout, upstream_io.write_all(&request_bytes))
             .await
+            .context("raw SSE upstream request write timed out")?
             .with_context(|| format!("failed sending raw SSE request to {upstream_url}"))?;
 
-        let (status, response_headers, leftover) = read_http_response_head(&mut upstream_io)
-            .await
-            .with_context(|| format!("failed reading raw SSE response from {upstream_url}"))?;
+        let (status, response_headers, leftover) =
+            tokio::time::timeout(timeout, read_http_response_head(&mut upstream_io))
+                .await
+                .context("raw SSE upstream response headers timed out")?
+                .with_context(|| format!("failed reading raw SSE response from {upstream_url}"))?;
         let decoder = http1_body::ResponseBodyDecoder::new(method, status, &response_headers)?;
         let response_headers = response_headers
             .into_iter()
@@ -9444,7 +9635,10 @@ impl Gateway {
             status,
             headers: response_headers,
             body: Bytes::new(),
-            stream_body: Some(raw_sse_streaming_body(upstream_io, leftover, decoder)),
+            stream_body: Some(upstream_idle_body(
+                raw_sse_streaming_body(upstream_io, leftover, decoder),
+                timeout,
+            )),
             upstream: upstream_url.to_string(),
         };
         finalize_http_response(
@@ -9461,6 +9655,7 @@ impl Gateway {
         request: &PlainFastLaneRequest,
         remote_addr: SocketAddr,
     ) -> Result<bool> {
+        let timeout = Duration::from_millis(config.http.request_timeout_ms);
         if !request.accepts_sse {
             return Ok(false);
         }
@@ -9486,12 +9681,15 @@ impl Gateway {
             return Ok(false);
         };
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
-        let mut upstream_io = pool.checkout().await.with_context(|| {
-            format!(
-                "failed connecting plain raw SSE upstream {}",
-                route.upstream
-            )
-        })?;
+        let mut upstream_io = tokio::time::timeout(timeout, pool.checkout())
+            .await
+            .context("raw SSE upstream connect timed out")?
+            .with_context(|| {
+                format!(
+                    "failed connecting plain raw SSE upstream {}",
+                    route.upstream
+                )
+            })?;
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_latency(&upstream_io);
         let request_bytes = if route.emit_metadata_headers {
@@ -9540,20 +9738,25 @@ impl Gateway {
                 },
             )
         };
-        write_all_plain_fast(&upstream_io, &request_bytes)
+        tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, &request_bytes))
             .await
+            .context("raw SSE upstream write timed out")?
             .with_context(|| {
                 format!("failed sending plain raw SSE request to {}", route.upstream)
             })?;
 
-        let response_head = read_raw_fast_http_response_head(&mut upstream_io, true)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed reading plain raw SSE response from {}",
-                    route.upstream
-                )
-            })?;
+        let response_head = tokio::time::timeout(
+            timeout,
+            read_raw_fast_http_response_head(&mut upstream_io, true),
+        )
+        .await
+        .context("raw SSE upstream response headers timed out")?
+        .with_context(|| {
+            format!(
+                "failed reading plain raw SSE response from {}",
+                route.upstream
+            )
+        })?;
         let upstream_keep_alive = !response_head.connection_close;
         let content_length = response_head.content_length;
         let transfer_chunked = response_head.transfer_chunked;
@@ -9586,13 +9789,20 @@ impl Gateway {
                     write_all_plain_fast(downstream, &response_head_bytes)
                         .await
                         .context("failed writing raw SSE response head")?;
-                    relay_fixed_http_body(&mut upstream_io, downstream, Some(leftover), len).await?
+                    relay_fixed_http_body(
+                        &mut upstream_io,
+                        downstream,
+                        Some(leftover),
+                        len,
+                        timeout,
+                    )
+                    .await?
                 }
             } else {
                 write_all_plain_fast(downstream, &response_head_bytes)
                     .await
                     .context("failed writing raw SSE response head")?;
-                relay_fixed_http_body(&mut upstream_io, downstream, None, len).await?
+                relay_fixed_http_body(&mut upstream_io, downstream, None, len, timeout).await?
             };
             if reusable && upstream_keep_alive {
                 pool.checkin(upstream_io);
@@ -9605,6 +9815,7 @@ impl Gateway {
                 &mut upstream_io,
                 downstream,
                 response_head.leftover,
+                timeout,
             )
             .await
             .context("plain raw SSE stream relay failed")?;
@@ -9615,9 +9826,14 @@ impl Gateway {
             write_all_plain_fast(downstream, &response_head_bytes)
                 .await
                 .context("failed writing raw SSE response head")?;
-            relay_raw_http_body(&mut upstream_io, downstream, response_head.leftover)
-                .await
-                .context("plain raw SSE stream relay failed")?;
+            relay_raw_http_body(
+                &mut upstream_io,
+                downstream,
+                response_head.leftover,
+                timeout,
+            )
+            .await
+            .context("plain raw SSE stream relay failed")?;
         }
         Ok(true)
     }
@@ -9629,6 +9845,7 @@ impl Gateway {
         request: &PlainFastLaneRequest,
         options: RawReverseFastLaneOptions<'_>,
     ) -> Result<bool> {
+        let timeout = Duration::from_millis(config.http.request_timeout_ms);
         let RawReverseFastLaneOptions {
             remote_addr,
             cached_upstream_request,
@@ -9685,9 +9902,12 @@ impl Gateway {
             if let Some(previous) = lane_upstream.take() {
                 previous.pool.checkin(previous.stream);
             }
-            pool.checkout().await.with_context(|| {
-                format!("failed checking out plain raw reverse upstream {upstream}")
-            })?
+            tokio::time::timeout(timeout, pool.checkout())
+                .await
+                .context("raw reverse upstream connect timed out")?
+                .with_context(|| {
+                    format!("failed checking out plain raw reverse upstream {upstream}")
+                })?
         };
         let request_bytes = if let Some(cached) = cached_upstream_request {
             cached
@@ -9712,16 +9932,21 @@ impl Gateway {
                 .as_ref()
                 .expect("raw reverse request serialized")
         };
-        write_all_plain_fast(&upstream_io, request_bytes)
+        tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, request_bytes))
             .await
+            .context("raw reverse upstream write timed out")?
             .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
 
-        let response = read_raw_reverse_http_response_into(
-            &mut upstream_io,
-            upstream_response_buffer,
-            response_cache,
+        let response = tokio::time::timeout(
+            timeout,
+            read_raw_reverse_http_response_into(
+                &mut upstream_io,
+                upstream_response_buffer,
+                response_cache,
+            ),
         )
         .await
+        .context("raw reverse upstream response headers timed out")?
         .with_context(|| format!("failed reading plain raw reverse response from {upstream}"))?;
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
@@ -9753,6 +9978,7 @@ impl Gateway {
                     downstream,
                     None,
                     len - buffered_body_len_u64,
+                    timeout,
                 )
                 .await?
             };
@@ -9769,8 +9995,13 @@ impl Gateway {
             write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
-            let reusable =
-                relay_passthrough_chunked_http_body(&mut upstream_io, downstream, leftover).await?;
+            let reusable = relay_passthrough_chunked_http_body(
+                &mut upstream_io,
+                downstream,
+                leftover,
+                timeout,
+            )
+            .await?;
             if reusable && upstream_keep_alive {
                 *lane_upstream = Some(RawReverseLaneUpstream {
                     key: pool_key.clone(),
@@ -9784,7 +10015,7 @@ impl Gateway {
             write_all_plain_fast(downstream, &upstream_response_buffer[..response.head_end])
                 .await
                 .context("failed writing raw HTTP response head")?;
-            relay_raw_http_body(&mut upstream_io, downstream, leftover).await?;
+            relay_raw_http_body(&mut upstream_io, downstream, leftover, timeout).await?;
         }
         Ok(true)
     }
@@ -9853,14 +10084,19 @@ impl Gateway {
         };
         let path_and_query =
             reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
-        let mut upstream_io = TcpStream::connect((upstream_host.as_str(), upstream_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed connecting plain raw websocket upstream {}",
-                    selected_upstream
-                )
-            })?;
+        let timeout = Duration::from_millis(config.http.request_timeout_ms);
+        let mut upstream_io = tokio::time::timeout(
+            timeout,
+            TcpStream::connect((upstream_host.as_str(), upstream_port)),
+        )
+        .await
+        .context("WebSocket upstream connect timed out")?
+        .with_context(|| {
+            format!(
+                "failed connecting plain raw websocket upstream {}",
+                selected_upstream
+            )
+        })?;
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_latency(&upstream_io);
 
@@ -9872,9 +10108,9 @@ impl Gateway {
             scheme,
             route.forward_headers,
         );
-        upstream_io
-            .write_all(&request_bytes)
+        tokio::time::timeout(timeout, upstream_io.write_all(&request_bytes))
             .await
+            .context("WebSocket upstream handshake write timed out")?
             .with_context(|| {
                 format!(
                     "failed sending plain raw websocket handshake to {}",
@@ -9882,19 +10118,55 @@ impl Gateway {
                 )
             })?;
 
-        let response_head = read_raw_fast_http_response_head(&mut upstream_io, false)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed reading plain raw websocket response from {}",
-                    selected_upstream
-                )
-            })?;
+        let response_head = tokio::time::timeout(
+            timeout,
+            read_raw_fast_http_response_head(&mut upstream_io, false),
+        )
+        .await
+        .context("WebSocket upstream handshake timed out")?
+        .with_context(|| {
+            format!(
+                "failed reading plain raw websocket response from {}",
+                selected_upstream
+            )
+        })?;
         *downstream_started = true;
         downstream
             .write_all(&response_head.raw_head)
             .await
             .context("failed writing raw websocket response head")?;
+        if response_head.status != StatusCode::SWITCHING_PROTOCOLS {
+            if status_has_no_body(response_head.status) {
+                return Ok(true);
+            }
+            if let Some(length) = response_head.content_length {
+                relay_fixed_http_body(
+                    &mut upstream_io,
+                    downstream,
+                    response_head.leftover,
+                    length,
+                    timeout,
+                )
+                .await?;
+            } else if response_head.transfer_chunked {
+                relay_passthrough_chunked_http_body(
+                    &mut upstream_io,
+                    downstream,
+                    response_head.leftover,
+                    timeout,
+                )
+                .await?;
+            } else {
+                relay_raw_http_body(
+                    &mut upstream_io,
+                    downstream,
+                    response_head.leftover,
+                    timeout,
+                )
+                .await?;
+            }
+            return Ok(true);
+        }
         if let Some(leftover) = response_head.leftover {
             if !leftover.is_empty() {
                 downstream
@@ -9902,9 +10174,6 @@ impl Gateway {
                     .await
                     .context("failed writing raw websocket upstream prelude")?;
             }
-        }
-        if response_head.status != StatusCode::SWITCHING_PROTOCOLS {
-            return Ok(true);
         }
 
         if !downstream_leftover.is_empty() {
@@ -9999,28 +10268,41 @@ impl Gateway {
             forward_headers,
         )?;
         let upstream = upstream_url.to_string();
-        let mut upstream_io =
-            connect_upgrade_upstream(&upstream_url, state.config.http.allow_insecure_upstreams)
-                .await
-                .with_context(|| format!("failed connecting websocket upstream {upstream}"))?;
+        let timeout = Duration::from_millis(state.config.http.request_timeout_ms);
+        let mut upstream_io = tokio::time::timeout(
+            timeout,
+            connect_upgrade_upstream(&upstream_url, state.config.http.allow_insecure_upstreams),
+        )
+        .await
+        .context("WebSocket upstream connect timed out")?
+        .with_context(|| format!("failed connecting websocket upstream {upstream}"))?;
 
         let request_bytes =
             serialize_http_request(&method, &upstream_url, &upstream_headers, &body)?;
-        upstream_io
-            .write_all(&request_bytes)
+        tokio::time::timeout(timeout, upstream_io.write_all(&request_bytes))
             .await
+            .context("WebSocket upstream handshake write timed out")?
             .with_context(|| format!("failed sending websocket handshake to {upstream}"))?;
 
-        let (status, response_headers, leftover) = read_http_response_head(&mut upstream_io)
-            .await
-            .with_context(|| format!("failed reading websocket handshake from {upstream}"))?;
+        let (status, response_headers, leftover) =
+            tokio::time::timeout(timeout, read_http_response_head(&mut upstream_io))
+                .await
+                .context("WebSocket upstream handshake timed out")?
+                .with_context(|| format!("failed reading websocket handshake from {upstream}"))?;
 
         if status != StatusCode::SWITCHING_PROTOCOLS {
+            let decoder = http1_body::ResponseBodyDecoder::new(&method, status, &response_headers)?;
             return Ok(GatewayHttpResponse {
                 status,
-                headers: response_headers,
-                body: leftover.unwrap_or_default(),
-                stream_body: None,
+                headers: response_headers
+                    .into_iter()
+                    .filter(|(name, _)| !is_hop_header(name.as_str()))
+                    .collect(),
+                body: Bytes::new(),
+                stream_body: Some(upstream_idle_body(
+                    raw_sse_streaming_body(upstream_io, leftover, decoder),
+                    timeout,
+                )),
                 upstream,
             });
         }
@@ -11733,7 +12015,6 @@ impl GatewayHttpResponse {
         &self.headers
     }
 
-    #[cfg(test)]
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }
@@ -13330,6 +13611,20 @@ where
     GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
 }
 
+fn upstream_idle_body(body: GatewayBody, timeout: Duration) -> GatewayBody {
+    let stream = futures::stream::try_unfold(body, move |mut body| async move {
+        // Arm only while polling the upstream. Time spent under downstream
+        // backpressure is not charged, and successful frames reset the wait.
+        let frame = tokio::time::timeout(timeout, body.frame())
+            .await
+            .context("upstream response body idle timeout")?;
+        frame
+            .transpose()
+            .map(|frame| frame.map(|frame| (frame, body)))
+    });
+    GatewayBody::Stream(StreamBody::new(stream).boxed_unsync())
+}
+
 fn file_streaming_body<R>(file: R) -> GatewayBody
 where
     R: AsyncRead + Send + 'static,
@@ -13969,6 +14264,7 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
     let mut http_connector = HttpConnector::new();
     http_connector.set_nodelay(true);
     http_connector.set_keepalive(Some(Duration::from_secs(90)));
+    http_connector.set_connect_timeout(Some(Duration::from_millis(config.http.request_timeout_ms)));
     http_connector.enforce_http(true);
     let http_fast_client = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))
@@ -13991,7 +14287,7 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         .http2_keep_alive_timeout(Duration::from_secs(HTTP2_KEEP_ALIVE_TIMEOUT_SECS))
         .http2_keep_alive_interval(Some(Duration::from_secs(HTTP2_KEEP_ALIVE_INTERVAL_SECS)))
         .http2_keep_alive_while_idle(true)
-        .timeout(Duration::from_millis(config.http.request_timeout_ms.max(1)))
+        .connect_timeout(Duration::from_millis(config.http.request_timeout_ms.max(1)))
         .build()
         .context("failed to build upstream http client")?;
 
@@ -17001,6 +17297,17 @@ fn filecloud_admin_summary(config: &GatewayConfig) -> serde_json::Value {
 
 fn sanitize_config(config: &GatewayConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}));
+    for path in [
+        ["services", "webdav", "auth", "password"].as_slice(),
+        ["admin", "monitor", "password"].as_slice(),
+    ] {
+        if let Some(secret) = path
+            .iter()
+            .try_fold(&mut value, |value, key| value.get_mut(*key))
+        {
+            *secret = serde_json::Value::String("***".into());
+        }
+    }
 
     if let Some(admin) = value.get_mut("admin").and_then(|item| item.as_object_mut()) {
         admin.insert(
@@ -18487,9 +18794,9 @@ fn raw_http_pool_key(url: &Url) -> Result<Option<(String, String, u16)>> {
     Ok(Some((format!("{host}:{port}"), host, port)))
 }
 
-fn write_access_log_if_enabled(
+fn write_access_log_if_enabled<B>(
     config: &GatewayConfig,
-    request: &Request<Incoming>,
+    request: &Request<B>,
     response: &GatewayHttpResponse,
     remote_addr: SocketAddr,
     elapsed: Duration,
@@ -19379,92 +19686,17 @@ async fn dispatch_static_site_authorized(
             "static path not found",
         ));
     }
-    let modified = metadata.modified().ok();
-    let etag = format!(
-        "W/\"{:x}-{:x}\"",
-        metadata.len(),
-        modified
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let unmodified_since = |value: &HeaderValue| -> bool {
-        value
-            .to_str()
-            .ok()
-            .and_then(|v| httpdate::parse_http_date(v).ok())
-            .zip(modified)
-            .is_some_and(|(date, time)| {
-                time.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    <= date
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-            })
-    };
-    // Preconditions precede cache validation and Range (RFC 9110 section 13.2.2).
-    // This resource has only a weak metadata ETag, so only '*' can satisfy
-    // If-Match's strong comparison. Ignore invalid If-Unmodified-Since dates.
-    let precondition_failed = if let Some(value) = headers.get(http::header::IF_MATCH) {
-        !value.to_str().is_ok_and(|value| value.trim() == "*")
-    } else {
-        headers
-            .get(http::header::IF_UNMODIFIED_SINCE)
-            .is_some_and(|value| {
-                modified.is_some()
-                    && value
-                        .to_str()
-                        .ok()
-                        .and_then(|v| httpdate::parse_http_date(v).ok())
-                        .is_some()
-                    && !unmodified_since(value)
-            })
-    };
-    let not_modified = if let Some(value) = headers.get(http::header::IF_NONE_MATCH) {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                candidate == "*"
-                    || candidate.trim_start_matches("W/") == etag.trim_start_matches("W/")
-            })
-        })
-    } else {
-        headers
-            .get(http::header::IF_MODIFIED_SINCE)
-            .is_some_and(unmodified_since)
-    };
-    let mut response = if precondition_failed {
+    let validators = file_download::Validators::new(&metadata);
+    let mut response = if let Some(status) = validators.status(headers) {
         GatewayHttpResponse::bytes(
-            StatusCode::PRECONDITION_FAILED,
-            "text/plain; charset=utf-8",
-            Bytes::new(),
-            "proxysss://static",
-        )
-    } else if not_modified {
-        GatewayHttpResponse::bytes(
-            StatusCode::NOT_MODIFIED,
+            status,
             static_content_type(&target),
             Bytes::new(),
             "proxysss://static",
         )
     } else {
-        // If-Range requires an exact, strong validator, unlike If-Modified-Since.
-        // Metadata ETags are weak. Conservatively accept exact dates only after
-        // the file has been stable for a minute (HTTP dates have second precision).
         let without_range;
-        let range_headers = if headers.get(http::header::IF_RANGE).is_some_and(|value| {
-            !value
-                .to_str()
-                .ok()
-                .and_then(|v| httpdate::parse_http_date(v).ok())
-                .zip(modified)
-                .is_some_and(|(date, time)| {
-                    httpdate::fmt_http_date(date) == httpdate::fmt_http_date(time)
-                        && time.elapsed().is_ok_and(|age| age.as_secs() >= 60)
-                })
-        }) {
+        let range_headers = if !validators.allows_range(headers) {
             without_range = {
                 let mut copy = headers.clone();
                 copy.remove(RANGE);
@@ -19485,15 +19717,7 @@ async fn dispatch_static_site_authorized(
         )
         .await?
     };
-    response
-        .headers
-        .push((http::header::ETAG, HeaderValue::from_str(&etag)?));
-    if let Some(modified) = modified {
-        response.headers.push((
-            http::header::LAST_MODIFIED,
-            HeaderValue::from_str(&httpdate::fmt_http_date(modified))?,
-        ));
-    }
+    validators.append(&mut response)?;
     Ok(response)
 }
 
@@ -20430,6 +20654,10 @@ fn static_content_type(path: &Path) -> &'static str {
     }
 }
 
+#[cfg(test)]
+#[path = "webdav_tests.rs"]
+mod webdav_tests;
+
 async fn dispatch_webdav(
     config: &WebDavConfig,
     method: &Method,
@@ -20437,19 +20665,92 @@ async fn dispatch_webdav(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<GatewayHttpResponse> {
-    let Some(target) = webdav_filesystem_path(config, uri.path())? else {
-        return Ok(GatewayHttpResponse::error(
-            StatusCode::NOT_FOUND,
-            "webdav path not found",
-        ));
+    if config.auth.enabled && !webdav_authenticated(config, headers) {
+        let mut response =
+            GatewayHttpResponse::error(StatusCode::UNAUTHORIZED, "webdav authentication required");
+        response.push_header(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"proxysss WebDAV\", charset=\"UTF-8\""),
+        );
+        response.push_header(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+        return Ok(response);
+    }
+    let mut response = dispatch_webdav_authorized(config, method, uri, headers, body).await?;
+    if config.auth.enabled {
+        response.push_header(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
+    Ok(response)
+}
+
+fn webdav_authenticated(config: &WebDavConfig, headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let Some(value) = values.next().and_then(|v| v.to_str().ok()) else {
+        return false;
     };
+    if values.next().is_some() || value.len() > 8192 {
+        return false;
+    }
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return false;
+    }
+    let Ok(supplied) = base64::engine::general_purpose::STANDARD.decode(token) else {
+        return false;
+    };
+    let mut expected =
+        Hmac::<Sha256>::new_from_slice(config.auth.password.as_bytes()).expect("HMAC key");
+    expected.update(config.auth.username.as_bytes());
+    expected.update(b":");
+    expected.update(config.auth.password.as_bytes());
+    let mut actual =
+        Hmac::<Sha256>::new_from_slice(config.auth.password.as_bytes()).expect("HMAC key");
+    actual.update(&supplied);
+    actual
+        .verify_slice(&expected.finalize().into_bytes())
+        .is_ok()
+}
+
+async fn dispatch_webdav_authorized(
+    config: &WebDavConfig,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<GatewayHttpResponse> {
+    let target = match webdav_filesystem_path(config, uri.path()) {
+        Ok(Some(target)) => target,
+        Err(_) => return Ok(webdav_boundary_error()),
+        Ok(None) => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "webdav path not found",
+            ));
+        }
+    };
+
+    if crate::filesystem_boundary::confined_path_async(&config.root, &target)
+        .await
+        .is_err()
+    {
+        return Ok(webdav_boundary_error());
+    }
 
     let upstream = "proxysss://webdav";
     match method.as_str() {
-        "OPTIONS" => Ok(webdav_options_response(upstream)),
-        "PROPFIND" => webdav_propfind(config, uri.path(), &target, upstream).await,
-        "GET" => webdav_get(&target, false, upstream).await,
-        "HEAD" => webdav_get(&target, true, upstream).await,
+        "OPTIONS" => Ok(webdav_options_response(config.allow_write, upstream)),
+        "PROPFIND" => webdav_propfind(config, uri.path(), &target, headers, upstream).await,
+        "GET" | "HEAD" => {
+            file_download::response(
+                &target,
+                method,
+                headers,
+                "application/octet-stream",
+                upstream,
+            )
+            .await
+        }
         "PUT" => {
             if !config.allow_write {
                 return Ok(GatewayHttpResponse::error(
@@ -20457,6 +20758,7 @@ async fn dispatch_webdav(
                     "webdav writes are disabled",
                 ));
             }
+            tokio::fs::create_dir_all(&config.root).await?;
             webdav_put(&target, body, upstream).await
         }
         "DELETE" => {
@@ -20475,6 +20777,13 @@ async fn dispatch_webdav(
                     "webdav writes are disabled",
                 ));
             }
+            if !body.is_empty() {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "MKCOL request bodies are not supported",
+                ));
+            }
+            tokio::fs::create_dir_all(&config.root).await?;
             webdav_mkcol(&target, upstream).await
         }
         "COPY" | "MOVE" => {
@@ -20484,13 +20793,28 @@ async fn dispatch_webdav(
                     "webdav writes are disabled",
                 ));
             }
-            let Some(destination) = webdav_destination_path(config, headers)? else {
-                return Ok(GatewayHttpResponse::error(
-                    StatusCode::BAD_REQUEST,
-                    "missing webdav Destination header",
-                ));
+            if let Some(error) = webdav_destination_authority_error(uri, headers) {
+                return Ok(error);
+            }
+            let destination = match webdav_destination_path(config, headers) {
+                Ok(Some(destination)) => destination,
+                Err(_) => return Ok(webdav_boundary_error()),
+                Ok(None) => {
+                    return Ok(GatewayHttpResponse::error(
+                        StatusCode::BAD_REQUEST,
+                        "missing webdav Destination header",
+                    ));
+                }
             };
-            webdav_copy_or_move(method.as_str(), &target, &destination, upstream).await
+            webdav_copy_or_move(
+                &config.root,
+                method.as_str(),
+                &target,
+                &destination,
+                headers,
+                upstream,
+            )
+            .await
         }
         _ => Ok(GatewayHttpResponse::bytes(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -20501,20 +20825,29 @@ async fn dispatch_webdav(
     }
 }
 
-fn webdav_options_response(upstream: &str) -> GatewayHttpResponse {
+fn webdav_boundary_error() -> GatewayHttpResponse {
+    GatewayHttpResponse::error(
+        StatusCode::FORBIDDEN,
+        "webdav path is outside the permitted filesystem boundary",
+    )
+}
+
+fn webdav_options_response(allow_write: bool, upstream: &str) -> GatewayHttpResponse {
     let mut response = GatewayHttpResponse::bytes(
         StatusCode::NO_CONTENT,
         "text/plain; charset=utf-8",
         Bytes::new(),
         upstream,
     );
-    response.headers.push((
-        HeaderName::from_static("dav"),
-        HeaderValue::from_static("1, 2"),
-    ));
+    // These filesystem methods do not implement every DAV class-1 property
+    // operation or class-2 locking requirement. Do not advertise conformance.
     response.headers.push((
         HeaderName::from_static("allow"),
-        HeaderValue::from_static("OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE"),
+        HeaderValue::from_static(if allow_write {
+            "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE"
+        } else {
+            "OPTIONS, PROPFIND, GET, HEAD"
+        }),
     ));
     response
 }
@@ -20523,6 +20856,7 @@ async fn webdav_propfind(
     config: &WebDavConfig,
     request_path: &str,
     target: &Path,
+    headers: &HeaderMap,
     upstream: &str,
 ) -> Result<GatewayHttpResponse> {
     let metadata = match tokio::fs::metadata(target).await {
@@ -20536,84 +20870,113 @@ async fn webdav_propfind(
         Err(error) => return Err(error).context("failed reading webdav metadata"),
     };
 
-    let mut responses = Vec::new();
-    responses.push(webdav_prop_response(request_path, &metadata));
-
-    if metadata.is_dir() {
-        let mut entries = tokio::fs::read_dir(target)
-            .await
-            .context("failed reading webdav directory")?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .context("failed reading webdav directory entry")?
-        {
-            let child_metadata = entry
-                .metadata()
-                .await
-                .context("failed reading webdav child metadata")?;
-            let child_name = entry.file_name().to_string_lossy().to_string();
-            let href = join_webdav_href(&config.path_prefix, request_path, &child_name);
-            responses.push(webdav_prop_response(&href, &child_metadata));
-        }
-    }
-
-    let body = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">{}</D:multistatus>"#,
-        responses.join("")
-    );
-    Ok(GatewayHttpResponse::bytes(
-        StatusCode::from_u16(207).expect("valid multistatus code"),
-        "application/xml; charset=utf-8",
-        Bytes::from(body),
-        upstream,
-    ))
-}
-
-async fn webdav_get(target: &Path, head_only: bool, upstream: &str) -> Result<GatewayHttpResponse> {
-    let metadata = match tokio::fs::metadata(target).await {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GatewayHttpResponse::error(
-                StatusCode::NOT_FOUND,
-                "webdav path not found",
-            ));
-        }
-        Err(error) => return Err(error).context("failed reading webdav metadata"),
+    let depth = match headers.get("depth") {
+        None => "infinity",
+        Some(value) => value.to_str().unwrap_or("invalid"),
     };
-
-    if metadata.is_dir() {
+    if !matches!(depth, "0" | "1" | "infinity") {
         return Ok(GatewayHttpResponse::error(
+            StatusCode::BAD_REQUEST,
+            "invalid PROPFIND Depth",
+        ));
+    }
+    if metadata.is_dir() && depth == "infinity" {
+        return Ok(GatewayHttpResponse::bytes(
             StatusCode::FORBIDDEN,
-            "webdav GET on directories is disabled",
+            "application/xml; charset=utf-8",
+            Bytes::from_static(b"<D:error xmlns:D=\"DAV:\"><D:propfind-finite-depth/></D:error>"),
+            upstream,
         ));
     }
 
-    let body = if head_only {
-        Bytes::new()
+    struct Listing {
+        root: PathBuf,
+        prefix: String,
+        request_path: String,
+        entries: Option<tokio::fs::ReadDir>,
+        initial: Option<Bytes>,
+        finished: bool,
+    }
+    let entries = if metadata.is_dir() && depth == "1" {
+        Some(tokio::fs::read_dir(target).await?)
     } else {
-        Bytes::from(
-            tokio::fs::read(target)
-                .await
-                .context("failed reading webdav file")?,
-        )
+        None
     };
-    let mut response =
-        GatewayHttpResponse::bytes(StatusCode::OK, "application/octet-stream", body, upstream);
-    response.headers.push((
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.len().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    let initial = Bytes::from(format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">{}"#,
+        webdav_prop_response(request_path, &metadata)
+    ));
+    let state = Listing {
+        root: config.root.clone(),
+        prefix: config.path_prefix.clone(),
+        request_path: request_path.to_string(),
+        entries,
+        initial: Some(initial),
+        finished: false,
+    };
+    let stream = futures::stream::try_unfold(state, |mut state| async move {
+        if let Some(initial) = state.initial.take() {
+            return Ok::<_, anyhow::Error>(Some((initial, state)));
+        }
+        while let Some(entries) = state.entries.as_mut() {
+            let Some(entry) = entries.next_entry().await? else {
+                state.entries = None;
+                break;
+            };
+            if crate::filesystem_boundary::confined_path_async(&state.root, &entry.path())
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let metadata = tokio::fs::metadata(entry.path()).await?;
+            let href = join_webdav_href(
+                &state.prefix,
+                &state.request_path,
+                &entry.file_name().to_string_lossy(),
+            );
+            return Ok(Some((
+                Bytes::from(webdav_prop_response(&href, &metadata)),
+                state,
+            )));
+        }
+        if state.finished {
+            return Ok(None);
+        }
+        state.finished = true;
+        Ok(Some((Bytes::from_static(b"</D:multistatus>"), state)))
+    });
+    let mut response = GatewayHttpResponse::bytes(
+        StatusCode::MULTI_STATUS,
+        "application/xml; charset=utf-8",
+        Bytes::new(),
+        upstream,
+    );
+    response.stream_body = Some(GatewayBody::Stream(
+        StreamBody::new(stream.map_ok(Frame::data)).boxed_unsync(),
     ));
     Ok(response)
 }
 
 async fn webdav_put(target: &Path, body: Bytes, upstream: &str) -> Result<GatewayHttpResponse> {
-    let existed = tokio::fs::metadata(target).await.is_ok();
+    let metadata = tokio::fs::metadata(target).await.ok();
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file())
+    {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::CONFLICT,
+            "PUT requires a regular file target",
+        ));
+    }
+    let existed = metadata.is_some();
     if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("failed creating webdav parent directory")?;
+        if !tokio::fs::metadata(parent).await.is_ok_and(|m| m.is_dir()) {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::CONFLICT,
+                "parent collection does not exist",
+            ));
+        }
     }
     tokio::fs::write(target, body)
         .await
@@ -20667,7 +21030,18 @@ async fn webdav_mkcol(target: &Path, upstream: &str) -> Result<GatewayHttpRespon
             "webdav collection already exists",
         ));
     }
-    tokio::fs::create_dir_all(target)
+    if let Some(parent) = target.parent() {
+        if !tokio::fs::metadata(parent)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::CONFLICT,
+                "parent collection does not exist",
+            ));
+        }
+    }
+    tokio::fs::create_dir(target)
         .await
         .context("failed creating webdav collection")?;
     Ok(GatewayHttpResponse::bytes(
@@ -20679,11 +21053,42 @@ async fn webdav_mkcol(target: &Path, upstream: &str) -> Result<GatewayHttpRespon
 }
 
 async fn webdav_copy_or_move(
+    root: &Path,
     method: &str,
     source: &Path,
     destination: &Path,
+    headers: &HeaderMap,
     upstream: &str,
 ) -> Result<GatewayHttpResponse> {
+    let Ok(canonical_source) = crate::filesystem_boundary::confined_path_async(root, source).await
+    else {
+        return Ok(webdav_boundary_error());
+    };
+    let Ok(resolved_destination) =
+        crate::filesystem_boundary::confined_path_async(root, destination).await
+    else {
+        return Ok(webdav_boundary_error());
+    };
+    let Some(destination_parent) = destination.parent() else {
+        return Ok(webdav_boundary_error());
+    };
+    let Some(destination_name) = destination.file_name() else {
+        return Ok(webdav_boundary_error());
+    };
+    let Ok(parent) =
+        crate::filesystem_boundary::confined_path_async(root, destination_parent).await
+    else {
+        return Ok(webdav_boundary_error());
+    };
+    let canonical_destination = parent.join(destination_name);
+    // This also rejects paths through internal aliases before creating parents.
+    if canonical_destination.starts_with(&canonical_source)
+        || canonical_source.starts_with(&canonical_destination)
+        || resolved_destination.starts_with(&canonical_source)
+        || canonical_source.starts_with(&resolved_destination)
+    {
+        return Ok(webdav_boundary_error());
+    }
     let metadata = match tokio::fs::metadata(source).await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -20695,10 +21100,58 @@ async fn webdav_copy_or_move(
         Err(error) => return Err(error).context("failed reading webdav source metadata"),
     };
 
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("failed creating webdav destination parent")?;
+    let overwrite = match headers.get("overwrite") {
+        None => true,
+        Some(value) if value == "T" => true,
+        Some(value) if value == "F" => false,
+        _ => {
+            return Ok(GatewayHttpResponse::error(
+                StatusCode::BAD_REQUEST,
+                "Overwrite must be T or F",
+            ))
+        }
+    };
+    let depth = headers
+        .get("depth")
+        .map(|v| v.to_str().unwrap_or("invalid"))
+        .unwrap_or("infinity");
+    if !matches!(depth, "0" | "infinity") || method == "MOVE" && depth != "infinity" {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::BAD_REQUEST,
+            "invalid COPY/MOVE Depth",
+        ));
+    }
+    let existed = tokio::fs::symlink_metadata(destination).await.is_ok();
+    if existed && !overwrite {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::PRECONDITION_FAILED,
+            "destination exists and Overwrite is F",
+        ));
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::FORBIDDEN,
+            "COPY/MOVE requires a file or directory",
+        ));
+    }
+
+    if !tokio::fs::metadata(destination_parent)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return Ok(GatewayHttpResponse::error(
+            StatusCode::CONFLICT,
+            "destination parent collection does not exist",
+        ));
+    }
+
+    if existed {
+        let destination_metadata = tokio::fs::symlink_metadata(destination).await?;
+        if destination_metadata.is_dir() {
+            tokio::fs::remove_dir_all(destination).await?;
+        } else {
+            tokio::fs::remove_file(destination).await?;
+        }
     }
 
     if method == "MOVE" {
@@ -20706,7 +21159,21 @@ async fn webdav_copy_or_move(
             .await
             .context("failed moving webdav path")?;
     } else if metadata.is_dir() {
-        copy_dir_recursive(source, destination).await?;
+        if depth == "0" {
+            tokio::fs::create_dir(destination).await?;
+        } else {
+            if !copy_dir_recursive(
+                root,
+                source,
+                destination,
+                &canonical_source,
+                &canonical_destination,
+            )
+            .await?
+            {
+                return Ok(webdav_boundary_error());
+            }
+        }
     } else {
         tokio::fs::copy(source, destination)
             .await
@@ -20714,45 +21181,67 @@ async fn webdav_copy_or_move(
     }
 
     Ok(GatewayHttpResponse::bytes(
-        StatusCode::CREATED,
+        if existed {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::CREATED
+        },
         "text/plain; charset=utf-8",
         Bytes::new(),
         upstream,
     ))
 }
 
-async fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
-    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
-
-    while let Some((from, to)) = pending.pop() {
-        tokio::fs::create_dir_all(&to)
-            .await
-            .context("failed creating copied webdav directory")?;
-        let mut entries = tokio::fs::read_dir(&from)
-            .await
-            .context("failed reading copied webdav directory")?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .context("failed reading copied webdav directory entry")?
-        {
+async fn copy_dir_recursive(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    canonical_source: &Path,
+    canonical_destination: &Path,
+) -> Result<bool> {
+    tokio::fs::create_dir_all(destination).await?;
+    let mut ancestors = std::collections::HashSet::from([canonical_source.to_path_buf()]);
+    // Depth-first traversal keeps one directory iterator per ancestor, not a
+    // growing list of all pending children. Cyclic internal links fail closed.
+    let mut pending = vec![(
+        tokio::fs::read_dir(source).await?,
+        destination.to_path_buf(),
+        canonical_source.to_path_buf(),
+    )];
+    while let Some((entries, to, _)) = pending.last_mut() {
+        if let Some(entry) = entries.next_entry().await? {
             let child_from = entry.path();
             let child_to = to.join(entry.file_name());
-            let metadata = entry
-                .metadata()
-                .await
-                .context("failed reading copied webdav metadata")?;
+            let Ok(from) = crate::filesystem_boundary::confined_path_async(root, &child_from).await
+            else {
+                return Ok(false);
+            };
+            let Ok(to) = crate::filesystem_boundary::confined_path_async(root, &child_to).await
+            else {
+                return Ok(false);
+            };
+            if from.starts_with(canonical_destination) || to.starts_with(&from) {
+                return Ok(false);
+            }
+            let metadata = tokio::fs::metadata(&child_from).await?;
             if metadata.is_dir() {
-                pending.push((child_from, child_to));
+                if !ancestors.insert(from.clone()) {
+                    return Ok(false);
+                }
+                tokio::fs::create_dir_all(&child_to).await?;
+                pending.push((tokio::fs::read_dir(&child_from).await?, child_to, from));
             } else {
                 tokio::fs::copy(&child_from, &child_to)
                     .await
                     .context("failed copying webdav file")?;
             }
+        } else {
+            let (_, _, from) = pending.pop().expect("current directory exists");
+            ancestors.remove(&from);
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn webdav_path_matches(prefix: &str, path: &str) -> bool {
@@ -20777,18 +21266,11 @@ fn webdav_filesystem_path(config: &WebDavConfig, request_path: &str) -> Result<O
     let mut target = config.root.clone();
 
     for part in decoded.split('/') {
-        if part.is_empty() {
+        if part.is_empty() || part == "." {
             continue;
         }
-        let component_path = Path::new(part);
-        if component_path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
+        if !crate::static_security::allowed_component(part, false) {
             return Err(anyhow!("webdav path escapes root"));
-        }
-        if part == "." {
-            continue;
         }
         target.push(part);
     }
@@ -20814,6 +21296,49 @@ fn webdav_destination_path(config: &WebDavConfig, headers: &HeaderMap) -> Result
     };
 
     webdav_filesystem_path(config, &path)
+}
+
+fn webdav_destination_authority_error(
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<GatewayHttpResponse> {
+    let destination = headers.get("destination")?.to_str().ok()?;
+    if destination.starts_with('/')
+        && !destination.starts_with("//")
+        && !destination.contains(['?', '#'])
+    {
+        return None;
+    }
+    let parsed = Url::parse(destination).ok().filter(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    });
+    let Some(destination) = parsed else {
+        return Some(GatewayHttpResponse::error(
+            StatusCode::BAD_REQUEST,
+            "invalid webdav Destination URI",
+        ));
+    };
+    let authority = headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(|a| a.as_str()));
+    let same_origin = authority
+        .and_then(|authority| Url::parse(&format!("{}://{authority}/", destination.scheme())).ok())
+        .is_some_and(|source| {
+            source.host() == destination.host()
+                && source.port_or_known_default() == destination.port_or_known_default()
+        });
+    if !same_origin {
+        return Some(GatewayHttpResponse::error(
+            StatusCode::BAD_GATEWAY,
+            "cross-server WebDAV COPY/MOVE is not supported",
+        ));
+    }
+    None
 }
 
 fn normalize_webdav_prefix(prefix: &str) -> String {
@@ -20859,10 +21384,24 @@ fn join_webdav_href(prefix: &str, base_path: &str, child_name: &str) -> String {
     } else {
         format!("{}/", normalize_webdav_prefix(prefix))
     };
-    format!("{base}{}", xml_escape(child_name))
+    let mut encoded = String::with_capacity(child_name.len());
+    for byte in child_name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("write URL component");
+        }
+    }
+    format!("{base}{encoded}")
 }
 
 fn webdav_prop_response(path: &str, metadata: &std::fs::Metadata) -> String {
+    let path = if metadata.is_dir() && !path.ends_with('/') {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    };
     let resource_type = if metadata.is_dir() {
         "<D:resourcetype><D:collection/></D:resourcetype>"
     } else {
@@ -20871,7 +21410,7 @@ fn webdav_prop_response(path: &str, metadata: &std::fs::Metadata) -> String {
     let content_length = if metadata.is_dir() { 0 } else { metadata.len() };
     format!(
         r#"<D:response><D:href>{}</D:href><D:propstat><D:prop>{}<D:getcontentlength>{}</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
-        xml_escape(path),
+        xml_escape(&path),
         resource_type,
         content_length
     )
@@ -21129,16 +21668,27 @@ where
     T: AsyncRead + Unpin + ?Sized,
 {
     let mut buffer = BytesMut::with_capacity(4096);
+    let mut informational = 0;
 
     loop {
         if let Some(position) = find_header_end(&buffer) {
+            if position + 4 > 64 * 1024 {
+                return Err(anyhow!("upstream response headers exceeded 64KiB"));
+            }
             let head = buffer.split_to(position + 4).freeze();
+            let (status, headers) = parse_http_response_head(&head)?;
+            if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+                informational += 1;
+                if informational > 16 {
+                    return Err(anyhow!("too many informational upstream responses"));
+                }
+                continue;
+            }
             let leftover = if buffer.is_empty() {
                 None
             } else {
                 Some(buffer.freeze())
             };
-            let (status, headers) = parse_http_response_head(&head)?;
             return Ok((status, headers, leftover));
         }
 
@@ -21171,6 +21721,12 @@ fn parse_http_response_head(head: &[u8]) -> Result<(StatusCode, Vec<(HeaderName,
             .ok_or_else(|| anyhow!("missing upstream status code"))?,
     )?;
     let mut parsed_headers = Vec::new();
+    http1_body::response_framing(
+        response
+            .headers
+            .iter()
+            .map(|header| (header.name, header.value)),
+    )?;
     for header in response.headers.iter() {
         let name = HeaderName::from_bytes(header.name.as_bytes())?;
         let value = HeaderValue::from_bytes(header.value)?;
@@ -21223,6 +21779,7 @@ async fn read_raw_reverse_http_response_into(
     response_cache: &mut Option<RawReverseResponseCache>,
 ) -> Result<RawReverseHttpResponse> {
     buffer.clear();
+    let mut informational = 0;
 
     loop {
         let cached_prefix = response_cache.as_ref().is_some_and(|cached| {
@@ -21245,6 +21802,9 @@ async fn read_raw_reverse_http_response_into(
         };
         if let Some(position) = header_end {
             let head_end = position + 4;
+            if head_end > 64 * 1024 {
+                return Err(anyhow!("upstream response headers exceeded 64KiB"));
+            }
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut response = httparse::Response::new(&mut headers);
             let status = response
@@ -21259,26 +21819,30 @@ async fn read_raw_reverse_http_response_into(
                     .code
                     .ok_or_else(|| anyhow!("missing upstream status code"))?,
             )?;
-            let mut content_length = None;
-            let mut transfer_chunked = false;
-            let mut connection_close = false;
-            for header in response.headers.iter() {
-                if header.name.eq_ignore_ascii_case("content-length") {
-                    content_length = std::str::from_utf8(header.value)
-                        .ok()
-                        .and_then(|value| value.trim().parse::<u64>().ok());
-                } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-                    transfer_chunked = std::str::from_utf8(header.value).ok().is_some_and(|raw| {
-                        raw.split(',')
-                            .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
-                    });
-                } else if header.name.eq_ignore_ascii_case("connection") {
-                    connection_close = std::str::from_utf8(header.value).ok().is_some_and(|raw| {
+            let (content_length, transfer_chunked) = http1_body::response_framing(
+                response
+                    .headers
+                    .iter()
+                    .map(|header| (header.name, header.value)),
+            )?;
+            if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+                informational += 1;
+                if informational > 16 {
+                    return Err(anyhow!("too many informational upstream responses"));
+                }
+                buffer.drain(..head_end);
+                continue;
+            }
+            let connection_close = response
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+                .any(|header| {
+                    std::str::from_utf8(header.value).ok().is_some_and(|raw| {
                         raw.split(',')
                             .any(|item| item.trim().eq_ignore_ascii_case("close"))
-                    });
-                }
-            }
+                    })
+                });
 
             let parsed = RawReverseHttpResponse {
                 status,
@@ -21318,16 +21882,30 @@ async fn read_raw_fast_http_response_head(
     filter_hop_headers: bool,
 ) -> Result<RawFastHttpResponseHead> {
     let mut buffer = BytesMut::with_capacity(4096);
+    let mut informational = 0;
 
     loop {
         if let Some(position) = find_header_end(&buffer) {
+            if position + 4 > 64 * 1024 {
+                return Err(anyhow!("upstream response headers exceeded 64KiB"));
+            }
             let head = buffer.split_to(position + 4).freeze();
+            let mut parsed = parse_raw_fast_http_response_head(head, None, filter_hop_headers)?;
+            if parsed.status.is_informational() && parsed.status != StatusCode::SWITCHING_PROTOCOLS
+            {
+                informational += 1;
+                if informational > 16 {
+                    return Err(anyhow!("too many informational upstream responses"));
+                }
+                continue;
+            }
             let leftover = if buffer.is_empty() {
                 None
             } else {
                 Some(buffer.freeze())
             };
-            return parse_raw_fast_http_response_head(head, leftover, filter_hop_headers);
+            parsed.leftover = leftover;
+            return Ok(parsed);
         }
 
         if buffer.len() > 64 * 1024 {
@@ -21361,8 +21939,12 @@ fn parse_raw_fast_http_response_head(
             .code
             .ok_or_else(|| anyhow!("missing upstream status code"))?,
     )?;
-    let mut content_length = None;
-    let mut transfer_chunked = false;
+    let (content_length, transfer_chunked) = http1_body::response_framing(
+        response
+            .headers
+            .iter()
+            .map(|header| (header.name, header.value)),
+    )?;
     let mut connection_close = false;
     let mut filtered = if filter_hop_headers {
         Vec::with_capacity(head.len().min(4096))
@@ -21373,17 +21955,8 @@ fn parse_raw_fast_http_response_head(
     for header in response.headers.iter() {
         let name = header.name;
         let value = header.value;
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = std::str::from_utf8(value)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok());
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            transfer_chunked = std::str::from_utf8(value).ok().is_some_and(|raw| {
-                raw.split(',')
-                    .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
-            });
-        } else if name.eq_ignore_ascii_case("connection") {
-            connection_close = std::str::from_utf8(value).ok().is_some_and(|raw| {
+        if name.eq_ignore_ascii_case("connection") {
+            connection_close |= std::str::from_utf8(value).ok().is_some_and(|raw| {
                 raw.split(',')
                     .any(|item| item.trim().eq_ignore_ascii_case("close"))
             });
@@ -21448,8 +22021,9 @@ fn append_u16_decimal(out: &mut Vec<u8>, value: u16) {
 
 async fn relay_raw_http_body(
     upstream: &mut (impl AsyncRead + Unpin + ?Sized),
-    downstream: &mut TcpStream,
+    downstream: &mut (impl AsyncWrite + Unpin + ?Sized),
     leftover: Option<Bytes>,
+    timeout: Duration,
 ) -> Result<()> {
     if let Some(leftover) = leftover {
         if !leftover.is_empty() {
@@ -21462,9 +22036,9 @@ async fn relay_raw_http_body(
 
     let mut buffer = relay_buffer_pool().acquire();
     loop {
-        let read = upstream
-            .read(&mut buffer)
+        let read = tokio::time::timeout(timeout, upstream.read(&mut buffer))
             .await
+            .context("upstream body idle timeout")?
             .context("failed reading raw upstream body")?;
         if read == 0 {
             break;
@@ -21479,37 +22053,40 @@ async fn relay_raw_http_body(
 
 async fn relay_passthrough_chunked_http_body(
     upstream: &mut (impl AsyncRead + Unpin + ?Sized),
-    downstream: &mut TcpStream,
+    downstream: &mut (impl AsyncWrite + Unpin + ?Sized),
     leftover: Option<Bytes>,
+    timeout: Duration,
 ) -> Result<bool> {
     let mut scanner = ChunkedBodyScanner::default();
     if let Some(leftover) = leftover {
         if !leftover.is_empty() {
+            let (consumed, done) = scanner.observe_prefix(&leftover)?;
             downstream
-                .write_all(&leftover)
+                .write_all(&leftover[..consumed])
                 .await
                 .context("failed writing chunked upstream prelude")?;
-            if scanner.observe(&leftover)? {
-                return Ok(true);
+            if done {
+                return Ok(consumed == leftover.len());
             }
         }
     }
 
     let mut buffer = relay_buffer_pool().acquire();
     loop {
-        let read = upstream
-            .read(&mut buffer)
+        let read = tokio::time::timeout(timeout, upstream.read(&mut buffer))
             .await
+            .context("upstream body idle timeout")?
             .context("failed reading chunked raw upstream body")?;
         if read == 0 {
-            return Ok(false);
+            return Err(anyhow!("upstream closed before terminating chunk"));
         }
+        let (consumed, done) = scanner.observe_prefix(&buffer[..read])?;
         downstream
-            .write_all(&buffer[..read])
+            .write_all(&buffer[..consumed])
             .await
             .context("failed writing chunked raw upstream body")?;
-        if scanner.observe(&buffer[..read])? {
-            return Ok(true);
+        if done {
+            return Ok(consumed == read);
         }
     }
 }
@@ -21517,6 +22094,7 @@ async fn relay_passthrough_chunked_http_body(
 #[derive(Default)]
 struct ChunkedBodyScanner {
     state: ChunkedScanState,
+    trailer_bytes: usize,
 }
 
 enum ChunkedScanState {
@@ -21534,7 +22112,8 @@ impl Default for ChunkedScanState {
 }
 
 impl ChunkedBodyScanner {
-    fn observe(&mut self, mut bytes: &[u8]) -> Result<bool> {
+    fn observe_prefix(&mut self, mut bytes: &[u8]) -> Result<(usize, bool)> {
+        let input_len = bytes.len();
         while !bytes.is_empty() {
             match &mut self.state {
                 ChunkedScanState::SizeLine(line) => {
@@ -21543,9 +22122,12 @@ impl ChunkedBodyScanner {
                         if line.len() > 16 * 1024 {
                             return Err(anyhow!("chunk size line exceeded 16KiB"));
                         }
-                        return Ok(false);
+                        return Ok((input_len, false));
                     };
                     line.extend_from_slice(&bytes[..=pos]);
+                    if line.len() > 16 * 1024 {
+                        return Err(anyhow!("chunk size line exceeded 16KiB"));
+                    }
                     bytes = &bytes[pos + 1..];
                     if !line.ends_with(b"\r\n") {
                         return Err(anyhow!("invalid chunk size line"));
@@ -21580,21 +22162,38 @@ impl ChunkedBodyScanner {
                     }
                 }
                 ChunkedScanState::Trailer(trailer) => {
-                    trailer.extend_from_slice(bytes);
-                    if trailer.len() > 64 * 1024 {
+                    let newline = bytes.iter().position(|byte| *byte == b'\n');
+                    let count = newline.map_or(bytes.len(), |position| position + 1);
+                    self.trailer_bytes += count;
+                    if self.trailer_bytes > 64 * 1024 || trailer.len() + count > 16 * 1024 {
                         return Err(anyhow!("chunk trailer exceeded 64KiB"));
                     }
-                    if trailer.starts_with(b"\r\n") || find_header_end(trailer).is_some() {
-                        self.state = ChunkedScanState::Done;
-                        return Ok(true);
+                    trailer.extend_from_slice(&bytes[..count]);
+                    bytes = &bytes[count..];
+                    if newline.is_none() {
+                        return Ok((input_len, false));
                     }
-                    return Ok(false);
+                    if !trailer.ends_with(b"\r\n") {
+                        return Err(anyhow!("invalid chunk trailer line"));
+                    }
+                    if trailer.len() == 2 {
+                        self.state = ChunkedScanState::Done;
+                        return Ok((input_len - bytes.len(), true));
+                    }
+                    let line = &trailer[..trailer.len() - 2];
+                    let colon = line
+                        .iter()
+                        .position(|byte| *byte == b':')
+                        .ok_or_else(|| anyhow!("invalid chunk trailer"))?;
+                    HeaderName::from_bytes(&line[..colon])?;
+                    HeaderValue::from_bytes(&line[colon + 1..])?;
+                    trailer.clear();
                 }
-                ChunkedScanState::Done => return Ok(true),
+                ChunkedScanState::Done => return Ok((input_len - bytes.len(), true)),
             }
         }
 
-        Ok(matches!(self.state, ChunkedScanState::Done))
+        Ok((input_len, matches!(self.state, ChunkedScanState::Done)))
     }
 }
 
@@ -21607,14 +22206,18 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<u64> {
         .map(|(size, _)| size)
         .unwrap_or(line)
         .trim();
+    if size_hex.is_empty() || !size_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("invalid chunk size"));
+    }
     u64::from_str_radix(size_hex, 16).context("invalid chunk size")
 }
 
 async fn relay_fixed_http_body(
     upstream: &mut (impl AsyncRead + Unpin + ?Sized),
-    downstream: &mut TcpStream,
+    downstream: &mut (impl AsyncWrite + Unpin + ?Sized),
     leftover: Option<Bytes>,
     len: u64,
+    timeout: Duration,
 ) -> Result<bool> {
     let mut remaining = len;
     if let Some(leftover) = leftover {
@@ -21636,12 +22239,12 @@ async fn relay_fixed_http_body(
     let mut buffer = relay_buffer_pool().acquire();
     while remaining > 0 {
         let read_target = remaining.min(buffer.len() as u64) as usize;
-        let read = upstream
-            .read(&mut buffer[..read_target])
+        let read = tokio::time::timeout(timeout, upstream.read(&mut buffer[..read_target]))
             .await
+            .context("upstream body idle timeout")?
             .context("failed reading fixed raw upstream body")?;
         if read == 0 {
-            return Ok(false);
+            return Err(anyhow!("upstream closed before declared content length"));
         }
         downstream
             .write_all(&buffer[..read])
@@ -24189,6 +24792,7 @@ mod tests {
             path_prefix: "/dav".to_string(),
             root: PathBuf::from("/tmp/webdav-root"),
             allow_write: true,
+            ..Default::default()
         };
 
         let error = webdav_filesystem_path(&config, "/dav/%2e%2e/secret")
@@ -24203,6 +24807,7 @@ mod tests {
             path_prefix: "/dav".to_string(),
             root: PathBuf::from("/tmp/webdav-root"),
             allow_write: true,
+            ..Default::default()
         };
 
         let target = webdav_filesystem_path(&config, "/dav/folder/a%20b.txt")
@@ -24221,6 +24826,7 @@ mod tests {
             path_prefix: "/dav".to_string(),
             root: root.clone(),
             allow_write: true,
+            ..Default::default()
         };
         let uri: Uri = "/dav/hello.txt".parse().expect("valid uri");
         let headers = HeaderMap::new();
@@ -24266,20 +24872,31 @@ mod tests {
             path_prefix: "/dav".to_string(),
             root: root.clone(),
             allow_write: true,
+            ..Default::default()
         };
         let uri: Uri = "/dav".parse().expect("valid uri");
-        let response = dispatch_webdav(
+        let mut headers = HeaderMap::new();
+        headers.insert("depth", HeaderValue::from_static("1"));
+        let mut response = dispatch_webdav(
             &config,
             &Method::from_bytes(b"PROPFIND").unwrap(),
             &uri,
-            &HeaderMap::new(),
+            &headers,
             Bytes::new(),
         )
         .await
         .expect("propfind succeeds");
 
         assert_eq!(response.status, StatusCode::from_u16(207).unwrap());
-        let body = String::from_utf8(response.body.to_vec()).expect("utf8 body");
+        let bytes = response
+            .stream_body
+            .take()
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
         assert!(body.contains("item.txt"));
 
         let _ = tokio::fs::remove_dir_all(root).await;

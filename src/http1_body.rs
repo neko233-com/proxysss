@@ -4,10 +4,48 @@
 
 use anyhow::{anyhow, bail, Result};
 use bytes::{Buf, Bytes};
-use http::{header, HeaderName, HeaderValue, Method, StatusCode};
+#[cfg(test)]
+use http::header;
+use http::{HeaderName, HeaderValue, Method, StatusCode};
 
 const LINE_LIMIT: usize = 16 * 1024;
 const TRAILER_LIMIT: usize = 64 * 1024;
+
+/// Shared allocation-free framing validation for raw response fast paths.
+pub(super) fn response_framing<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<(Option<u64>, bool)> {
+    let mut length = None;
+    let mut chunked = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked
+                || !std::str::from_utf8(value)?
+                    .trim()
+                    .eq_ignore_ascii_case("chunked")
+            {
+                bail!("unsupported upstream transfer encoding");
+            }
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            for field in std::str::from_utf8(value)?.split(',') {
+                let field = field.trim();
+                if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+                    bail!("invalid upstream content length");
+                }
+                let parsed = field.parse::<u64>()?;
+                if length.is_some_and(|previous| previous != parsed) {
+                    bail!("conflicting upstream content lengths");
+                }
+                length = Some(parsed);
+            }
+        }
+    }
+    if chunked && length.is_some() {
+        bail!("ambiguous upstream transfer encoding and content length");
+    }
+    Ok((length, chunked))
+}
 
 enum State {
     CloseDelimited,
@@ -44,33 +82,11 @@ impl ResponseBodyDecoder {
             decoder.state = State::Done;
             return Ok(decoder);
         }
-        let mut chunked = false;
-        let mut length = None;
-        for (name, value) in headers {
-            if name == header::TRANSFER_ENCODING {
-                // We do not advertise transfer compression support. Reject
-                // unsupported stacks rather than emit coded bytes as plain data.
-                if chunked || !value.to_str()?.trim().eq_ignore_ascii_case("chunked") {
-                    bail!("unsupported upstream transfer encoding");
-                }
-                chunked = true;
-            } else if name == header::CONTENT_LENGTH {
-                for field in value.to_str()?.split(',') {
-                    let field = field.trim();
-                    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
-                        bail!("invalid upstream content length");
-                    }
-                    let parsed = field.parse::<u64>()?;
-                    if length.is_some_and(|previous| previous != parsed) {
-                        bail!("conflicting upstream content lengths");
-                    }
-                    length = Some(parsed);
-                }
-            }
-        }
-        if chunked && length.is_some() {
-            bail!("ambiguous upstream transfer encoding and content length");
-        }
+        let (length, chunked) = response_framing(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )?;
         decoder.state = if chunked {
             State::Size
         } else {

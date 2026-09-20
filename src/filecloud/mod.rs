@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, SET_COOKIE};
+use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, SET_COOKIE};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -70,7 +70,7 @@ pub async fn dispatch_filecloud(
             .strip_prefix("dl/")
             .unwrap_or("")
             .trim_start_matches('/');
-        return serve_download(config, file_relative, headers, &secret).await;
+        return serve_download(config, method, file_relative, headers, &secret).await;
     }
 
     if method == Method::GET && (relative.is_empty() || relative == "index.html") {
@@ -159,6 +159,9 @@ async fn handle_tree(config: &FileCloudConfig, query: TreeQuery) -> Result<Gatew
         .await
         .context("failed listing filecloud directory")?;
     while let Some(entry) = entries.next_entry().await? {
+        if ensure_within_root(&config.root, &entry.path()).is_err() {
+            continue;
+        }
         nodes.push(read_node(&config.root, &entry).await?);
     }
     nodes.sort_by(|left, right| match (left.is_dir, right.is_dir) {
@@ -245,6 +248,12 @@ async fn handle_rename(config: &FileCloudConfig, body: &Bytes) -> Result<Gateway
         ));
     }
     let payload: RenameRequest = serde_json::from_slice(body)?;
+    if !crate::static_security::allowed_component(payload.name.trim(), false) {
+        return Ok(json_error(
+            StatusCode::BAD_REQUEST,
+            "rename name must be a single filename",
+        ));
+    }
     let from = resolve_relative_path(&config.root, &payload.path)?;
     let parent = from
         .parent()
@@ -295,10 +304,10 @@ async fn handle_upload(
             "filecloud upload is disabled",
         ));
     }
-    if query.name.trim().is_empty() {
+    if !crate::static_security::allowed_component(query.name.trim(), false) {
         return Ok(json_error(
             StatusCode::BAD_REQUEST,
-            "upload name query parameter is required",
+            "upload name must be a single filename",
         ));
     }
     if body.len() as u64 > config.max_upload_bytes {
@@ -326,66 +335,82 @@ async fn handle_upload(
 
 async fn serve_download(
     config: &FileCloudConfig,
+    method: &Method,
     relative: &str,
     headers: &HeaderMap,
     secret: &[u8; 32],
 ) -> Result<GatewayHttpResponse> {
     if config.require_auth_for_download && !is_authenticated(secret, headers) {
-        return Ok(json_error(
+        let mut response = json_error(
             StatusCode::UNAUTHORIZED,
             "filecloud authentication required",
-        ));
+        );
+        response.push_header(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+        return Ok(response);
     }
-    let target = resolve_relative_path(&config.root, relative)?;
-    ensure_within_root(&config.root, &target)?;
-    let metadata = match fs::metadata(&target).await {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GatewayHttpResponse::error(
-                StatusCode::NOT_FOUND,
-                "file not found",
-            ));
-        }
-        Err(error) => return Err(error.into()),
+    let target = match path::percent_decode_path(relative)
+        .and_then(|decoded| resolve_relative_path(&config.root, &decoded))
+    {
+        Ok(target) => target,
+        Err(_) => return Ok(json_error(StatusCode::BAD_REQUEST, "invalid file path")),
     };
-    if metadata.is_dir() {
+    if ensure_within_root(&config.root, &target).is_err() {
         return Ok(json_error(
-            StatusCode::BAD_REQUEST,
-            "cannot download a directory",
+            StatusCode::FORBIDDEN,
+            "file path is outside the permitted filesystem boundary",
         ));
     }
-
-    let bytes = fs::read(&target)
-        .await
-        .context("failed reading filecloud download file")?;
+    let mut response = crate::gateway::file_download::response(
+        &target,
+        method,
+        headers,
+        filecloud_content_type(&target),
+        "proxysss://filecloud",
+    )
+    .await?;
+    if config.require_auth_for_download {
+        response.push_header(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
+    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
+        return Ok(response);
+    }
     let file_name = target
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("download");
-    let mut response = GatewayHttpResponse::bytes(
-        StatusCode::OK,
-        filecloud_content_type(&target),
-        Bytes::from(bytes),
-        "proxysss://filecloud",
-    );
-    response.push_header(
-        CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("inline; filename=\"{file_name}\""))?,
-    );
-    response.push_header(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.len().to_string())?,
-    );
-    if config.cdn_cache_secs > 0 {
+    response.push_header(CONTENT_DISPOSITION, download_disposition(file_name)?);
+    if !config.require_auth_for_download && config.cdn_cache_secs > 0 {
         response.push_header(
             CACHE_CONTROL,
-            HeaderValue::from_str(&format!(
-                "public, max-age={}, immutable",
-                config.cdn_cache_secs
-            ))?,
+            HeaderValue::from_str(&format!("public, max-age={}", config.cdn_cache_secs))?,
         );
     }
     Ok(response)
+}
+
+fn download_disposition(name: &str) -> Result<HeaderValue> {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || " ._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut encoded = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}")?;
+        }
+    }
+    Ok(HeaderValue::from_str(&format!(
+        "inline; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))?)
 }
 
 async fn search_recursive(
@@ -403,6 +428,9 @@ async fn search_recursive(
     while let Some(entry) = entries.next_entry().await? {
         if matches.len() >= limit {
             break;
+        }
+        if ensure_within_root(root, &entry.path()).is_err() {
+            continue;
         }
         let node = read_node(root, &entry).await?;
         if node.name.to_ascii_lowercase().contains(needle) {
@@ -691,6 +719,155 @@ mod tests {
             password: "test-secret".to_string(),
             title: "Test FileCloud".to_string(),
             ..FileCloudConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn filecloud_download_names_are_decoded_once_and_private_cache_is_enforced() {
+        let fixture = crate::test_support::TestDir::new("filecloud-download-names");
+        let mut config = test_config(fixture.to_path_buf());
+        config.require_auth_for_download = true;
+        let login = dispatch_filecloud(
+            &config,
+            &Method::POST,
+            "/filecloud/api/login",
+            None,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"password":"test-secret"}"#),
+        )
+        .await
+        .unwrap();
+        let cookie = login
+            .headers()
+            .iter()
+            .find(|(name, _)| name == SET_COOKIE)
+            .unwrap()
+            .1
+            .clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::COOKIE, cookie);
+        for (name, encoded) in [
+            ("a+b.txt", "a+b.txt"),
+            ("%2e%2e.txt", "%252e%252e.txt"),
+            ("资源.txt", "%E8%B5%84%E6%BA%90.txt"),
+        ] {
+            fs::write(fixture.join(name), b"0123456789").await.unwrap();
+            let path = format!("/filecloud/dl/{encoded}");
+            headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=2-4"));
+            let response =
+                dispatch_filecloud(&config, &Method::GET, &path, None, &headers, Bytes::new())
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{name}");
+            assert_eq!(response.body().as_ref(), b"234");
+            assert!(response
+                .headers()
+                .iter()
+                .any(|(name, value)| name == CACHE_CONTROL && value == "private, no-store"));
+            assert!(response
+                .headers()
+                .iter()
+                .find(|(name, _)| name == CONTENT_DISPOSITION)
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap()
+                .contains("filename*=UTF-8''"));
+            let response =
+                dispatch_filecloud(&config, &Method::HEAD, &path, None, &headers, Bytes::new())
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.body().is_empty());
+            assert!(response
+                .headers()
+                .iter()
+                .any(|(name, value)| name == http::header::CONTENT_LENGTH && value == "10"));
+            let response = dispatch_filecloud(
+                &config,
+                &Method::GET,
+                &path,
+                None,
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = dispatch_filecloud(
+            &config,
+            &Method::GET,
+            "/filecloud/dl/bad%ZZ",
+            None,
+            &headers,
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filecloud_dangling_upload_and_directory_entries_stay_confined() {
+        let fixture = crate::test_support::TestDir::new("filecloud-write-boundary");
+        let root = fixture.join("served");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("visible"), b"visible").unwrap();
+        std::fs::write(fixture.join("sibling"), b"outside").unwrap();
+        std::os::unix::fs::symlink(fixture.join("new-outside"), root.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(fixture.join("sibling"), root.join("outside")).unwrap();
+        let config = test_config(root);
+        for name in ["dangling", "outside"] {
+            assert!(handle_upload(
+                &config,
+                UploadQuery {
+                    path: "/".into(),
+                    name: name.into()
+                },
+                &Bytes::from_static(b"overwrite")
+            )
+            .await
+            .is_err());
+        }
+        assert!(!fixture.join("new-outside").exists());
+        assert_eq!(std::fs::read(fixture.join("sibling")).unwrap(), b"outside");
+        for response in [
+            handle_tree(&config, TreeQuery::default()).await.unwrap(),
+            handle_search(
+                &config,
+                SearchQuery {
+                    path: "/".into(),
+                    q: "outside".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        ] {
+            let body = String::from_utf8(response.body().to_vec()).unwrap();
+            assert!(!body.contains("outside"));
+            assert!(!body.contains("dangling"));
+        }
+        for name in ["../sibling", "nested/name", "\\sibling", "name:stream"] {
+            let response = handle_upload(
+                &config,
+                UploadQuery {
+                    path: "/".into(),
+                    name: name.into(),
+                },
+                &Bytes::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"path":"visible", "name":name})).unwrap(),
+            );
+            assert_eq!(
+                handle_rename(&config, &body).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 

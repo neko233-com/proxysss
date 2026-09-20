@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Buf;
 use reqwest::{Client, StatusCode};
 
@@ -116,6 +116,15 @@ async fn integration_deep_static_virtual_hosts_http3_authority_and_ranges() -> R
     let base =
         base_gateway_yaml(port).replace("h3_bind: ''", &format!("h3_bind: 127.0.0.1:{h3_port}"));
     let yaml = format!("{base}\nservices:\n  static_sites:\n    - name: alpha\n      hosts: [alpha.example.com]\n      path_prefix: /assets\n      root: '{}'\n    - name: bravo\n      hosts: [bravo.example.com]\n      path_prefix: /assets\n      root: '{}'\n", a.display().to_string().replace('\\', "/"), b.display().to_string().replace('\\', "/"));
+    let dav = root.join("dav");
+    let yaml = format!(
+        "{}  webdav:\n    enabled: true\n    root: '{}'\n    allow_write: true\n",
+        yaml.replace(
+            "http:\n",
+            "http:\n  max_request_body_bytes: 16\n  request_body_timeout_ms: 10000\n"
+        ),
+        dav.display().to_string().replace('\\', "/")
+    );
     let path = write_config(&root, &yaml)?;
     let (_gateway, runner) = spawn_gateway(path.clone()).await?;
     let config = crate::config::GatewayConfig::load(&path)?;
@@ -139,6 +148,89 @@ async fn integration_deep_static_virtual_hosts_http3_authority_and_ranges() -> R
     .await??;
     let (mut driver, mut requests) = h3::client::new(h3_quinn::Connection::new(connection)).await?;
     let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    // An unfinished upload must not block any other stream on this connection.
+    let mut upload = requests
+        .send_request(http::Request::put("https://alpha.example.com/dav/complete").body(())?)
+        .await?;
+    upload.send_data(bytes::Bytes::from_static(b"abc")).await?;
+    let mut independent = requests
+        .send_request(http::Request::get("https://alpha.example.com/assets/asset.txt").body(())?)
+        .await?;
+    independent.finish().await?;
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            independent.recv_response()
+        )
+        .await??
+        .status(),
+        StatusCode::OK
+    );
+    while independent.recv_data().await?.is_some() {}
+    upload.send_data(bytes::Bytes::from_static(b"xyz")).await?;
+    upload.finish().await?;
+    assert_eq!(
+        upload
+            .recv_response()
+            .await
+            .context("completed H3 upload response")?
+            .status(),
+        StatusCode::CREATED
+    );
+    while upload.recv_data().await?.is_some() {}
+    assert_eq!(std::fs::read(dav.join("complete"))?, b"abcxyz");
+    let mut oversized = requests
+        .send_request(http::Request::put("https://alpha.example.com/dav/oversized").body(())?)
+        .await?;
+    oversized
+        .send_data(bytes::Bytes::from_static(
+            b"this-body-exceeds-sixteen-bytes",
+        ))
+        .await?;
+    oversized.finish().await?;
+    assert_eq!(
+        oversized
+            .recv_response()
+            .await
+            .context("oversized H3 upload response")?
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    while oversized.recv_data().await?.is_some() {}
+    assert!(!dav.join("oversized").exists());
+    let mut incomplete = requests
+        .send_request(
+            http::Request::put("https://alpha.example.com/dav/incomplete")
+                .header("content-length", "7")
+                .body(())?,
+        )
+        .await?;
+    incomplete
+        .send_data(bytes::Bytes::from_static(b"abc"))
+        .await?;
+    incomplete.finish().await?;
+    assert_eq!(
+        incomplete
+            .recv_response()
+            .await
+            .context("incomplete H3 upload response")?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    while incomplete.recv_data().await?.is_some() {}
+    assert!(!dav.join("incomplete").exists());
+    let mut cancelled = requests
+        .send_request(http::Request::put("https://alpha.example.com/dav/cancelled").body(())?)
+        .await?;
+    cancelled
+        .send_data(bytes::Bytes::from_static(b"partial"))
+        .await?;
+    cancelled.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    // Cancel both directions. Parsing a response after cancelling before the
+    // server resolves request headers can make the client itself close the
+    // connection on a headerless FIN; that is not a gateway response failure.
+    cancelled.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    drop(cancelled);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         for _ in 0..2 {
             for (host, expected) in [
@@ -153,7 +245,10 @@ async fn integration_deep_static_virtual_hosts_http3_authority_and_ranges() -> R
                     }
                     let mut stream = requests.send_request(request.body(())?).await?;
                     stream.finish().await?;
-                    let response = stream.recv_response().await?;
+                    let response = stream
+                        .recv_response()
+                        .await
+                        .context("H3 download after rejected/cancelled uploads")?;
                     assert_eq!(
                         response.status(),
                         if range {
@@ -180,6 +275,7 @@ async fn integration_deep_static_virtual_hosts_http3_authority_and_ranges() -> R
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    assert!(!dav.join("cancelled").exists());
     endpoint.close(0_u32.into(), b"test finished");
     driver_task.abort();
     runner.abort();

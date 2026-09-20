@@ -166,9 +166,22 @@ pub(super) async fn response(
     file_len: u64,
     ranges: Vec<ByteRange>,
 ) -> Result<GatewayHttpResponse> {
-    let content_type = static_content_type(target);
+    response_typed(target, file_len, ranges, static_content_type(target), true).await
+}
+
+pub(super) async fn response_typed(
+    target: &Path,
+    file_len: u64,
+    ranges: Vec<ByteRange>,
+    content_type: &str,
+    partial: bool,
+) -> Result<GatewayHttpResponse> {
     let mut response = GatewayHttpResponse::bytes(
-        StatusCode::PARTIAL_CONTENT,
+        if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        },
         content_type,
         Bytes::new(),
         "proxysss://static-range",
@@ -182,10 +195,12 @@ pub(super) async fn response(
     if ranges.len() == 1 {
         let range = ranges[0];
         length = range.end - range.start + 1;
-        response.headers.push((
-            CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {}-{}/{file_len}", range.start, range.end))?,
-        ));
+        if partial {
+            response.headers.push((
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {}-{}/{file_len}", range.start, range.end))?,
+            ));
+        }
         if length <= CHUNK_BYTES as u64 {
             file.seek(SeekFrom::Start(range.start)).await?;
             let mut data = vec![0_u8; length as usize];

@@ -11,6 +11,8 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 | `src/gateway.rs` | 监听器、HTTP 分发、上游池、缓存、健康状态、TCP/UDP 与管理 API |
 | `src/static_security.rs` | 静态源站令牌、真实路径边界、签名 URL 和目录规则 |
 | `src/static_hosts.rs` | 无分配的静态域名模式匹配、端口/IPv6 处理与字段校验 |
+| `src/filesystem_boundary.rs` | WebDAV/FileCloud 已有目标与新建目标父目录的真实路径边界检查 |
+| `src/file_download.rs` | 共享文件条件请求；WebDAV/FileCloud 的有界完整/Range 下载 |
 | `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
 | `src/http1_body.rs` | 原始 SSE 转换为 Hyper 响应前的有界 HTTP/1 正文解码 |
 | `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
@@ -23,7 +25,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 
 ## HTTP 请求路径
 
-配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。`static_sites` 同时匹配可选 `hosts` 与路径；单个 `webdav` 仍按路径匹配，没有内建 Basic auth 配置。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
+配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。`static_sites` 同时匹配可选 `hosts` 与路径；单个 `webdav` 按路径匹配，可通过 `auth.enabled/username/password` 开启内建 Basic 认证，认证先于路径检查和任何文件操作。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
 
 1. 公共 HTTP 默认监听 80，TLS/H2/H3 默认使用 443。accept 与握手由监听运行时负责，H2/H3 分别管理多路复用流。
 2. 判断协议与配置路由，处理内建服务、ACME challenge、管理 HTTPS/monitor。用户公共路由优先于欢迎页兜底；默认 `/` 仅显示 `Welcome to proxysss`、GitHub 与 GitHub Docs 链接。
@@ -38,6 +40,14 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 原始 SSE 转换为 TLS/HTTP2 下游响应前先按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB；长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件，完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding；移除编码头而保留压缩字节会破坏正文。
 
 ## CDN 和复杂下载
+
+WebDAV 与 FileCloud 使用共享文件系统边界检查：已有目标解析真实路径，新建目标解析最近存在的父目录后追加缺失部分；使用 symlink_metadata 识别悬空链接，不能用 exists 跳过它们。WebDAV 在阻塞任务池检查源路径、COPY/MOVE 目标及递归 COPY 的每个子项；越界、悬空链接、复制到自身/子目录或内部循环返回 403。COPY 以深度优先目录迭代器遍历，只保存当前祖先，允许根目录内部的有效链接；删除/移动仍使用原始路径，避免误删链接指向的文件。PROPFIND 和 FileCloud 列表/搜索隐藏不满足边界的子项。递归 COPY 不是事务，遇到后续错误时根目录内已完成的部分可能保留。
+
+这些检查要求配置根目录及其链接由可信运维管理，不是基于目录描述符的原子沙箱；检查与文件打开之间仍有时间窗口，不能据此允许不可信本地进程并发改写链接。文件服务的路径边界检查不进入普通 HTTP 反代、静态缓存或 TCP/UDP 转发路径。
+
+WebDAV/FileCloud 下载共用静态服务的条件请求规则与 Range 解析、缓冲池。完整小文件最多预读 64 KiB，大文件与多段响应按消费进度读取，每次最多 64 KiB，空闲池总计最多 8 MiB；取消或截断释放描述符与缓冲。HEAD 不读取正文且忽略 Range。FileCloud 只对 GET/HEAD 提供下载，认证下载返回 private, no-store；公开下载按 cdn_cache_secs 缓存，不给可覆盖文件自动添加 immutable。下载路径只解码一次，API/JSON 中的路径保留字面 + 与 %，中文文件名通过 filename* 编码。
+
+WebDAV PROPFIND 支持 Depth 0/1，以流式 XML 返回目录，不积累全部条目；目录的默认/infinity 深度返回 403 propfind-finite-depth。COPY 支持 Depth 0/infinity，MOVE 要求 infinity，Overwrite F 遇到已有目标返回 412；覆盖替换整个目标集合，创建返回 201、覆盖返回 204。缺少父集合返回 409，MKCOL 的非空请求体返回 415；跨服务器 Destination 返回 502。方法检查不等于完整 WebDAV 扩展支持，锁与自定义属性能力必须按实际实现声明。
 
 静态站点先按 YAML 顺序同时匹配 hosts/path，再进入授权与文件处理。多站点或配置 hosts 时，预热路由键由配置内站点序号和路径组成，H2 快照与连接缓存使用同一个键；相同路径在不同根目录不互相覆盖。单个无 hosts 站点继续借用路径作为键。热重载清空路由/H2 映射并重新预热，可变配置不使用连接级免策略缓存。文件正文仍按真实文件路径共享有界快照，站点授权、缓存响应头和条件处理独立执行。
 
@@ -100,3 +110,11 @@ admin.monitor 是独立 HTTPS 只读入口，使用专用密码与 monitor:read 
 QuickJS 与 swc_ts_fast_strip 内嵌进程，无外部 Node/Deno/tsc。routeHttp/routeTcp/routeUdp 与插件钩子负责可选业务扩展；核心边缘策略保持原生实现。主动健康覆盖 HTTP/TCP 和显式 UDP 探测，被动失败可隔离上游；watchdog 观察关键后台任务，metrics 暴露重启/失败计数。
 
 管理 HTML/CSS、内置文档和站点资源嵌入二进制。管理 `/docs` 与 `/docs.html` 经过管理传输检查；公开文档导航只链接 HTML。详细配置见 [配置指南](CONFIGURATION.md)，扩展见 [脚本指南](../ts-how-to-use.md)，交付顺序见 [验证与发布](VALIDATION.md)。
+
+## 流式协议与入站正文边界
+
+HTTP/1 原始上游响应使用共享分帧校验：拒绝冲突 Content-Length、TE/CL 共存和不支持的 Transfer-Encoding；跳过有界数量的信息响应，再转发最终响应。chunked 扫描先确认片段边界，再发送有效前缀，不把尾随的另一响应混入正文；固定长度或 chunked 提前 EOF 作为失败关闭，异常连接不能回池。
+
+HTTP 上游等待采用连接/响应头期限与逐帧正文空闲期限，持续 SSE、下载不受总时长限制，下游背压不消耗上游空闲预算。WebSocket 非 101 响应仍完整转发其固定长度、chunked 或 EOF 正文。具体配置见 [HTTP 正文边界](CONFIGURATION.md)。
+
+HTTP/2 的快速路径仅处理已经结束的入站正文，不能仅凭 GET 或缺少 Content-Length 推断无正文。HTTP/3 每个请求流独立驱动，慢上传/下载不会串行阻塞同连接其他请求；逐帧发送保持 QUIC 背压并保留响应 trailers，正文生产失败会重置流而非发送正常 FIN。HTTP/3 使用与其他 HTTP 路径相同的访问日志和错误装饰。入站正文具有单请求大小与空闲期限，失败正文不会进入业务分发；当前入站正文仍按请求缓冲，不宣称已实现大上传零拷贝。
