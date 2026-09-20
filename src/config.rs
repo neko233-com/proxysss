@@ -1110,6 +1110,8 @@ pub enum DomainTlsMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticSiteConfig {
     pub name: String,
+    #[serde(default)]
+    pub hosts: Vec<String>,
     #[serde(default = "default_static_path_prefix")]
     pub path_prefix: String,
     #[serde(default = "default_static_root")]
@@ -1771,6 +1773,14 @@ impl GatewayConfig {
 
         let mut static_names = HashSet::<String>::new();
         for site in &self.services.static_sites {
+            for host in &site.hosts {
+                if !crate::static_hosts::valid_pattern(host) {
+                    errors.push(format!(
+                        "services.static_sites.{}.hosts: invalid host pattern {host}",
+                        site.name
+                    ));
+                }
+            }
             if let Err(error) = crate::static_security::validate(site) {
                 errors.push(format!("services.static_sites.{}: {error}", site.name));
             }
@@ -2839,6 +2849,7 @@ impl Default for StaticSiteConfig {
     fn default() -> Self {
         Self {
             name: "public".to_string(),
+            hosts: Vec::new(),
             path_prefix: default_static_path_prefix(),
             root: default_static_root(),
             index_files: default_static_index_files(),

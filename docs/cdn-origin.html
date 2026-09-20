@@ -68,5 +68,6 @@ signature = base64url_no_padding(HMAC_SHA256(secret_utf8, message_utf8))</code><
 curl -I -H 'Range: bytes=0-15' http://127.0.0.1/assets/game.pak
 </code></pre>
 <p>这些下载行为由原生静态服务实现，无需脚本 API。反向代理下载保留上游响应语义。Linux 混合负载、Windows 功能与发布验收见 <a href="validation.html">验证指南</a>。</p>
-</section></main><script src="site.js?v=a6853f3b77dd" defer></script>
+</section><section class="panel" id="static-virtual-hosts"><h2>静态域名与缓存隔离</h2><p><code>services.static_sites[].hosts</code> 支持精确域名、IPv4、方括号 IPv6、<code>*.example.com</code> 和 <code>*</code>；大小写、请求端口与末尾根点不影响匹配。通配子域不包含裸域，需另列域名。省略或空数组接受全部 Host。按 YAML 顺序选择首个同时满足 hosts/path_prefix 的站点；缺文件返回该站点 404，不继续搜索其他根目录。</p><p>多站点预热路由、H2 快照与连接缓存按站点隔离，单个无 hosts 站点保留路径快缓存。配置重载后新请求使用新规则，已开始下载继续原响应。hosts 是路由条件，不是鉴权；源站令牌、签名和访问规则仍独立执行。</p><p>示例：仓库 examples/static-virtual-hosts.example.yaml。<a href="cdn-origin.html">查看 CDN 下载与安全策略</a></p></section>
+</main><script src="site.js?v=a6853f3b77dd" defer></script>
 </body></html>

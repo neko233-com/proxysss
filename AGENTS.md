@@ -34,6 +34,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
 - Static asset serving must cover HTML, CSS, JS, images, fonts, audio/video, CDN-origin assets, large-file streaming, and byte `Range` resumable downloads.
+- 静态 hosts/path 按 YAML 首个匹配项选站；多站点预热、H2 和连接缓存必须按站点隔离，同路径不得串根目录。单站点无 hosts 的默认快路径保持原有性能，改动必须覆盖 Host 切换、Range、sendfile 与热重载撤销域名。
 - 可变静态源文件不得作为跨请求的裸 mmap 正文交给 TLS/压缩；使用有界不可变快照。文件截断、删除、局部下载及 H2 连接缓存失效必须有回归覆盖，具体规则见 [CDN 下载](docs/CDN-ORIGIN.md)。
 - API gateway surfaces must cover HTTP/1.1, HTTP/2, gRPC-style requests, WebSocket reverse proxying, edge rate limiting, active/passive health, retry, weighted/canary upstreams, and circuit-breaker-style passive quarantine without making proxysss a business gateway.
 - SSE 快路径必须保持 HTTP 消息边界与正文编码：转换到 TLS/HTTP2 响应时解码上游 chunked，按 Content-Length/终止块结束，截断报错；不能把 chunk 标记/trailer 当作事件数据，不能移除未解压正文的 Content-Encoding。

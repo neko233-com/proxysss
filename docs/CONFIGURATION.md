@@ -85,7 +85,7 @@ services:
 
 ### 1.3 静态资源和 API 按路径分开
 
-适用场景：`/assets` 走静态目录，`/api` 继续走源站服务。当前 `static_sites` 按路径匹配，不支持 `hosts`；不要用无效字段假装实现了静态虚拟主机隔离。
+适用场景：`/assets` 走静态目录，`/api` 继续走源站服务。`static_sites[].hosts` 可按域名隔离静态根目录；省略或空数组表示接受所有 Host，匹配还需满足 path_prefix。
 
 ```yaml
 http:
@@ -94,6 +94,7 @@ http:
 services:
   static_sites:
     - name: homepage
+      hosts: [www.example.com]
       path_prefix: /assets
       root: ./www
       index_files: ["index.html"]

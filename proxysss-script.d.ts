@@ -6,6 +6,7 @@
  * CDN 源站鉴权与短期 URL 属于原生 services.static_sites.security，先于文件缓存/Range/304。
  * static-sign 从 YAML 读取密钥；脚本 API 不暴露 origin_token 或 signed_url.secret。
  * 原生静态站点不调用脚本路由钩子；业务 Referer/UA 规则应放在 CDN WAF 或脚本代理路由。
+ * services.static_sites[].hosts/path_prefix 在原生路径选站，多站点缓存隔离；Host 匹配不是鉴权。
  * 原生 Range 支持最多 16 段及有界流式下载，HEAD/条件请求由 Rust 处理，不新增脚本钩子。
  * 配置与安全边界：docs/cdn-origin.html。
  */

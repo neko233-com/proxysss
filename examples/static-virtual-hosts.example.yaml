@@ -1,0 +1,13 @@
+# 同一路径按域名隔离。按 YAML 顺序取首个同时匹配 hosts 与路径的站点。
+services:
+  static_sites:
+    - name: game-a-assets
+      hosts: [assets-a.example.com]
+      path_prefix: /assets
+      root: ./game-a-public
+      index_files: [index.html]
+    - name: game-b-assets
+      hosts: [assets-b.example.com, '*.game-b.example.com']
+      path_prefix: /assets
+      root: ./game-b-public
+      index_files: [index.html]

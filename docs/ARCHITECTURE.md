@@ -10,6 +10,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 | `src/config.rs`、`src/config/performance.rs` | 单 YAML 配置、默认值、校验、重载指纹和流量 profile |
 | `src/gateway.rs` | 监听器、HTTP 分发、上游池、缓存、健康状态、TCP/UDP 与管理 API |
 | `src/static_security.rs` | 静态源站令牌、真实路径边界、签名 URL 和目录规则 |
+| `src/static_hosts.rs` | 无分配的静态域名模式匹配、端口/IPv6 处理与字段校验 |
 | `src/static_ranges.rs` | Range 解析、重叠合并、单段读取与多段流式下载 |
 | `src/http1_body.rs` | 原始 SSE 转换为 Hyper 响应前的有界 HTTP/1 正文解码 |
 | `src/stream_reactor.rs`、`src/sendfile_reactor.rs` | Linux 明文实时流 epoll relay、大文件 sendfile 作业与完成通知 |
@@ -22,7 +23,7 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 
 ## HTTP 请求路径
 
-配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。当前 `static_sites` 和单个 `webdav` 按路径匹配，没有域名隔离字段；WebDAV 没有内建 Basic auth 配置。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
+配置边界：`reverse_proxy.routes` 用 `hosts`，`domain_routes` 用 `domains`，两者每条路由都直接指向 `upstream`。后者不是引用其他服务的嵌套路由编排器。`static_sites` 同时匹配可选 `hosts` 与路径；单个 `webdav` 仍按路径匹配，没有内建 Basic auth 配置。具体可执行片段与边界见 [配置指南](CONFIGURATION.md)，不能将忽略的未知字段视为能力实现。
 
 1. 公共 HTTP 默认监听 80，TLS/H2/H3 默认使用 443。accept 与握手由监听运行时负责，H2/H3 分别管理多路复用流。
 2. 判断协议与配置路由，处理内建服务、ACME challenge、管理 HTTPS/monitor。用户公共路由优先于欢迎页兜底；默认 `/` 仅显示 `Welcome to proxysss`、GitHub 与 GitHub Docs 链接。
@@ -37,6 +38,8 @@ proxysss 用单个 Rust 二进制承担通用边缘网关职责：协议终止�
 原始 SSE 转换为 TLS/HTTP2 下游响应前先按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB；长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件，完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding；移除编码头而保留压缩字节会破坏正文。
 
 ## CDN 和复杂下载
+
+静态站点先按 YAML 顺序同时匹配 hosts/path，再进入授权与文件处理。多站点或配置 hosts 时，预热路由键由配置内站点序号和路径组成，H2 快照与连接缓存使用同一个键；相同路径在不同根目录不互相覆盖。单个无 hosts 站点继续借用路径作为键。热重载清空路由/H2 映射并重新预热，可变配置不使用连接级免策略缓存。文件正文仍按真实文件路径共享有界快照，站点授权、缓存响应头和条件处理独立执行。
 
 完整小对象使用有界缓存和预构建 HTTP/1 keep-alive 响应，大文件流式发送；Linux 合适的明文完整响应使用 sendfile。Range 按偏移读取所需字节，不读取整个原文件。HEAD 忽略 Range，只返回完整表示元数据。
 

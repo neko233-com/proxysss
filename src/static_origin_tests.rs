@@ -272,6 +272,7 @@ async fn preload_excludes_hidden_and_encodes_names() {
     let h2 = DashMap::new();
     preload_static_site_fast_lane_cache(
         &site,
+        None,
         RuntimePerformanceTrafficProfile::Small,
         u64::MAX,
         &DashMap::new(),
@@ -320,6 +321,7 @@ async fn static_symlinks_cannot_leave_root_in_dispatch_preload_or_listing() {
     let routes = DashMap::new();
     preload_static_site_fast_lane_cache(
         &site,
+        None,
         RuntimePerformanceTrafficProfile::Small,
         u64::MAX,
         &DashMap::new(),

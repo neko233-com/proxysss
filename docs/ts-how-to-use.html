@@ -703,6 +703,7 @@ export default plugin;</code></pre>
 <section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
 <section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 <section class="panel" id="complex-downloads"><h2>游戏资源与复杂下载</h2><p>原生静态服务支持单段和最多 16 段 Range，合并重叠区间并流式发送 multipart/byteranges。HEAD 忽略 Range；条件失败返回 412，全部越界返回 416。大文件局部读取不载入整文件，取消释放资源。脚本 API 无需变化。</p><p><a href="cdn-origin.html#complex-downloads">下载语义与限制</a> · <a href="validation.html">Linux 优先验证与发布流程</a></p></section>
+<section class="panel" id="static-virtual-hosts"><h2>静态虚拟主机</h2><p>使用 services.static_sites[].hosts 与 path_prefix 按域名分发资源，多站点预热与连接缓存保持隔离。匹配语法、优先级、重载和鉴权边界统一见 <a href="cdn-origin.html#static-virtual-hosts">CDN 域名隔离指南</a>。</p></section>
 </main>
     </div>
 

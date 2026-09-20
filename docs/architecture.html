@@ -643,7 +643,7 @@
           <div class="section-head">
             <div>
               <div class="kicker">HTTP flow</div>
-              <h2>一条 HTTP 请求怎么走</h2><p>配置边界：reverse_proxy.routes 用 hosts，domain_routes 用 domains，每条路由直接指向 upstream；后者不引用静态或 WebDAV 服务。当前 static_sites 与单个 webdav 按路径匹配，没有域名隔离字段，WebDAV 也没有内建 Basic auth 配置。<a href="configuration.html#protocol-examples">查看真实配置与限制</a>。</p>
+              <h2>一条 HTTP 请求怎么走</h2><p>配置边界：reverse_proxy.routes 用 hosts，domain_routes 用 domains，每条路由直接指向 upstream；后者不引用静态或 WebDAV 服务。static_sites 同时匹配可选 hosts 与路径；单个 webdav 仍按路径匹配，没有内建 Basic auth 配置。<a href="configuration.html#protocol-examples">查看真实配置与限制</a>。</p>
             </div>
             <p class="subtle">这是大多数人最先要理解的路径，因为它串起了反向代理、AI SSE、静态站点和脚本扩展。</p>
           </div>
@@ -974,6 +974,7 @@ udp:
 <section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
 <section class="panel" id="complex-downloads"><p>热正文缓存持有自有不可变 Bytes 快照，单对象读取最多 32 MiB，不直接 mmap 可变文件；源文件截断不会让 TLS/压缩访问失效映射。2 秒 freshness 与后台刷新期间可继续发送旧快照，H2 删除/重验证失败会使连接快照失效并回到正常分发。资源发布仍推荐原子替换。</p><p>正文缓存使用原子预留的 256 MiB 上限；进程内全部静态快照（含正在填充、已淘汰但响应仍引用的正文）另受 320 MiB 硬上限约束。最后一个 Bytes 引用释放时归还预算，预算耗尽的冷下载立即回退流式读取，预热跳过该对象。缓存淘汰只扣减一次，填充协调锁随成功、失败或取消清理；缓存命中不重新争用预算。此上限不包括 socket、TLS、压缩输出与其他网关内存。</p><h2>游戏资源与复杂下载</h2><p>原生静态服务支持单段和最多 16 段 Range，合并重叠区间并流式发送 multipart/byteranges。HEAD 忽略 Range；条件失败返回 412，全部越界返回 416。大文件局部读取不载入整文件，取消释放资源。脚本 API 无需变化。</p><p><a href="cdn-origin.html#complex-downloads">下载语义与限制</a> · <a href="validation.html">Linux 优先验证与发布流程</a></p></section>
 <section class="panel" id="sse-response-framing"><h2>SSE 消息边界与资源释放</h2><p><code>src/http1_body.rs</code> 在原始 SSE 转换为 TLS/HTTP2 响应前按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB。长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。</p><p>每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件；完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding，避免移除编码头后让客户端误读压缩字节。<a href="configuration.html#sse-framing">配置与使用边界</a></p></section>
+<section class="panel" id="static-virtual-hosts"><h2>静态站点与缓存所有权</h2><p>按 hosts/path 首个匹配项选站后执行授权。多站点或配置 hosts 时，预热路由键由站点序号与路径组成；H2 快照和连接缓存使用相同键，避免同路径覆盖。单个无 hosts 站点继续借用路径作为键。正文按真实文件路径共享有界快照，但站点授权、响应头与条件处理独立执行。重载清空路由/H2 映射后重新预热；可变配置不使用连接级免策略缓存。</p><p><a href="cdn-origin.html#static-virtual-hosts">域名配置与安全边界</a></p></section>
 </main>
     </div>
 

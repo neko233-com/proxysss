@@ -2,6 +2,7 @@
 
 ## v1.3.9 - 2026-09-09
 
+- 新增静态站点 hosts 匹配（精确、通配子域、IPv4/IPv6）与多站点缓存隔离；同路径按 YAML 首个匹配站点解析，预热、HTTP/1 keep-alive、H2 快照、Range 与 Linux sendfile 不跨站复用资源，支持热重载撤销域名。
 - 修正配置指南中无效的反代、静态、WebDAV、TCP/UDP、权重/限流、DNS-01 和管理 token 示例；Markdown/HTML 示例统一通过真实配置类型与逐字段回读测试，避免未知字段静默失效。
 - 修复原始 SSE 向 TLS/HTTP2 转换时泄漏 chunked 分块字节、等待 keep-alive EOF 和丢失上游 Content-Encoding 的问题；有界解码消息边界，保留压缩正文元数据，截断/非法分块不再伪装为完整响应。同步修正 AI/SSE 文档中未实现的配置字段。
 - 修复 Linux 原生 sendfile 的取消清理：HTTP 等待任务退出后主动唤醒 owner 并释放后台 socket/file 副本，避免客户端保持连接但停止读取时遗留作业；使用每 owner 有界无锁通知，普通完成不扫描任务表。

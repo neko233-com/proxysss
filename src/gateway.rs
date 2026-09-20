@@ -2705,9 +2705,10 @@ impl Gateway {
         let profile = config.runtime.performance.traffic_profile;
         let sendfile_threshold = static_sendfile_fast_path_threshold_bytes(config);
         let mut preloaded = 0_usize;
-        for site in &config.services.static_sites {
+        for (site_index, site) in config.services.static_sites.iter().enumerate() {
             match preload_static_site_fast_lane_cache(
                 site,
+                static_cache_namespaced(config).then_some(site_index),
                 profile,
                 sendfile_threshold,
                 &self.static_file_cache,
@@ -5708,9 +5709,14 @@ impl Gateway {
                 }
                 continue;
             }
+            let Some(route_key) =
+                static_route_cache_key(config, request.host.unwrap_or(""), request.path)
+            else {
+                break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+            };
             let cached_candidate = self
                 .static_route_cache
-                .get(request.path)
+                .get(route_key.as_ref())
                 .map(|target| target.clone())
                 .and_then(|target| {
                     stale_cached_static_file_candidate(
@@ -6037,9 +6043,14 @@ impl Gateway {
             let Some(request) = parse_static_fast_path_request(&prefix[..head_end]) else {
                 return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
             };
+            let Some(route_key) =
+                static_route_cache_key(config, request.host.unwrap_or(""), request.path)
+            else {
+                return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
+            };
             let Some(target) = self
                 .static_route_cache
-                .get(request.path)
+                .get(route_key.as_ref())
                 .map(|target| target.clone())
             else {
                 return Ok(TlsStaticFastLaneAttempt::Fallback(prefix.freeze()));
@@ -8180,7 +8191,13 @@ impl Gateway {
             && !request.headers().contains_key(RANGE)
             && !monitoring_path_matches(&self.bootstrap_config.monitoring, request.uri().path())
         {
-            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
+            if let Some(target) = static_route_cache_key(
+                &self.bootstrap_config,
+                static_request_host(request.headers(), request.uri()),
+                request.uri().path(),
+            )
+            .and_then(|key| self.static_route_cache.get(key.as_ref()))
+            {
                 if let Some(cached) = cached_static_file_response_stale_while_revalidate(
                     target.as_path(),
                     method,
@@ -8213,12 +8230,13 @@ impl Gateway {
             return Ok(None);
         }
 
-        let Some(site) = config
-            .services
-            .static_sites
-            .iter()
-            .find(|site| static_site_path_matches(site, request.uri().path()))
-        else {
+        let Some(site) = config.services.static_sites.iter().find(|site| {
+            static_site_matches(
+                site,
+                static_request_host(request.headers(), request.uri()),
+                request.uri().path(),
+            )
+        }) else {
             return Ok(None);
         };
 
@@ -8229,7 +8247,13 @@ impl Gateway {
         // preserves hot-update correctness while removing a metadata syscall
         // from every ordinary H2 request.
         if !request.headers().contains_key(RANGE) {
-            if let Some(target) = self.static_route_cache.get(request.uri().path()) {
+            if let Some(target) = static_route_cache_key(
+                config,
+                static_request_host(request.headers(), request.uri()),
+                request.uri().path(),
+            )
+            .and_then(|key| self.static_route_cache.get(key.as_ref()))
+            {
                 if let Some(cached) = cached_static_file_response_stale_while_revalidate(
                     target.as_path(),
                     method,
@@ -8292,20 +8316,25 @@ impl Gateway {
             return None;
         }
 
+        let route_key = static_route_cache_key(
+            &self.bootstrap_config,
+            static_request_host(request.headers(), request.uri()),
+            request.uri().path(),
+        )?;
         if let Some(response) =
-            self.try_h2_cached_static_response(request.uri().path(), connection_cache)
+            self.try_h2_cached_static_response(route_key.as_ref(), connection_cache)
         {
             return Some(response);
         }
         let snapshots = self.h2_static_response_cache.load();
         if let Some(cached) = snapshots
-            .get(request.uri().path())
+            .get(route_key.as_ref())
             .filter(|cached| !cached.freshness.is_stale())
         {
             return Some(cached.response());
         }
 
-        let target = self.static_route_cache.get(request.uri().path())?;
+        let target = self.static_route_cache.get(route_key.as_ref())?;
         let cached = cached_static_file_response_stale_while_revalidate(
             target.as_path(),
             method,
@@ -8718,12 +8747,10 @@ impl Gateway {
             );
         }
 
-        if let Some(site) = state
-            .config
-            .services
-            .static_sites
-            .iter()
-            .find(|site| static_site_path_matches(site, uri.path()))
+        if let Some(site) =
+            state.config.services.static_sites.iter().find(|site| {
+                static_site_matches(site, static_request_host(&headers, &uri), uri.path())
+            })
         {
             if !crate::static_security::site_peer_allowed(site, remote_addr.ip()) {
                 return Ok(static_denied());
@@ -12431,8 +12458,12 @@ async fn resolve_large_static_fast_path_candidate(
     static_file_load_locks: &DashMap<String, Arc<TokioMutex<()>>>,
 ) -> Result<Option<StaticFastPathCandidate>> {
     let mut matched_site = None;
+    let Some(route_key) = static_route_cache_key(config, request.host.unwrap_or(""), request.path)
+    else {
+        return Ok(None);
+    };
     let route_cached_target = static_route_cache
-        .get(request.path)
+        .get(route_key.as_ref())
         .map(|target| target.clone());
     if route_cached_target.is_none() || http_to_https_redirect_can_apply(config) {
         let uri = request
@@ -12456,7 +12487,7 @@ async fn resolve_large_static_fast_path_candidate(
             .services
             .static_sites
             .iter()
-            .find(|site| static_site_path_matches(site, request.path))
+            .find(|site| static_site_matches(site, request.host.unwrap_or(""), request.path))
         else {
             return Ok(None);
         };
@@ -20027,6 +20058,7 @@ fn cached_static_sendfile(
 #[allow(clippy::too_many_arguments)]
 async fn preload_static_site_fast_lane_cache(
     site: &StaticSiteConfig,
+    namespace: Option<usize>,
     traffic_profile: RuntimePerformanceTrafficProfile,
     sendfile_threshold: u64,
     static_file_cache: &DashMap<String, CachedStaticFile>,
@@ -20080,7 +20112,8 @@ async fn preload_static_site_fast_lane_cache(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("failed reading static preload metadata"),
         };
-        static_route_cache.insert(request_path.clone(), target.clone());
+        let route_key = static_cache_key(namespace, &request_path).into_owned();
+        static_route_cache.insert(route_key.clone(), target.clone());
 
         let preload_body_max_bytes = static_preload_body_max_bytes(traffic_profile);
         let existing_body_bytes = static_file_cache
@@ -20119,7 +20152,7 @@ async fn preload_static_site_fast_lane_cache(
                 Err(error) => return Err(error),
             };
             h2_static_route_cache.insert(
-                request_path,
+                route_key,
                 Arc::new(CachedH2StaticRoute {
                     target: target.clone(),
                     content_type: HeaderValue::from_static(static_content_type(&target)),
@@ -20258,6 +20291,50 @@ async fn static_autoindex(
         HeaderValue::from_static("no-referrer"),
     ));
     Ok(response)
+}
+
+fn static_cache_namespaced(config: &GatewayConfig) -> bool {
+    config.services.static_sites.len() != 1 || !config.services.static_sites[0].hosts.is_empty()
+}
+
+fn static_cache_key(namespace: Option<usize>, path: &str) -> Cow<'_, str> {
+    match namespace {
+        Some(index) => Cow::Owned(format!("{index}:{path}")),
+        None => Cow::Borrowed(path),
+    }
+}
+
+fn static_request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> &'a str {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| uri.authority().map(|authority| authority.as_str()))
+        .unwrap_or("")
+}
+
+fn static_route_cache_key<'a>(
+    config: &GatewayConfig,
+    host: &str,
+    path: &'a str,
+) -> Option<Cow<'a, str>> {
+    if !static_cache_namespaced(config) {
+        return Some(Cow::Borrowed(path));
+    }
+    let index = config
+        .services
+        .static_sites
+        .iter()
+        .position(|site| static_site_matches(site, host, path))?;
+    Some(static_cache_key(Some(index), path))
+}
+
+fn static_site_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
+    static_site_path_matches(site, path)
+        && (site.hosts.is_empty()
+            || site
+                .hosts
+                .iter()
+                .any(|pattern| crate::static_hosts::matches(pattern, host)))
 }
 
 fn static_site_path_matches(site: &StaticSiteConfig, path: &str) -> bool {

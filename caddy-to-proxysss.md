@@ -133,7 +133,8 @@ services:
   static_sites:
     - name: homepage
       hosts: ["www.example.com"]
-      root_dir: "/srv/www"
+      path_prefix: /
+      root: "/srv/www"
       index_files: ["index.html"]
 ```
 
@@ -425,3 +426,5 @@ proxysss 的性能优化和迁移结论都要遵循同一条纪律：
 ## 原生复杂下载
 
 静态服务支持单段/多段 Range（最多 16 段）、重叠合并、有界流式读取、HEAD 与条件请求优先级，无需脚本钩子；反代下载由上游决定表示语义。详见 [CDN 下载说明](docs/CDN-ORIGIN.md)。
+
+静态域名入口对应 services.static_sites[].hosts，目录字段为 root，根站点显式设置 path_prefix: /。多站点缓存按站点隔离，通配子域不包含裸域。见 [CDN 下载](docs/CDN-ORIGIN.md)。

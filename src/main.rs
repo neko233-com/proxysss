@@ -15,6 +15,7 @@ mod security;
 mod security_guidance;
 #[cfg(target_os = "linux")]
 mod sendfile_reactor;
+mod static_hosts;
 mod static_security;
 #[cfg(target_os = "linux")]
 mod stream_reactor;
@@ -323,7 +324,7 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "static files",
-        "built-in services.static_sites runtime for HTML/CSS/JS/images/fonts/audio/video, GET/HEAD, index files, optional autoindex, large-file streaming, and HTTP Range downloads",
+        "built-in services.static_sites with optional hosts isolation and site-scoped warm caches for HTML/CSS/JS/images/fonts/audio/video, GET/HEAD, index files, optional autoindex, large-file streaming, and HTTP Range downloads",
     ),
     (
         "static origin security",
@@ -529,7 +530,7 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "static file service",
         status: ParityStatus::Supported,
-        evidence: "services.static_sites supports GET/HEAD, index files, autoindex, bounded small-file cache, large-file streaming, and byte-range resumable downloads",
+        evidence: "services.static_sites supports hosts/path matching, isolated warm caches, GET/HEAD, index files, autoindex, bounded small-file cache, large-file streaming, and byte-range resumable downloads",
         next_gap: "",
     },
     NginxParityItem {
@@ -1704,8 +1705,9 @@ fn render_route_topology(config: &GatewayConfig) -> String {
     } else {
         for site in &config.services.static_sites {
             output.push_str(&format!(
-                "{} path={} root={} autoindex={} hide_dotfiles={} origin_token_configured={} signed_url={} peer_rules={} rate_limit={}\n",
+                "{} hosts={} path={} root={} autoindex={} hide_dotfiles={} origin_token_configured={} signed_url={} peer_rules={} rate_limit={}\n",
                 site.name,
+                if site.hosts.is_empty() { "*".to_string() } else { site.hosts.join(",") },
                 site.path_prefix,
                 site.root.display(),
                 site.autoindex,
@@ -1820,7 +1822,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
     output.push_str("main extension script from script.entry\n");
     output.push_str("auto-loaded plugin scripts from plugins.auto_load_dir\n");
     output.push_str("reverse_proxy routes\n");
-    output.push_str("static_sites (origin authorization, signed URL, safe autoindex, rate limit and cache policy)\n");
+    output.push_str("static_sites (hosts/path isolation, origin authorization, signed URL, safe autoindex, rate limit and cache policy)\n");
     output.push_str("webdav settings\n");
     output.push_str("ftp upstream when services.ftp listener identity is unchanged\n");
 
@@ -2586,7 +2588,11 @@ mod tests {
         assert!(topology.contains("plain=0.0.0.0:80"));
         assert!(topology.contains("tls=0.0.0.0:443"));
         assert!(topology.contains("api hosts=api.example.com path=/api"));
-        assert!(topology.contains("public path=/assets"));
+        assert!(topology.contains("public hosts=* path=/assets"));
+        config.services.static_sites[0].hosts = vec!["assets.example.com".to_string()];
+        assert!(
+            render_route_topology(&config).contains("public hosts=assets.example.com path=/assets")
+        );
         assert!(topology.contains("[webdav]"));
         assert!(topology.contains("[access_control]"));
         assert!(topology.contains("deny=203.0.113.0/24"));

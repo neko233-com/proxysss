@@ -180,7 +180,8 @@ services:
   static_sites:
     - name: homepage
       hosts: ["www.example.com"]
-      root_dir: "/srv/www"
+      path_prefix: /
+      root: "/srv/www"
       index_files: ["index.html"]
 ```
 
@@ -442,3 +443,5 @@ proxysss 的迁移证明应该看 Linux mixed-load：CDN/static、reverse proxy�
 ## 原生复杂下载
 
 静态服务支持单段/多段 Range（最多 16 段）、重叠合并、有界流式读取、HEAD 与条件请求优先级，无需脚本钩子；反代下载由上游决定表示语义。详见 [CDN 下载说明](docs/CDN-ORIGIN.md)。
+
+静态 server_name 对应 services.static_sites[].hosts，目录使用 root。通配子域不包含裸域；按 YAML 首个 hosts/path 匹配项选站，缓存按站点隔离。见 [CDN 下载](docs/CDN-ORIGIN.md)。
