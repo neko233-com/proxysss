@@ -28,8 +28,6 @@ const REGISTRATION_QUEUE_CAPACITY: usize = 4_096;
 const EVENT_BATCH: usize = 1_024;
 const REGISTRATION_BATCH: usize = 256;
 const WAKE_TOKEN: u64 = u64::MAX;
-pub(crate) const SHARED_SEND_BYTES: u64 = 1024 * 1024;
-const SHARED_ADMISSION_BATCH: usize = 32;
 
 pub(crate) struct SendfileCompletion {
     pub(crate) bytes: u64,
@@ -128,82 +126,13 @@ impl SendfileTable {
     }
 }
 
-pub(crate) struct ReactorWorker {
+struct ReactorWorker {
     registrations: ArrayQueue<SendfileJob>,
     cancellations: ArrayQueue<RawFd>,
     sweep_cancelled: AtomicBool,
     wake_fd: RawFd,
 }
 
-impl ReactorWorker {
-    pub(crate) fn shared(wake_fd: RawFd) -> Arc<Self> {
-        Arc::new(Self {
-            registrations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
-            cancellations: ArrayQueue::new(REGISTRATION_QUEUE_CAPACITY),
-            sweep_cancelled: AtomicBool::new(false),
-            wake_fd,
-        })
-    }
-}
-
-/// Download state owned by the same epoll loop as realtime sockets. There is
-/// no second ready queue: EPOLLOUT gets one bounded sendfile turn in the shared
-/// kernel ready order. A still-writable descriptor remains level-triggered;
-/// EAGAIN removes it from runnable work until the socket can make progress.
-#[derive(Default)]
-pub(crate) struct SharedDownloads {
-    jobs: SendfileTable,
-}
-
-impl SharedDownloads {
-    pub(crate) fn on_event(&mut self, epoll_fd: RawFd, event: &libc::epoll_event) -> bool {
-        let fd = event.u64 as RawFd;
-        if !self.jobs.contains(fd) {
-            return false;
-        }
-        let flags = event.events as i32;
-        let result = if flags & (libc::EPOLLERR | libc::EPOLLHUP) != 0 {
-            DriveResult::Complete(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "sendfile client socket closed",
-            )))
-        } else if flags & libc::EPOLLOUT != 0 {
-            drive_job(&mut self.jobs, fd)
-        } else {
-            DriveResult::Pending
-        };
-        if let DriveResult::Complete(result) = result {
-            complete_job(epoll_fd, &mut self.jobs, fd, result);
-        }
-        true
-    }
-
-    // Install only after every cached event was consumed, including events for
-    // relay fds. Admission itself performs no sends: reconnect bursts join the
-    // ready set rather than consuming many quanta ahead of established work.
-    pub(crate) fn on_wake(&mut self, epoll_fd: RawFd, worker: &ReactorWorker) {
-        cancel_abandoned_jobs(epoll_fd, &mut self.jobs, worker);
-        for _ in 0..SHARED_ADMISSION_BATCH {
-            let Some(mut job) = worker.registrations.pop() else {
-                break;
-            };
-            job.max_chunk_bytes = SHARED_SEND_BYTES;
-            register_job_inner(epoll_fd, &mut self.jobs, job, false);
-        }
-        if !worker.registrations.is_empty() {
-            wake(worker.wake_fd);
-        }
-    }
-
-    pub(crate) fn fail(&mut self, epoll_fd: RawFd, worker: &ReactorWorker) {
-        fail_all_jobs(epoll_fd, &mut self.jobs, "shared realtime epoll failed");
-        while let Some(job) = worker.registrations.pop() {
-            let _ = job
-                .completion
-                .send(Err(io::Error::other("shared realtime epoll failed")));
-        }
-    }
-}
 struct Reactors {
     workers: Vec<Arc<ReactorWorker>>,
     worker_cpus: Vec<Option<usize>>,
@@ -232,32 +161,6 @@ pub(crate) fn dispatch(
     active_workers: usize,
     scheduler_nice: i32,
 ) -> io::Result<PendingSendfile> {
-    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
-    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
-    let index = preferred_worker_index_limited(
-        &reactors.worker_cpus,
-        current_cpu(),
-        fallback,
-        active_workers,
-    );
-    dispatch_to_worker(
-        &reactors.workers[index],
-        socket_fd,
-        file_fd,
-        offset,
-        len,
-        max_chunk_bytes,
-    )
-}
-
-pub(crate) fn dispatch_to_worker(
-    worker: &Arc<ReactorWorker>,
-    socket_fd: RawFd,
-    file_fd: RawFd,
-    offset: u64,
-    len: u64,
-    max_chunk_bytes: u64,
-) -> io::Result<PendingSendfile> {
     if len == 0 {
         let (sender, receiver) = oneshot::channel();
         let _ = sender.send(Ok(SendfileCompletion {
@@ -269,6 +172,7 @@ pub(crate) fn dispatch_to_worker(
             cancellation: None,
         });
     }
+    let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
     let socket = duplicate_stream(socket_fd)?;
     let reactor_fd = socket.as_raw_fd();
     let file = duplicate_file(file_fd)?;
@@ -281,6 +185,15 @@ pub(crate) fn dispatch_to_worker(
         max_chunk_bytes: max_chunk_bytes.max(1),
         completion: sender,
     };
+    let fallback = reactors.next.fetch_add(1, Ordering::Relaxed);
+    let current_cpu = current_cpu();
+    let index = preferred_worker_index_limited(
+        &reactors.worker_cpus,
+        current_cpu,
+        fallback,
+        active_workers,
+    );
+    let worker = &reactors.workers[index];
     worker
         .registrations
         .push(job)
@@ -493,15 +406,6 @@ fn register_pending_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &Rea
 }
 
 fn register_job(epoll_fd: RawFd, jobs: &mut SendfileTable, job: SendfileJob) {
-    register_job_inner(epoll_fd, jobs, job, true);
-}
-
-fn register_job_inner(
-    epoll_fd: RawFd,
-    jobs: &mut SendfileTable,
-    job: SendfileJob,
-    immediate: bool,
-) {
     if job.completion.is_closed() {
         return;
     }
@@ -518,11 +422,9 @@ fn register_job_inner(
             completion: Some(job.completion),
         },
     );
-    if immediate {
-        if let DriveResult::Complete(result) = drive_job(jobs, fd) {
-            finish_unregistered_job(jobs, fd, result);
-            return;
-        }
+    if let DriveResult::Complete(result) = drive_job(jobs, fd) {
+        finish_unregistered_job(jobs, fd, result);
+        return;
     }
 
     let mut event = libc::epoll_event {
@@ -596,14 +498,8 @@ fn cancelled_download() -> io::Error {
 }
 
 fn cancel_abandoned_jobs(epoll_fd: RawFd, jobs: &mut SendfileTable, worker: &ReactorWorker) {
-    for _ in 0..REGISTRATION_BATCH {
-        let Some(fd) = worker.cancellations.pop() else {
-            break;
-        };
+    while let Some(fd) = worker.cancellations.pop() {
         cancel_abandoned_job(epoll_fd, jobs, fd);
-    }
-    if !worker.cancellations.is_empty() {
-        wake(worker.wake_fd);
     }
     // A cancellation burst cannot grow the queue indefinitely. Only overflow
     // triggers this scan; normal completions and cancellation use indexed slots.
@@ -713,85 +609,6 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::time::Duration;
 
-    #[test]
-    fn every_ready_download_advances_once_and_cancel_releases_epoll_registration() {
-        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        assert!(wake_fd >= 0);
-        let _wake = unsafe { OwnedFd::from_raw_fd(wake_fd) };
-        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(epoll_fd >= 0);
-        let _epoll = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
-        let worker = ReactorWorker::shared(wake_fd);
-        let mut downloads = SharedDownloads::default();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let name = CString::new("proxysss-shared-ready-test").unwrap();
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0);
-        let file = unsafe { File::from_raw_fd(fd) };
-        file.set_len(4 * SHARED_SEND_BYTES).unwrap();
-        let mut clients = Vec::new();
-        let mut pending = Vec::new();
-        let mut fds = Vec::new();
-        for _ in 0..3 {
-            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            client.set_nonblocking(true).unwrap();
-            let (server, _) = listener.accept().unwrap();
-            let future = dispatch_to_worker(
-                &worker,
-                server.as_raw_fd(),
-                file.as_raw_fd(),
-                0,
-                4 * SHARED_SEND_BYTES,
-                4 * SHARED_SEND_BYTES,
-            )
-            .unwrap();
-            fds.push(future.cancellation.as_ref().unwrap().1);
-            pending.push(future);
-            clients.push(client);
-        }
-        // A cached event for a now-reused number precedes admission.
-        assert!(!downloads.on_event(
-            epoll_fd,
-            &libc::epoll_event {
-                events: libc::EPOLLHUP as u32,
-                u64: fds[0] as u64,
-            }
-        ));
-        downloads.on_wake(epoll_fd, &worker);
-        for (client, fd) in clients.iter_mut().zip(&fds) {
-            assert_eq!(downloads.jobs.get_mut(*fd).unwrap().sent, 0);
-            assert_eq!(
-                client.read(&mut [0; 1]).unwrap_err().kind(),
-                io::ErrorKind::WouldBlock
-            );
-        }
-        // Real kernel readiness must give all three downloads a bounded turn,
-        // not just the head of a separate once-per-relay-batch download queue.
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
-        let ready = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 8, 1000) };
-        assert_eq!(ready, 3);
-        for event in &events[..ready as usize] {
-            assert!(downloads.on_event(epoll_fd, event));
-        }
-        for fd in &fds {
-            let sent = downloads.jobs.get_mut(*fd).unwrap().sent;
-            assert!(
-                sent > 0 && sent <= SHARED_SEND_BYTES,
-                "unexpected progress {sent}"
-            );
-        }
-        drop(pending.remove(1));
-        downloads.on_wake(epoll_fd, &worker);
-        assert!(!downloads.jobs.contains(fds[1]));
-        assert!(downloads.jobs.contains(fds[0]) && downloads.jobs.contains(fds[2]));
-        drop(pending);
-        downloads.on_wake(epoll_fd, &worker);
-        assert!(downloads.jobs.active_fds().is_empty());
-        assert_eq!(
-            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 8, 0) },
-            0
-        );
-    }
     #[test]
     fn admission_ignores_cached_hup_for_reused_descriptor_and_bounds_queued_work() {
         let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
