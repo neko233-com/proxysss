@@ -2,7 +2,15 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
-## 2026-09-21：下载收包入口归属，未证明 backlog 根因
+## 2026-09-21：安全状态生命周期修复，性能目标仍未完成
+
+提交 7c14777 修复过期安全状态长期积累、黑名单旧读者误删并发续封、超大封禁秒数导致 Instant 溢出，以及并发登录失败重置活动锁定的问题；DDoS/黑名单使用 IpAddr 键，独立控制循环回收过期数据。Ubuntu 24.04 两轮各 382 项 Rust 测试、Clippy/格式、Go/文档、CPU 约束及 CLI 场景全部通过。新增真实管理 API 测试确认 u64::MAX 封禁后继续服务，并在关闭热重载和主动健康时自动清理过期状态；单元回归同时覆盖有效窗口保留、到期边界和并发续封。
+
+同提交无插桩标准 6/6/12 核完整混合矩阵仍未通过。198 个原始样本零错误，132 个等负载样本最低完成率 0.995851；1×/2×/4× 大文件吞吐比为 0.799/0.641/0.602，小静态 p99 为 3.197/3.853/3.164。4× WebSocket p50/p95/p99 为 1.140/1.153/1.166，游戏/普通 TCP 也有延迟门槛失败。内存 current/peak bytes 为 proxysss 91848704/296177664、nginx 208363520/412028928。当前及此前基线都未全过，单轮波动不证明此次正确性修复改善或导致既有性能差距。
+
+18 秒活跃、165 秒矩阵 wall、334 秒总耗时。原始工件 `.benchmark/direct-ubuntu24-amd64/goal-security-state/`，功能与审计工件 `.benchmark/security-state-functional/`；固定 Linux 二进制 SHA256 为 `5992f6b77e4448a7737a875738a24596de1d1b84121da790aa03f1363ab84498`。功能修复保留，性能结果不作为发布通过证据；未执行 Windows、push 或发布。
+
+## 2026-09-21：下载收包入口与 backlog 调用路径诊断
 
 后续固定同一二进制增加 socket 用户持有状态和每线程每 128 次入口一次的内核栈采样。18 波/504 条连接均有效，所有权计数、skb 字节、直方图及采样序列严格一致。下载入口的 owned=1 比例均至少 99.85%，字节近乎 100%；双方全部采样下载调用者都是 socket backlog，网关端 ACK 大小入口则是未持有状态下的直接 IPv4 路径。该结果确认先前看到的客户端上下文工作路径，但“存在 backlog”是双方共有行为，不能单凭这一点解释吞吐差距。
 
@@ -14,7 +22,7 @@
 
 在下载客户端进程上下文和测量窗口内，未观测到无关 TCP 或 UDP 入口。1×/2×/4× 饱和时下载 skb 平均大小，nginx 为 58.24/57.33/55.79 KiB，proxysss 为 56.88/56.37/56.78 KiB，接近而非明显碎片化。该上下文中的下载 skb 字节相对 TCP_INFO 接收增量约为 nginx 46.02%/28.02%/28.49%、proxysss 65.15%/69.08%/73.22%；另有同一连接网关端的 ACK 大小入口。该近似比例包含协议头和窗口边界差异，只说明处理上下文分配有差别，不是 CPU 占比、物理帧大小或整个内核网络处理量。
 
-下一步检查 socket 用户持有状态和 backlog 调用路径。实际 Docker 内核对应的 [tcp_ipv4.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp_ipv4.c) 在 socket 由用户线程持有时将接收包交给 backlog，[tcp.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp.c) 的读取路径可排空它；这是待验证假设，现有入口计数不能证明此路径导致吞吐差距。
+入口观察轮提出了 socket 用户持有状态和 backlog 调用路径假设。实际 Docker 内核对应的 [tcp_ipv4.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp_ipv4.c) 在 socket 由用户线程持有时将接收包交给 backlog，[tcp.c](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.87.2/net/ipv4/tcp.c) 的读取路径可排空它；本节上方的后续调用栈确认了双方共有这一处理路径，尚未证明它导致吞吐差距。
 
 探针、共享 client CPU 的观察器和持有 socket 副本会影响时序，本轮仅作诊断。198 个原始样本零错误，132 个等负载样本最低完成率 0.996269；大文件吞吐比 0.770/0.623/0.602，三个尺度延迟门槛仍失败。18 秒活跃、165 秒矩阵 wall；4× current/peak bytes 为 proxysss 91545600/300101632、nginx 208453632/411656192。源码、自检、原始数据、报告和摘要在 `.benchmark/goal-rx-entry/`。生产代码保持不变，最近完整功能验证仍是两轮各 378 项 Rust 测试及 Go/Clippy/文档/CLI 检查；未执行 Windows、push 或发布。
 
