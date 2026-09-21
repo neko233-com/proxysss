@@ -37,6 +37,12 @@ jobs:
             # Operator explicitly approved this one functional release on 2026-09-08.
             # No strict Linux/nginx performance claim is attached to this version.
             echo "v1.3.8: operator-approved functional release; strict performance evidence waived"
+          elif [[ "$tag" == "v1.3.9" ]]; then
+            # 2026-09-21: operator requests a stable functional release now;
+            # nginx superiority and cross-host performance evidence are waived.
+            # Local Linux/Windows validation is recorded before pushing this tag.
+            test -s docs/RELEASE-1.3.9.md
+            echo "v1.3.9: operator-approved stability release; no nginx superiority claim"
           else
             go run scripts/verify-production-evidence.go --manifest "performance-evidence/${tag}.json" --tag "$tag" --commit "$GITHUB_SHA"
           fi

@@ -1,6 +1,6 @@
 # 验证与发布流程
 
-本页定义验证顺序与证据边界。产品能力是否存在，以代码、配置和功能测试为准；性能是否胜出，以相同提交、相同资源的实测为准。不能承诺在任意硬件与负载下始终最优。
+本页定义验证顺序与证据边界。2026-09-21 用户授权 v1.3.9 优先发布稳定功能版本：Linux 功能与混合负载稳定性、本机 Windows 测试、六平台打包通过即可，不要求超过 nginx 或提供跨主机性能胜出证据。详见 [本次版本验证](RELEASE-1.3.9.md) / [HTML](release-1.3.9.html)。CDN 后续优化优先小文件，大、小文件择一胜出即可，不再以同时胜出阻塞当前发布。产品能力是否存在，以代码、配置和功能测试为准；性能是否胜出，以相同提交、相同资源的实测为准。不能承诺在任意硬件与负载下始终最优。
 
 ## 1. Ubuntu 24 LTS 功能检查
 
@@ -45,7 +45,7 @@ HTTP/1 每个并发 worker 使用独立、最多一个空闲连接的 client，�
 
 预热错过 `--start-at-unix-ms` 时整波失败，不能自行延后开始而把异步运行当作同时混合负载。双方每轮都必须完成至少 98% 的可执行目标，参考 nginx 不达标同样使比较无效。CDN 预检在测量前依次确认 v1 正文、原子发布 v2、确认双方确实返回 v2；其后测量的是更新生效后的读取吞吐，不声称是一秒内连续发布的性能。
 
-严格入口要求零错误、每项吞吐与 p50/p95/p99 都胜出；单项通过不能覆盖混合回归。旧共享角色诊断 `benchmark-all-scenarios.sh` 的 `CRITICAL_RATIO=0.97` 和 `MIN_RATIO=0.50` 不等于严格发布通过。内存报告双方 cgroup current、peak、每连接成本，各项不得超过 nginx 的 2 倍；只在声明实际生产预算时设置 MemoryMax。4c/4096 active WSS/20k idle WSS 是参考负载，100k 容量为额外诊断。
+现有严格实验入口仍输出逐项吞吐与 p50/p95/p99 的历史比较门槛；它用于诊断，不是本次 v1.3.9 稳定版本的发布否决条件。相对速度落后与功能/运行错误必须分别报告。CDN 优化优先小文件，不要求大、小文件同时胜出。旧共享角色诊断 `benchmark-all-scenarios.sh` 的 `CRITICAL_RATIO=0.97` 和 `MIN_RATIO=0.50` 不等于严格发布通过。内存报告双方 cgroup current、peak、每连接成本，各项不得超过 nginx 的 2 倍；只在声明实际生产预算时设置 MemoryMax。4c/4096 active WSS/20k idle WSS 是参考负载，100k 容量为额外诊断。
 
 每轮原始结果保存在带 `-r1`、`-r2` 等序号的目录，包含逐场景输出和 results.jsonl；后续轮次不得覆盖早期失败详情。无序号场景文件仅为最后一轮的便捷副本。网关、后端与客户端的逐轮容器日志和测量前后网络计数器在活跃窗口之外采集，便于区分 UDP 内核丢包、超时及连接错误。UDP/QCP echo 检查回复长度和内容，失败输出阶段、错误种类和系统错误码，每进程最多打印 8 条详情，额外错误仍计数。计数器或错误详情缺失时，不得从汇总的 errors 数字猜测根因。
 
@@ -57,15 +57,15 @@ WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websock
 
 ## 3. Windows 功能验收
 
-Linux 全部功能与性能门槛通过后，在本机 Windows 快速运行 `cargo test --locked`，确认现有单元与集成用例通过；不执行 Windows 性能矩阵。用户当前验收要求以这轮本机测试作为 Windows 快速功能验证；不能把未覆盖的安装器、第三方服务或外部系统场景写成已实测。Windows 桌面成绩不代替 Linux 性能证据。
+本次稳定发布在 Linux 功能与混合负载稳定性通过后，在本机 Windows 快速运行 `cargo test --locked`，确认现有单元与集成用例通过；不执行 Windows 性能矩阵。用户当前验收要求以这轮本机测试作为 Windows 快速功能验证；不能把未覆盖的安装器、第三方服务或外部系统场景写成已实测。Windows 桌面成绩不代替 Linux 性能证据。
 
 ## 4. Push 与发布
 
 使用 [gh-cli 技能](../skills/gh-cli/SKILL.md)，检查实际 Actions 状态。CI 只做六平台打包，禁止云端功能测试和性能 benchmark。Node.js action 使用 24 LTS 或更高，artifact action 至少 v6。
 
-正式版本必须匹配 Cargo.toml、CHANGELOG.md 与 [性能证据清单](../performance-evidence/README.md)。schema v3 要求同一 tag 提交上的角色隔离矩阵和三台不同 machine-id Linux 主机的 WSS 1×/2×/4× 复验、真实工件 URI/摘要、吞吐/延迟/容量/内存数据。运行 `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>` 后才能推 tag。v1.3.8 的一次性功能发布豁免不适用于其他版本。
+正式版本必须匹配 Cargo.toml、CHANGELOG.md 与 [性能证据清单](../performance-evidence/README.md)。schema v3 要求同一 tag 提交上的角色隔离矩阵和三台不同 machine-id Linux 主机的 WSS 1×/2×/4× 复验、真实工件 URI/摘要、吞吐/延迟/容量/内存数据。运行 `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>` 后才能推 tag。v1.3.8 的一次性豁免仍仅限旧标签；v1.3.9 另有 2026-09-21 用户明确授权的稳定功能发布例外，使用本次版本验证记录，免于严格性能胜出与跨主机证据检查。
 
-报告明确列出通过项、失败项、未执行项、提交和工件位置。缺少跨主机环境或严格性能未过时，保留修复和证据，不能生成虚假清单或宣称发布完成。
+报告明确列出通过项、失败项、未执行项、提交和工件位置。性能未胜出时保留真实结果，不生成虚假胜出清单；本次 v1.3.9 依明确授权按稳定性发布。只有 tag、构建、六个附件与 GitHub Release 实际核验完成后，才能报告发布完成。
 
 ## 诊断发生器瓶颈
 

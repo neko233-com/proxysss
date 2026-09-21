@@ -1,6 +1,6 @@
 # Linux 性能证据清单
 
-按仓库发布规则，正式 tag 要求匹配的版本号、changelog 和同一提交的严格 Linux 性能证据。功能测试与性能测试在本地运行，GitHub Actions 仅校验发布材料并完成六平台打包。性能清单必须真实、可审计，并通过下面的验证器；Windows/macOS 适配检查或单机开关对比不能替代这份证据：
+通常正式 tag 要求匹配的版本号、changelog 和同一提交的严格 Linux 性能证据。**本次 v1.3.9 例外：2026-09-21 用户明确授权尽快发布功能完整、运行稳定的版本，性能无需超过 nginx；Linux 功能/混合负载稳定性、Windows 快速测试和六平台打包仍须通过。** 本次以 [版本验证记录](../docs/RELEASE-1.3.9.md) 为准，不伪造下述严格胜出清单；CDN 优化优先小文件，大、小文件不再要求同时超过 nginx。功能测试与性能测试在本地运行，GitHub Actions 仅校验发布材料并完成六平台打包。性能清单必须真实、可审计，并通过下面的验证器；Windows/macOS 适配检查或单机开关对比不能替代这份证据：
 
 ```bash
 go run scripts/verify-production-evidence.go \

@@ -15,7 +15,11 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 ## 当前验收约束
 
-允许根据实测调整不合理的内部架构，但不能减少现有功能。关联问题集中修复后统一验证：先 Ubuntu 24 Docker 完整功能与混合性能，再本机 Windows 快速运行 cargo test --locked；全部通过后才 push 与发布。共享调度器改动必须覆盖就绪重装、背压、半关闭、取消和 fd 复用，不能只验证单项吞吐。
+**CDN 性能优先小文件，大、小文件满足一类超过 nginx 即可，不要求两类同时胜出。** 不为大文件单项落后反复牺牲小文件或游戏长连接表现。两类都必须保留完整下载、Range、背压、零错误、负载完成率与有界内存验证。这是产品优化方向，不能再把历史双项胜出门槛当作当前发布阻塞。
+
+**当前稳定版本优先落地。2026-09-21 用户明确授权 v1.3.9 按功能与稳定性发布，性能无需超过 nginx。** Linux 功能及混合负载无错误后，完成本机 Windows 快速测试，再 push 和六平台打包发布；保留性能数据并如实说明差距，不宣传严格 nginx 胜出或跨主机验证。此授权覆盖本次 v1.3.9 的严格性能证据豁免，不豁免功能失败、运行错误或打包失败。
+
+允许根据实测调整不合理的内部架构，但不能减少现有功能。关联问题集中修复后统一验证：先 Ubuntu 24 Docker 完整功能与混合负载稳定性，再本机 Windows 快速运行 cargo test --locked；功能与稳定性通过后才 push 与发布。共享调度器改动必须覆盖就绪重装、背压、半关闭、取消和 fd 复用，不能只验证单项吞吐。
 
 ## Product Direction
 
@@ -129,6 +133,7 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 - **Workflow JavaScript actions must target Node.js 24 LTS or newer.** Use `actions/upload-artifact@v6` and `actions/download-artifact@v6` (or later). Do not add `actions/*-artifact@v4` or other Node 20 actions without upgrading.
 - **Release tags require a matching changelog section and strict Linux evidence on the same commit.** Before pushing `vX.Y.Z`, ensure `CHANGELOG.md` contains `## vX.Y.Z`, `Cargo.toml` `version` matches, and `performance-evidence/vX.Y.Z.json` passes `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>`. Functional tests and benchmarks run locally; GitHub Actions only validates release metadata/evidence and packages six platforms. All release bundles include the binary, changelog, Chinese HTML documentation, configuration examples/templates, script declarations, and install scripts; `scripts/package-release.ps1` cleans fixed project-local staging and atomically replaces each archive.
 - **One-time operator exception, 2026-09-08:** the user explicitly authorized publishing `v1.3.8` as a functional release after local functional checks and six-platform packaging passed, waiving strict Linux performance evidence for this tag only. Do not describe this release as a strict nginx performance win. Other tags retain the evidence gate.
+- **本次稳定发布授权，2026-09-21：** v1.3.9 按上述最新用户要求豁免严格性能胜出和跨主机性能证据；本地 Ubuntu 功能、混合负载稳定性、本机 Windows 测试和六平台打包仍须通过。记录见 [v1.3.9 验证说明](docs/RELEASE-1.3.9.md)。
 
 One-click bootstrap for autonomous agents:
 
