@@ -19,6 +19,8 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 ## Product Direction
 
+安全状态过期回收独立于热重载和健康探测；保留活动窗口/封禁，黑名单读取不得删除并发续封的新状态。外部封禁秒数必须避免 Instant 加法溢出，相关实现及后台循环同时维护真实管理 API、并发和时间边界测试，见架构与配置指南。
+
 proxysss exists to **fully replace nginx** as a same-level general-purpose gateway. It is **not** a business gateway. Business-aware behavior belongs in optional scripts/plugins, similar to using Lua modules with nginx.
 
 Keep these invariants aligned across code, docs, examples, tests, and generated config:

@@ -348,6 +348,8 @@ udp:
 
 TCP 新连接和 UDP 新 association 都依次执行 `services.rate_limit.stream`、动态黑名单、`security.ddos` 与 `services.access_control.stream`。UDP 不产生 HTTP 错误响应，被拒绝的首包直接丢弃。`connections` 按新 association 计数，同一 IP 的 TCP/UDP 共用 stream zone；既有 UDP 会话的数据报不重复扣配额，也不重新执行准入检查。策略热更新与新增封禁作用于随后准入的会话，已有会话保留到过期、关闭或 listener 移除。数字上游、DNS、脚本路由遵守相同规则，拒绝发生在脚本和解析前；`blocked_requests_total` 每次拒绝只累加一次。
 
+过期安全状态由独立控制任务每秒回收，无需开启热重载或主动健康。DDoS 与 admin/monitor 登录失败窗口只在窗口失效且没有活动封禁时清理；动态黑名单按实际封禁到期回收，仍活动的封禁保留。查询不会删除并发续封的新值。`ban_secs` / `lockout_secs` 使用单调时间计算，超大秒数不会触发时间点加法溢出，返回的剩余秒数向上取整；0 秒保留至少 1 秒的原有语义。并发登录失败不会重置已经生效的锁定时间。
+
 ### 2.9 MQTT / IoT
 
 ```yaml

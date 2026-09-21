@@ -130,6 +130,8 @@ token 认证 API 可持久化允许的路由、listener、TLS、filecloud 和黑
 
 ## 管理、监控和扩展
 
+`security_cleanup` 在控制运行时每秒读取当前配置，清理过期的 DDoS 窗口、admin/monitor 登录失败窗口和动态黑名单；它由现有 supervisor 管理，独立于热重载、主动健康开关，无需额外数据线程。清理在各 DashMap 分片内检查并删除，保留仍活动的窗口和封禁；普通黑名单查询只读，避免旧读者删除并发替换的新封禁。DDoS/黑名单按 IpAddr 查表，接入检查不再分配 IP 字符串。封禁记录使用起点与秒数计算剩余时间，外部超大秒数不会溢出未来 Instant；并发登录失败不能清除或延长已生效的锁定。
+
 admin 默认只监听 127.0.0.1:7777，enable_write_ops=false、expose_config=false。token 经 `proxysss token show/set` 检查和轮换，一般配置展示脱敏。loopback 管理面可引导 ACME/TLS，admin.https 在主 TLS listener 提供相同 `/v1/*` API。
 
 admin.monitor 是独立 HTTPS 只读入口，使用专用密码与 monitor:read 短期会话。登录后仅提供 health、summary、stats、SSL 状态，拒绝写接口，不暴露管理 token、私钥、DNS 凭据或配置写入能力。

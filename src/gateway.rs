@@ -2988,6 +2988,13 @@ impl Gateway {
             gateway.run_active_health_loop().await
         });
 
+        Self::spawn_supervised_task(
+            &mut tasks,
+            self.clone(),
+            "security_cleanup",
+            |gateway| async { gateway.run_security_cleanup_loop().await },
+        );
+
         if self.bootstrap_config.http.tls.on_demand.enabled {
             Self::spawn_supervised_task(
                 &mut tasks,
@@ -3073,6 +3080,21 @@ impl Gateway {
                     .load(Ordering::Relaxed),
                 "watchdog heartbeat"
             );
+        }
+    }
+
+    async fn run_security_cleanup_loop(self: Arc<Self>) -> Result<()> {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let state = self.current_state().await;
+            let now = Instant::now();
+            self.ddos_guard
+                .prune_expired(now, &state.config.security.ddos);
+            self.admin_auth_guard
+                .prune_expired(now, &state.config.admin.auth_rate_limit);
+            self.monitor_auth_guard
+                .prune_expired(now, &state.config.admin.auth_rate_limit);
+            self.dynamic_blacklist.prune_expired(now);
         }
     }
 
@@ -22729,6 +22751,89 @@ mod tests {
         AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
     };
+
+    #[tokio::test]
+    async fn live_security_cleanup_retires_idle_state_and_maximum_admin_ban_survives() {
+        use crate::verify::harness;
+
+        let root = harness::temp_root("security-state-lifecycle");
+        let http_port = harness::reserve_port().await.unwrap();
+        let admin_port = harness::reserve_port().await.unwrap();
+        let mut config: GatewayConfig =
+            serde_yaml::from_str(&harness::base_gateway_yaml(http_port)).unwrap();
+        config.admin.enabled = true;
+        config.admin.bind = format!("127.0.0.1:{admin_port}");
+        config.admin.enable_write_ops = true;
+        config.admin.bearer_token = "security-lifecycle-test-token-12345".into();
+        config.admin.auth_rate_limit.window_secs = 1;
+        config.security.ddos.enabled = true;
+        config.security.ddos.window_secs = 1;
+        config.security.ddos.max_connections = 1000;
+        let path = harness::write_config(&root, &serde_yaml::to_string(&config).unwrap()).unwrap();
+        let (gateway, task) = harness::spawn_gateway(path).await.unwrap();
+        let _abort = AbortTaskOnDrop(task.abort_handle());
+        harness::wait_tcp_ready(&format!("127.0.0.1:{admin_port}"))
+            .await
+            .unwrap();
+
+        let short_ip = "203.0.113.90".parse().unwrap();
+        let long_ip = "2001:db8::90".parse().unwrap();
+        gateway.dynamic_blacklist.add(short_ip, 1);
+        gateway
+            .ddos_guard
+            .check_and_record(short_ip, &config.security.ddos);
+        gateway
+            .admin_auth_guard
+            .record_failure("idle-admin", &config.admin.auth_rate_limit);
+        gateway
+            .monitor_auth_guard
+            .record_failure("idle-monitor", &config.admin.auth_rate_limit);
+        assert_eq!(gateway.admin_auth_guard.tracked_entries(), 1);
+        assert_eq!(gateway.monitor_auth_guard.tracked_entries(), 1);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{admin_port}/v1/security/blacklist/add"
+            ))
+            .bearer_auth(&config.admin.bearer_token)
+            .json(&serde_json::json!({"ip": "2001:db8::90", "ban_secs": u64::MAX}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.json::<serde_json::Value>().await.unwrap()["ok"]
+            .as_bool()
+            .unwrap());
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if gateway.dynamic_blacklist.tracked_entries() == 1
+                    && gateway.ddos_guard.tracked_entries() == 1
+                    && gateway.admin_auth_guard.tracked_entries() == 0
+                    && gateway.monitor_auth_guard.tracked_entries() == 0 { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the running control loop must retire all idle security state without revisits or hot reload");
+        assert!(gateway.dynamic_blacklist.is_blocked(long_ip));
+        assert!(gateway
+            .ddos_guard
+            .check_and_record(long_ip, &config.security.ddos)
+            .is_some());
+        assert!(!gateway.dynamic_blacklist.is_blocked(short_ip));
+        assert!(client
+            .get(format!("http://127.0.0.1:{http_port}/"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        task.abort();
+        let _ = task.await;
+    }
 
     #[tokio::test]
     async fn unknown_config_field_rejects_reload_without_changing_live_service() {

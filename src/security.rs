@@ -15,6 +15,32 @@ use crate::config::{
 };
 use crate::stream_endpoint::StreamEndpoint;
 
+// Store elapsed-time TTLs rather than adding untrusted seconds to Instant:
+// u64::MAX is valid input but cannot be represented as a future Instant.
+#[derive(Clone, Copy)]
+struct Expiry {
+    started_at: Instant,
+    ttl_secs: u64,
+}
+
+impl Expiry {
+    fn new(now: Instant, ttl_secs: u64) -> Self {
+        Self {
+            started_at: now,
+            ttl_secs: ttl_secs.max(1),
+        }
+    }
+
+    fn remaining_secs(self, now: Instant) -> u64 {
+        self.ttl_secs
+            .saturating_sub(now.saturating_duration_since(self.started_at).as_secs())
+    }
+
+    fn active(self, now: Instant) -> bool {
+        self.remaining_secs(now) != 0
+    }
+}
+
 #[derive(Clone)]
 pub struct AdminAuthGuard {
     failures: std::sync::Arc<DashMap<String, AdminAuthFailureState>>,
@@ -24,7 +50,7 @@ pub struct AdminAuthGuard {
 struct AdminAuthFailureState {
     count: u32,
     window_start: Instant,
-    locked_until: Option<Instant>,
+    locked_until: Option<Expiry>,
 }
 
 impl Default for AdminAuthGuard {
@@ -49,7 +75,7 @@ impl AdminAuthGuard {
         };
         entry
             .locked_until
-            .is_some_and(|until| until > Instant::now())
+            .is_some_and(|until| until.active(Instant::now()))
     }
 
     pub fn record_failure(&self, key: &str, config: &AdminAuthRateLimitConfig) {
@@ -58,7 +84,6 @@ impl AdminAuthGuard {
         }
         let now = Instant::now();
         let window = Duration::from_secs(config.window_secs.max(1));
-        let lockout = Duration::from_secs(config.lockout_secs.max(1));
         let mut entry = self
             .failures
             .entry(key.to_string())
@@ -67,6 +92,11 @@ impl AdminAuthGuard {
                 window_start: now,
                 locked_until: None,
             });
+        // Another authentication attempt may have locked this key after the
+        // caller checked it. Do not erase or extend that active lockout.
+        if entry.locked_until.is_some_and(|until| until.active(now)) {
+            return;
+        }
         if now.duration_since(entry.window_start) >= window {
             entry.window_start = now;
             entry.count = 0;
@@ -74,12 +104,25 @@ impl AdminAuthGuard {
         }
         entry.count = entry.count.saturating_add(1);
         if entry.count >= config.max_failures.max(1) {
-            entry.locked_until = Some(now + lockout);
+            entry.locked_until = Some(Expiry::new(now, config.lockout_secs));
         }
     }
 
     pub fn clear_failures(&self, key: &str) {
         self.failures.remove(key);
+    }
+
+    pub(crate) fn prune_expired(&self, now: Instant, config: &AdminAuthRateLimitConfig) {
+        self.failures.retain(|_, state| {
+            state.locked_until.is_some_and(|until| until.active(now))
+                || now.saturating_duration_since(state.window_start).as_secs()
+                    < config.window_secs.max(1)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_entries(&self) -> usize {
+        self.failures.len()
     }
 }
 
@@ -376,12 +419,12 @@ fn ip_matches_cidr(ip: IpAddr, cidr: &str) -> bool {
 struct DdosWindowState {
     count: u32,
     window_start: Instant,
-    banned_until: Option<Instant>,
+    banned_until: Option<Expiry>,
 }
 
 #[derive(Clone, Default)]
 pub struct DdosGuard {
-    windows: std::sync::Arc<DashMap<String, DdosWindowState>>,
+    windows: std::sync::Arc<DashMap<IpAddr, DdosWindowState>>,
 }
 
 impl DdosGuard {
@@ -389,27 +432,18 @@ impl DdosGuard {
         if !config.enabled {
             return None;
         }
-        let key = ip.to_string();
         let now = Instant::now();
         let window = Duration::from_secs(config.window_secs.max(1));
-        let ban = Duration::from_secs(config.ban_secs.max(1));
         let limit = config.max_connections.saturating_add(config.burst);
 
-        let mut entry = self.windows.entry(key).or_insert(DdosWindowState {
+        let mut entry = self.windows.entry(ip).or_insert(DdosWindowState {
             count: 0,
             window_start: now,
             banned_until: None,
         });
 
-        if entry.banned_until.is_some_and(|until| until > now) {
-            return Some(
-                entry
-                    .banned_until
-                    .unwrap()
-                    .duration_since(now)
-                    .as_secs()
-                    .max(1),
-            );
+        if let Some(until) = entry.banned_until.filter(|until| until.active(now)) {
+            return Some(until.remaining_secs(now));
         }
 
         if now.duration_since(entry.window_start) >= window {
@@ -420,8 +454,8 @@ impl DdosGuard {
 
         entry.count = entry.count.saturating_add(1);
         if entry.count > limit {
-            entry.banned_until = Some(now + ban);
-            return Some(ban.as_secs().max(1));
+            entry.banned_until = Some(Expiry::new(now, config.ban_secs));
+            return Some(config.ban_secs.max(1));
         }
 
         None
@@ -429,25 +463,37 @@ impl DdosGuard {
 
     pub fn ban_ip(&self, ip: IpAddr, ban_secs: u64) {
         let now = Instant::now();
-        let ban = Duration::from_secs(ban_secs.max(1));
         self.windows.insert(
-            ip.to_string(),
+            ip,
             DdosWindowState {
                 count: 0,
                 window_start: now,
-                banned_until: Some(now + ban),
+                banned_until: Some(Expiry::new(now, ban_secs)),
             },
         );
     }
 
     pub fn unban_ip(&self, ip: IpAddr) {
-        self.windows.remove(&ip.to_string());
+        self.windows.remove(&ip);
+    }
+
+    pub(crate) fn prune_expired(&self, now: Instant, config: &DdosProtectionConfig) {
+        self.windows.retain(|_, state| {
+            state.banned_until.is_some_and(|until| until.active(now))
+                || now.saturating_duration_since(state.window_start).as_secs()
+                    < config.window_secs.max(1)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_entries(&self) -> usize {
+        self.windows.len()
     }
 }
 
 #[derive(Clone, Default)]
 pub struct DynamicBlacklist {
-    entries: std::sync::Arc<DashMap<String, Instant>>,
+    entries: std::sync::Arc<DashMap<IpAddr, Expiry>>,
 }
 
 impl DynamicBlacklist {
@@ -458,10 +504,11 @@ impl DynamicBlacklist {
         }
         if let Ok(bytes) = std::fs::read(&config.path) {
             if let Ok(items) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                let ban = Duration::from_secs(3600);
-                let until = Instant::now() + ban;
+                let until = Expiry::new(Instant::now(), 3600);
                 for item in items {
-                    blacklist.entries.insert(item, until);
+                    if let Ok(ip) = item.parse() {
+                        blacklist.entries.insert(ip, until);
+                    }
                 }
             }
         }
@@ -480,8 +527,8 @@ impl DynamicBlacklist {
         let active = self
             .entries
             .iter()
-            .filter(|entry| entry.value() > &now)
-            .map(|entry| entry.key().clone())
+            .filter(|entry| entry.value().active(now))
+            .map(|entry| entry.key().to_string())
             .collect::<Vec<_>>();
         std::fs::write(
             &config.path,
@@ -492,33 +539,39 @@ impl DynamicBlacklist {
     }
 
     pub fn add(&self, ip: IpAddr, ban_secs: u64) {
-        let until = Instant::now() + Duration::from_secs(ban_secs.max(1));
-        self.entries.insert(ip.to_string(), until);
+        self.entries
+            .insert(ip, Expiry::new(Instant::now(), ban_secs));
     }
 
     pub fn remove(&self, ip: IpAddr) {
-        self.entries.remove(&ip.to_string());
+        self.entries.remove(&ip);
     }
 
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        let Some(until) = self.entries.get(&ip.to_string()) else {
-            return false;
-        };
-        if *until <= Instant::now() {
-            drop(until);
-            self.entries.remove(&ip.to_string());
-            return false;
-        }
-        true
+        // A lookup never deletes: an old reader must not remove a replacement
+        // ban after releasing its shard guard. The control loop retires stale
+        // entries while holding the same shard guard as its expiry check.
+        self.entries
+            .get(&ip)
+            .is_some_and(|until| until.active(Instant::now()))
     }
 
     pub fn list_active(&self) -> Vec<String> {
         let now = Instant::now();
         self.entries
             .iter()
-            .filter(|entry| *entry.value() > now)
-            .map(|entry| entry.key().clone())
+            .filter(|entry| entry.value().active(now))
+            .map(|entry| entry.key().to_string())
             .collect()
+    }
+
+    pub(crate) fn prune_expired(&self, now: Instant) {
+        self.entries.retain(|_, until| until.active(now));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_entries(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -766,6 +819,140 @@ mod tests {
             reject_ambiguous_http1_request(&headers, &security),
             Some(StatusCode::BAD_REQUEST)
         );
+    }
+
+    #[test]
+    fn untrusted_maximum_ban_durations_do_not_overflow_or_clear_active_lockouts() {
+        let ip = "203.0.113.42".parse().unwrap();
+        let ddos = DdosGuard::default();
+        let config = DdosProtectionConfig {
+            enabled: true,
+            max_connections: 1,
+            burst: 0,
+            window_secs: 1,
+            ban_secs: u64::MAX,
+        };
+        assert!(ddos.check_and_record(ip, &config).is_none());
+        assert_eq!(ddos.check_and_record(ip, &config), Some(u64::MAX));
+        ddos.ban_ip(ip, u64::MAX);
+        ddos.prune_expired(Instant::now() + Duration::from_secs(5), &config);
+        assert!(ddos.check_and_record(ip, &config).is_some());
+
+        let auth = AdminAuthGuard::default();
+        let config = AdminAuthRateLimitConfig {
+            enabled: true,
+            max_failures: 1,
+            window_secs: 1,
+            lockout_secs: u64::MAX,
+        };
+        auth.record_failure("admin", &config);
+        let locked_at = {
+            let mut state = auth.failures.get_mut("admin").unwrap();
+            state.window_start = Instant::now() - Duration::from_secs(5);
+            state.locked_until.unwrap().started_at
+        };
+        auth.record_failure("admin", &config);
+        assert_eq!(
+            auth.failures
+                .get("admin")
+                .unwrap()
+                .locked_until
+                .unwrap()
+                .started_at,
+            locked_at
+        );
+        auth.prune_expired(Instant::now() + Duration::from_secs(5), &config);
+        assert!(auth.is_locked("admin", &config));
+
+        let blacklist = DynamicBlacklist::default();
+        blacklist.add(ip, u64::MAX);
+        blacklist.prune_expired(Instant::now() + Duration::from_secs(5));
+        assert!(blacklist.is_blocked(ip));
+    }
+
+    #[test]
+    fn security_retirement_keeps_live_windows_and_bans_without_future_visits() {
+        let ddos = DdosGuard::default();
+        let config = DdosProtectionConfig {
+            enabled: true,
+            max_connections: 2,
+            burst: 0,
+            window_secs: 10,
+            ban_secs: 30,
+        };
+        let short = "203.0.113.10".parse().unwrap();
+        let long = "2001:db8::10".parse().unwrap();
+        assert!(ddos.check_and_record(short, &config).is_none());
+        ddos.ban_ip(long, 30);
+        ddos.prune_expired(Instant::now(), &config);
+        assert!(ddos.check_and_record(short, &config).is_none());
+        assert!(
+            ddos.check_and_record(short, &config).is_some(),
+            "sweeping must not reset a live rate window"
+        );
+        let observed = Instant::now();
+        ddos.prune_expired(observed + Duration::from_secs(11), &config);
+        assert_eq!(ddos.tracked_entries(), 2, "bans outlive the rate window");
+        ddos.prune_expired(observed + Duration::from_secs(31), &config);
+        assert_eq!(ddos.tracked_entries(), 0);
+
+        let auth = AdminAuthGuard::default();
+        let auth_config = AdminAuthRateLimitConfig {
+            enabled: true,
+            max_failures: 2,
+            window_secs: 10,
+            lockout_secs: 30,
+        };
+        auth.record_failure("single", &auth_config);
+        auth.record_failure("locked", &auth_config);
+        auth.record_failure("locked", &auth_config);
+        auth.prune_expired(Instant::now() + Duration::from_secs(11), &auth_config);
+        assert_eq!(auth.tracked_entries(), 1);
+        assert!(auth.is_locked("locked", &auth_config));
+        auth.prune_expired(Instant::now() + Duration::from_secs(31), &auth_config);
+        assert_eq!(auth.tracked_entries(), 0);
+
+        let blacklist = DynamicBlacklist::default();
+        blacklist.add(short, 0);
+        blacklist.add(long, 30);
+        let started = blacklist.entries.get(&short).unwrap().started_at;
+        blacklist.prune_expired(started + Duration::from_millis(999));
+        assert_eq!(blacklist.tracked_entries(), 2);
+        blacklist.prune_expired(started + Duration::from_secs(1));
+        assert_eq!(blacklist.tracked_entries(), 1);
+        assert!(blacklist.is_blocked(long));
+        blacklist.prune_expired(Instant::now() + Duration::from_secs(31));
+        assert!(blacklist.list_active().is_empty());
+        assert_eq!(blacklist.tracked_entries(), 0);
+    }
+
+    #[test]
+    fn concurrent_blacklist_retirement_never_removes_a_replacement_ban() {
+        let blacklist = DynamicBlacklist::default();
+        let ip = "2001:db8::9".parse().unwrap();
+        let expired = Expiry::new(Instant::now() - Duration::from_secs(2), 1);
+        blacklist.entries.insert(ip, expired);
+        assert!(!blacklist.is_blocked(ip));
+        let observed = Instant::now();
+        blacklist.add(ip, u64::MAX);
+        blacklist.prune_expired(observed);
+        assert!(blacklist.is_blocked(ip));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let blacklist = &blacklist;
+                scope.spawn(move || {
+                    for _ in 0..2000 {
+                        blacklist.prune_expired(Instant::now());
+                    }
+                });
+            }
+            for _ in 0..2000 {
+                blacklist.add(ip, u64::MAX);
+                assert!(blacklist.is_blocked(ip));
+            }
+        });
+        assert!(blacklist.is_blocked(ip));
+        assert_eq!(blacklist.tracked_entries(), 1);
     }
 
     #[test]

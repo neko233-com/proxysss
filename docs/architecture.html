@@ -703,6 +703,7 @@ services:
             <div>
               <div class="kicker">Stream flow</div>
               <h2>一条 TCP / UDP 流量怎么走</h2><p>TCP 新连接与 UDP 新 association 统一执行 stream 限流、动态黑名单、DDoS 和 allow/deny。UDP 在 pending 去重后、容量预留及脚本/DNS 前准入，数字目标和扩展路由规则相同；同 IP 的 TCP/UDP 共用 stream zone，既有 UDP 数据报不重复扣配额或检查准入策略。每次拒绝统一计数一次。<a href="configuration.html#stream-admission">配置与生效范围</a>。</p>
+              <p>security_cleanup 在控制运行时每秒读取当前配置，回收过期 DDoS、admin/monitor 登录失败窗口及动态黑名单；使用现有 supervisor，独立于热重载/健康探测，无额外数据线程。清理在 DashMap 分片内检查并删除，保留活动窗口与封禁；黑名单查询只读，避免旧读者误删并发续封。DDoS/黑名单用 IpAddr 键，接入检查不分配 IP 字符串。封禁记录用起点和秒数计算，超大秒数不溢出未来 Instant；并发登录失败不能重置有效锁定。</p>
               <p>管理 API 的 TCP/UDP listener 和 stream route 在落盘及重载前使用相同目标策略：主机规则比较去除端口与末尾点后的名称，数字地址检查 IP/CIDR。检查不解析 DNS，不等于重绑定防护，也不限制本地可信 YAML 与脚本使用内网目标。<a href="security-performance.html">开关与边界</a>。</p>
               <p>stream_endpoint 统一目标语法，在配置加载、管理更新及脚本路由返回时检查主目标、候选和权重键。UDP 域名仅在建立 association 时查询系统 DNS，取首个解析地址并按其地址族绑定；数字 IP 保持直接路径，已有会话复用 socket。解析等待最多 5 秒、全进程最多 64 个作业，超时后实际系统调用仍持有名额直到结束。健康探测的单一期限覆盖解析、发送和回复。<a href="configuration.html#stream-targets">地址格式与生效边界</a>。</p>
             </div>
