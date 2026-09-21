@@ -557,8 +557,21 @@ async fn udp_ddos_and_dynamic_blacklist_reject_new_sessions_and_count_once() -> 
         fixture
             .gateway
             .dynamic_blacklist
-            .remove("127.0.0.1".parse()?);
-        fixture.gateway.ddos_guard.unban_ip("127.0.0.1".parse()?);
+            .apply_admin(
+                fixture
+                    .gateway
+                    .current_state()
+                    .await
+                    .config
+                    .security
+                    .dynamic_blacklist
+                    .clone(),
+                fixture.gateway.ddos_guard.clone(),
+                crate::security::BlacklistMutation::Remove {
+                    ip: "127.0.0.1".parse()?,
+                },
+            )
+            .await?;
         assert!(echo(&blacklisted, b"ban-removed", 500).await);
         assert_eq!(fixture.active(), 2);
         fixture.stop().await?;

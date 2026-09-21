@@ -350,6 +350,18 @@ TCP 新连接和 UDP 新 association 都依次执行 `services.rate_limit.stream
 
 过期安全状态由独立控制任务每秒回收，无需开启热重载或主动健康。DDoS 与 admin/monitor 登录失败窗口只在窗口失效且没有活动封禁时清理；动态黑名单按实际封禁到期回收，仍活动的封禁保留。查询不会删除并发续封的新值。`ban_secs` / `lockout_secs` 使用单调时间计算，超大秒数不会触发时间点加法溢出，返回的剩余秒数向上取整；0 秒保留至少 1 秒的原有语义。并发登录失败不会重置已经生效的锁定时间。
 
+动态黑名单通过 `GET /v1/security/blacklist` 查询，通过令牌鉴权的 `POST /v1/security/blacklist/add` / `remove` 管理；写操作要求 `admin.enable_write_ops=true`。开启 `security.dynamic_blacklist.enabled` 后，管理操作先完成快照文件替换，再发布到内存；成功返回 `ok=true, persisted=true`，写失败返回 HTTP 500，原内存/DDoS 状态保持。未开启持久化的管理更新仍在内存生效，返回 `persisted=false`。HTTP keep-alive 后续请求、HTTP/2 请求、AI 路由与新 WebSocket 握手都执行当前准入策略，既有 WS/TCP relay 不因新增准入封禁被强制中断。`ban_secs: 0` 规范为 1 秒。已交给写入 worker 的操作不会因为客户端断开而撤回，重试前可先查询当前列表。
+
+持久化文件使用下列版本 1 JSON，`created_at_unix_secs` / `created_at_nanos` 保存原始 UTC 起点，`ttl_secs` 保留原始秒数；IP 和 TTL 由管理 API 写入。重启按 UTC 扣除已经过去的时间，保留小数秒，已过期条目不会复活，重复保存不会延长原 TTL。`created_at_nanos` 省略时为 0。
+
+```json
+{"version":1,"entries":[{"ip":"203.0.113.5","created_at_unix_secs":1789948800,"created_at_nanos":0,"ttl_secs":3600}]}
+```
+
+上例仅说明存储格式，不应直接复制为新的封禁。启用持久化时，未知版本、重复 IP、错误字段、损坏/不可读文件均使启动失败；文件缺失表示空列表。旧纯 IP 数组缺少期限信息，不能还原原期限，需明确设置时间和 TTL 后迁移，不能默默重置成一小时。每次成功管理更新保存当时采集到的活动列表；采集之后新增的自动 DDoS 封禁在下次管理快照前仅存于内存。热更新开关/路径影响随后管理请求的保存位置，当前活动表保留，外部文件在进程启动时读取。
+
+快照目录必须支持同目录原子替换。Linux 容器应把状态目录放在原生 Docker volume 或 Linux 本地磁盘；Windows 主机共享的 v9fs 挂载不具备本次验证要求的完整替换可见性，不能据此承诺并发读取始终存在文件。文件已同步后才 rename，但未承诺断电后目录项事务，也不支持多个进程同时写同一快照。
+
 ### 2.9 MQTT / IoT
 
 ```yaml

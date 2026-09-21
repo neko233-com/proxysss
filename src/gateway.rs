@@ -7,6 +7,9 @@ use file_io::{ExactReader, FileVersion};
 #[path = "http1_body.rs"]
 mod http1_body;
 #[cfg(test)]
+#[path = "http_blacklist_tests.rs"]
+mod http_blacklist_tests;
+#[cfg(test)]
 #[path = "http_metrics_tests.rs"]
 mod http_metrics_tests;
 #[cfg(test)]
@@ -2787,7 +2790,7 @@ impl Gateway {
         let dynamic = Arc::new(dynamic_state);
         let (on_demand_trigger, on_demand_rx) = tokio::sync::mpsc::unbounded_channel();
         let dynamic_blacklist =
-            DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist);
+            DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist)?;
 
         let gateway = Arc::new(Self {
             config_path,
@@ -4214,14 +4217,23 @@ impl Gateway {
             let ban_secs = payload
                 .ban_secs
                 .unwrap_or(state.config.security.ddos.ban_secs.max(1));
-            self.dynamic_blacklist.add(ip, ban_secs);
-            self.ddos_guard.ban_ip(ip, ban_secs);
-            let _ = self
+            if let Err(error) = self
                 .dynamic_blacklist
-                .persist(&state.config.security.dynamic_blacklist);
+                .apply_admin(
+                    state.config.security.dynamic_blacklist.clone(),
+                    self.ddos_guard.clone(),
+                    security::BlacklistMutation::Add { ip, ban_secs },
+                )
+                .await
+            {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": format!("blacklist update failed: {error:#}")}),
+                ));
+            }
             return Ok(json_response(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "ip": ip.to_string(), "ban_secs": ban_secs}),
+                serde_json::json!({"ok": true, "ip": ip.to_string(), "ban_secs": ban_secs.max(1), "persisted": state.config.security.dynamic_blacklist.enabled}),
             ));
         }
 
@@ -4251,14 +4263,23 @@ impl Gateway {
                     ));
                 }
             };
-            self.dynamic_blacklist.remove(ip);
-            self.ddos_guard.unban_ip(ip);
-            let _ = self
+            if let Err(error) = self
                 .dynamic_blacklist
-                .persist(&state.config.security.dynamic_blacklist);
+                .apply_admin(
+                    state.config.security.dynamic_blacklist.clone(),
+                    self.ddos_guard.clone(),
+                    security::BlacklistMutation::Remove { ip },
+                )
+                .await
+            {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": format!("blacklist update failed: {error:#}")}),
+                ));
+            }
             return Ok(json_response(
                 StatusCode::OK,
-                serde_json::json!({"ok": true, "ip": ip.to_string()}),
+                serde_json::json!({"ok": true, "ip": ip.to_string(), "persisted": state.config.security.dynamic_blacklist.enabled}),
             ));
         }
 
@@ -18638,7 +18659,9 @@ fn http_to_https_redirect_can_apply(config: &GatewayConfig) -> bool {
 }
 
 fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
-    !config.logging.access_log
+    !config.runtime.hot_reload.enabled
+        && !config.admin.enabled
+        && !config.logging.access_log
         && !config.script.enabled
         && !config.plugins.enabled
         && !config.security.ddos.enabled
@@ -22753,6 +22776,145 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn blacklist_api_failure_and_restart_preserve_the_committed_snapshot() {
+        use crate::verify::harness;
+        let root = harness::temp_root("blacklist-api-persistence");
+        let http_port = harness::reserve_port().await.unwrap();
+        let admin_port = harness::reserve_port().await.unwrap();
+        let mut config: GatewayConfig =
+            serde_yaml::from_str(&harness::base_gateway_yaml(http_port)).unwrap();
+        config.admin.enabled = true;
+        config.admin.bind = format!("127.0.0.1:{admin_port}");
+        config.admin.enable_write_ops = true;
+        config.admin.bearer_token = "blacklist-persistence-test-token-12345".into();
+        config.security.dynamic_blacklist.enabled = true;
+        config.security.dynamic_blacklist.path = root.join("blacklist.json");
+        let path = harness::write_config(&root, &serde_yaml::to_string(&config).unwrap()).unwrap();
+        let (gateway, task) = harness::spawn_gateway(path.clone()).await.unwrap();
+        let _abort = AbortTaskOnDrop(task.abort_handle());
+        harness::wait_tcp_ready(&config.admin.bind).await.unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let endpoint = format!("http://127.0.0.1:{admin_port}/v1/security/blacklist");
+        let long: IpAddr = "2001:db8::81".parse().unwrap();
+        let rejected: IpAddr = "203.0.113.82".parse().unwrap();
+        let short: IpAddr = "203.0.113.83".parse().unwrap();
+        for (ip, secs) in [(short, 1), (long, u64::MAX)] {
+            let response = client
+                .post(format!("{endpoint}/add"))
+                .bearer_auth(&config.admin.bearer_token)
+                .json(&serde_json::json!({"ip":ip.to_string(),"ban_secs":secs}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["persisted"], true);
+        }
+        let committed = fs::read(&config.security.dynamic_blacklist.path).unwrap();
+        let backup = root.join("committed.json");
+        fs::rename(&config.security.dynamic_blacklist.path, &backup).unwrap();
+        fs::create_dir(&config.security.dynamic_blacklist.path).unwrap();
+        for (action, ip) in [("add", rejected), ("remove", long)] {
+            let response = client
+                .post(format!("{endpoint}/{action}"))
+                .bearer_auth(&config.admin.bearer_token)
+                .json(&serde_json::json!({"ip":ip.to_string(),"ban_secs":120}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["ok"], false);
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to replace blacklist"));
+        }
+        assert!(gateway.dynamic_blacklist.is_blocked(long));
+        assert!(!gateway.dynamic_blacklist.is_blocked(rejected));
+        let mut ddos_config = config.security.ddos.clone();
+        ddos_config.enabled = true;
+        assert!(gateway
+            .ddos_guard
+            .check_and_record(long, &ddos_config)
+            .is_some());
+        assert!(gateway
+            .ddos_guard
+            .check_and_record(rejected, &ddos_config)
+            .is_none());
+        assert_eq!(fs::read(&backup).unwrap(), committed);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".proxysss-blacklist-")));
+        fs::remove_dir(&config.security.dynamic_blacklist.path).unwrap();
+        fs::rename(&backup, &config.security.dynamic_blacklist.path).unwrap();
+        task.abort();
+        let _ = task.await;
+        drop(gateway);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // A new gateway instance must consume the on-disk timestamps. The
+        // expired one-second ban must not come back as a one-hour ban.
+        let next_http = harness::reserve_port().await.unwrap();
+        let next_admin = harness::reserve_port().await.unwrap();
+        config.http.plain_bind = format!("127.0.0.1:{next_http}");
+        config.admin.bind = format!("127.0.0.1:{next_admin}");
+        harness::write_config(&root, &serde_yaml::to_string(&config).unwrap()).unwrap();
+        let (restored, task) = harness::spawn_gateway(path.clone()).await.unwrap();
+        let _abort_restored = AbortTaskOnDrop(task.abort_handle());
+        harness::wait_tcp_ready(&config.admin.bind).await.unwrap();
+        assert!(restored.dynamic_blacklist.is_blocked(long));
+        assert!(!restored.dynamic_blacklist.is_blocked(short));
+        assert_eq!(
+            restored.dynamic_blacklist.list_active(),
+            vec![long.to_string()]
+        );
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{next_admin}/v1/security/blacklist/remove"
+            ))
+            .bearer_auth(&config.admin.bearer_token)
+            .json(&serde_json::json!({"ip":long.to_string()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.json::<serde_json::Value>().await.unwrap()["persisted"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist)
+                .unwrap()
+                .list_active()
+                .is_empty()
+        );
+        assert!(client
+            .get(format!("http://127.0.0.1:{next_http}/"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        task.abort();
+        let _ = task.await;
+        drop(restored);
+        fs::write(&config.security.dynamic_blacklist.path, b"{incomplete").unwrap();
+        assert!(
+            Gateway::from_config(path, config).await.is_err(),
+            "corrupt enabled persistence must fail startup before listeners serve"
+        );
+        harness::cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn live_security_cleanup_retires_idle_state_and_maximum_admin_ban_survives() {
         use crate::verify::harness;
 
@@ -23530,6 +23692,8 @@ mod tests {
     #[test]
     fn raw_proxy_fast_lane_never_bypasses_observability_or_policy_hooks() {
         let mut config = GatewayConfig::default();
+        config.admin.enabled = false;
+        config.runtime.hot_reload.enabled = false;
         config.logging.access_log = false;
         config.script.enabled = false;
         config.plugins.enabled = false;
@@ -23539,6 +23703,12 @@ mod tests {
         config.affinity.enabled = false;
         assert!(simple_http_proxy_fast_path_allowed(&config));
 
+        config.admin.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.admin.enabled = false;
+        config.runtime.hot_reload.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.runtime.hot_reload.enabled = false;
         config.logging.access_log = true;
         assert!(!simple_http_proxy_fast_path_allowed(&config));
         config.logging.access_log = false;

@@ -14,9 +14,20 @@ rm -rf -- /work/.tmp/docker-scenarios /work/.tmp/docker-toolchain
 mkdir -p "$report" /work/.tmp/docker-toolchain /work/.tmp/go /work/.tmp/tools
 export TMPDIR=/work/.tmp/docker-toolchain TEMP=/work/.tmp/docker-toolchain TMP=/work/.tmp/docker-toolchain
 export GOCACHE=/work/.cache/go-linux-build GOPATH=/work/.cache/go GOMODCACHE=/work/.cache/go-mod GOTMPDIR=/work/.tmp/go
-cleanup() { rm -rf -- /work/.tmp/tests /work/.tmp/docker-toolchain /work/.tmp/platform-performance/linux/work; rm -f -- /work/.tmp/platform-performance-linux.lock; }
-trap cleanup EXIT
+# The fixture root is an owned anonymous Docker volume. Keep the mountpoint;
+# deleting it fails with EBUSY. --rm removes the volume after the container exits.
+clear_tests() {
+  [[ -d /work/.tmp/tests && ! -L /work/.tmp/tests ]]
+  mountpoint -q /work/.tmp/tests
+  find /work/.tmp/tests -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+cleanup() { clear_tests; rm -rf -- /work/.tmp/docker-toolchain /work/.tmp/platform-performance/linux/work; rm -f -- /work/.tmp/platform-performance-linux.lock; }
 printf 'verification container OS: %s %s %s\n' "$ID" "$VERSION_ID" "$(uname -m)" | tee "$report/environment.txt"
+mountpoint -q /work/.tmp/tests || { echo 'Missing isolated fixture volume' >&2; exit 1; }
+fixture_fs="$(stat -f -c %T /work/.tmp/tests)"
+printf 'fixture filesystem: %s; source filesystem: %s\n' "$fixture_fs" "$(stat -f -c %T /work)" | tee -a "$report/environment.txt"
+case "$fixture_fs" in 9p|v9fs|fuseblk|cifs|smb2) echo 'Linux fixtures require a native Docker volume, not a host-sharing filesystem' >&2; exit 1;; esac
+trap cleanup EXIT
 bash -n /work/scripts/verify-docker-scenarios.sh /work/scripts/verify-docker-container.sh
 go run /work/scripts/verify-docs.go
 go test /work/scripts/verify-docs.go /work/scripts/verify-docs_test.go
@@ -29,9 +40,9 @@ fi
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 for ((pass=1; pass<=repeat; pass++)); do
-  rm -rf -- /work/.tmp/tests
+  clear_tests
   cargo test --locked 2>&1 | tee "$report/tests-$pass.log"
-  rm -rf -- /work/.tmp/tests
+  clear_tests
 done
 cargo build --locked
 binary=/work/.benchmark/linux-target/debug/proxysss

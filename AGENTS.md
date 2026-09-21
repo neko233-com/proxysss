@@ -21,6 +21,8 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 安全状态过期回收独立于热重载和健康探测；保留活动窗口/封禁，黑名单读取不得删除并发续封的新状态。外部封禁秒数必须避免 Instant 加法溢出，相关实现及后台循环同时维护真实管理 API、并发和时间边界测试，见架构与配置指南。
 
+Linux 功能夹具使用独占匿名 Docker volume，避免把 Windows 共享 v9fs 的替换语义当作本地 Linux；严格断言不能忽略瞬时 ENOENT。黑名单持久化要求支持同目录原子替换的状态目录，保存原始 UTC 起点和 TTL，重启不得统一续成一小时；启用的损坏快照须明确报错。管理写入先完整同步临时文件并原子替换，再更新内存/DDoS；错误不能返回成功。写入顺序和取消责任留在控制面，普通准入与自动封禁不得等待磁盘锁。admin 或热重载开启时，HTTP/AI/WS 反代必须逐请求经过当前准入链，不能通过免策略快路径绕过内存黑名单；已有 WS/TCP relay 不因新准入封禁被强行切断。
+
 proxysss exists to **fully replace nginx** as a same-level general-purpose gateway. It is **not** a business gateway. Business-aware behavior belongs in optional scripts/plugins, similar to using Lua modules with nginx.
 
 Keep these invariants aligned across code, docs, examples, tests, and generated config:

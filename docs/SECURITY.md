@@ -1,24 +1,24 @@
-# proxysss security guide
+# proxysss 安全指南
 
-proxysss is designed as an **agent-native edge gateway** with secure defaults and explicit production hardening paths.
+proxysss 是可扩展的通用网关。核心负责协议边界、访问策略、限流、认证和安全下载；业务身份、Referer/User-Agent 与 bot-score 判断由应用或可选脚本承担。面向人的入口是 [安全与系统适配 HTML](security-performance.html)，详细字段以 [配置指南](CONFIGURATION.md) 为准。
 
-## Secure defaults
+## 安全默认值
 
-| Setting | Default | Purpose |
+| 配置 | 默认值 | 作用 |
 | --- | --- | --- |
-| `admin.bind` | `127.0.0.1:7777` | Admin API is loopback-only |
-| `admin.loopback_only` | `true` | Reject non-loopback admin clients when bind is local |
-| `admin.enable_write_ops` | `false` | Mutations require explicit enablement |
-| `admin.expose_config` | `false` | Full config export disabled by default |
-| `admin.auth_rate_limit.enabled` | `true` | Brute-force protection on admin auth |
-| `admin.monitor.enabled` | `false` | Dedicated mobile/desktop read-only API is opt-in |
-| `admin.monitor.password` | empty | Separate password, minimum 12 characters when enabled |
-| `admin.monitor.path_prefix` | `/_proxysss/monitor` | HTTPS-only monitor URL prefix |
-| `security.validate_admin_mutations` | `true` | Validate route/listener payloads from the admin API |
-| `security.block_ssrf_targets` | `true` | Block metadata/private IPs in admin mutation upstreams |
-| `security.reject_ambiguous_http1` | `true` | Reject ambiguous `Content-Length` + `Transfer-Encoding` |
+| `admin.bind` | `127.0.0.1:7777` | 管理接口默认在 loopback |
+| `admin.loopback_only` | `true` | 本地绑定拒绝非 loopback 客户端 |
+| `admin.enable_write_ops` | `false` | 自动化写入须显式开启 |
+| `admin.expose_config` | `false` | 默认不导出完整配置 |
+| `admin.auth_rate_limit.enabled` | `true` | 限制管理登录失败尝试 |
+| `admin.monitor.enabled` | `false` | 移动端/桌面监控独立启用 |
+| `admin.monitor.password` | 空 | 启用时使用至少 12 字符的独立密码 |
+| `admin.monitor.path_prefix` | `/_proxysss/monitor` | 仅通过 HTTPS 提供只读监控 |
+| `security.validate_admin_mutations` | `true` | 校验管理路由/listener 更新 |
+| `security.block_ssrf_targets` | `true` | 限制管理更新指定的上游目标 |
+| `security.reject_ambiguous_http1` | `true` | 拒绝歧义 HTTP/1 消息边界 |
 
-Enable automation explicitly when you trust the admin network:
+可信自动化可显式开启写入；示例中的密码和令牌必须替换：
 
 ```yaml
 admin:
@@ -37,45 +37,25 @@ admin:
     lockout_secs: 900
 ```
 
-## Threat mitigations
+## 管理、监控和上游目标
 
-### Path traversal
+管理 Basic/bearer 登录失败按客户端 IP 计数，在 `window_secs` 内达到 `max_failures` 后返回 429，直至锁定到期。并发失败不会清除或延长已经生效的锁定；过期失败窗口由独立控制任务清理。
 
-Static and WebDAV handlers reject `..` segments and unsafe encodings.
+`admin.monitor` 使用独立密码和短期 `monitor:read` 会话，登录后仅允许 `GET /v1/health`、`summary`、`stats`、`ssl`。这些路径位于配置的 monitor 前缀下，由主 HTTPS listener 提供；管理员 bearer token 不能代替监控会话。SSL 摘要不包含证书/密钥路径和 DNS 凭据，写入返回 `monitor_read_only`。移动端凭据应放在系统安全存储中，避免进入日志、URL 或版本库。
 
-### Read-only mobile monitor
+管理路由更新会检查上游主机/IP：IPv4 loopback、RFC1918、link-local、元数据地址，IPv6 loopback/未指定地址，以及配置的 blocked host/CIDR 会被对应策略拒绝。该检查面向管理更新输入，不查询 DNS，也不能当作 DNS 重绑定防护；可信 YAML/脚本仍可指向内网上游。完整目标语法和边界见配置指南。
 
-`admin.monitor` is intentionally separate from the administrator credential. The login endpoint issues a short-lived `monitor:read` session, and the session can access only:
+## HTTP、文件和 IP 策略
 
-- `GET /v1/health`
-- `GET /v1/summary`
-- `GET /v1/stats`
-- `GET /v1/ssl`
+HTTP/1 消息边界校验拒绝冲突长度、TE/CL 共存和不支持的编码。普通代理、SSE、WebSocket 非升级响应都要保持正文边界；截断必须失败，不能把下一条响应混入当前正文。
 
-The monitor endpoint is served only through the main HTTPS listener. It rejects non-GET methods with `monitor_read_only`, does not accept the administrator bearer token, and redacts certificate/key paths and DNS credentials from the SSL summary. Keep the monitor password in iOS Keychain, Android Keystore, or an equivalent secure store; never place it in logs, source control, ordinary iCloud records, URLs, or clipboard contents.
+静态、WebDAV 和 FileCloud 检查目录边界及真实路径，CDN 令牌、签名和对端 ACL 在缓存/Range 处理之前执行。可信运维应以原子替换方式发布文件，避免不可信本地进程并发修改目录链接；路径校验不是目录描述符沙箱。下载语义、取消和资源上限见 [CDN 回源与安全下载](CDN-ORIGIN.md) / [HTML](cdn-origin.html)。
 
-### SSRF via admin API
+`services.access_control.http` 控制 HTTP，`services.access_control.stream` 和 stream route 策略控制 TCP/UDP。新 TCP 连接和 UDP association 共用连接准入，既有 UDP 数据报不重复扣连接配额。IPv4/IPv6 CIDR 和 mapped IPv4 的匹配语义由真实准入回归保护。
 
-When agents register upstreams, `security.block_ssrf_targets` rejects:
+`security.mac_deny` 未接入数据路径，非空配置会被拒绝。网关使用 IP/CIDR；二层 MAC 过滤应由主机或网络设备承担。
 
-- `127.0.0.0/8`, RFC1918, link-local, and `169.254.169.254`
-- Hostnames in `security.blocked_upstream_hosts`
-
-YAML-configured internal upstreams remain allowed; SSRF policy applies to **admin mutation payloads**.
-
-### HTTP request smuggling
-
-Ambiguous HTTP/1 requests with both `Content-Length` and `Transfer-Encoding` are rejected when `security.reject_ambiguous_http1=true`.
-
-### Admin brute force
-
-Failed basic/bearer auth attempts per client IP are counted. After `max_failures` inside `window_secs`, the client receives `429` until `lockout_secs` elapses.
-
-### IP allow/deny and stream access control
-
-HTTP clients are filtered by `services.access_control.http` (aliases: `whitelist`/`blacklist`). TCP/stream listeners honor `services.access_control.stream` globally and per `tcp.stream_routes[].access_control`.
-
-### DDoS mitigation
+## DDoS 与动态黑名单
 
 ```yaml
 security:
@@ -90,53 +70,26 @@ security:
     path: runtime/dynamic-blacklist.json
 ```
 
-When a client exceeds `max_connections + burst` inside `window_secs`, proxysss temporarily bans the IP for `ban_secs`. Metrics: `proxysss_blocked_requests_total`, `proxysss_ddos_bans_total`.
+窗口内超过 `max_connections + burst` 时临时封禁 IP；指标包括 `proxysss_blocked_requests_total` 和 `proxysss_ddos_bans_total`。独立控制任务每秒回收失效窗口/封禁，不依赖热重载或健康探测开关；活动状态保留。TTL 按单调时间计算，超大秒数不会导致未来 Instant 溢出。
 
-Agent API (requires `admin.enable_write_ops`):
+令牌鉴权的管理接口：
 
-- `GET /v1/security/blacklist`
-- `POST /v1/security/blacklist/add` — body `{"ip":"203.0.113.5","ban_secs":3600}`
-- `POST /v1/security/blacklist/remove` — body `{"ip":"203.0.113.5"}`
+- `GET /v1/security/blacklist`：当前有效 IP 列表。
+- `POST /v1/security/blacklist/add`：`{"ip":"203.0.113.5","ban_secs":3600}`。
+- `POST /v1/security/blacklist/remove`：`{"ip":"203.0.113.5"}`。
 
-### MAC 黑名单的支持边界
+两个 POST 还要求 `admin.enable_write_ops=true`。开启持久化时先完整同步同目录临时文件并原子替换，再更新内存/DDoS；成功返回 `persisted=true`，写失败返回 500 并保留原内存状态。关闭持久化仍可更新内存，返回 `persisted=false`。单 writer 排队不阻塞普通连接检查；已经交给 worker 的请求在客户端断开后继续完成，重试前可查询列表。
 
-`security.mac_deny` 从未接入实际数据路径，现统一拒绝非空配置，避免造成防护已生效的错觉。使用 `services.access_control` 的 IP/CIDR 策略；需要二层 MAC 过滤时在主机防火墙或网络设备上配置。
+版本 1 快照保存原始 UTC 秒/纳秒和 TTL，重启扣除停机时间，已到期封禁不复活，重复保存不延长期限。缺失文件可从空列表启动；启用持久化时损坏、不可读、未知版本和重复条目都会报错。旧纯 IP 数组缺少期限，须明确时间/TTL 后迁移。每次管理更新保存采集到的活动列表；此后新增的自动封禁在下一次管理快照前只保存在内存。热更新开关/路径影响后续保存，外部文件在启动时读取。格式见 [配置指南](CONFIGURATION.md) / [HTML](configuration.html#blacklist-persistence)。
 
-### TLS
+## TLS 与自动化
 
-- Use `http.tls.mode: acme_managed` for public sites (HTTP-01 / TLS-ALPN-01).
-- Managed ACME defaults to ECDSA P-256; use `http.tls.acme.key_algorithm: rsa2048` only when legacy-client compatibility requires it.
-- Use `http.tls.on_demand` for first-hit managed ACME with `allow` glob patterns and optional `ask_url` gate.
-- Use built-in `http.tls.mode: acme_managed` + `challenge: dns01` for wildcard certificates (`manual` needs no API key). Legacy `acme_dns_external` + `acme.sh` is optional only for unsupported DNS vendors.
-- Avoid `self_signed` on the public internet.
+公网通常使用 `http.tls.mode: acme_managed`，默认 TLS-ALPN-01 和 ECDSA P-256；HTTP-01 可显式选择，旧客户端需要时可选择 `rsa2048`。通配符使用内建 DNS-01 provider，未内建厂商才使用外部 acme.sh 模式。按需签发由 `http.tls.on_demand` 的 allow/ask_url 控制；self_signed 适合开发或内部环境。
 
-### Atomic configuration writes
+路由/listener 管理更新采用临时文件和 rename 写 YAML，重载失败会尝试恢复原文件。各管理操作的并发、失败和生效边界以相应 API 文档为准，不能把文件替换等同于所有网关状态的事务。
 
-Admin mutations write via a temp file + rename so partial YAML is not left on disk if the process crashes mid-write. Failed reloads restore the previous file.
+## 运维与验证
 
-## Production checklist
+替换默认管理凭据，按需启用写入/配置导出；远程管理使用受控网络和 HTTPS。监控使用独立密码及 hosts 范围，指标采集放在受控网络。安全问题报告应给出受影响版本、最小复现与脱敏日志，通过仓库报告渠道提交。
 
-1. Change `admin.username` / `admin.password` and set a unique `admin.bearer_token`.
-2. Keep `admin.loopback_only: true` or bind admin to a private interface only.
-3. Set `admin.enable_write_ops: true` only on nodes that run cluster automation.
-4. Leave `admin.expose_config: false` unless config export is required.
-5. If a mobile monitor is needed, enable `admin.monitor` with a unique 12+ character password and an explicit `hosts` allowlist.
-6. Review `security.blocked_upstream_hosts` for your cloud metadata endpoints.
-7. Scrape `/metrics` from an internal network; do not expose admin on `0.0.0.0` without a firewall.
-
-## Reporting issues
-
-Open security-related reports in the GitHub repository with reproduction steps and affected version.
-
-## CDN 回源、安全下载与幂等验证
-
-静态源站令牌、签名、真实对端 ACL 在缓存之前校验。签名资源默认 no-store；默认隐藏点文件并拒绝越过根目录的真实路径。CDN 缓存命中时的访客授权和流量费用限制由边缘执行。
-
-完整说明：[CDN 回源与安全下载](CDN-ORIGIN.md)；面向人的入口：[HTML 文档](cdn-origin.html)。使用 `static-sign --site cdn --path /assets/file.bin --ttl-secs 120` 签发短期 URL，密钥从 YAML 读取。
-
-`test.cmd` 连续验证两轮；临时数据和最新报告放在 `.tmp/`，依赖放在 `.cache/`，编译缓存放在 `target/`，本地包固定为 `dist/proxysss-local.zip`，重复运行覆盖并清理 staging。
-
-
-## 安全开关与跨系统性能适配
-
-`proxysss config security` 输出安全开关、默认值和建议；CDN 的 enabled/origin_token_enabled/allowed_peers_enabled 与 FTP 各类策略支持独立停用并保留参数。`config performance` 探测 Windows IOCP、macOS kqueue、Linux epoll 与实际 socket 能力。Windows/macOS 保持现有调度并按系统适配 socket，Linux 保留独立数据运行时并继续发行版/CPU 自适应。runtime.performance 只在启动时应用，变更需重启。Docker 验证固定命名 `proxysss-verify`，前后清理同名项目容器，覆盖项目内报告。完整说明见 [安全与性能指南](SECURITY-PERFORMANCE.md)。
+`proxysss config security` 检查安全开关，`config performance` 检查系统/socket 能力，不执行主机修改。`runtime.performance` 在启动时应用，改变需重启。先完成 Ubuntu 24 Docker 全功能和完整混合性能验证，再做本机 Windows 快速 `cargo test --locked`；所有门槛通过后才发布。工件和缓存按 [验证流程](VALIDATION.md) 保留，单项性能结果不能冒充完整场景通过。

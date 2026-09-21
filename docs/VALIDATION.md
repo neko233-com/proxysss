@@ -12,6 +12,8 @@ Windows Docker Desktop 在 PowerShell 运行：
 
 Linux/macOS 使用 `scripts/verify-docker-scenarios.sh`。脚本探测 Ubuntu 24.04 x86_64，检查格式、Clippy、两轮测试、全场景配置、CLI 能力和 nginx 对照声明。固定容器名 `proxysss-verify` 带项目所有者标记；不得清理其他任务的容器。最新报告位于 `.tmp/docker-scenarios/`，测试目录在结束或失败后清理。
 
+文件夹具 `.tmp/tests` 挂载本次容器独占的匿名 Docker volume，验证 Linux 原生文件系统的重命名、权限和链接语义；退出后由 `--rm` 回收该卷。源码、构建缓存与报告仍在工作区，报告记录两种文件系统。不能把 Windows 共享目录的 v9fs 行为当作 Linux 本地磁盘：本机独立诊断中同目录替换会短暂返回 ENOENT，原生 Linux 卷未出现；并发快照测试保持严格断言，不忽略或重试该错误。这不是断电持久性测试，也不代表网络文件系统全部可用。
+
 CPU 功能探针 `scripts/verify-linux-cpu/main.go` 随 Docker 功能检查运行：用 taskset 收窄真实网关的 CPU 范围，验证 HTTP/TCP/UDP 正文、所有线程 affinity，以及 HTTP/native relay/sendfile owner 数量。单独在带 CPU quota 的容器中可使用 `go run scripts/verify-linux-cpu/main.go --binary <Linux二进制> --expected-workers <预算>` 断言 quota 生效；这是功能检查，不是性能胜出证据。检查结果保存为 cpu-confinement.txt。
 
 同一入口也运行 `scripts/benchmark-helper_test.go`，保护性能报告、原始样本汇总和门槛判定；这些 Go 验证只在本地执行，不加入 GitHub Actions。

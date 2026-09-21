@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -15,29 +15,37 @@ use crate::config::{
 };
 use crate::stream_endpoint::StreamEndpoint;
 
+#[cfg(test)]
+#[path = "security_blacklist_tests.rs"]
+mod blacklist_tests;
+
 // Store elapsed-time TTLs rather than adding untrusted seconds to Instant:
 // u64::MAX is valid input but cannot be represented as a future Instant.
 #[derive(Clone, Copy)]
 struct Expiry {
     started_at: Instant,
-    ttl_secs: u64,
+    valid_for: Duration,
 }
 
 impl Expiry {
     fn new(now: Instant, ttl_secs: u64) -> Self {
         Self {
             started_at: now,
-            ttl_secs: ttl_secs.max(1),
+            valid_for: Duration::from_secs(ttl_secs.max(1)),
         }
     }
 
     fn remaining_secs(self, now: Instant) -> u64 {
-        self.ttl_secs
-            .saturating_sub(now.saturating_duration_since(self.started_at).as_secs())
+        let remaining = self
+            .valid_for
+            .saturating_sub(now.saturating_duration_since(self.started_at));
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0))
     }
 
     fn active(self, now: Instant) -> bool {
-        self.remaining_secs(now) != 0
+        now.saturating_duration_since(self.started_at) < self.valid_for
     }
 }
 
@@ -461,14 +469,14 @@ impl DdosGuard {
         None
     }
 
-    pub fn ban_ip(&self, ip: IpAddr, ban_secs: u64) {
+    fn ban_ip(&self, ip: IpAddr, until: Expiry) {
         let now = Instant::now();
         self.windows.insert(
             ip,
             DdosWindowState {
                 count: 0,
                 window_start: now,
-                banned_until: Some(Expiry::new(now, ban_secs)),
+                banned_until: Some(until),
             },
         );
     }
@@ -491,60 +499,220 @@ impl DdosGuard {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy)]
+struct BlacklistEntry {
+    expiry: Expiry,
+    created_at: Duration,
+    ttl_secs: u64,
+}
+
+impl BlacklistEntry {
+    fn new(ban_secs: u64) -> Self {
+        Self {
+            expiry: Expiry::new(Instant::now(), ban_secs),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+            ttl_secs: ban_secs.max(1),
+        }
+    }
+
+    fn stored(self, ip: IpAddr) -> StoredBan {
+        StoredBan {
+            ip,
+            created_at_unix_secs: self.created_at.as_secs(),
+            created_at_nanos: self.created_at.subsec_nanos(),
+            ttl_secs: self.ttl_secs,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlacklistSnapshot {
+    version: u32,
+    entries: Vec<StoredBan>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredBan {
+    ip: IpAddr,
+    created_at_unix_secs: u64,
+    #[serde(default)]
+    created_at_nanos: u32,
+    ttl_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+pub enum BlacklistMutation {
+    Add { ip: IpAddr, ban_secs: u64 },
+    Remove { ip: IpAddr },
+}
+
+#[derive(Clone)]
 pub struct DynamicBlacklist {
-    entries: std::sync::Arc<DashMap<IpAddr, Expiry>>,
+    entries: std::sync::Arc<DashMap<IpAddr, BlacklistEntry>>,
+    writer: std::sync::Arc<std::sync::Mutex<()>>,
+    worker_permit: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for DynamicBlacklist {
+    fn default() -> Self {
+        Self {
+            entries: Default::default(),
+            writer: Default::default(),
+            worker_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
 }
 
 impl DynamicBlacklist {
-    pub fn load_from_disk(config: &DynamicBlacklistConfig) -> Self {
+    pub fn load_from_disk(config: &DynamicBlacklistConfig) -> Result<Self> {
         let blacklist = Self::default();
         if !config.enabled {
-            return blacklist;
+            return Ok(blacklist);
         }
-        if let Ok(bytes) = std::fs::read(&config.path) {
-            if let Ok(items) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                let until = Expiry::new(Instant::now(), 3600);
-                for item in items {
-                    if let Ok(ip) = item.parse() {
-                        blacklist.entries.insert(ip, until);
+        let bytes = match std::fs::read(&config.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&config.path) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(blacklist)
+                    }
+                    _ => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "blacklist path exists but cannot be read: {}",
+                                config.path.display()
+                            )
+                        })
                     }
                 }
             }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read blacklist {}", config.path.display()))
+            }
+        };
+        let snapshot: BlacklistSnapshot = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "invalid blacklist snapshot {}; expected version 1 with timestamps and TTLs",
+                config.path.display()
+            )
+        })?;
+        if snapshot.version != 1 {
+            anyhow::bail!(
+                "unsupported blacklist snapshot version {}",
+                snapshot.version
+            );
         }
-        blacklist
+        let wall_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?;
+        let now = Instant::now();
+        let mut seen = std::collections::HashSet::new();
+        for stored in snapshot.entries {
+            if stored.created_at_nanos >= 1_000_000_000
+                || stored.ttl_secs == 0
+                || !seen.insert(stored.ip)
+            {
+                anyhow::bail!("invalid or duplicate blacklist entry for {}", stored.ip);
+            }
+            let created_at = Duration::new(stored.created_at_unix_secs, stored.created_at_nanos);
+            let remaining = Duration::from_secs(stored.ttl_secs)
+                .saturating_sub(wall_now.saturating_sub(created_at));
+            if remaining.is_zero() {
+                continue;
+            }
+            blacklist.entries.insert(
+                stored.ip,
+                BlacklistEntry {
+                    expiry: Expiry {
+                        started_at: now,
+                        valid_for: remaining,
+                    },
+                    created_at,
+                    ttl_secs: stored.ttl_secs,
+                },
+            );
+        }
+        Ok(blacklist)
     }
 
-    pub fn persist(&self, config: &DynamicBlacklistConfig) -> Result<()> {
-        if !config.enabled {
-            return Ok(());
-        }
-        if let Some(parent) = config.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+    // At most one blocking writer per blacklist. The permit travels into the
+    // worker so disconnecting a caller cannot admit a second unfinished writer.
+    pub async fn apply_admin(
+        &self,
+        config: DynamicBlacklistConfig,
+        ddos: DdosGuard,
+        mutation: BlacklistMutation,
+    ) -> Result<()> {
+        let permit = self
+            .worker_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .context("blacklist writer closed")?;
+        let blacklist = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            blacklist.apply_admin_sync(&config, &ddos, mutation)
+        })
+        .await
+        .context("blacklist writer failed")?
+    }
+
+    fn apply_admin_sync(
+        &self,
+        config: &DynamicBlacklistConfig,
+        ddos: &DdosGuard,
+        mutation: BlacklistMutation,
+    ) -> Result<()> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("blacklist writer lock poisoned"))?;
+        let (ip, replacement) = match mutation {
+            BlacklistMutation::Add { ip, ban_secs } => (ip, Some(BlacklistEntry::new(ban_secs))),
+            BlacklistMutation::Remove { ip } => (ip, None),
+        };
         let now = Instant::now();
-        let active = self
-            .entries
-            .iter()
-            .filter(|entry| entry.value().active(now))
-            .map(|entry| entry.key().to_string())
-            .collect::<Vec<_>>();
-        std::fs::write(
-            &config.path,
-            serde_json::to_vec_pretty(&active).context("failed to serialize blacklist")?,
-        )
-        .with_context(|| format!("failed to write {}", config.path.display()))?;
+        if config.enabled {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?;
+            let mut entries = self
+                .entries
+                .iter()
+                .filter(|entry| *entry.key() != ip && entry.value().expiry.active(now))
+                .map(|entry| entry.value().stored(*entry.key()))
+                .collect::<Vec<_>>();
+            if let Some(entry) = replacement {
+                entries.push(entry.stored(ip));
+            }
+            entries.sort_unstable_by_key(|entry| entry.ip);
+            let bytes = serde_json::to_vec_pretty(&BlacklistSnapshot {
+                version: 1,
+                entries,
+            })
+            .context("failed to serialize blacklist")?;
+            write_blacklist_snapshot(&config.path, &bytes)?;
+        }
+        // Rename is the commit boundary. Nothing observable in memory changes
+        // before it succeeds. Automatic bans never acquire the writer lock.
+        if let Some(entry) = replacement {
+            self.entries.insert(ip, entry);
+            ddos.ban_ip(ip, entry.expiry);
+        } else {
+            self.entries.remove(&ip);
+            ddos.unban_ip(ip);
+        }
         Ok(())
     }
 
     pub fn add(&self, ip: IpAddr, ban_secs: u64) {
-        self.entries
-            .insert(ip, Expiry::new(Instant::now(), ban_secs));
-    }
-
-    pub fn remove(&self, ip: IpAddr) {
-        self.entries.remove(&ip);
+        self.entries.insert(ip, BlacklistEntry::new(ban_secs));
     }
 
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
@@ -553,26 +721,66 @@ impl DynamicBlacklist {
         // entries while holding the same shard guard as its expiry check.
         self.entries
             .get(&ip)
-            .is_some_and(|until| until.active(Instant::now()))
+            .is_some_and(|entry| entry.expiry.active(Instant::now()))
     }
 
     pub fn list_active(&self) -> Vec<String> {
         let now = Instant::now();
         self.entries
             .iter()
-            .filter(|entry| entry.value().active(now))
+            .filter(|entry| entry.value().expiry.active(now))
             .map(|entry| entry.key().to_string())
             .collect()
     }
 
     pub(crate) fn prune_expired(&self, now: Instant) {
-        self.entries.retain(|_, until| until.active(now));
+        self.entries.retain(|_, entry| entry.expiry.active(now));
     }
 
     #[cfg(test)]
     pub(crate) fn tracked_entries(&self) -> usize {
         self.entries.len()
     }
+}
+
+fn write_blacklist_snapshot(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let temp = parent.join(format!(".proxysss-blacklist-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .with_context(|| format!("failed to create {}", temp.display()))?;
+    struct TempFile(std::path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = TempFile(temp.clone());
+    let written = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temp.display()))?;
+        Ok(())
+    })();
+    drop(file);
+    written?;
+    std::fs::rename(&temp, path)
+        .with_context(|| format!("failed to replace blacklist {}", path.display()))?;
+    Ok(())
 }
 
 pub fn ip_access_is_denied(config: &HttpAccessControlConfig, ip: IpAddr) -> Option<String> {
@@ -834,7 +1042,7 @@ mod tests {
         };
         assert!(ddos.check_and_record(ip, &config).is_none());
         assert_eq!(ddos.check_and_record(ip, &config), Some(u64::MAX));
-        ddos.ban_ip(ip, u64::MAX);
+        ddos.ban_ip(ip, Expiry::new(Instant::now(), u64::MAX));
         ddos.prune_expired(Instant::now() + Duration::from_secs(5), &config);
         assert!(ddos.check_and_record(ip, &config).is_some());
 
@@ -883,7 +1091,7 @@ mod tests {
         let short = "203.0.113.10".parse().unwrap();
         let long = "2001:db8::10".parse().unwrap();
         assert!(ddos.check_and_record(short, &config).is_none());
-        ddos.ban_ip(long, 30);
+        ddos.ban_ip(long, Expiry::new(Instant::now(), 30));
         ddos.prune_expired(Instant::now(), &config);
         assert!(ddos.check_and_record(short, &config).is_none());
         assert!(
@@ -915,7 +1123,7 @@ mod tests {
         let blacklist = DynamicBlacklist::default();
         blacklist.add(short, 0);
         blacklist.add(long, 30);
-        let started = blacklist.entries.get(&short).unwrap().started_at;
+        let started = blacklist.entries.get(&short).unwrap().expiry.started_at;
         blacklist.prune_expired(started + Duration::from_millis(999));
         assert_eq!(blacklist.tracked_entries(), 2);
         blacklist.prune_expired(started + Duration::from_secs(1));
@@ -930,7 +1138,8 @@ mod tests {
     fn concurrent_blacklist_retirement_never_removes_a_replacement_ban() {
         let blacklist = DynamicBlacklist::default();
         let ip = "2001:db8::9".parse().unwrap();
-        let expired = Expiry::new(Instant::now() - Duration::from_secs(2), 1);
+        let mut expired = BlacklistEntry::new(1);
+        expired.expiry.started_at = Instant::now() - Duration::from_secs(2);
         blacklist.entries.insert(ip, expired);
         assert!(!blacklist.is_blocked(ip));
         let observed = Instant::now();

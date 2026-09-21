@@ -40,7 +40,8 @@ try {
     docker run --name $container --label "com.proxysss.owner=$owner" --rm `
         -e CARGO_HOME=/work/.cache/cargo -e CARGO_TARGET_DIR=/work/.benchmark/linux-target `
         -e "VERIFY_CONFIG=$configRelative" -e "VERIFY_REPEAT=$Repeat" -e "VERIFY_PERFORMANCE=$performanceValue" `
-        -v "${repoRoot}:/work" -w /work $Image bash /work/scripts/verify-docker-container.sh
+        -v "${repoRoot}:/work" --mount type=volume,destination=/work/.tmp/tests,volume-nocopy `
+        -w /work $Image bash /work/scripts/verify-docker-container.sh
     if ($LASTEXITCODE -ne 0) { throw "Docker verification failed with exit code $LASTEXITCODE" }
     Write-Host 'proxysss Docker scenario verification passed'
 } finally {
