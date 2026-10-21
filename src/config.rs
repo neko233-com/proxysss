@@ -3929,7 +3929,7 @@ fn normalize_compression_algorithms(
     }
 }
 
-fn validate_compression_config(
+pub(crate) fn validate_compression_config(
     config: &ResponseCompressionConfig,
     prefix: &str,
     errors: &mut Vec<String>,

@@ -60,6 +60,8 @@ export interface RouteCachePolicy {
 
 /** String applies to all statuses; object requires exactly one source. */
 export type RouteResponseHeader = string | {
+  /** Append one independent field after upstream values; default false replaces. Never folds Set-Cookie. */
+  append?: boolean;
   value?: string;
   from_header?: string;
   /** Omitted = all; [] = none. Nginx non-always add_header needs an explicit status list. */
@@ -84,6 +86,10 @@ export interface RouteDecision {
   affinity_key?: string;
   /** Optional rewritten path sent downstream. / 发往下游的可选改写路径。 */
   rewrite_path?: string;
+  /** Override only ordinary HTTP upstream requests; visitor ctx.method and fixed GET auth/WS stay unchanged.
+   * HEAD visitors receive metadata without a body; HEAD cache access remains bypassed.
+   */
+  upstream_method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE";
   /** Extra headers to inject. / 要额外注入的 header。 */
   set_headers?: Record<string, string>;
   /** Headers to strip before proxying. / 代理前需要移除的 header。 */
@@ -99,6 +105,12 @@ export interface RouteDecision {
   /** Fixed GET authorization runs before route cache, selected static files or main upstream. */
   auth_request?: AuthRequestPolicy;
   cache?: RouteCachePolicy;
+  /** Entire per-route native compression policy; omitted/null inherits global, enabled:false disables.
+   * Transforms only eligible known-length entities up to 4 MiB; unknown/larger responses stream.
+   * SSE, 206 and existing Content-Encoding are never transformed. Preserves origin Vary tokens.
+   * Encoded HEAD omits derived Content-Length; transforms and matching HEAD weaken strong ETags.
+   */
+  compression?: { enabled?: boolean; algorithms?: ("gzip" | "brotli" | "zstd")[]; min_length?: number; content_types?: string[] } | null;
   /** Generate forwarding headers (default true), then apply strip_headers/set_headers. */
   forward_headers?: boolean;
   /** Copy visitor headers (default true); explicit set_headers still apply. */

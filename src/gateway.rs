@@ -31,6 +31,9 @@ mod stream_endpoint_tests;
 #[cfg(test)]
 #[path = "udp_session_tests.rs"]
 mod udp_session_tests;
+#[cfg(test)]
+#[path = "upstream_method_tests.rs"]
+mod upstream_method_tests;
 use std::cell::Cell;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -1800,6 +1803,7 @@ const PLAIN_FAST_DIRECT_WRITE_FAIR_BYTES: usize = 256 * 1024;
 // that mixed-load knee while preserving the lower-overhead 1x path.
 const PLAIN_FAST_LANE_HIGH_DENSITY_CONNECTIONS_PER_SHARD: usize = 64;
 const UPSTREAM_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
+const MAX_BUFFERED_COMPRESSION_BYTES: u64 = 4 * 1024 * 1024;
 const TCP_LISTEN_BACKLOG: u32 = 262_144;
 // With the Linux fair scheduler enabled, a hot listen backlog can keep
 // `accept()` immediately ready long enough to queue hundreds of TLS tasks
@@ -9326,6 +9330,13 @@ impl Gateway {
                 .map(|policy| Cow::Owned(policy.clone()))
                 .unwrap_or_else(|| Cow::Borrowed(&state.config.services.response_policy.cache));
             let forward_headers = decision.forward_headers.unwrap_or(true);
+            let compression = decision
+                .compression
+                .as_ref()
+                .map(|policy| Cow::Owned(policy.clone()))
+                .unwrap_or_else(|| {
+                    Cow::Borrowed(&state.config.services.response_policy.compression)
+                });
             let rate_limit = decision
                 .upstream
                 .strip_prefix("proxysss://static-site/")
@@ -9347,7 +9358,7 @@ impl Gateway {
             HttpRouteConfig {
                 runtime_scope: Some("script".to_string()),
                 decision,
-                compression: Cow::Borrowed(&state.config.services.response_policy.compression),
+                compression,
                 cache,
                 rate_limit,
                 forward_headers,
@@ -9451,7 +9462,12 @@ impl Gateway {
             return Ok(self.purge_http_cache(&state.config, &route.cache, &host, &uri));
         }
 
-        let cache_key = cache_lookup_key(&route.cache, &method, &host, &uri, &headers);
+        let upstream_method = route.decision.upstream_http_method(&method)?;
+        let cache_key = if upstream_method == Method::GET {
+            cache_lookup_key(&route.cache, &method, &host, &uri, &headers)
+        } else {
+            None
+        };
         if let Some(cache_key) = cache_key.as_deref() {
             match self.lookup_cached_http_response(&state.config, &route.cache, cache_key) {
                 Some(CacheLookup::Fresh(mut response)) => {
@@ -9554,7 +9570,7 @@ impl Gateway {
 
             let send_result = state
                 .dispatch_upstream_http(
-                    method.clone(),
+                    upstream_method.clone(),
                     upstream_target,
                     upstream_headers,
                     if route.decision.pass_request_body {
@@ -9613,7 +9629,11 @@ impl Gateway {
             if track_runtime {
                 self.on_upstream_success("http", route.runtime_scope.as_deref(), upstream);
             }
-            let (body, stream_body) = if stream_upstream_body {
+            let (body, stream_body) = if method == Method::HEAD || upstream_method == Method::HEAD {
+                // Only headers are needed. Do not buffer a GET body for a visitor HEAD request.
+                drop(upstream_response);
+                (Bytes::new(), None)
+            } else if stream_upstream_body {
                 (Bytes::new(), Some(upstream_response.into_stream_body()))
             } else {
                 let response_body = match upstream_response.bytes().await {
@@ -9643,10 +9663,40 @@ impl Gateway {
                 self.store_cached_http_response(&state.config, cache_key, &route.cache, &response);
             }
             let mut response = response;
+            if upstream_method == Method::HEAD && method != Method::HEAD {
+                // A non-HEAD visitor cannot receive HEAD's hypothetical GET Content-Length.
+                response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
+                response
+                    .headers
+                    .push((CONTENT_LENGTH, HeaderValue::from_static("0")));
+            }
             if cache_key.is_some() && route.cache.enabled {
                 let _ = apply_cache_response_headers(&route.cache, &mut response, "MISS");
             }
             apply_route_response_headers(&route.decision, &mut response)?;
+            if method == Method::HEAD {
+                apply_streaming_response_headers(&mut response)?;
+                let eligible = apply_compression_vary(&mut response, &route.compression)?;
+                if eligible && response.status != StatusCode::PARTIAL_CONTENT {
+                    if let Some(encoding) =
+                        select_compression_encoding(&headers, &route.compression)
+                    {
+                        // GET would encode this representation. Do not read its body only to
+                        // calculate a derived HEAD length; omit that unknown encoded length.
+                        response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
+                        response.headers.push((
+                            CONTENT_ENCODING,
+                            match encoding {
+                                CompressionEncoding::Gzip => HeaderValue::from_static("gzip"),
+                                CompressionEncoding::Brotli => HeaderValue::from_static("br"),
+                                CompressionEncoding::Zstd => HeaderValue::from_static("zstd"),
+                            },
+                        ));
+                        weaken_transformed_etags(&mut response)?;
+                    }
+                }
+                return Ok(response);
+            }
             return finalize_http_response(&headers, &route.compression, response);
         }
 
@@ -10877,6 +10927,19 @@ impl Gateway {
         response: &GatewayHttpResponse,
     ) {
         if !cache_config.enabled
+            || response.stream_body.is_some()
+            || (!cache_config
+                .vary_headers
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("accept-encoding"))
+                && response.headers.iter().any(|(name, value)| {
+                    name == CONTENT_ENCODING
+                        && value.to_str().map_or(true, |value| {
+                            value
+                                .split(',')
+                                .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+                        })
+                }))
             || cache_config.behavior == CacheBehavior::Bypass
             || cache_config.behavior == CacheBehavior::NoCache
             || response.body.len() > cache_config.max_body_bytes
@@ -15790,7 +15853,11 @@ fn finalize_http_response(
     mut response: GatewayHttpResponse,
 ) -> Result<GatewayHttpResponse> {
     apply_streaming_response_headers(&mut response)?;
-    if !compression.enabled || !response_allows_compression(&response) {
+    apply_compression_vary(&mut response, compression)?;
+    if !compression.enabled
+        || !response_allows_compression(&response)
+        || response.body.len() as u64 > MAX_BUFFERED_COMPRESSION_BYTES
+    {
         return Ok(response);
     }
     let Some(encoding) = select_compression_encoding(request_headers, compression) else {
@@ -15817,9 +15884,9 @@ fn finalize_http_response(
         ),
     };
     response.body = Bytes::from(compressed);
+    weaken_transformed_etags(&mut response)?;
     response.headers.retain(|(name, _)| name != CONTENT_LENGTH);
     response.headers.push((CONTENT_ENCODING, encoding_header));
-    append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
     response.headers.push((
         CONTENT_LENGTH,
         HeaderValue::from_str(&response.body.len().to_string())
@@ -15996,6 +16063,83 @@ fn response_allows_compression(response: &GatewayHttpResponse) -> bool {
             .headers
             .iter()
             .any(|(name, _)| name == CONTENT_ENCODING)
+}
+
+fn apply_compression_vary(
+    response: &mut GatewayHttpResponse,
+    compression: &ResponseCompressionConfig,
+) -> Result<bool> {
+    if !compression.enabled
+        || matches!(
+            response.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        )
+        || response_content_type_is(response, "text/event-stream")
+        || response
+            .headers
+            .iter()
+            .any(|(name, _)| name == CONTENT_ENCODING)
+        || !content_type_matches(response, &compression.content_types)
+    {
+        return Ok(false);
+    }
+    let length = if response.status == StatusCode::PARTIAL_CONTENT {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name == CONTENT_RANGE)
+            .and_then(|(_, value)| value.to_str().ok())
+            .and_then(|value| value.rsplit_once('/'))
+            .and_then(|(_, total)| total.parse::<u64>().ok())
+    } else {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name == CONTENT_LENGTH)
+            .and_then(|(_, value)| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                response
+                    .stream_body
+                    .is_none()
+                    .then_some(response.body.len() as u64)
+            })
+    };
+    if length.is_none_or(|length| {
+        length < compression.min_length as u64 || length > MAX_BUFFERED_COMPRESSION_BYTES
+    }) {
+        return Ok(false);
+    }
+    if !response
+        .headers
+        .iter()
+        .filter(|(name, _)| name == VARY)
+        .filter_map(|(_, value)| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| {
+            matches!(token.trim(), "*") || token.trim().eq_ignore_ascii_case("accept-encoding")
+        })
+    {
+        append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
+    }
+    Ok(true)
+}
+
+fn weaken_transformed_etags(response: &mut GatewayHttpResponse) -> Result<()> {
+    for (_, value) in response
+        .headers
+        .iter_mut()
+        .filter(|(name, _)| name == http::header::ETAG)
+    {
+        let tag = value.as_bytes();
+        if tag.len() >= 2 && tag.first() == Some(&b'"') && tag.last() == Some(&b'"') {
+            let mut weak = Vec::with_capacity(tag.len() + 2);
+            weak.extend_from_slice(b"W/");
+            weak.extend_from_slice(tag);
+            *value = HeaderValue::from_bytes(&weak)?;
+        }
+    }
+    Ok(())
 }
 
 fn content_type_matches(response: &GatewayHttpResponse, patterns: &[String]) -> bool {
@@ -18892,18 +19036,53 @@ fn should_stream_upstream_body(
     cache_key: Option<&str>,
     compression: &ResponseCompressionConfig,
 ) -> bool {
-    if !status.is_success() || version == "HTTP/3" || cache_key.is_some() || compression.enabled {
-        return false;
-    }
-
     if upstream_response_is_sse(headers) {
         return true;
+    }
+    if compression.enabled {
+        let length = upstream_content_length(headers);
+        if length.is_none_or(|length| length > MAX_BUFFERED_COMPRESSION_BYTES) {
+            return true;
+        }
+        if upstream_compression_eligible(status, headers, compression) {
+            return false;
+        }
+    }
+    if !status.is_success() || version == "HTTP/3" || cache_key.is_some() {
+        return false;
     }
 
     match upstream_content_length(headers) {
         Some(len) => len >= UPSTREAM_STREAM_THRESHOLD_BYTES,
         None => true,
     }
+}
+
+fn upstream_compression_eligible(
+    status: StatusCode,
+    headers: &HeaderMap,
+    compression: &ResponseCompressionConfig,
+) -> bool {
+    compression.enabled
+        && !matches!(
+            status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT
+        )
+        && !upstream_response_is_sse(headers)
+        && !headers.contains_key(CONTENT_ENCODING)
+        && upstream_content_length(headers).is_some_and(|length| {
+            length >= compression.min_length as u64 && length <= MAX_BUFFERED_COMPRESSION_BYTES
+        })
+        && headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                let content_type = value.to_ascii_lowercase();
+                compression
+                    .content_types
+                    .iter()
+                    .any(|pattern| content_type.starts_with(&pattern.to_ascii_lowercase()))
+            })
 }
 
 fn request_accepts_sse(headers: &HeaderMap) -> bool {
@@ -22041,6 +22220,25 @@ fn apply_route_response_headers(
     response: &mut GatewayHttpResponse,
 ) -> Result<()> {
     route.validate_http_policy()?;
+    let replacements = route
+        .response_headers
+        .iter()
+        .filter_map(|(name, policy)| {
+            policy
+                .value(response.status.as_u16(), &response.headers)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.clone(), value.to_string(), policy.append()))
+        })
+        .collect::<Vec<_>>();
+    for (name, value, append) in replacements {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).context("invalid route response header")?;
+        let value = HeaderValue::from_str(&value).context("invalid route response header value")?;
+        if !append {
+            response.headers.retain(|(existing, _)| existing != name);
+        }
+        response.headers.push((name, value));
+    }
     if route.cookie_secure {
         for (name, value) in &mut response.headers {
             if *name != http::header::SET_COOKIE {
@@ -22057,23 +22255,6 @@ fn apply_route_response_headers(
                 *value = HeaderValue::from_bytes(&secured)?;
             }
         }
-    }
-    let replacements = route
-        .response_headers
-        .iter()
-        .filter_map(|(name, policy)| {
-            policy
-                .value(response.status.as_u16(), &response.headers)
-                .filter(|value| !value.is_empty())
-                .map(|value| (name.clone(), value.to_string()))
-        })
-        .collect::<Vec<_>>();
-    for (name, value) in replacements {
-        let name =
-            HeaderName::from_bytes(name.as_bytes()).context("invalid route response header")?;
-        let value = HeaderValue::from_str(&value).context("invalid route response header value")?;
-        response.headers.retain(|(existing, _)| existing != name);
-        response.headers.push((name, value));
     }
     Ok(())
 }

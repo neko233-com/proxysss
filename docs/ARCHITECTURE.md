@@ -285,3 +285,8 @@ HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 共用计数；每个 chunk 复制前预
 不把此功能宣称为 nginx 磁盘临时文件或端到端 streaming 上传；仍需实际负载与进程内存限制共同验证。
 
 `http.redirect_http_to_https` 默认 true；证书域名命中时原生 308 先于脚本。需要脚本保留各站点明文跳转/代理策略时显式 false，不改变 TLS/SNI 和 ACME challenge。
+
+普通 HTTP 代理在脚本与固定 GET 授权之后解析可选 `upstream_method`，不改变访客 ctx.method 或 WebSocket；访客 HEAD 显式 GET 回源时仅取头部并丢弃上游正文，HTTP/1、HTTP/2、HTTP/3 均保持 HEAD 无正文和 GET 元数据。HEAD 仍绕过 GET 缓存。响应头对象 `append: true` 在上游同名字段之后追加独立字段，默认仍替换；Set-Cookie 不折叠，cookie_secure 在最终头集合上逐条执行。
+
+脚本 compression 省略/null 时继承全局，显式对象覆盖整个策略，enabled:false 可关闭。上游仅在已知 Content-Length≤4 MiB、达到 min_length 且 MIME 合格时为压缩收集正文；SSE 优先保持流式，未知或更大响应流式发送并跳过变换，206/已有编码也不变换。Vary 在编码协商前按完整表示资格补充，保留上游 token；HEAD 用表示长度，206 用 Content-Range total。非 identity 源站编码未以 Accept-Encoding 区分缓存键时不入缓存，流式响应也不入整块缓存。该有界收集不是 nginx 的端到端流式 gzip，详细契约见配置指南。
+HEAD 不读取正文计算压后长度：协商压缩时设置 GET 对应编码、删除未知派生长度，identity 保留原长度。压缩表征及其 HEAD 元数据将强 ETag 弱化，已有弱标签不重复处理，identity/206/已有编码保留原 ETag。

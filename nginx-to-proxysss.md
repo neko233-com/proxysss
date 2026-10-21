@@ -84,6 +84,10 @@ services:
 `try_files $uri $uri/ /index.html` 可用单文件 `spa_fallback: index.html`：合法目标不存在时才回退，
 现存目录缺 index、隐藏路径和越界/悬空链接保持拒绝，不变成 SPA 成功。Host/path、真实 peer、文件授权和 HEAD/Range 仍由核心执行。
 
+迁移脚本可用 `upstream_method: "GET"` 显式保留 `proxy_cache_convert_head` 的 HEAD→GET 回源语义：访客方法仍是 HEAD，前端保留 GET 元数据且不发正文，HEAD 缓存仍 bypass。`add_header` 使用 `response_headers` 对象的 `append:true` 和显式状态列表，保留上游同名头及独立 Set-Cookie；字符串默认替换。
+
+`compression` 脚本覆盖复用现有算法/类型/最小长度策略；省略继承全局，`enabled:false` 明确关闭。仅已知长度且不超过 4 MiB 的合格响应收集压缩，SSE、206、已有编码和未知/大响应不变换，后两类继续流式；这不等价于 nginx 全流式 gzip。Vary 保留上游 token；源站压缩与缓存同时启用时显式设置 `cache.vary_headers:["Accept-Encoding"]`。完整条件见[配置指南](docs/CONFIGURATION.md)。
+
 ### 2.3 自动 HTTPS 与 WSS
 
 先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。

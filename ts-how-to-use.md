@@ -412,6 +412,12 @@ HTTP RouteDecision 可声明 auth_request 固定 GET 授权、proxysss://respons
 
 `RouteDecision.cookie_secure: true` 逐个为 Set-Cookie 补 Secure（默认 false），保留重复 cookie、Expires 逗号、HttpOnly 与 SameSite，已有大小写变体的 Secure 不重复添加。上游网络失败生成的 502 也执行路由 response_headers 的状态规则。
 
+`upstream_method: "GET"` 可让访客 HEAD 请求 GET 回源；`ctx.method` 仍为 HEAD，前端仅返回 GET 的头部元数据，HTTP/1、HTTP/2、HTTP/3 均无正文。默认省略沿用访客方法，只接受标准大写普通 HTTP 方法，不改变固定 GET 授权或 WebSocket。HEAD 缓存仍 bypass。
+`response_headers: { "Strict-Transport-Security": { value: "max-age=15552000", statuses: [200,301,302], append: true } }` 在上游同名字段之后追加，保留上游 includeSubDomains 和重复字段；默认仍替换。Set-Cookie 始终为独立字段，`cookie_secure` 在追加后逐个生效。完整方法范围和 framing 限制见配置指南。
+
+`compression: { enabled:true, algorithms:["gzip"], min_length:1024, content_types:["text/", "application/javascript"] }` 复用原生压缩；省略/null 继承全局，`{enabled:false}` 明确关闭，整个对象覆盖而非逐字段合并。仅已知 Content-Length 且不超过 4 MiB 的可压表示缓冲变换，未知/更大响应继续流式发送。SSE、206 和已有编码跳过变换；合格 identity/HEAD 响应及可确认完整表示长度的 206 保留 Accept-Encoding Vary，不压缩 Range 正文。源站可能返回压缩内容时，为缓存显式声明 `vary_headers:["Accept-Encoding"]`。细节与边界见配置指南，不宣称 nginx 流式 gzip 完全等价。
+HEAD 协商到压缩时声明 GET 会使用的 Content-Encoding，省略未知压后 Content-Length；identity HEAD 保留原长度。实际压缩及其 HEAD 元数据将强 ETag 弱化为 W/，原弱标签、identity 和 Range 不变。
+
 `http.redirect_http_to_https` 默认 true；证书域名命中时原生 308 先于脚本。需要脚本保留各站点明文跳转/代理策略时显式 false，不改变 TLS/SNI 和 ACME challenge。
 
 http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。

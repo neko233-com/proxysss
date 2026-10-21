@@ -235,4 +235,6 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 
 HTTP auth_request 必须在路由缓存/静态/主上游前执行，失败拒绝且不缓存。strict SNI 以配置域名选择器为准；TLS reload 需完整公私钥校验后发布不可变材料和监听指纹，半更新不得撤销旧监听。新增脚本策略同步 proxysss-script.d.ts 与配置/脚本/架构说明。
 
+脚本 upstream_method 只改变普通回源方法，不改变访客 ctx.method、固定 GET 授权或 WS；HEAD 转 GET 保留元数据但前端无正文。响应头 append 保留重复字段和状态规则，不合并 Set-Cookie。路由 compression 省略时继承全局；仅已知长度≤4 MiB 的合格表示为压缩缓冲，SSE/206/已有编码不变换，未知或大响应继续流式。Vary 保留上游 token，非 identity 源站表示缺少 Accept-Encoding 缓存维度时不得存储；不宣称完整 nginx 流式 gzip 等价。
+
 请求体 aggregate budget 属于 Gateway 生命周期，reload 不得 reset。H1/H2/H3 chunk 复制前预留，Bytes 所有 clone 最后释放后才退款；不要在 dispatch 返回但上游仍持有 body 时提前释放。

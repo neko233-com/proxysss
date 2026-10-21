@@ -236,7 +236,7 @@
     </header>
 
     <main class="content">
-<!-- migration-source: nginx-to-proxysss.md sha256=c89755d978eadcd4ab3ad1656e95a4affab648206a431ab58f00476a0ce37f1a body-sha256=b228ec2ce74f54bb777c32134207b264bec9ad275eda6674ea66cc71e265c147 -->
+<!-- migration-source: nginx-to-proxysss.md sha256=48a558fb5a77857b2e55f67689762c9f5b72cce525a7071a5eb596a4fea9843a body-sha256=ddf2012ea93a7f77afa79faf2be4b16a716812e81835eb34d83f997fe46d0e04 -->
 <section class="panel" id="intro">
 <p>本教程把 nginx 的网站、静态下载与 stream 配置迁到单个 proxysss.yaml。先确认路径和请求头语义，再接入证书、集群与长连接，最后使用实际流量验收。</p>
 </section>
@@ -329,6 +329,8 @@ location / {
 <code>rewrite_path</code> 保留站点前缀内完整 URI 路径，原生匹配/快缓存不会先于脚本直接提供文件。
 <code>try_files $uri $uri/ /index.html</code> 可用单文件 <code>spa_fallback: index.html</code>：合法目标不存在时才回退，
 现存目录缺 index、隐藏路径和越界/悬空链接保持拒绝，不变成 SPA 成功。Host/path、真实 peer、文件授权和 HEAD/Range 仍由核心执行。</p>
+<p>迁移脚本可用 <code>upstream_method: &quot;GET&quot;</code> 显式保留 <code>proxy_cache_convert_head</code> 的 HEAD→GET 回源语义：访客方法仍是 HEAD，前端保留 GET 元数据且不发正文，HEAD 缓存仍 bypass。<code>add_header</code> 使用 <code>response_headers</code> 对象的 <code>append:true</code> 和显式状态列表，保留上游同名头及独立 Set-Cookie；字符串默认替换。</p>
+<p><code>compression</code> 脚本覆盖复用现有算法/类型/最小长度策略；省略继承全局，<code>enabled:false</code> 明确关闭。仅已知长度且不超过 4 MiB 的合格响应收集压缩，SSE、206、已有编码和未知/大响应不变换，后两类继续流式；这不等价于 nginx 全流式 gzip。Vary 保留上游 token；源站压缩与缓存同时启用时显式设置 <code>cache.vary_headers:[&quot;Accept-Encoding&quot;]</code>。完整条件见<a href="configuration.html">配置指南</a>。</p>
 <h3 id="https-wss">2.3 自动 HTTPS 与 WSS</h3>
 <p>先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。</p>
 <pre><code class="language-yaml">http:

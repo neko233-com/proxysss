@@ -83,6 +83,8 @@ services:
 可选单文件 `spa_fallback` 只对合法缺失目标回退，不覆盖现存目录缺 index、隐藏路径或越界链接；
 Host/path、真实 peer、文件授权和 HEAD/Range 继续执行，原生选站与快缓存不绕过脚本。
 
+脚本支持 `upstream_method` 覆盖普通回源方法；HEAD 显式 GET 回源保留元数据且前端无正文，HEAD 缓存仍 bypass。响应头对象的 `append:true` 保留独立重复字段，省略时替换；状态列表与 framing 限制仍适用。脚本 `compression` 省略时继承全局，显式对象覆盖，`enabled:false` 可关闭。压缩只收集已知长度≤4 MiB 的合格表示，SSE、206、已有编码不变换，未知/大响应继续流式，不宣称与其它网关的流式压缩完全等价。源站编码缓存需要 `vary_headers:["Accept-Encoding"]`；详见[配置指南](docs/CONFIGURATION.md)。
+
 ### 2.3 自动 HTTPS 与 WSS
 
 先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。

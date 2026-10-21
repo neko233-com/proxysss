@@ -35,8 +35,8 @@ use serde_json::{json, Value as JsonValue};
 use tokio::sync::oneshot;
 
 use crate::auth_request::AuthRequestConfig;
-use crate::config::ResponseCacheConfig;
 use crate::config::ScriptConfig;
+use crate::config::{ResponseCacheConfig, ResponseCompressionConfig};
 use crate::ts_transpile::transpile_module;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,8 @@ pub struct RouteDecision {
     pub affinity_key: Option<String>,
     #[serde(default)]
     pub rewrite_path: Option<String>,
+    #[serde(default)]
+    pub upstream_method: Option<String>,
     #[serde(default, alias = "add_headers")]
     pub set_headers: BTreeMap<String, String>,
     #[serde(default, alias = "remove_headers")]
@@ -96,6 +98,8 @@ pub struct RouteDecision {
     pub response_headers: BTreeMap<String, ResponseHeader>,
     #[serde(default)]
     pub cache: Option<ResponseCacheConfig>,
+    #[serde(default)]
+    pub compression: Option<ResponseCompressionConfig>,
     #[serde(default)]
     pub forward_headers: Option<bool>,
     #[serde(default = "route_default_true")]
@@ -120,6 +124,7 @@ impl Default for RouteDecision {
             upstream_weights: BTreeMap::new(),
             affinity_key: None,
             rewrite_path: None,
+            upstream_method: None,
             set_headers: BTreeMap::new(),
             strip_headers: Vec::new(),
             status: None,
@@ -128,6 +133,7 @@ impl Default for RouteDecision {
             response_body: None,
             response_headers: BTreeMap::new(),
             cache: None,
+            compression: None,
             forward_headers: None,
             pass_request_headers: true,
             pass_request_body: true,
@@ -149,6 +155,8 @@ pub enum ResponseHeader {
 #[serde(deny_unknown_fields)]
 pub struct ResponseHeaderPolicy {
     #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
     pub value: Option<String>,
     #[serde(default)]
     pub from_header: Option<String>,
@@ -157,6 +165,10 @@ pub struct ResponseHeaderPolicy {
 }
 
 impl ResponseHeader {
+    pub fn append(&self) -> bool {
+        matches!(self, Self::OnStatus(policy) if policy.append)
+    }
+
     pub fn value<'a>(
         &'a self,
         status: u16,
@@ -185,7 +197,23 @@ impl ResponseHeader {
 }
 
 impl RouteDecision {
+    pub fn upstream_http_method(&self, visitor: &http::Method) -> Result<http::Method> {
+        let Some(method) = self.upstream_method.as_deref() else {
+            return Ok(visitor.clone());
+        };
+        anyhow::ensure!(
+            matches!(
+                method,
+                "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE"
+            ),
+            "route.upstream_method must be a standard uppercase HTTP request method"
+        );
+        http::Method::from_bytes(method.as_bytes())
+            .map_err(|_| anyhow!("invalid route.upstream_method"))
+    }
+
     pub fn validate_http_policy(&self) -> Result<()> {
+        self.upstream_http_method(&http::Method::GET)?;
         anyhow::ensure!(
             self.request_timeout_ms
                 .is_none_or(|value| (1..=86_400_000).contains(&value)),
@@ -198,6 +226,11 @@ impl RouteDecision {
             let mut errors = Vec::new();
             crate::config::validate_cache_config(policy, "route.cache", &mut errors);
             anyhow::ensure!(errors.is_empty(), "invalid route cache policy");
+        }
+        if let Some(policy) = &self.compression {
+            let mut errors = Vec::new();
+            crate::config::validate_compression_config(policy, "route.compression", &mut errors);
+            anyhow::ensure!(errors.is_empty(), "invalid route compression policy");
         }
         anyhow::ensure!(
             self.response_body
@@ -288,6 +321,8 @@ struct PartialRoute {
     affinity_key: Option<String>,
     #[serde(default)]
     rewrite_path: Option<String>,
+    #[serde(default)]
+    upstream_method: Option<String>,
     #[serde(default, alias = "add_headers")]
     set_headers: Option<BTreeMap<String, String>>,
     #[serde(default, alias = "remove_headers")]
@@ -304,6 +339,8 @@ struct PartialRoute {
     response_headers: Option<BTreeMap<String, ResponseHeader>>,
     #[serde(default)]
     cache: Option<ResponseCacheConfig>,
+    #[serde(default)]
+    compression: Option<ResponseCompressionConfig>,
     #[serde(default)]
     forward_headers: Option<bool>,
     #[serde(default)]
@@ -1211,6 +1248,9 @@ fn merge_route(current: &mut Option<PartialRoute>, next: PartialRoute) {
             if next.cache.is_some() {
                 cur.cache = next.cache;
             }
+            if next.compression.is_some() {
+                cur.compression = next.compression;
+            }
             if next.forward_headers.is_some() {
                 cur.forward_headers = next.forward_headers;
             }
@@ -1222,6 +1262,9 @@ fn merge_route(current: &mut Option<PartialRoute>, next: PartialRoute) {
             }
             if next.request_timeout_ms.is_some() {
                 cur.request_timeout_ms = next.request_timeout_ms;
+            }
+            if next.upstream_method.is_some() {
+                cur.upstream_method = next.upstream_method;
             }
             if next.pass_request_body.is_some() {
                 cur.pass_request_body = next.pass_request_body;
@@ -1257,6 +1300,7 @@ fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
         upstream_weights: partial.upstream_weights.unwrap_or_default(),
         affinity_key: partial.affinity_key,
         rewrite_path: partial.rewrite_path,
+        upstream_method: partial.upstream_method,
         set_headers: partial.set_headers.unwrap_or_default(),
         strip_headers: partial.strip_headers.unwrap_or_default(),
         status: partial.status,
@@ -1265,6 +1309,7 @@ fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
         response_body: partial.response_body,
         response_headers: partial.response_headers.unwrap_or_default(),
         cache: partial.cache,
+        compression: partial.compression,
         forward_headers: partial.forward_headers,
         pass_request_headers: partial.pass_request_headers.unwrap_or(true),
         pass_request_body: partial.pass_request_body.unwrap_or(true),
@@ -1292,6 +1337,9 @@ fn partial_to_json(partial: &PartialRoute) -> JsonValue {
     if let Some(value) = &partial.rewrite_path {
         map.insert("rewrite_path".into(), json!(value));
     }
+    if let Some(value) = &partial.upstream_method {
+        map.insert("upstream_method".into(), json!(value));
+    }
     if let Some(value) = &partial.auth_request {
         map.insert("auth_request".into(), json!(value));
     }
@@ -1303,6 +1351,9 @@ fn partial_to_json(partial: &PartialRoute) -> JsonValue {
     }
     if let Some(value) = &partial.cache {
         map.insert("cache".into(), json!(value));
+    }
+    if let Some(value) = &partial.compression {
+        map.insert("compression".into(), json!(value));
     }
     if let Some(value) = partial.forward_headers {
         map.insert("forward_headers".into(), json!(value));
@@ -1416,6 +1467,64 @@ fn js_to_json(value: Value) -> Result<JsonValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_method_survives_partial_route_merge_and_json_roundtrip() {
+        let mut merged = None;
+        merge_route(
+            &mut merged,
+            serde_json::from_value(
+                json!({"upstream":"http://127.0.0.1:9","upstream_method":"POST"}),
+            )
+            .unwrap(),
+        );
+        merge_route(
+            &mut merged,
+            serde_json::from_value(json!({
+                "upstream_method":"GET",
+                "response_headers":{"x-fixture":{"value":"yes","append":true}},
+                "compression":{"enabled":true,"algorithms":["gzip"],"min_length":8,"content_types":["text/plain"]}
+            })).unwrap(),
+        );
+        // A later partial route without compression must retain the chosen policy.
+        merge_route(
+            &mut merged,
+            serde_json::from_value(json!({"status":200})).unwrap(),
+        );
+        let partial = merged.unwrap();
+        let json = partial_to_json(&partial);
+        assert_eq!(json["upstream_method"], "GET");
+        assert_eq!(json["response_headers"]["x-fixture"]["append"], true);
+        assert_eq!(json["compression"]["enabled"], true);
+        assert_eq!(json["compression"]["min_length"], 8);
+        let route = normalize_route(serde_json::from_value(json).unwrap()).unwrap();
+        assert_eq!(
+            route.upstream_http_method(&http::Method::HEAD).unwrap(),
+            http::Method::GET
+        );
+        assert!(route.response_headers["x-fixture"].append());
+        assert!(route.compression.as_ref().unwrap().enabled);
+        assert_eq!(
+            route.compression.as_ref().unwrap().content_types,
+            ["text/plain"]
+        );
+        assert!(RouteDecision::default().compression.is_none());
+        for invalid in [
+            json!({"enabled":true,"algorithms":[]}),
+            json!({"enabled":true,"min_length":0}),
+            json!({"enabled":true,"content_types":[]}),
+        ] {
+            let route: RouteDecision = serde_json::from_value(
+                json!({"upstream":"http://127.0.0.1:9","compression":invalid}),
+            )
+            .unwrap();
+            assert!(route.validate_http_policy().is_err());
+        }
+        assert!(serde_json::from_value::<RouteDecision>(
+            json!({"upstream":"http://127.0.0.1:9","compression":{"enabled":true,"algorithms":["unknown"]}})
+        )
+        .is_err());
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = crate::test_support::temp_base()

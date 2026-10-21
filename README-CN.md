@@ -118,3 +118,5 @@ proxysss service status
 本地验证、缓存与安装包使用项目内固定的 `.tmp`、`.cache`、`target`、`dist` 目录。Windows 可运行 `test.cmd`，Docker 场景验证使用 `scripts/verify-docker-scenarios.ps1`；验证容器固定为 `proxysss-verify`，结束后自动删除。
 
 HTTP 路由支持有界异步授权、脚本合成响应和独立路由策略；严格 SNI 与全部证书的校验重载见[配置指南](docs/CONFIGURATION.md#路由授权响应策略与证书轮换)，上线仍须逐路由 canary。
+脚本可显式覆盖普通回源方法，并追加独立响应头；HEAD 转 GET 回源保留 GET 元数据且前端无正文，HEAD 缓存仍 bypass。
+路由压缩省略时继承全局，只缓冲已知长度≤4 MiB 的合格表示；未知/大响应继续流式，SSE、Range 和已有编码不变换。Vary 与源站编码缓存隔离的边界见配置指南，不宣称完整 nginx 流式 gzip 等价。
