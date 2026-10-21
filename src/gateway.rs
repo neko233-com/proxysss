@@ -16099,15 +16099,11 @@ fn apply_compression_vary(
             .and_then(|(_, value)| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .or_else(|| {
-                response
-                    .stream_body
-                    .is_none()
+                (response.stream_body.is_none() && !response.body.is_empty())
                     .then_some(response.body.len() as u64)
             })
     };
-    if length.is_none_or(|length| {
-        length < compression.min_length as u64 || length > MAX_BUFFERED_COMPRESSION_BYTES
-    }) {
+    if length.is_some_and(|length| length < compression.min_length as u64) {
         return Ok(false);
     }
     if !response
@@ -16122,7 +16118,10 @@ fn apply_compression_vary(
     {
         append_or_insert_header(&mut response.headers, VARY, "accept-encoding")?;
     }
-    Ok(true)
+    // Negotiation metadata is retained for streaming representations too.
+    // A HEAD may only advertise an encoding when the equivalent GET would
+    // actually fit the bounded compression transform path.
+    Ok(length.is_some_and(|length| length <= MAX_BUFFERED_COMPRESSION_BYTES))
 }
 
 fn weaken_transformed_etags(response: &mut GatewayHttpResponse) -> Result<()> {

@@ -290,3 +290,5 @@ HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 共用计数；每个 chunk 复制前预
 
 脚本 compression 省略/null 时继承全局，显式对象覆盖整个策略，enabled:false 可关闭。上游仅在已知 Content-Length≤4 MiB、达到 min_length 且 MIME 合格时为压缩收集正文；SSE 优先保持流式，未知或更大响应流式发送并跳过变换，206/已有编码也不变换。Vary 在编码协商前按完整表示资格补充，保留上游 token；HEAD 用表示长度，206 用 Content-Range total。非 identity 源站编码未以 Accept-Encoding 区分缓存键时不入缓存，流式响应也不入整块缓存。该有界收集不是 nginx 的端到端流式 gzip，详细契约见配置指南。
 HEAD 不读取正文计算压后长度：协商压缩时设置 GET 对应编码、删除未知派生长度，identity 保留原长度。压缩表征及其 HEAD 元数据将强 ETag 弱化，已有弱标签不重复处理，identity/206/已有编码保留原 ETag。
+
+未知/大表示的合格 MIME 仍保留 Accept-Encoding Vary，但保持流式并返回不可变换资格；HEAD 不宣称本次 GET 实际不会执行的编码。已知低于 min_length 的表示不增加该 Vary。

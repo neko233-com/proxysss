@@ -1,5 +1,7 @@
 # 验证与发布流程
 
+当前 v1.3.10 按 2026-10-21 用户“没问题就全部发布”的明确授权，以生产 Linux nginx 迁移的功能与稳定性验收发布；仅本标签豁免严格性能胜出及跨主机性能证据。Linux 完整协议/容量与六平台打包保留，Windows 完整执行并披露本机 IPv6 UDP loopback 不可达的环境失败，不改写/跳过专门 IPv6 用例，不宣称全平台运行全绿。详见 [v1.3.10 验证记录](RELEASE-1.3.10.md) / [HTML](release-1.3.10.html)。
+
 本页定义验证顺序与证据边界。2026-09-21 用户授权 v1.3.9 优先发布稳定功能版本：Linux 功能与混合负载稳定性、本机 Windows 测试、六平台打包通过即可，不要求超过 nginx 或提供跨主机性能胜出证据。详见 [本次版本验证](RELEASE-1.3.9.md) / [HTML](release-1.3.9.html)。CDN 后续优化优先小文件，大、小文件择一胜出即可，不再以同时胜出阻塞当前发布。产品能力是否存在，以代码、配置和功能测试为准；性能是否胜出，以相同提交、相同资源的实测为准。不能承诺在任意硬件与负载下始终最优。
 
 ## 1. Ubuntu 24 LTS 功能检查
@@ -64,6 +66,8 @@ WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websock
 使用 [gh-cli 技能](../skills/gh-cli/SKILL.md)，检查实际 Actions 状态。CI 只做六平台打包，禁止云端功能测试和性能 benchmark。Node.js action 使用 24 LTS 或更高，artifact action 至少 v6。
 
 正式版本必须匹配 Cargo.toml、CHANGELOG.md 与 [性能证据清单](../performance-evidence/README.md)。schema v3 要求同一 tag 提交上的角色隔离矩阵和三台不同 machine-id Linux 主机的 WSS 1×/2×/4× 复验、真实工件 URI/摘要、吞吐/延迟/容量/内存数据。运行 `go run scripts/verify-production-evidence.go --manifest performance-evidence/vX.Y.Z.json --tag vX.Y.Z --commit <tag-commit>` 后才能推 tag。v1.3.8 的一次性豁免仍仅限旧标签；v1.3.9 另有 2026-09-21 用户明确授权的稳定功能发布例外，使用本次版本验证记录，免于严格性能胜出与跨主机证据检查。
+
+v1.3.10 的一次性例外仅按页首本次授权执行，使用其版本记录披露 Linux 真实产物验收和 Windows 环境限制；不能把该例外扩展到其它标签、跨平台运行全绿或性能胜出声明。最终附件来自标签构建，早期功能候选的 SHA 不能冒充平台正式附件。
 
 报告明确列出通过项、失败项、未执行项、提交和工件位置。性能未胜出时保留真实结果，不生成虚假胜出清单；本次 v1.3.9 依明确授权按稳定性发布。只有 tag、构建、六个附件与 GitHub Release 实际核验完成后，才能报告发布完成。
 

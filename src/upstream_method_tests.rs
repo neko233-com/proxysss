@@ -103,6 +103,27 @@ fn compression_override_keeps_streaming_ineligible_and_unbounded_entities() {
         Some("cache-fixture"),
         &policy
     ));
+    for length in [None, Some("4194305"), Some("7")] {
+        let mut response = GatewayHttpResponse {
+            status: StatusCode::OK,
+            headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+            body: Bytes::new(),
+            stream_body: None,
+            upstream: "fixture".into(),
+        };
+        if let Some(value) = length {
+            response.push_header(CONTENT_LENGTH, HeaderValue::from_static(value));
+        }
+        assert!(!apply_compression_vary(&mut response, &policy).unwrap());
+        let has_vary = response.headers.iter().any(|(name, value)| {
+            name == VARY && value.to_str().unwrap().contains("accept-encoding")
+        });
+        assert_eq!(
+            has_vary,
+            length != Some("7"),
+            "unknown/large are Vary-only; known sub-minimum stays ineligible"
+        );
+    }
 }
 
 struct Task(tokio::task::JoinHandle<()>);
@@ -144,8 +165,14 @@ async fn route_compression_wire_gzip_identity_sse_range_and_encoded_cache_isolat
                 count.fetch_add(1, Ordering::Relaxed);
                 let text = String::from_utf8_lossy(&request);
                 let path = text.split_whitespace().nth(1).unwrap_or("/");
-                if path == "/sse" {
-                    let _=stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nD\r\ndata: first\n\n\r\n").await;
+                if path == "/sse" || path == "/unknown" {
+                    let content_type = if path == "/sse" {
+                        "text/event-stream"
+                    } else {
+                        "text/html"
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nVary: Origin\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nD\r\ndata: first\n\n\r\n");
+                    let _ = stream.write_all(head.as_bytes()).await;
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     let _ = stream.write_all(b"E\r\ndata: second\n\n\r\n").await;
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -188,7 +215,7 @@ async fn route_compression_wire_gzip_identity_sse_range_and_encoded_cache_isolat
     std::fs::write(
         &script,
         format!(
-            r#"export default {{name:"compression-fixture",access(message){{const p=message.ctx.path;return {{upstream:"http://{address}",upstream_method:message.ctx.method==="HEAD"?"GET":null,compression:{{enabled:true,algorithms:["gzip"],min_length:8,content_types:["text/plain","text/event-stream"]}},cache:{{enabled:p.indexOf("/encoded")===0,behavior:"override",ttl_secs:30,vary_headers:p.indexOf("/encoded-vary")===0?["Accept-Encoding"]:[]}} }};}} }};"#
+            r#"export default {{name:"compression-fixture",access(message){{const p=message.ctx.path;return {{upstream:"http://{address}",upstream_method:message.ctx.method==="HEAD"?"GET":null,compression:{{enabled:true,algorithms:["gzip"],min_length:8,content_types:["text/plain","text/html","text/event-stream"]}},cache:{{enabled:p.indexOf("/encoded")===0,behavior:"override",ttl_secs:30,vary_headers:p.indexOf("/encoded-vary")===0?["Accept-Encoding"]:[]}} }};}} }};"#
         ),
     )?;
     let mut config = GatewayConfig::default();
@@ -332,26 +359,50 @@ async fn route_compression_wire_gzip_identity_sse_range_and_encoded_cache_isolat
             .iter()
             .any(|value| value.to_str().unwrap().contains("accept-encoding")));
         assert_eq!(response.bytes().await?.as_ref(), &BODY[..3]);
-        let started = Instant::now();
-        let mut response = tokio::time::timeout(
-            Duration::from_secs(1),
-            client
-                .get(format!("http://{address}/sse"))
-                .header(ACCEPT_ENCODING, "gzip")
-                .send(),
-        )
-        .await??;
-        assert!(response.headers().get(CONTENT_ENCODING).is_none());
-        let first = tokio::time::timeout(Duration::from_secs(1), response.chunk())
-            .await??
-            .unwrap();
-        assert_eq!(first.as_ref(), b"data: first\n\n");
-        let second = tokio::time::timeout(Duration::from_secs(1), response.chunk())
-            .await??
-            .unwrap();
-        assert_eq!(second.as_ref(), b"data: second\n\n");
-        assert!(started.elapsed() < Duration::from_secs(2));
-        drop(response);
+        for path in ["/sse", "/unknown"] {
+            let started = Instant::now();
+            let mut response = tokio::time::timeout(
+                Duration::from_secs(1),
+                client
+                    .get(format!("http://{address}{path}"))
+                    .header(ACCEPT_ENCODING, "gzip")
+                    .send(),
+            )
+            .await??;
+            assert!(response.headers().get(CONTENT_ENCODING).is_none());
+            if path == "/unknown" {
+                assert!(response
+                    .headers()
+                    .get_all(VARY)
+                    .iter()
+                    .any(|v| v.to_str().unwrap().contains("accept-encoding")));
+            }
+            let first = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+                .await??
+                .unwrap();
+            assert_eq!(first.as_ref(), b"data: first\n\n");
+            let second = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+                .await??
+                .unwrap();
+            assert_eq!(second.as_ref(), b"data: second\n\n");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(response);
+        }
+        let response = client
+            .head(format!("http://{address}/unknown"))
+            .header(ACCEPT_ENCODING, "gzip")
+            .send()
+            .await?;
+        assert!(
+            response.headers().get(CONTENT_ENCODING).is_none(),
+            "unknown HEAD must not advertise an unperformed transform"
+        );
+        assert!(response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .any(|v| v.to_str().unwrap().contains("accept-encoding")));
+        assert!(response.bytes().await?.is_empty());
         for vary in [false, true] {
             for gzip_first in [false, true] {
                 let path = format!(

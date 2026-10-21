@@ -421,3 +421,5 @@ HEAD 协商到压缩时声明 GET 会使用的 Content-Encoding，省略未知�
 `http.redirect_http_to_https` 默认 true；证书域名命中时原生 308 先于脚本。需要脚本保留各站点明文跳转/代理策略时显式 false，不改变 TLS/SNI 和 ACME challenge。
 
 http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。
+
+合格 MIME 的未知或大于 4 MiB 表示仍保留 Accept-Encoding Vary，但不压缩正文，HEAD 也不假报压缩；已知小于 min_length 的表示不增加该 Vary。

@@ -45,6 +45,11 @@ impl Fixture {
         let address = SocketAddr::from(([127, 0, 0, 1], reserve_port().await?));
         let mut config: GatewayConfig =
             serde_yaml::from_str(&base_gateway_yaml(reserve_port().await?))?;
+        // Raw serde decoding does not normalize paths as GatewayConfig::load
+        // does. Keep each generated pair local to this independent fixture.
+        config.root_dir = root.clone();
+        config.http.tls.cert_path = root.join("cert.pem");
+        config.http.tls.key_path = root.join("key.pem");
         let mut listener: UdpListenerConfig = serde_json::from_value(serde_json::json!({
             "name":"bounded", "bind":address.to_string(), "max_associations":cap,
             "session_ttl_secs":ttl, "upstream":backend.to_string()

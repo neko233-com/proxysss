@@ -21,6 +21,11 @@ impl Fixture {
         let root = temp_root("listener-lifetime");
         let mut config: GatewayConfig =
             serde_yaml::from_str(&base_gateway_yaml(reserve_port().await?))?;
+        // This fixture bypasses GatewayConfig::load, so resolve all TLS material
+        // into its own root rather than sharing the process working directory.
+        config.root_dir = root.clone();
+        config.http.tls.cert_path = root.join("cert.pem");
+        config.http.tls.key_path = root.join("key.pem");
         config.http.tls_bind = format!("127.0.0.1:{}", reserve_port().await?);
         config.http.h3_bind = format!("127.0.0.1:{}", reserve_port().await?);
         config.admin.enabled = true;
