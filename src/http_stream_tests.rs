@@ -277,6 +277,10 @@ async fn https_upstream_sse_outlives_total_timeout_but_stalled_body_fails() -> R
     config.plugins.enabled = false;
     config.http.allow_insecure_upstreams = true;
     config.http.request_timeout_ms = 500;
+    let root = crate::test_support::TestDir::new("https-sse-state");
+    config.http.tls.cert_path = root.join("cert.pem");
+    config.http.tls.key_path = root.join("key.pem");
+    prepare_tls_material(&config)?;
     let state = build_dynamic_state(config).await?;
     let response = state
         .dispatch_upstream_http(
@@ -284,6 +288,7 @@ async fn https_upstream_sse_outlives_total_timeout_but_stalled_body_fails() -> R
             UpstreamHttpTarget::Reqwest(format!("https://{address}/live").parse()?),
             HeaderMap::new(),
             Bytes::new(),
+            None,
         )
         .await?;
     assert_eq!(response.bytes().await?.as_ref(), b"xxxxxxxxxxx");
@@ -293,6 +298,7 @@ async fn https_upstream_sse_outlives_total_timeout_but_stalled_body_fails() -> R
             UpstreamHttpTarget::Reqwest(format!("https://{address}/stall").parse()?),
             HeaderMap::new(),
             Bytes::new(),
+            None,
         )
         .await?;
     assert!(response.bytes().await.is_err());

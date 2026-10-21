@@ -986,6 +986,9 @@ udp:
 <section class="panel" id="native-reactor-admission"><h2>原生 reactor 的事件与接收边界</h2><p>TCP/WebSocket 与 sendfile owner 先消费完整个 epoll_wait 事件批次，再安装新连接或下载，避免旧 ERR/HUP 作用于复用 fd 的新任务。每轮最多接收 256 个任务，剩余队列通过 eventfd 唤醒下一轮，让已有流量先处理 I/O；不减少 CPU 自适应 owner 数，也不改变数据发送预算和背压。</p><p>EPOLL_CTL_DEL 不会删除已取回用户态的事件，参见 <a href="https://www.man7.org/linux/man-pages/man7/epoll.7.html">Linux epoll 事件缓存说明</a>。</p></section>
 <p>原始 HTTP 上游空闲池记录 socket 的 runtime ID。同 runtime 直接复用；控制面预热转入数据面或跨 HTTP shard 复用时，解除旧 reactor 注册，通过非阻塞 peek 排除关闭或有残留数据的连接，再把同一 TCP 连接注册到当前 reactor。池容量不变、不额外预拨，也不把普通转发改成重连。</p>
 <section class="panel" id="file-generations"><h2>文件版本与下载边界</h2><p><code>src/file_io.rs</code> 统一文件版本核对和严格长度读取。版本包含长度、修改/创建时间；Unix 还包含设备、inode 和纳秒 ctime，保留大小与 mtime 的原子替换也会更新缓存和弱 ETag。正文快照填充前后核对版本，完整流式与 Range 下载打开文件后核对元数据，避免把不同发布版本混入同一个响应。</p><p>完整流式正文和非 Linux 明文复制都限制到声明的 Content-Length，文件增长不发送多余字节，提前 EOF 作为正文错误；HTTP/3 重置失败流而非正常 FIN。读取仍受下游背压控制，取消释放文件，不增加预读生产任务。</p><p>Linux sendfile 每个池保留一个版本锚点。预热和池耗尽时通过 /proc/self/fd 打开锚点，取得同一 inode 的独立描述符；路径替换或删除后仍读取原版本。procfs 不可用时复制锚点并继续使用显式发送偏移。空闲池保持有界，多余归还立即关闭，锚点随旧缓存和最后一个响应释放。这不是不可变文件系统快照，仍应避免就地覆盖正在发送的资源。<a href="cdn-origin.html#file-generations">下载发布说明</a></p></section>
+<section class="panel" id="script-static"><h2>脚本静态调度边界</h2><p><code>script_only</code> 站点从原生选站与所有预热/HTTP1/TLS/H2 快缓存中排除；脚本显式选择 <code>proxysss://static-site/&lt;name&gt;</code> 后复用 Host/path、真实 peer 与文件授权。可选 <code>spa_fallback</code> 仅处理合法缺失目标，保留目录、链接、HEAD/Range 边界。详见<a href="configuration.html#script-static">配置指南</a>。</p></section>
+<section class="panel" id="buffered-body-budget"><h2>聚合请求体预算</h2><p>http.max_buffered_request_body_bytes 默认 0，限制同 Gateway 跨 HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 的在飞 buffered payload；chunk 复制前预留，容量满立即503。失败/超时/取消归还；成功 Bytes 的所有 clone 最后释放才返还。重载仅改限额而不重建计数，0 模式也计数。1 GiB 单体可搭配 2 GiB 聚合预算并预留系统内存余量。这是payload预算，不是RSS、分配器/解析器/业务复制总量上限，也不是磁盘spool或全链streaming上传。</p></section>
+<p><code>http.redirect_http_to_https</code> 默认 true，原生 308 先于脚本；显式 false 交给既有 HTTP 路由处理，不改变 TLS/SNI 或 ACME challenge。</p>
 </main>
     </div>
 
@@ -993,7 +996,8 @@ udp:
 
     <section class="section"><h2>低频 HTTP/1 静态连接的时效</h2><p>明文 HTTP/1 连接缓存每次命中都检查单调时间上的 2 秒 freshness，不按请求次数推迟检查。低频复用同一连接仍会触发共享后台重验证，不能因尚未积累 256 次访问而长期保留旧版本；过期不等于每次同步 stat，文件刷新仍由现有控制运行时合并执行。</p></section>
 <section class="section"><h2>监听任务的取消责任</h2><p>supervisor 持有每个监听任务的取消守卫；HTTP、TLS（含弹性 accept）、TCP、UDP 跨 runtime 包装任务也持有守卫，包括尚未轮询就被取消的任务。移除监听、失败重试或 supervisor 退出不再只丢弃 JoinHandle，旧 accept/recv 会退出并释放端口。已建立 TCP/HTTP 会话继续自行结束；UDP 会话统一退休。撤销监听不等于强制中断全部 TCP 下载。</p></section>
-    <footer class="footer">
+    <section class="section" id="route-auth-response-tls"><h2>授权与 TLS 状态发布</h2><p>异步授权由 src/auth_request.rs 持有单个 HTTP client 和 128 个共享许可，调用仍属于原请求 future；不创建脱离请求的授权任务。路由决策先完成策略/限流，随后授权，再进入缓存/静态/主代理。拒绝路径不读取业务上游，认证响应正文不累计。脚本合成状态/响应头和单路由超时由核心执行，详情见配置指南。TLS 状态保存已解析且 keys_match 验证的默认/SNI keys 与同一状态的指纹；supervisor 只依赖该指纹换监听，不以磁盘半更新提前撤销旧监听。失败的续期保留旧状态。strict SNI 只接受显式配置选择器，不扩张证书 SAN 或 on-demand 白名单。</p></section>
+<footer class="footer">
       <strong>这页架构文档的落点只有一个：</strong> 让你知道 proxysss 的请求路径、扩展边界、热重载边界和性能纪律都在哪里，而不是把“架构”写成一页炫技海报。
     </footer>
   </div>

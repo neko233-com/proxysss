@@ -236,7 +236,7 @@
     </header>
 
     <main class="content">
-<!-- migration-source: nginx-to-proxysss.md sha256=23e4000c972831c0ad378ef1c80f667ecc4af62ae0d771c0a81e2b3b50893998 body-sha256=5b5e9c55339bad9bba2d798e141c6a3b459bfa11f9230d9c8de27287cf398312 -->
+<!-- migration-source: nginx-to-proxysss.md sha256=c89755d978eadcd4ab3ad1656e95a4affab648206a431ab58f00476a0ce37f1a body-sha256=b228ec2ce74f54bb777c32134207b264bec9ad275eda6674ea66cc71e265c147 -->
 <section class="panel" id="intro">
 <p>本教程把 nginx 的网站、静态下载与 stream 配置迁到单个 proxysss.yaml。先确认路径和请求头语义，再接入证书、集群与长连接，最后使用实际流量验收。</p>
 </section>
@@ -325,6 +325,10 @@ location / {
 </code></pre>
 <p>/assets/client.zip 对应 /srv/game-assets/client.zip。多站点按 YAML 首个 hosts/path 匹配项选站；不同根目录的相同 URL 缓存隔离。根站点把 path_prefix 设为 /。目录字段为 root。</p>
 <p>完整下载流式发送并保留背压；GET 支持单段和最多 16 段 Range，HEAD 与条件请求按 HTTP 语义处理。发布采用写新文件后原子替换，避免就地覆盖正在发送的资源。目录浏览默认关闭；回源令牌、签名 URL、授权和缓存规则见 <a href="cdn-origin.html">CDN 下载指南</a>。</p>
+<p>脚本保护的 root/alias 站点使用 <code>script_only: true</code>，由脚本显式返回 <code>proxysss://static-site/&lt;name&gt;</code>；
+<code>rewrite_path</code> 保留站点前缀内完整 URI 路径，原生匹配/快缓存不会先于脚本直接提供文件。
+<code>try_files $uri $uri/ /index.html</code> 可用单文件 <code>spa_fallback: index.html</code>：合法目标不存在时才回退，
+现存目录缺 index、隐藏路径和越界/悬空链接保持拒绝，不变成 SPA 成功。Host/path、真实 peer、文件授权和 HEAD/Range 仍由核心执行。</p>
 <h3 id="https-wss">2.3 自动 HTTPS 与 WSS</h3>
 <p>先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。</p>
 <pre><code class="language-yaml">http:

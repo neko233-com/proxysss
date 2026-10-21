@@ -97,6 +97,7 @@ pub fn build_route_decision(
         strip_headers: route.strip_headers.clone(),
         status: None,
         content_type: None,
+        ..RouteDecision::default()
     }
 }
 

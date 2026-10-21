@@ -18,6 +18,9 @@ mod http_stream_tests;
 #[cfg(test)]
 #[path = "listener_lifetime_tests.rs"]
 mod listener_lifetime_tests;
+#[cfg(test)]
+#[path = "production_http_policy_tests.rs"]
+mod production_http_policy_tests;
 #[path = "static_ranges.rs"]
 mod static_ranges;
 #[path = "static_snapshot.rs"]
@@ -167,10 +170,14 @@ pub struct Gateway {
     ftp_session_users: Arc<DashMap<SocketAddr, String>>,
     admin_auth_guard: AdminAuthGuard,
     monitor_auth_guard: AdminAuthGuard,
+    auth_requests: crate::auth_request::AuthRequestExecutor,
+    buffered_request_bodies: crate::body_budget::BufferedBodyBudget,
 }
 
 struct DynamicState {
     config: GatewayConfig,
+    tls_fingerprint: String,
+    tls_material: Option<Arc<PreparedTlsMaterial>>,
     fast_lane: FastLaneState,
     http_client: reqwest::Client,
     http_fast_client: HyperClient<HttpConnector, Full<Bytes>>,
@@ -429,6 +436,7 @@ impl DynamicState {
         upstream_target: UpstreamHttpTarget,
         upstream_headers: HeaderMap,
         body: Bytes,
+        request_timeout_ms: Option<u64>,
     ) -> Result<UpstreamHttpResponse> {
         if let UpstreamHttpTarget::Hyper(upstream_uri) = upstream_target {
             let mut request = Request::builder()
@@ -437,7 +445,9 @@ impl DynamicState {
                 .body(Full::new(body))
                 .context("failed building upstream request")?;
             *request.headers_mut() = upstream_headers;
-            let timeout = Duration::from_millis(self.config.http.request_timeout_ms);
+            let timeout = Duration::from_millis(
+                request_timeout_ms.unwrap_or(self.config.http.request_timeout_ms),
+            );
             let response = tokio::time::timeout(timeout, self.http_fast_client.request(request))
                 .await
                 .context("upstream response headers timed out")?
@@ -460,7 +470,9 @@ impl DynamicState {
             .headers(upstream_headers)
             .body(body)
             .send();
-        let timeout = Duration::from_millis(self.config.http.request_timeout_ms);
+        let timeout = Duration::from_millis(
+            request_timeout_ms.unwrap_or(self.config.http.request_timeout_ms),
+        );
         let response = tokio::time::timeout(timeout, request)
             .await
             .context("upstream response headers timed out")?
@@ -524,12 +536,13 @@ fn request_body_limit(config: &GatewayConfig, uri: &Uri) -> u64 {
     }
 }
 
-async fn collect_request_body_if_needed<B>(
+async fn collect_request_body_with_budget<B>(
     _method: &Method,
     headers: &HeaderMap,
     body: &mut B,
     limit: u64,
     idle_timeout: Duration,
+    budget: &crate::body_budget::BufferedBodyBudget,
 ) -> Result<Bytes, RequestBodyError>
 where
     B: HyperBody<Data = Bytes> + Unpin,
@@ -549,6 +562,7 @@ where
             message: "request body exceeds configured limit",
         });
     }
+    let mut reservation = budget.reservation();
     let mut data = BytesMut::new();
     loop {
         let frame = tokio::time::timeout(idle_timeout, body.frame())
@@ -571,6 +585,12 @@ where
                     message: "request body exceeds configured limit",
                 });
             }
+            reservation
+                .reserve(chunk.len())
+                .map_err(|_| RequestBodyError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "buffered request body capacity exhausted",
+                })?;
             data.extend_from_slice(&chunk);
         }
     }
@@ -580,7 +600,29 @@ where
             message: "request body length mismatch",
         });
     }
-    Ok(data.freeze())
+    Ok(reservation.finish(data.freeze()))
+}
+
+#[cfg(test)]
+async fn collect_request_body_if_needed<B>(
+    method: &Method,
+    headers: &HeaderMap,
+    body: &mut B,
+    limit: u64,
+    idle_timeout: Duration,
+) -> Result<Bytes, RequestBodyError>
+where
+    B: HyperBody<Data = Bytes> + Unpin,
+{
+    collect_request_body_with_budget(
+        method,
+        headers,
+        body,
+        limit,
+        idle_timeout,
+        &crate::body_budget::BufferedBodyBudget::new(0),
+    )
+    .await
 }
 
 fn request_body_declared_empty(method: &Method, headers: &HeaderMap) -> bool {
@@ -2467,6 +2509,7 @@ struct ResolvedActiveHealthConfig {
 #[derive(Debug)]
 struct SniResolver {
     default: Arc<CertifiedKey>,
+    reject_unknown_sni: bool,
     by_name: BTreeMap<String, Arc<CertifiedKey>>,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
@@ -2695,9 +2738,20 @@ impl ServerCertVerifier for InsecureUpstreamVerifier {
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let Some(server_name) = client_hello.server_name() else {
-            return Some(self.default.clone());
+            return (!self.reject_unknown_sni).then(|| self.default.clone());
         };
         let server_name = server_name.to_ascii_lowercase();
+        let configured = self.by_name.get(&server_name).cloned().or_else(|| {
+            let labels = server_name.split('.').collect::<Vec<_>>();
+            (1..labels.len()).find_map(|index| {
+                self.by_name
+                    .get(&format!(".{}", labels[index..].join(".")))
+                    .cloned()
+            })
+        });
+        if self.reject_unknown_sni && configured.is_none() {
+            return None;
+        }
         let is_acme_tls_alpn = client_hello
             .alpn()
             .map(|protocols| {
@@ -2711,8 +2765,8 @@ impl ResolvesServerCert for SniResolver {
                 return Some(certified.clone());
             }
         }
-        if let Some(certified) = self.by_name.get(&server_name) {
-            return Some(certified.clone());
+        if let Some(certified) = configured {
+            return Some(certified);
         }
         if let Some(certified) = self.on_demand_certs.get(&server_name) {
             return Some(certified.clone());
@@ -2730,7 +2784,7 @@ impl ResolvesServerCert for SniResolver {
             }
         }
 
-        Some(self.default.clone())
+        (!self.reject_unknown_sni).then(|| self.default.clone())
     }
 }
 
@@ -2792,6 +2846,9 @@ impl Gateway {
         let dynamic_blacklist =
             DynamicBlacklist::load_from_disk(&config.security.dynamic_blacklist)?;
 
+        let body_budget = crate::body_budget::BufferedBodyBudget::new(
+            config.http.max_buffered_request_body_bytes,
+        );
         let gateway = Arc::new(Self {
             config_path,
             bootstrap_config: config,
@@ -2823,6 +2880,8 @@ impl Gateway {
             ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
             monitor_auth_guard: AdminAuthGuard::default(),
+            auth_requests: crate::auth_request::AuthRequestExecutor::new()?,
+            buffered_request_bodies: body_budget,
         });
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
@@ -2902,6 +2961,77 @@ impl Gateway {
         predialed
     }
 
+    async fn dispatch_script_static_site(
+        &self,
+        state: &DynamicState,
+        route: &RouteDecision,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        remote_addr: SocketAddr,
+    ) -> Result<Option<GatewayHttpResponse>> {
+        let Some(name) = route.upstream.strip_prefix("proxysss://static-site/") else {
+            return Ok(None);
+        };
+        let Some(site) = state
+            .config
+            .services
+            .static_sites
+            .iter()
+            .find(|site| site.name == name)
+        else {
+            return Ok(Some(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "static site not found",
+            )));
+        };
+        let request_host = static_request_host(headers, uri);
+        let Some(uri) = script_static_uri(route, uri) else {
+            return Ok(Some(GatewayHttpResponse::error(
+                StatusCode::BAD_REQUEST,
+                "invalid static request path",
+            )));
+        };
+        if !static_site_request_matches(site, request_host, uri.path()) {
+            return Ok(Some(GatewayHttpResponse::error(
+                StatusCode::NOT_FOUND,
+                "static site not found",
+            )));
+        }
+        if !crate::static_security::site_peer_allowed(site, remote_addr.ip()) {
+            return Ok(Some(static_denied()));
+        }
+        let error_status = route
+            .status
+            .filter(|status| (400..=599).contains(status))
+            .and_then(|status| StatusCode::from_u16(status).ok());
+        let error_headers;
+        let headers = if error_status.is_some() {
+            error_headers = script_static_error_headers(headers);
+            &error_headers
+        } else {
+            headers
+        };
+        let mut response = dispatch_static_site(
+            site,
+            method,
+            &uri,
+            headers,
+            &self.static_file_cache,
+            &self.static_file_cache_bytes,
+            &self.static_file_load_locks,
+        )
+        .await?;
+        // Explicit error-page dispatch preserves its error only after a successful file read.
+        if response.status.is_success() {
+            if let Some(status) = error_status {
+                response.status = status;
+                response.upstream = format!("proxysss://static-error-page/{name}");
+            }
+        }
+        Ok(Some(response))
+    }
+
     async fn preload_static_fast_lane_cache(&self, config: &GatewayConfig) {
         if !config.runtime.performance.enabled {
             return;
@@ -2911,6 +3041,9 @@ impl Gateway {
         let sendfile_threshold = static_sendfile_fast_path_threshold_bytes(config);
         let mut preloaded = 0_usize;
         for (site_index, site) in config.services.static_sites.iter().enumerate() {
+            if site.script_only {
+                continue;
+            }
             match preload_static_site_fast_lane_cache(
                 site,
                 static_cache_namespaced(config).then_some(site_index),
@@ -3352,7 +3485,8 @@ impl Gateway {
 
         loop {
             let state = self.current_state().await;
-            let desired = listener_specs(&state.config);
+            let desired =
+                listener_specs_with_tls_fingerprint(&state.config, &state.tls_fingerprint);
             let desired_keys = desired
                 .iter()
                 .map(ListenerSpec::key)
@@ -3472,12 +3606,13 @@ impl Gateway {
         let path = request.uri().path().to_string();
         let headers = request.headers().clone();
         let body_config = self.current_state().await;
-        let body = match collect_request_body_if_needed(
+        let body = match collect_request_body_with_budget(
             &method,
             &headers,
             request.body_mut(),
             body_config.config.http.max_request_body_bytes,
             Duration::from_millis(body_config.config.http.request_body_timeout_ms),
+            &self.buffered_request_bodies,
         )
         .await
         {
@@ -4920,10 +5055,14 @@ impl Gateway {
         }
         prepare_tls_material(&new_config)?;
 
+        // 续期工具可能分两次替换证书和私钥；完整验证后才发布配置或撤销旧监听。
+
         let new_state = Arc::new(build_dynamic_state(new_config.clone()).await?);
         self.stats.warm.store(false, Ordering::Release);
         self.static_route_cache.clear();
         self.h2_static_route_cache.clear();
+        self.buffered_request_bodies
+            .set_limit(new_config.http.max_buffered_request_body_bytes);
         self.dynamic.store(new_state);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
@@ -5777,7 +5916,7 @@ impl Gateway {
                     .services
                     .static_sites
                     .iter()
-                    .any(|site| static_site_path_matches(site, path_hint));
+                    .any(|site| !site.script_only && static_site_path_matches(site, path_hint));
             let raw_sse_prefix_hit = !raw_reverse_exact_head_hit
                 && fast_lane.raw_sse_proxy
                 && ai_proxy_fast_lane_path_matches(config, path_hint);
@@ -6382,8 +6521,12 @@ impl Gateway {
     async fn run_tls_http(self: Arc<Self>, bind: String) -> Result<()> {
         let bind_addr: SocketAddr = bind.parse().context("invalid http.tls_bind address")?;
         let state = self.current_state().await;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(build_rustls_server_config(
+        let tls_acceptor = TlsAcceptor::from(Arc::new(build_rustls_server_config_with_material(
             &state.config,
+            state
+                .tls_material
+                .as_ref()
+                .context("TLS material unavailable")?,
             self.acme_tls_alpn_certs.clone(),
             self.on_demand_certs.clone(),
             self.on_demand_trigger.clone(),
@@ -6721,8 +6864,12 @@ impl Gateway {
 
         let state = self.current_state().await;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(build_rustls_server_config(
+            QuicServerConfig::try_from(build_rustls_server_config_with_material(
                 &state.config,
+                state
+                    .tls_material
+                    .as_ref()
+                    .context("TLS material unavailable")?,
                 self.acme_tls_alpn_certs.clone(),
                 self.on_demand_certs.clone(),
                 self.on_demand_trigger.clone(),
@@ -6816,6 +6963,7 @@ impl Gateway {
                                         }),
                                     ),
                                 };
+                                let mut reservation = gateway.buffered_request_bodies.reservation();
                                 let mut body = BytesMut::new();
                                 if body_error.is_none() {
                                     'body: loop {
@@ -6833,6 +6981,10 @@ impl Gateway {
                                                         > limit
                                                     {
                                                         body_error = Some(RequestBodyError { status: StatusCode::PAYLOAD_TOO_LARGE, message: "request body exceeds configured limit" });
+                                                        break 'body;
+                                                    }
+                                                    if reservation.reserve(data.len()).is_err() {
+                                                        body_error = Some(RequestBodyError { status: StatusCode::SERVICE_UNAVAILABLE, message: "buffered request body capacity exhausted" });
                                                         break 'body;
                                                     }
                                                     body.extend_from_slice(data);
@@ -6869,6 +7021,8 @@ impl Gateway {
                                 }
 
                                 let mut response = if let Some(error) = body_error {
+                                    drop(body);
+                                    drop(reservation);
                                     stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
                                     GatewayHttpResponse::error(error.status, error.message)
                                 } else {
@@ -6877,7 +7031,7 @@ impl Gateway {
                                             request.method().clone(),
                                             request.uri().clone(),
                                             request.headers().clone(),
-                                            body.freeze(),
+                                            reservation.finish(body.freeze()),
                                             remote_addr,
                                             "https",
                                             "HTTP/3",
@@ -7222,6 +7376,7 @@ impl Gateway {
                             strip_headers: Vec::new(),
                             status: None,
                             content_type: None,
+                            ..RouteDecision::default()
                         }
                     } else if listener_name == "ftp" && state.config.services.ftp.enabled {
                         RouteDecision {
@@ -7234,6 +7389,7 @@ impl Gateway {
                             strip_headers: Vec::new(),
                             status: None,
                             content_type: None,
+                            ..RouteDecision::default()
                         }
                     } else if let Some(route) = configured_tcp_listener_route(
                         &state.config,
@@ -8277,12 +8433,13 @@ impl Gateway {
             .then(|| hyper::upgrade::on(&mut request));
         let headers = request.headers().clone();
         let body_config = self.current_state().await;
-        let body = match collect_request_body_if_needed(
+        let body = match collect_request_body_with_budget(
             &method,
             &headers,
             request.body_mut(),
             request_body_limit(&body_config.config, &uri),
             Duration::from_millis(body_config.config.http.request_body_timeout_ms),
+            &self.buffered_request_bodies,
         )
         .await
         {
@@ -9145,30 +9302,55 @@ impl Gateway {
             route
         } else if let Some(script) = &state.script {
             let request_id = Uuid::new_v4().to_string();
+            let decision = script
+                .route_http(HttpContext {
+                    request_id,
+                    host: host.clone(),
+                    method: method.as_str().to_string(),
+                    path: uri.path().to_string(),
+                    query: uri.query().map(str::to_string),
+                    scheme: scheme.to_string(),
+                    version: version.to_string(),
+                    remote_addr: remote_addr.to_string(),
+                    player_id: player_id.clone(),
+                    headers: header_map_to_btree(&headers),
+                    body_len: body.len(),
+                })
+                .await
+                .inspect_err(|_| {
+                    self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
+                })?;
+            let cache = decision
+                .cache
+                .as_ref()
+                .map(|policy| Cow::Owned(policy.clone()))
+                .unwrap_or_else(|| Cow::Borrowed(&state.config.services.response_policy.cache));
+            let forward_headers = decision.forward_headers.unwrap_or(true);
+            let rate_limit = decision
+                .upstream
+                .strip_prefix("proxysss://static-site/")
+                .and_then(|name| {
+                    state
+                        .config
+                        .services
+                        .static_sites
+                        .iter()
+                        .find(|site| site.name == name)
+                })
+                .map(|site| {
+                    merge_rate_limit_policy(
+                        &state.config.services.rate_limit.http,
+                        &site.rate_limit,
+                    )
+                })
+                .unwrap_or_else(|| Cow::Borrowed(&state.config.services.rate_limit.http));
             HttpRouteConfig {
                 runtime_scope: Some("script".to_string()),
-                decision: script
-                    .route_http(HttpContext {
-                        request_id: request_id.clone(),
-                        host: host.clone(),
-                        method: method.as_str().to_string(),
-                        path: uri.path().to_string(),
-                        query: uri.query().map(|value| value.to_string()),
-                        scheme: scheme.to_string(),
-                        version: version.to_string(),
-                        remote_addr: remote_addr.to_string(),
-                        player_id: player_id.clone(),
-                        headers: header_map_to_btree(&headers),
-                        body_len: body.len(),
-                    })
-                    .await
-                    .inspect_err(|_| {
-                        self.stats.script_fail_total.fetch_add(1, Ordering::Relaxed);
-                    })?,
+                decision,
                 compression: Cow::Borrowed(&state.config.services.response_policy.compression),
-                cache: Cow::Borrowed(&state.config.services.response_policy.cache),
-                rate_limit: Cow::Borrowed(&state.config.services.rate_limit.http),
-                forward_headers: true,
+                cache,
+                rate_limit,
+                forward_headers,
             }
         } else if let Some(route) = builtin_http_route(uri.path()) {
             HttpRouteConfig {
@@ -9192,8 +9374,50 @@ impl Gateway {
                 Err(response) => return Ok(*response),
             };
 
+        if let Some(policy) = &route.decision.auth_request {
+            if let crate::auth_request::AuthRequestOutcome::Denied {
+                status,
+                authenticate,
+            } = self.auth_requests.authorize(policy).await
+            {
+                let mut response = GatewayHttpResponse::bytes(
+                    status,
+                    "text/plain; charset=utf-8",
+                    Bytes::new(),
+                    "proxysss://auth-request-denied",
+                );
+                if let Some(value) = authenticate {
+                    response
+                        .headers
+                        .push((http::header::WWW_AUTHENTICATE, value));
+                }
+                apply_route_response_headers(&route.decision, &mut response)?;
+                response.headers.retain(|(name, _)| name != CACHE_CONTROL);
+                response
+                    .headers
+                    .push((CACHE_CONTROL, HeaderValue::from_static("private, no-store")));
+                return Ok(response);
+            }
+        }
+
+        if let Some(mut response) = self
+            .dispatch_script_static_site(
+                &state,
+                &route.decision,
+                &method,
+                &uri,
+                &headers,
+                remote_addr,
+            )
+            .await?
+        {
+            apply_route_response_headers(&route.decision, &mut response)?;
+            return finalize_http_response(&headers, &route.compression, response);
+        }
+
         if route.decision.upstream.starts_with("proxysss://") {
-            let response = dispatch_internal_http(&state.config, &route.decision);
+            let mut response = dispatch_internal_http(&state.config, &route.decision);
+            apply_route_response_headers(&route.decision, &mut response)?;
             return finalize_http_response(&headers, &route.compression, response);
         }
 
@@ -9201,12 +9425,16 @@ impl Gateway {
             let on_upgrade = on_upgrade.ok_or_else(|| {
                 anyhow!("websocket route requires an HTTP/1.1 upgrade-capable request")
             })?;
-            return self
+            let mut response = self
                 .dispatch_websocket(
                     method,
                     uri,
                     headers,
-                    body,
+                    if route.decision.pass_request_body {
+                        body
+                    } else {
+                        Bytes::new()
+                    },
                     remote_addr,
                     scheme,
                     &host,
@@ -9214,7 +9442,9 @@ impl Gateway {
                     route.forward_headers,
                     on_upgrade,
                 )
-                .await;
+                .await?;
+            apply_route_response_headers(&route.decision, &mut response)?;
+            return Ok(response);
         }
 
         if method.as_str() == "PURGE" {
@@ -9226,6 +9456,7 @@ impl Gateway {
             match self.lookup_cached_http_response(&state.config, &route.cache, cache_key) {
                 Some(CacheLookup::Fresh(mut response)) => {
                     let _ = apply_cache_response_headers(&route.cache, &mut response, "HIT");
+                    apply_route_response_headers(&route.decision, &mut response)?;
                     return finalize_http_response(&headers, &route.compression, response);
                 }
                 Some(CacheLookup::Stale(mut response)) => {
@@ -9257,6 +9488,7 @@ impl Gateway {
                         }
                     });
                     let _ = apply_cache_response_headers(&route.cache, &mut response, "STALE");
+                    apply_route_response_headers(&route.decision, &mut response)?;
                     return finalize_http_response(&headers, &route.compression, response);
                 }
                 Some(CacheLookup::StaleIfError(mut response)) => {
@@ -9325,7 +9557,12 @@ impl Gateway {
                     method.clone(),
                     upstream_target,
                     upstream_headers,
-                    body.clone(),
+                    if route.decision.pass_request_body {
+                        body.clone()
+                    } else {
+                        Bytes::new()
+                    },
+                    route.decision.request_timeout_ms,
                 )
                 .await;
 
@@ -9409,6 +9646,7 @@ impl Gateway {
             if cache_key.is_some() && route.cache.enabled {
                 let _ = apply_cache_response_headers(&route.cache, &mut response, "MISS");
             }
+            apply_route_response_headers(&route.decision, &mut response)?;
             return finalize_http_response(&headers, &route.compression, response);
         }
 
@@ -9418,10 +9656,17 @@ impl Gateway {
             ) = self.lookup_cached_http_response(&state.config, &route.cache, cache_key)
             {
                 let _ = apply_cache_response_headers(&route.cache, &mut response, "STALE");
+                apply_route_response_headers(&route.decision, &mut response)?;
                 return finalize_http_response(&headers, &route.compression, response);
             }
         }
 
+        if !route.decision.response_headers.is_empty() {
+            let mut response =
+                GatewayHttpResponse::error(StatusCode::BAD_GATEWAY, "upstream request failed");
+            apply_route_response_headers(&route.decision, &mut response)?;
+            return finalize_http_response(&headers, &route.compression, response);
+        }
         Err(last_error.unwrap_or_else(|| anyhow!("upstream request failed after retries")))
     }
 
@@ -9551,6 +9796,7 @@ impl Gateway {
                 upstream_target,
                 upstream_headers,
                 body.clone(),
+                None,
             )
             .await?;
 
@@ -10217,6 +10463,7 @@ impl Gateway {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
         let remote_addr_text = remote_addr.to_string();
         let selected_upstream = self
@@ -10426,7 +10673,11 @@ impl Gateway {
             forward_headers,
         )?;
         let upstream = upstream_url.to_string();
-        let timeout = Duration::from_millis(state.config.http.request_timeout_ms);
+        let timeout = Duration::from_millis(
+            route
+                .request_timeout_ms
+                .unwrap_or(state.config.http.request_timeout_ms),
+        );
         let mut upstream_io = tokio::time::timeout(
             timeout,
             connect_upgrade_upstream(&upstream_url, state.config.http.allow_insecure_upstreams),
@@ -11469,6 +11720,7 @@ fn route_names_for_runtime_scope(
                     strip_headers: Vec::new(),
                     status: None,
                     content_type: None,
+                    ..RouteDecision::default()
                 })
                 .iter()
                 .any(|candidate| candidate == upstream)
@@ -11487,6 +11739,7 @@ fn route_names_for_runtime_scope(
                     strip_headers: Vec::new(),
                     status: None,
                     content_type: None,
+                    ..RouteDecision::default()
                 })
                 .iter()
                 .any(|candidate| candidate == upstream)
@@ -11552,6 +11805,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                 strip_headers: Vec::new(),
                 status: None,
                 content_type: None,
+                ..RouteDecision::default()
             }) {
                 let key = runtime_scope_key("http", Some(&route.name), &upstream);
                 upstreams.entry(key).or_insert(ActiveHealthTarget {
@@ -11578,6 +11832,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                 strip_headers: Vec::new(),
                 status: None,
                 content_type: None,
+                ..RouteDecision::default()
             }) {
                 let key = runtime_scope_key("http", Some(&route.name), &upstream);
                 upstreams.entry(key).or_insert(ActiveHealthTarget {
@@ -11606,6 +11861,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                 strip_headers: Vec::new(),
                 status: None,
                 content_type: None,
+                ..RouteDecision::default()
             }) {
                 let key = runtime_scope_key("tcp", Some(&listener.name), &upstream);
                 upstreams.entry(key).or_insert(ActiveHealthTarget {
@@ -11645,6 +11901,7 @@ fn collect_active_health_targets(config: &GatewayConfig) -> Vec<ActiveHealthTarg
                 strip_headers: Vec::new(),
                 status: None,
                 content_type: None,
+                ..RouteDecision::default()
             }) {
                 let key = runtime_scope_key("udp", Some(&listener.name), &upstream);
                 upstreams.entry(key).or_insert(ActiveHealthTarget {
@@ -12394,11 +12651,16 @@ fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
         && !config.services.access_control.http.enabled
         && !config.services.rate_limit.http.enabled
         && !config.services.response_policy.compression.enabled
-        && !config.services.static_sites.is_empty()
         && config
             .services
             .static_sites
             .iter()
+            .any(|site| !site.script_only)
+        && config
+            .services
+            .static_sites
+            .iter()
+            .filter(|site| !site.script_only)
             .all(crate::static_security::fast_lane_eligible)
 }
 
@@ -14236,7 +14498,13 @@ fn decorate_error_response(
     request_headers: &HeaderMap,
     response: GatewayHttpResponse,
 ) -> GatewayHttpResponse {
-    if response.stream_body.is_some() {
+    if !config.http.error_pages.enabled
+        || response.stream_body.is_some()
+        || response.upstream == "proxysss://response"
+        || response
+            .upstream
+            .starts_with("proxysss://static-error-page/")
+    {
         return response;
     }
 
@@ -14408,8 +14676,12 @@ async fn build_dynamic_state(config: GatewayConfig) -> Result<DynamicState> {
         auto_load_plugins(&config, script_runtime).await?;
     }
 
+    let tls_material = Arc::new(prepare_certified_material(&config)?);
+    let tls_fingerprint = tls_material.fingerprint.clone();
     Ok(DynamicState {
         fast_lane: FastLaneState::compile(&config),
+        tls_fingerprint,
+        tls_material: Some(tls_material),
         config,
         http_client: client,
         http_fast_client,
@@ -14547,7 +14819,15 @@ fn plugin_sidecar_paths(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(test)]
 fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
+    listener_specs_with_tls_fingerprint(config, &tls_fingerprint(config))
+}
+
+fn listener_specs_with_tls_fingerprint(
+    config: &GatewayConfig,
+    tls_fingerprint: &str,
+) -> Vec<ListenerSpec> {
     let mut specs = Vec::new();
 
     if !config.http.plain_bind.trim().is_empty() {
@@ -14558,13 +14838,13 @@ fn listener_specs(config: &GatewayConfig) -> Vec<ListenerSpec> {
     if !config.http.tls_bind.trim().is_empty() {
         specs.push(ListenerSpec::TlsHttp {
             bind: config.http.tls_bind.clone(),
-            tls_fingerprint: tls_fingerprint(config),
+            tls_fingerprint: tls_fingerprint.to_string(),
         });
     }
     if !config.http.h3_bind.trim().is_empty() {
         specs.push(ListenerSpec::Http3 {
             bind: config.http.h3_bind.clone(),
-            tls_fingerprint: tls_fingerprint(config),
+            tls_fingerprint: tls_fingerprint.to_string(),
         });
     }
     for listener in &config.tcp.listeners {
@@ -14640,6 +14920,7 @@ impl ListenerSpec {
     }
 }
 
+#[cfg(test)]
 fn read_file_hash(path: &Path) -> Result<u64> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -14648,16 +14929,70 @@ fn read_file_hash(path: &Path) -> Result<u64> {
     Ok(hasher.finish())
 }
 
+#[cfg(test)]
 fn tls_fingerprint(config: &GatewayConfig) -> String {
-    let cert_hash = read_file_hash(&config.http.tls.cert_path).unwrap_or(0);
-    let key_hash = read_file_hash(&config.http.tls.key_path).unwrap_or(0);
-    format!(
-        "{}:{}:{}:{}",
-        config.http.tls.mode as u8,
-        config.http.tls.cert_path.display(),
-        cert_hash,
-        key_hash
-    )
+    let mut hasher = DefaultHasher::new();
+    (config.http.tls.mode as u8).hash(&mut hasher);
+    config.http.tls.reject_unknown_sni.hash(&mut hasher);
+    for path in tls_certificate_paths(config) {
+        path.hash(&mut hasher);
+        read_file_hash(&path).unwrap_or(0).hash(&mut hasher);
+    }
+    for cert in &config.http.tls.certificates {
+        cert.domains.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn tls_certificate_paths(config: &GatewayConfig) -> Vec<PathBuf> {
+    let mut paths = vec![
+        config.http.tls.cert_path.clone(),
+        config.http.tls.key_path.clone(),
+    ];
+    for cert in &config.http.tls.certificates {
+        paths.push(cert.cert_path.clone());
+        paths.push(cert.key_path.clone());
+    }
+    paths
+}
+
+/// Parsed keys belong to the published state; listeners never re-read a partial renewal.
+struct PreparedTlsMaterial {
+    default: Arc<CertifiedKey>,
+    by_name: BTreeMap<String, Arc<CertifiedKey>>,
+    fingerprint: String,
+}
+
+fn prepare_certified_material(config: &GatewayConfig) -> Result<PreparedTlsMaterial> {
+    let default = Arc::new(build_certified_key(
+        &config.http.tls.cert_path,
+        &config.http.tls.key_path,
+    )?);
+    let mut by_name = BTreeMap::new();
+    for certificate in &config.http.tls.certificates {
+        let certified = Arc::new(build_certified_key(
+            &certificate.cert_path,
+            &certificate.key_path,
+        )?);
+        insert_certificate_domains(&mut by_name, certified, certificate);
+    }
+    let mut hash = DefaultHasher::new();
+    (config.http.tls.mode as u8).hash(&mut hash);
+    config.http.tls.reject_unknown_sni.hash(&mut hash);
+    for cert in &default.cert {
+        cert.as_ref().hash(&mut hash);
+    }
+    for (name, key) in &by_name {
+        name.hash(&mut hash);
+        for cert in &key.cert {
+            cert.as_ref().hash(&mut hash);
+        }
+    }
+    Ok(PreparedTlsMaterial {
+        default,
+        by_name,
+        fingerprint: format!("{:x}", hash.finish()),
+    })
 }
 
 fn prepare_tls_material(config: &GatewayConfig) -> Result<()> {
@@ -14748,8 +15083,9 @@ fn default_tls_alpn_protocols() -> Vec<Vec<u8>> {
     vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()]
 }
 
-fn build_rustls_server_config(
+fn build_rustls_server_config_with_material(
     config: &GatewayConfig,
+    material: &PreparedTlsMaterial,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
@@ -14759,6 +15095,7 @@ fn build_rustls_server_config(
         .with_no_client_auth()
         .with_cert_resolver(build_tls_resolver(
             config,
+            material,
             acme_tls_alpn_by_name,
             on_demand_certs,
             on_demand_trigger,
@@ -14774,29 +15111,35 @@ fn build_rustls_server_config(
     Ok(server_config)
 }
 
-fn build_tls_resolver(
+#[cfg(test)]
+fn build_rustls_server_config(
     config: &GatewayConfig,
     acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
     on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<rustls::ServerConfig> {
+    build_rustls_server_config_with_material(
+        config,
+        &prepare_certified_material(config)?,
+        acme_tls_alpn_by_name,
+        on_demand_certs,
+        on_demand_trigger,
+        alpn_protocols,
+    )
+}
+
+fn build_tls_resolver(
+    config: &GatewayConfig,
+    material: &PreparedTlsMaterial,
+    acme_tls_alpn_by_name: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    on_demand_trigger: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<Arc<dyn ResolvesServerCert>> {
-    let default = Arc::new(build_certified_key(
-        &config.http.tls.cert_path,
-        &config.http.tls.key_path,
-    )?);
-    let mut by_name = BTreeMap::<String, Arc<CertifiedKey>>::new();
-
-    for certificate in &config.http.tls.certificates {
-        let certified = Arc::new(build_certified_key(
-            &certificate.cert_path,
-            &certificate.key_path,
-        )?);
-        insert_certificate_domains(&mut by_name, certified, certificate);
-    }
-
     Ok(Arc::new(SniResolver {
-        default,
-        by_name,
+        default: material.default.clone(),
+        reject_unknown_sni: config.http.tls.reject_unknown_sni,
+        by_name: material.by_name.clone(),
         acme_tls_alpn_by_name,
         on_demand_certs,
         on_demand: config.http.tls.on_demand.clone(),
@@ -14812,7 +15155,11 @@ fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey
         .key_provider
         .load_private_key(key)
         .map_err(|error| anyhow!("failed loading private key {}: {error}", key_path.display()))?;
-    Ok(CertifiedKey::new(certs, signing_key))
+    let certified = CertifiedKey::new(certs, signing_key);
+    certified
+        .keys_match()
+        .context("TLS certificate and private key do not match")?;
+    Ok(certified)
 }
 
 fn insert_certificate_domains(
@@ -15337,11 +15684,24 @@ fn build_upstream_headers(
     let mut headers =
         HeaderMap::with_capacity(original.len() + route.set_headers.len() + forwarding_capacity);
 
-    for (name, value) in original {
-        if is_hop_header(name.as_str()) || name == HOST {
-            continue;
+    if route.pass_request_headers {
+        for (name, value) in original {
+            if is_hop_header(name.as_str())
+                || name == HOST
+                || (!route.pass_request_body
+                    && matches!(
+                        name.as_str(),
+                        "content-length" | "content-type" | "content-encoding" | "expect"
+                    ))
+            {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
         }
-        headers.append(name.clone(), value.clone());
+    }
+
+    if forward_headers {
+        apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
     }
 
     for header_name in &route.strip_headers {
@@ -15358,12 +15718,11 @@ fn build_upstream_headers(
         headers.insert(name, value);
     }
 
-    headers.insert(
-        HOST,
-        HeaderValue::from_str(host).context("invalid host header")?,
-    );
-    if forward_headers {
-        apply_forwarding_headers(&mut headers, host, remote_addr, scheme)?;
+    if !headers.contains_key(HOST) {
+        headers.insert(
+            HOST,
+            HeaderValue::from_str(host).context("invalid host header")?,
+        );
     }
 
     Ok(headers)
@@ -18629,11 +18988,16 @@ fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bo
         || config.services.response_policy.compression.enabled
         || config.services.filecloud.enabled
         || config.services.webdav.enabled
-        || config.services.static_sites.is_empty()
         || !config
             .services
             .static_sites
             .iter()
+            .any(|site| !site.script_only)
+        || !config
+            .services
+            .static_sites
+            .iter()
+            .filter(|site| !site.script_only)
             .all(crate::static_security::fast_lane_eligible)
     {
         return false;
@@ -18643,6 +19007,9 @@ fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bo
 }
 
 fn http_to_https_redirect_can_apply(config: &GatewayConfig) -> bool {
+    if !config.http.redirect_http_to_https {
+        return false;
+    }
     if config.http.tls_bind.trim().is_empty() {
         return false;
     }
@@ -18674,6 +19041,17 @@ fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
         && !config.load_balance.active_health.enabled
         && !config.load_balance.passive_health.enabled
         && !config.affinity.enabled
+        && config
+            .services
+            .reverse_proxy
+            .routes
+            .iter()
+            .all(|route| route.auth_request.is_none())
+        && config
+            .services
+            .domain_routes
+            .iter()
+            .all(|route| route.auth_request.is_none())
 }
 
 fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Cow<'a, str> {
@@ -18689,7 +19067,8 @@ fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Cow<'a, str> {
 }
 
 fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
-    route.upstreams.is_empty()
+    route.auth_request.is_none()
+        && route.upstreams.is_empty()
         && route.upstream_weights.is_empty()
         && route.set_headers.is_empty()
         && route.strip_headers.is_empty()
@@ -18699,7 +19078,8 @@ fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bo
 }
 
 fn websocket_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
-    route.set_headers.is_empty()
+    route.auth_request.is_none()
+        && route.set_headers.is_empty()
         && route.strip_headers.is_empty()
         && !route.compression.enabled
         && !route.cache.enabled
@@ -19189,6 +19569,7 @@ fn builtin_http_route(path: &str) -> Option<RouteDecision> {
                 strip_headers: Vec::new(),
                 status: None,
                 content_type: None,
+                ..RouteDecision::default()
             });
         }
         _ => return None,
@@ -19204,6 +19585,7 @@ fn builtin_http_route(path: &str) -> Option<RouteDecision> {
         strip_headers: Vec::new(),
         status: None,
         content_type: None,
+        ..RouteDecision::default()
     })
 }
 
@@ -19271,6 +19653,7 @@ fn configured_stream_listener_route(
         strip_headers: Vec::new(),
         status: None,
         content_type: None,
+        ..RouteDecision::default()
     })
 }
 
@@ -19494,6 +19877,9 @@ fn strip_default_port(host: &str, default_port: u16) -> String {
 }
 
 fn should_redirect_http_to_https(config: &GatewayConfig, host: &str, uri: &Uri) -> bool {
+    if !config.http.redirect_http_to_https {
+        return false;
+    }
     if uri.path().starts_with("/.well-known/acme-challenge/") {
         return false;
     }
@@ -19548,6 +19934,7 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
 
     RouteDecision {
         upstream: route.upstream.clone(),
+        auth_request: route.auth_request.clone(),
         upstreams: route.upstreams.clone(),
         upstream_weights: route.upstream_weights.clone(),
         affinity_key: None,
@@ -19556,6 +19943,7 @@ fn reverse_proxy_route_decision(route: &ReverseProxyRouteConfig, uri: &Uri) -> R
         strip_headers: route.strip_headers.clone(),
         status: None,
         content_type: None,
+        ..RouteDecision::default()
     }
 }
 
@@ -19568,6 +19956,7 @@ fn domain_route_config<'a>(
         runtime_scope: Some(route.name.clone()),
         decision: RouteDecision {
             upstream: route.upstream.clone(),
+            auth_request: route.auth_request.clone(),
             upstreams: route.upstreams.clone(),
             upstream_weights: route.upstream_weights.clone(),
             affinity_key: None,
@@ -19590,6 +19979,7 @@ fn domain_route_config<'a>(
             strip_headers: route.strip_headers.clone(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         },
         compression: merge_compression_policy(
             &config.services.response_policy.compression,
@@ -19776,9 +20166,7 @@ async fn dispatch_static_site_authorized(
         ));
     };
 
-    let Some(mut target) =
-        crate::static_security::confined_target(&site.root, &target, site.hide_dotfiles).await
-    else {
+    let Some(mut target) = resolve_static_site_target(site, &target).await else {
         return Ok(GatewayHttpResponse::error(
             StatusCode::NOT_FOUND,
             "static path not found",
@@ -20438,6 +20826,9 @@ async fn preload_static_site_fast_lane_cache(
     static_route_cache: &DashMap<String, PathBuf>,
     h2_static_route_cache: &DashMap<String, Arc<CachedH2StaticRoute>>,
 ) -> Result<usize> {
+    if site.script_only {
+        return Ok(0);
+    }
     let mut candidates = HashMap::<String, PathBuf>::new();
     let prefix = normalize_webdav_prefix(&site.path_prefix);
     for index in &site.index_files {
@@ -20665,7 +21056,9 @@ async fn static_autoindex(
 }
 
 fn static_cache_namespaced(config: &GatewayConfig) -> bool {
-    config.services.static_sites.len() != 1 || !config.services.static_sites[0].hosts.is_empty()
+    config.services.static_sites.len() != 1
+        || !config.services.static_sites[0].hosts.is_empty()
+        || config.services.static_sites[0].script_only
 }
 
 fn static_cache_key(namespace: Option<usize>, path: &str) -> Cow<'_, str> {
@@ -20700,6 +21093,10 @@ fn static_route_cache_key<'a>(
 }
 
 fn static_site_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
+    !site.script_only && static_site_request_matches(site, host, path)
+}
+
+fn static_site_request_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
     static_site_path_matches(site, path)
         && (site.hosts.is_empty()
             || site
@@ -20710,6 +21107,73 @@ fn static_site_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool 
 
 fn static_site_path_matches(site: &StaticSiteConfig, path: &str) -> bool {
     webdav_path_matches(&site.path_prefix, path)
+}
+
+fn script_static_error_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut headers = headers.clone();
+    headers.remove(RANGE);
+    let conditional: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("if-"))
+        .cloned()
+        .collect();
+    for name in conditional {
+        headers.remove(name);
+    }
+    headers
+}
+
+fn script_static_uri(route: &RouteDecision, original: &Uri) -> Option<Uri> {
+    let Some(path) = route.rewrite_path.as_deref() else {
+        return Some(original.clone());
+    };
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('#') {
+        return None;
+    }
+    let path_and_query = if path.contains('?') || original.query().is_none() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", original.query().unwrap_or_default())
+    };
+    let uri: Uri = path_and_query.parse().ok()?;
+    (uri.scheme().is_none() && uri.authority().is_none() && security::request_uri_is_safe(&uri))
+        .then_some(uri)
+}
+
+async fn resolve_static_site_target(site: &StaticSiteConfig, target: &Path) -> Option<PathBuf> {
+    if let Some(target) =
+        crate::static_security::confined_target(&site.root, target, site.hide_dotfiles).await
+    {
+        return Some(target);
+    }
+    let fallback = site.spa_fallback.as_ref()?;
+    if !matches!(tokio::fs::symlink_metadata(target).await, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    // Missing suffixes may fall back, but existing/dangling/outside symlinks must not turn into SPA success.
+    let projected = crate::filesystem_boundary::confined_path_async(&site.root, target)
+        .await
+        .ok()?;
+    let root = tokio::fs::canonicalize(&site.root).await.ok()?;
+    if projected.strip_prefix(root).ok()?.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_none_or(|name| !crate::static_security::allowed_component(name, site.hide_dotfiles))
+    }) {
+        return None;
+    }
+    let fallback = crate::static_security::confined_target(
+        &site.root,
+        &site.root.join(fallback),
+        site.hide_dotfiles,
+    )
+    .await?;
+    tokio::fs::metadata(&fallback)
+        .await
+        .ok()?
+        .is_file()
+        .then_some(fallback)
 }
 
 fn static_site_filesystem_path(
@@ -21572,9 +22036,77 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn apply_route_response_headers(
+    route: &RouteDecision,
+    response: &mut GatewayHttpResponse,
+) -> Result<()> {
+    route.validate_http_policy()?;
+    if route.cookie_secure {
+        for (name, value) in &mut response.headers {
+            if *name != http::header::SET_COOKIE {
+                continue;
+            }
+            let present = value
+                .as_bytes()
+                .split(|byte| *byte == b';')
+                .skip(1)
+                .any(|attribute| attribute.trim_ascii().eq_ignore_ascii_case(b"secure"));
+            if !present {
+                let mut secured = value.as_bytes().to_vec();
+                secured.extend_from_slice(b"; Secure");
+                *value = HeaderValue::from_bytes(&secured)?;
+            }
+        }
+    }
+    let replacements = route
+        .response_headers
+        .iter()
+        .filter_map(|(name, policy)| {
+            policy
+                .value(response.status.as_u16(), &response.headers)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.clone(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    for (name, value) in replacements {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).context("invalid route response header")?;
+        let value = HeaderValue::from_str(&value).context("invalid route response header value")?;
+        response.headers.retain(|(existing, _)| existing != name);
+        response.headers.push((name, value));
+    }
+    Ok(())
+}
+
 fn dispatch_internal_http(config: &GatewayConfig, route: &RouteDecision) -> GatewayHttpResponse {
     let upstream = route.upstream.as_str();
     match upstream {
+        "proxysss://response" => {
+            let Some(status) = route
+                .status
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .filter(|value| value.as_u16() >= 200)
+            else {
+                return GatewayHttpResponse::error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid synthetic response status",
+                );
+            };
+            let body = if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+                Bytes::new()
+            } else {
+                Bytes::from(route.response_body.clone().unwrap_or_default())
+            };
+            GatewayHttpResponse::bytes(
+                status,
+                route
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
+                body,
+                upstream,
+            )
+        }
         "proxysss://welcome" => {
             GatewayHttpResponse::html(render_welcome_html(config), "proxysss://welcome")
         }
@@ -22416,29 +22948,22 @@ fn build_websocket_upstream_headers(
     original_host: &str,
     forward_headers: bool,
 ) -> Result<HeaderMap> {
-    let forwarding_capacity = if forward_headers { 6 } else { 1 };
-    let mut headers =
-        HeaderMap::with_capacity(original.len() + route.set_headers.len() + forwarding_capacity);
-
-    for (name, value) in original {
-        if name == HOST || name.as_str().eq_ignore_ascii_case("proxy-connection") {
-            continue;
+    let mut headers = HeaderMap::with_capacity(original.len() + route.set_headers.len() + 6);
+    if route.pass_request_headers {
+        for (name, value) in original {
+            if name == HOST
+                || name.as_str().eq_ignore_ascii_case("proxy-connection")
+                || (!route.pass_request_body
+                    && matches!(
+                        name.as_str(),
+                        "content-length" | "content-type" | "content-encoding" | "expect"
+                    ))
+            {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
         }
-        headers.append(name.clone(), value.clone());
     }
-
-    for header_name in &route.strip_headers {
-        if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
-            headers.remove(name);
-        }
-    }
-
-    for (name, value) in &route.set_headers {
-        let name = HeaderName::from_bytes(name.as_bytes())?;
-        let value = HeaderValue::from_str(value)?;
-        headers.insert(name, value);
-    }
-
     let host = if original_host.trim().is_empty() {
         upstream_host
     } else {
@@ -22448,7 +22973,18 @@ fn build_websocket_upstream_headers(
     if forward_headers {
         apply_forwarding_headers(&mut headers, original_host, remote_addr, scheme)?;
     }
-
+    // Explicit route policy has the same precedence as ordinary HTTP proxying.
+    for header_name in &route.strip_headers {
+        if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+    for (name, value) in &route.set_headers {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
     Ok(headers)
 }
 
@@ -22679,6 +23215,17 @@ fn reload_fingerprint(config_path: &Path) -> Result<String> {
     context.consume(
         serde_json::to_vec(&config).context("failed serializing reload config fingerprint")?,
     );
+
+    for path in tls_certificate_paths(&config) {
+        context.consume(path.to_string_lossy().as_bytes());
+        match std::fs::read(&path) {
+            Ok(bytes) => context.consume(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                context.consume(b"missing TLS material")
+            }
+            Err(_) => anyhow::bail!("failed reading watched TLS material"),
+        }
+    }
 
     for path in watched_script_paths(&config) {
         context.consume(path.display().to_string().as_bytes());
@@ -23676,6 +24223,7 @@ mod tests {
     #[test]
     fn websocket_fast_lane_supports_multi_upstream_pool() {
         let route = ReverseProxyRouteConfig {
+            auth_request: None,
             upstream: "ws://10.0.0.1:60102".to_string(),
             upstreams: vec![
                 "ws://10.0.0.1:60102".to_string(),
@@ -23827,6 +24375,8 @@ mod tests {
             bootstrap_fast_lane: fast_lane.clone(),
             dynamic: Arc::new(ArcSwap::from(Arc::new(DynamicState {
                 config,
+                tls_fingerprint: String::new(),
+                tls_material: None,
                 fast_lane,
                 http_client: reqwest::Client::new(),
                 http_fast_client: HyperClient::builder(TokioExecutor::new())
@@ -23859,6 +24409,8 @@ mod tests {
             ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
             monitor_auth_guard: AdminAuthGuard::default(),
+            auth_requests: crate::auth_request::AuthRequestExecutor::new().unwrap(),
+            buffered_request_bodies: crate::body_budget::BufferedBodyBudget::new(0),
         };
         let remote_addr = "203.0.113.10:443".parse().expect("remote address");
         let login = gateway
@@ -24092,6 +24644,7 @@ mod tests {
         let updated = render_config_with_upserted_domain_route(
             "http:\n  plain_bind: 0.0.0.0:80\nservices:\n  domain_routes: []\n",
             &DomainRouteConfig {
+                auth_request: None,
                 name: "app".to_string(),
                 domains: vec!["example.com".to_string()],
                 path_prefix: "/".to_string(),
@@ -24121,6 +24674,7 @@ mod tests {
         let updated = render_config_with_upserted_domain_route(
             "services:\n  domain_routes:\n    - name: app\n      domains: [old.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:8000\n",
             &DomainRouteConfig {
+                auth_request: None,
                 name: "app".to_string(),
                 domains: vec!["new.example.com".to_string()],
                 path_prefix: "/api".to_string(),
@@ -24151,6 +24705,7 @@ mod tests {
         let updated = render_config_with_upserted_reverse_proxy_route(
             "services:\n  reverse_proxy:\n    routes:\n      - name: api\n        path_prefix: /api\n        hosts: [api.old.example.com]\n        upstream: http://127.0.0.1:8000\n",
             &ReverseProxyRouteConfig {
+                auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/v2".to_string(),
                 hosts: vec!["api.example.com".to_string()],
@@ -24232,6 +24787,7 @@ mod tests {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
 
         let candidates = normalize_candidates(&route);
@@ -24253,6 +24809,7 @@ mod tests {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
 
         let uri: Uri = "/room?id=42".parse().expect("valid uri");
@@ -24277,6 +24834,7 @@ mod tests {
     #[test]
     fn reverse_proxy_route_matches_wildcard_host_and_strips_prefix() {
         let route = ReverseProxyRouteConfig {
+            auth_request: None,
             name: "api".to_string(),
             path_prefix: "/api".to_string(),
             hosts: vec!["*.example.com".to_string()],
@@ -24309,6 +24867,7 @@ mod tests {
         config.services.reverse_proxy = ReverseProxyConfig {
             routes: vec![
                 ReverseProxyRouteConfig {
+                    auth_request: None,
                     name: "root-api".to_string(),
                     path_prefix: "/api".to_string(),
                     hosts: Vec::new(),
@@ -24325,6 +24884,7 @@ mod tests {
                     active_health: ActiveHealthOverrideConfig::default(),
                 },
                 ReverseProxyRouteConfig {
+                    auth_request: None,
                     name: "admin-api".to_string(),
                     path_prefix: "/api/admin".to_string(),
                     hosts: Vec::new(),
@@ -24353,6 +24913,7 @@ mod tests {
     fn configured_domain_route_matches_host_and_enables_features() {
         let mut config = GatewayConfig::default();
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_request: None,
             name: "app".to_string(),
             domains: vec!["example.com".to_string()],
             path_prefix: "/".to_string(),
@@ -24394,6 +24955,7 @@ mod tests {
     fn configured_domain_route_uses_domain_as_primary_service_group() {
         let mut config = GatewayConfig::default();
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_request: None,
             name: "example-site".to_string(),
             domains: vec!["example.com".to_string()],
             path_prefix: "/".to_string(),
@@ -24411,6 +24973,7 @@ mod tests {
             ssl: crate::config::DomainTlsConfig::default(),
         });
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_request: None,
             name: "store".to_string(),
             domains: vec!["neko233.store".to_string()],
             path_prefix: "/".to_string(),
@@ -24986,6 +25549,7 @@ mod tests {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
         let mut original = HeaderMap::new();
         original.insert(
@@ -25051,6 +25615,7 @@ mod tests {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
         let headers = build_upstream_headers(
             &HeaderMap::new(),
@@ -25110,6 +25675,8 @@ mod tests {
             bootstrap_fast_lane: FastLaneState::compile(&GatewayConfig::default()),
             dynamic: Arc::new(ArcSwap::from(Arc::new(DynamicState {
                 config: GatewayConfig::default(),
+                tls_fingerprint: String::new(),
+                tls_material: None,
                 fast_lane: FastLaneState::compile(&GatewayConfig::default()),
                 http_client: reqwest::Client::new(),
                 http_fast_client: HyperClient::builder(TokioExecutor::new())
@@ -25142,6 +25709,8 @@ mod tests {
             ftp_session_users: Arc::new(DashMap::new()),
             admin_auth_guard: AdminAuthGuard::default(),
             monitor_auth_guard: AdminAuthGuard::default(),
+            auth_requests: crate::auth_request::AuthRequestExecutor::new().unwrap(),
+            buffered_request_bodies: crate::body_budget::BufferedBodyBudget::new(0),
         };
         let mut weights = BTreeMap::new();
         weights.insert("http://127.0.0.1:9000".to_string(), 1);
@@ -25179,6 +25748,7 @@ mod tests {
             strip_headers: Vec::new(),
             status: None,
             content_type: None,
+            ..RouteDecision::default()
         };
         let first = gateway.select_upstream_plan(
             &config,
@@ -25823,6 +26393,11 @@ mod tests {
         config.script.entry = PathBuf::from("gateway.ts");
         config.plugins.enabled = false;
 
+        let root = crate::test_support::TestDir::new("embedded-script-state");
+        config.http.tls.cert_path = root.join("cert.pem");
+        config.http.tls.key_path = root.join("key.pem");
+        prepare_tls_material(&config).expect("prepare fixture TLS material");
+
         // The embedded engine starts even when the entry script is missing; the
         // gateway simply falls back to native/YAML routing for unmatched paths.
         let state = build_dynamic_state(config)
@@ -26169,3 +26744,7 @@ mod tests {
 #[cfg(test)]
 #[path = "static_origin_tests.rs"]
 mod static_origin_tests;
+
+#[cfg(test)]
+#[path = "script_static_tests.rs"]
+mod script_static_tests;

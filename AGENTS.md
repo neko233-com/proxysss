@@ -153,6 +153,13 @@ proxysss config nginx-parity --format yaml
 
 验证顺序：Ubuntu 24 LTS Docker 功能 → 角色隔离的全场景 Linux 混合性能 → Windows 功能 → push/六平台打包/发布。具体命令、CPU 资源、预热/测量时间、等负载算法、内存和三机证据要求集中维护在 [验证指南](docs/VALIDATION.md)。单场景、Windows 或 Docker-only 结果不能冒充严格跨主机发布证据；保存原始工件时显式设置 `KEEP_BENCH_ARTIFACTS=1`，禁止清理整个共享 benchmark/cache。
 
+## Script-gated static invariant
+
+`StaticSiteConfig.script_only` defaults to false. When true, native matching, preload and HTTP1/TLS/H2 fast caches
+must skip the site; only an explicit `proxysss://static-site/<name>` script decision may select it. Reuse all file,
+Host/path, peer and authorization checks. `spa_fallback` is a single root-contained file and applies only to safe
+missing targets, never existing directories without index, hidden paths, dangling links or root escapes.
+
 ## Hot Reload Boundaries
 
 **Hot-reloadable (fingerprinted):**
@@ -225,3 +232,7 @@ These are tracked in `proxysss config nginx-parity` and should move toward `supp
 - HTTP/2/3 请求正文不能因 GET 或缺少 Content-Length 被忽略；入站大小/空闲限制失败不得进入写入/反代。HTTP/3 每流独立驱动，正文失败重置流并保留正常 trailers。上游持续 SSE/下载按正文空闲期限计时，不使用整个响应总时长期限；对应语义与限制维护在配置和架构主题页。
 - Native epoll owners must consume each returned event batch before installing new registrations that may reuse descriptors. Admission work stays bounded per turn and re-wakes queued work; preserve CPU-adaptive owner counts and existing relay/sendfile backpressure budgets.
 - Raw HTTP idle pool entries carry their Tokio runtime ID. Cross-runtime checkout must detach and re-register the same live TCP connection on the consuming reactor; same-runtime reuse must avoid that work. Moving a Tokio TcpStream alone does not transfer reactor ownership.
+
+HTTP auth_request 必须在路由缓存/静态/主上游前执行，失败拒绝且不缓存。strict SNI 以配置域名选择器为准；TLS reload 需完整公私钥校验后发布不可变材料和监听指纹，半更新不得撤销旧监听。新增脚本策略同步 proxysss-script.d.ts 与配置/脚本/架构说明。
+
+请求体 aggregate budget 属于 Gateway 生命周期，reload 不得 reset。H1/H2/H3 chunk 复制前预留，Bytes 所有 clone 最后释放后才退款；不要在 dispatch 返回但上游仍持有 body 时提前释放。

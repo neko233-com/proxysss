@@ -44,6 +44,10 @@ Go 报告器聚合原始重复样本时，吞吐/延迟使用中位数，错误�
 
 原始 SSE 转换为 TLS/HTTP2 下游响应前先按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB；长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件，完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding；移除编码头而保留压缩字节会破坏正文。
 
+脚本保护的静态站点用 `script_only: true` 排除原生选站及预热/HTTP1/TLS/H2 快缓存；脚本显式选择
+`proxysss://static-site/<name>` 后，核心继续执行 Host/path、真实 peer 和文件授权。可选 `spa_fallback`
+只在合法目标不存在时回退根内单个 index 文件，保留原有目录、链接、HEAD/Range 安全边界。详见配置指南。
+
 ## CDN 和复杂下载
 
 WebDAV 与 FileCloud 使用共享文件系统边界检查：已有目标解析真实路径，新建目标解析最近存在的父目录后追加缺失部分；使用 symlink_metadata 识别悬空链接，不能用 exists 跳过它们。WebDAV 在阻塞任务池检查源路径、COPY/MOVE 目标及递归 COPY 的每个子项；越界、悬空链接、复制到自身/子目录或内部循环返回 403。COPY 以深度优先目录迭代器遍历，只保存当前祖先，允许根目录内部的有效链接；删除/移动仍使用原始路径，避免误删链接指向的文件。PROPFIND 和 FileCloud 列表/搜索隐藏不满足边界的子项。递归 COPY 不是事务，遇到后续错误时根目录内已完成的部分可能保留。
@@ -265,3 +269,19 @@ udp:
       max_associations: 50000
       upstream: 127.0.0.1:56831
 ```
+
+## 授权与 TLS 状态发布
+
+异步授权由 src/auth_request.rs 持有单个 HTTP client 和 128 个共享许可，调用仍属于原请求 future；不创建脱离请求的授权任务。路由决策先完成策略/限流，随后授权，再进入缓存/静态/主代理。拒绝路径不读取业务上游，认证响应正文不累计。脚本合成状态/响应头和单路由超时由核心执行，详情见配置指南。TLS 状态保存已解析且 keys_match 验证的默认/SNI keys 与同一状态的指纹；supervisor 只依赖该指纹换监听，不以磁盘半更新提前撤销旧监听。失败的续期保留旧状态。strict SNI 只接受显式配置选择器，不扩张证书 SAN 或 on-demand 白名单。
+
+## 聚合请求体预算
+
+`http.max_buffered_request_body_bytes` 默认 0（关闭 admission 限额），可限制同一个 Gateway 的在飞 buffered payload 总字节数。
+HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 共用计数；每个 chunk 复制前预留，预算不足立即 503，不排队，也不执行脚本或业务上游。
+读取失败、超时、取消归还已预留字节；成功的 Bytes 使用持有 RAII reservation 的 owner，所有 clone（包括上游客户端持有的正文）释放后才返还。
+重载只修改限额，不重建在飞计数；降低到已有占用以下不撤销已收正文，后续新增字节拒绝，0 模式也持续计数以支持之后开启。
+例如保留旧站点 1 GiB 单体上限时，可设 max_request_body_bytes=1073741824 与 max_buffered_request_body_bytes=2147483648，另按机器容量留足运行余量。
+该限额衡量 buffered payload，不是进程 RSS 或整个 HTTP/QUIC/TLS buffer 的硬上限；分配器 spare capacity、解析/解码/业务复制和其它状态仍占内存。
+不把此功能宣称为 nginx 磁盘临时文件或端到端 streaming 上传；仍需实际负载与进程内存限制共同验证。
+
+`http.redirect_http_to_https` 默认 true；证书域名命中时原生 308 先于脚本。需要脚本保留各站点明文跳转/代理策略时显式 false，不改变 TLS/SNI 和 ACME challenge。

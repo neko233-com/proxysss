@@ -122,12 +122,18 @@ pub struct HttpConfig {
     pub tls_bind: String,
     #[serde(default = "default_tls_gateway_bind")]
     pub h3_bind: String,
+    /// Native HTTPS upgrade; disable when HTTP routes are managed explicitly.
+    #[serde(default = "default_true")]
+    pub redirect_http_to_https: bool,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
     #[serde(default = "default_request_body_timeout_ms")]
     pub request_body_timeout_ms: u64,
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: u64,
+    /// Shared buffered payload cap; 0 disables admission limiting.
+    #[serde(default)]
+    pub max_buffered_request_body_bytes: u64,
     #[serde(default)]
     pub allow_insecure_upstreams: bool,
     #[serde(default)]
@@ -180,6 +186,9 @@ pub struct OnDemandTlsConfig {
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
+    /// 仅允许 certificates.domains 中显式配置的 SNI，缺失/未知名称拒绝握手。
+    #[serde(default)]
+    pub reject_unknown_sni: bool,
     #[serde(default)]
     pub auto_https: AutoHttpsConfig,
     #[serde(default)]
@@ -1007,6 +1016,8 @@ pub struct HttpResponsePolicyConfig {
 #[serde(deny_unknown_fields)]
 pub struct ReverseProxyRouteConfig {
     pub name: String,
+    #[serde(default)]
+    pub auth_request: Option<crate::auth_request::AuthRequestConfig>,
     #[serde(default = "default_route_path_prefix")]
     pub path_prefix: String,
     #[serde(default)]
@@ -1038,6 +1049,8 @@ pub struct ReverseProxyRouteConfig {
 #[serde(deny_unknown_fields)]
 pub struct DomainRouteConfig {
     pub name: String,
+    #[serde(default)]
+    pub auth_request: Option<crate::auth_request::AuthRequestConfig>,
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default = "default_route_path_prefix")]
@@ -1174,6 +1187,10 @@ pub enum DomainTlsMode {
 #[serde(deny_unknown_fields)]
 pub struct StaticSiteConfig {
     pub name: String,
+    #[serde(default)]
+    pub script_only: bool,
+    #[serde(default)]
+    pub spa_fallback: Option<String>,
     #[serde(default)]
     pub hosts: Vec<String>,
     #[serde(default = "default_static_path_prefix")]
@@ -1408,6 +1425,11 @@ impl GatewayConfig {
         validate_bind_optional("http.plain_bind", &self.http.plain_bind, &mut errors);
         validate_bind_optional("http.tls_bind", &self.http.tls_bind, &mut errors);
         validate_bind_optional("http.h3_bind", &self.http.h3_bind, &mut errors);
+        if self.http.tls.reject_unknown_sni && self.http.tls.certificates.is_empty() {
+            errors.push(
+                "http.tls.reject_unknown_sni requires explicit certificates.domains".to_string(),
+            );
+        }
 
         if self.http.request_timeout_ms == 0 {
             errors.push("http.request_timeout_ms must be greater than 0".to_string());
@@ -1629,6 +1651,11 @@ impl GatewayConfig {
 
         let mut route_names = HashSet::<String>::new();
         for route in &self.services.reverse_proxy.routes {
+            if let Some(policy) = &route.auth_request {
+                if let Err(error) = policy.validate() {
+                    errors.push(format!("route auth_request: {error}"));
+                }
+            }
             if route.name.trim().is_empty() {
                 errors.push("services.reverse_proxy.routes.name cannot be empty".to_string());
             }
@@ -1743,6 +1770,11 @@ impl GatewayConfig {
 
         let mut domain_route_names = HashSet::<String>::new();
         for route in &self.services.domain_routes {
+            if let Some(policy) = &route.auth_request {
+                if let Err(error) = policy.validate() {
+                    errors.push(format!("route auth_request: {error}"));
+                }
+            }
             if route.name.trim().is_empty() {
                 errors.push("services.domain_routes.name cannot be empty".to_string());
             }
@@ -1888,6 +1920,23 @@ impl GatewayConfig {
             }
             if !static_names.insert(site.name.clone()) {
                 errors.push(format!("duplicate static site name {}", site.name));
+            }
+            if site.script_only
+                && (site.name == "."
+                    || site.name == ".."
+                    || !site.name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    }))
+            {
+                errors.push("script-only static site names must be safe URI segments".to_string());
+            }
+            if site.spa_fallback.as_ref().is_some_and(|name| {
+                !crate::static_security::allowed_component(name, site.hide_dotfiles)
+            }) {
+                errors.push(format!(
+                    "services.static_sites.{}.spa_fallback must be a single allowed file name",
+                    site.name
+                ));
             }
             if site.path_prefix.trim().is_empty() || !site.path_prefix.starts_with('/') {
                 errors.push(format!(
@@ -2621,9 +2670,11 @@ impl Default for HttpConfig {
             plain_bind: default_plain_gateway_bind(),
             tls_bind: default_tls_gateway_bind(),
             h3_bind: default_tls_gateway_bind(),
+            redirect_http_to_https: true,
             request_timeout_ms: default_request_timeout_ms(),
             request_body_timeout_ms: default_request_body_timeout_ms(),
             max_request_body_bytes: default_max_request_body_bytes(),
+            max_buffered_request_body_bytes: 0,
             allow_insecure_upstreams: false,
             error_pages: HttpErrorPagesConfig::default(),
             tls: TlsConfig::default(),
@@ -2668,6 +2719,7 @@ impl Default for TlsConfig {
     fn default() -> Self {
         Self {
             mode: TlsMode::default(),
+            reject_unknown_sni: false,
             auto_https: AutoHttpsConfig::default(),
             on_demand: OnDemandTlsConfig::default(),
             certificates: Vec::new(),
@@ -2972,6 +3024,8 @@ impl Default for StaticSiteConfig {
     fn default() -> Self {
         Self {
             name: "public".to_string(),
+            script_only: false,
+            spa_fallback: None,
             hosts: Vec::new(),
             path_prefix: default_static_path_prefix(),
             root: default_static_root(),
@@ -2990,6 +3044,7 @@ impl Default for ReverseProxyRouteConfig {
     fn default() -> Self {
         Self {
             name: "api".to_string(),
+            auth_request: None,
             path_prefix: default_route_path_prefix(),
             hosts: Vec::new(),
             upstream: "http://127.0.0.1:8080".to_string(),
@@ -3011,6 +3066,7 @@ impl Default for DomainRouteConfig {
     fn default() -> Self {
         Self {
             name: "app".to_string(),
+            auth_request: None,
             domains: vec!["example.com".to_string()],
             path_prefix: default_route_path_prefix(),
             upstream: "http://127.0.0.1:8080".to_string(),
@@ -3892,7 +3948,11 @@ fn validate_compression_config(
     }
 }
 
-fn validate_cache_config(config: &ResponseCacheConfig, prefix: &str, errors: &mut Vec<String>) {
+pub(crate) fn validate_cache_config(
+    config: &ResponseCacheConfig,
+    prefix: &str,
+    errors: &mut Vec<String>,
+) {
     if !config.enabled {
         return;
     }
@@ -4717,6 +4777,7 @@ mod tests {
             .reverse_proxy
             .routes
             .push(ReverseProxyRouteConfig {
+                auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/api".to_string(),
                 hosts: Vec::new(),

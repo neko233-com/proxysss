@@ -1,5 +1,9 @@
 # proxysss
 
+Script-gated static sites use `script_only: true` and an explicit `proxysss://static-site/<name>` decision; native
+selection and fast caches cannot bypass the script. Optional `spa_fallback` applies only to safe missing targets.
+Host/path, peer, file authorization, HEAD and Range checks still apply. See the [configuration guide](docs/CONFIGURATION.md).
+
 Static downloads support bounded single and multipart byte ranges, coalescing up to 16 ranges without loading the whole source file. See the [CDN download guide](https://neko233-com.github.io/proxysss/cdn-origin.html) and [Linux-first validation process](https://neko233-com.github.io/proxysss/validation.html) for semantics and evidence requirements.
 
 **English** · [简体中文](README-CN.md) · [Documentation](https://neko233-com.github.io/proxysss/) · [Downloads](https://github.com/neko233-com/proxysss/releases/latest)
@@ -130,3 +134,5 @@ The official detailed guides are Chinese first; both README editions cover insta
 - [Migrate from nginx](https://neko233-com.github.io/proxysss/nginx-to-proxysss.html) · [Migrate from Caddy](https://neko233-com.github.io/proxysss/caddy-to-proxysss.html)
 
 Local validation, caches and packages use fixed project-local `.tmp`, `.cache`, `target` and `dist` paths. On Windows, run `test.cmd` or `scripts/verify-docker-scenarios.ps1`. Scenario validation uses the fixed Docker container `proxysss-verify` and removes it when finished.
+
+HTTP route authorization is bounded and asynchronous; script responses and per-route policies execute in the native gateway. Strict SNI and validated all-certificate reload are opt-in. See [configuration](docs/CONFIGURATION.md#路由授权响应策略与证书轮换) for defaults and failure boundaries.

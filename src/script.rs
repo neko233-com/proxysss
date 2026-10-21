@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::oneshot;
 
+use crate::auth_request::AuthRequestConfig;
+use crate::config::ResponseCacheConfig;
 use crate::config::ScriptConfig;
 use crate::ts_transpile::transpile_module;
 
@@ -86,6 +88,169 @@ pub struct RouteDecision {
     pub status: Option<u16>,
     #[serde(default)]
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub auth_request: Option<AuthRequestConfig>,
+    #[serde(default)]
+    pub response_body: Option<String>,
+    #[serde(default)]
+    pub response_headers: BTreeMap<String, ResponseHeader>,
+    #[serde(default)]
+    pub cache: Option<ResponseCacheConfig>,
+    #[serde(default)]
+    pub forward_headers: Option<bool>,
+    #[serde(default = "route_default_true")]
+    pub pass_request_headers: bool,
+    #[serde(default = "route_default_true")]
+    pub pass_request_body: bool,
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub cookie_secure: bool,
+}
+
+fn route_default_true() -> bool {
+    true
+}
+
+impl Default for RouteDecision {
+    fn default() -> Self {
+        Self {
+            upstream: String::new(),
+            upstreams: Vec::new(),
+            upstream_weights: BTreeMap::new(),
+            affinity_key: None,
+            rewrite_path: None,
+            set_headers: BTreeMap::new(),
+            strip_headers: Vec::new(),
+            status: None,
+            content_type: None,
+            auth_request: None,
+            response_body: None,
+            response_headers: BTreeMap::new(),
+            cache: None,
+            forward_headers: None,
+            pass_request_headers: true,
+            pass_request_body: true,
+            request_timeout_ms: None,
+            cookie_secure: false,
+        }
+    }
+}
+
+/// 字符串对所有状态生效；对象可复现 nginx add_header 的状态限制。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseHeader {
+    Always(String),
+    OnStatus(ResponseHeaderPolicy),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeaderPolicy {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub from_header: Option<String>,
+    #[serde(default)]
+    pub statuses: Option<Vec<u16>>,
+}
+
+impl ResponseHeader {
+    pub fn value<'a>(
+        &'a self,
+        status: u16,
+        headers: &'a [(http::HeaderName, http::HeaderValue)],
+    ) -> Option<&'a str> {
+        match self {
+            Self::Always(value) => Some(value),
+            Self::OnStatus(policy)
+                if policy
+                    .statuses
+                    .as_ref()
+                    .is_none_or(|values| values.contains(&status)) =>
+            {
+                if let Some(name) = &policy.from_header {
+                    headers
+                        .iter()
+                        .find(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
+                        .and_then(|(_, value)| value.to_str().ok())
+                } else {
+                    policy.value.as_deref()
+                }
+            }
+            Self::OnStatus(_) => None,
+        }
+    }
+}
+
+impl RouteDecision {
+    pub fn validate_http_policy(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.request_timeout_ms
+                .is_none_or(|value| (1..=86_400_000).contains(&value)),
+            "route.request_timeout_ms must be in 1..=86400000"
+        );
+        if let Some(policy) = &self.auth_request {
+            policy.validate()?;
+        }
+        if let Some(policy) = &self.cache {
+            let mut errors = Vec::new();
+            crate::config::validate_cache_config(policy, "route.cache", &mut errors);
+            anyhow::ensure!(errors.is_empty(), "invalid route cache policy");
+        }
+        anyhow::ensure!(
+            self.response_body
+                .as_ref()
+                .is_none_or(|body| body.len() <= 65536),
+            "synthetic response body exceeds 65536 bytes"
+        );
+        anyhow::ensure!(
+            self.response_headers.len() <= 128,
+            "too many route response headers"
+        );
+        let mut bytes = 0;
+        for (name, policy) in &self.response_headers {
+            http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow!("invalid route response header name"))?;
+            anyhow::ensure!(
+                !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "connection" | "transfer-encoding" | "content-length" | "trailer" | "upgrade"
+                ),
+                "route response header cannot change HTTP framing"
+            );
+            let value = match policy {
+                ResponseHeader::Always(value) => Some(value),
+                ResponseHeader::OnStatus(policy) => {
+                    anyhow::ensure!(
+                        policy.value.is_some() != policy.from_header.is_some(),
+                        "response header requires exactly one value or from_header"
+                    );
+                    if let Some(source) = &policy.from_header {
+                        http::HeaderName::from_bytes(source.as_bytes())
+                            .map_err(|_| anyhow!("invalid response source header"))?;
+                    }
+                    anyhow::ensure!(
+                        policy
+                            .statuses
+                            .as_ref()
+                            .is_none_or(|statuses| statuses.len() <= 400
+                                && statuses.iter().all(|status| (200..=599).contains(status))),
+                        "response header statuses must be in 200..=599"
+                    );
+                    policy.value.as_ref()
+                }
+            };
+            if let Some(value) = value {
+                http::HeaderValue::from_str(value)
+                    .map_err(|_| anyhow!("invalid route response header value"))?;
+                bytes += name.len() + value.len();
+            }
+        }
+        anyhow::ensure!(bytes <= 65536, "route response headers exceed 65536 bytes");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +296,24 @@ struct PartialRoute {
     status: Option<u16>,
     #[serde(default)]
     content_type: Option<String>,
+    #[serde(default)]
+    auth_request: Option<AuthRequestConfig>,
+    #[serde(default)]
+    response_body: Option<String>,
+    #[serde(default)]
+    response_headers: Option<BTreeMap<String, ResponseHeader>>,
+    #[serde(default)]
+    cache: Option<ResponseCacheConfig>,
+    #[serde(default)]
+    forward_headers: Option<bool>,
+    #[serde(default)]
+    pass_request_headers: Option<bool>,
+    #[serde(default)]
+    pass_request_body: Option<bool>,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    cookie_secure: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,11 +1197,43 @@ fn merge_route(current: &mut Option<PartialRoute>, next: PartialRoute) {
             if next.content_type.is_some() {
                 cur.content_type = next.content_type;
             }
+            if next.auth_request.is_some() {
+                cur.auth_request = next.auth_request;
+            }
+            if next.response_body.is_some() {
+                cur.response_body = next.response_body;
+            }
+            if let Some(headers) = next.response_headers {
+                cur.response_headers
+                    .get_or_insert_with(BTreeMap::new)
+                    .extend(headers);
+            }
+            if next.cache.is_some() {
+                cur.cache = next.cache;
+            }
+            if next.forward_headers.is_some() {
+                cur.forward_headers = next.forward_headers;
+            }
+            if next.pass_request_headers.is_some() {
+                cur.pass_request_headers = next.pass_request_headers;
+            }
+            if next.cookie_secure.is_some() {
+                cur.cookie_secure = next.cookie_secure;
+            }
+            if next.request_timeout_ms.is_some() {
+                cur.request_timeout_ms = next.request_timeout_ms;
+            }
+            if next.pass_request_body.is_some() {
+                cur.pass_request_body = next.pass_request_body;
+            }
         }
     }
 }
 
 fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
+    if let Some(policy) = &partial.auth_request {
+        policy.validate()?;
+    }
     let upstream = partial
         .upstream
         .map(|value| value.trim().to_string())
@@ -1036,7 +1251,7 @@ fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
         upstreams.insert(0, upstream.clone());
     }
 
-    Ok(RouteDecision {
+    let route = RouteDecision {
         upstream,
         upstreams,
         upstream_weights: partial.upstream_weights.unwrap_or_default(),
@@ -1046,7 +1261,18 @@ fn normalize_route(partial: PartialRoute) -> Result<RouteDecision> {
         strip_headers: partial.strip_headers.unwrap_or_default(),
         status: partial.status,
         content_type: partial.content_type,
-    })
+        auth_request: partial.auth_request,
+        response_body: partial.response_body,
+        response_headers: partial.response_headers.unwrap_or_default(),
+        cache: partial.cache,
+        forward_headers: partial.forward_headers,
+        pass_request_headers: partial.pass_request_headers.unwrap_or(true),
+        pass_request_body: partial.pass_request_body.unwrap_or(true),
+        request_timeout_ms: partial.request_timeout_ms,
+        cookie_secure: partial.cookie_secure.unwrap_or(false),
+    };
+    route.validate_http_policy()?;
+    Ok(route)
 }
 
 fn partial_to_json(partial: &PartialRoute) -> JsonValue {
@@ -1065,6 +1291,33 @@ fn partial_to_json(partial: &PartialRoute) -> JsonValue {
     }
     if let Some(value) = &partial.rewrite_path {
         map.insert("rewrite_path".into(), json!(value));
+    }
+    if let Some(value) = &partial.auth_request {
+        map.insert("auth_request".into(), json!(value));
+    }
+    if let Some(value) = &partial.response_body {
+        map.insert("response_body".into(), json!(value));
+    }
+    if let Some(value) = &partial.response_headers {
+        map.insert("response_headers".into(), json!(value));
+    }
+    if let Some(value) = &partial.cache {
+        map.insert("cache".into(), json!(value));
+    }
+    if let Some(value) = partial.forward_headers {
+        map.insert("forward_headers".into(), json!(value));
+    }
+    if let Some(value) = partial.pass_request_headers {
+        map.insert("pass_request_headers".into(), json!(value));
+    }
+    if let Some(value) = partial.cookie_secure {
+        map.insert("cookie_secure".into(), json!(value));
+    }
+    if let Some(value) = partial.request_timeout_ms {
+        map.insert("request_timeout_ms".into(), json!(value));
+    }
+    if let Some(value) = partial.pass_request_body {
+        map.insert("pass_request_body".into(), json!(value));
     }
     if let Some(value) = &partial.set_headers {
         map.insert("set_headers".into(), json!(value));

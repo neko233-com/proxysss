@@ -79,6 +79,10 @@ services:
 
 完整下载流式发送并保留背压；GET 支持单段和最多 16 段 Range，HEAD 与条件请求按 HTTP 语义处理。发布采用写新文件后原子替换，避免就地覆盖正在发送的资源。目录浏览默认关闭；回源令牌、签名 URL、授权和缓存规则见 [CDN 下载指南](docs/CDN-ORIGIN.md)。
 
+需要先执行脚本判定的文件站点使用 `script_only: true`，由脚本显式选择 `proxysss://static-site/<name>`。
+可选单文件 `spa_fallback` 只对合法缺失目标回退，不覆盖现存目录缺 index、隐藏路径或越界链接；
+Host/path、真实 peer、文件授权和 HEAD/Range 继续执行，原生选站与快缓存不绕过脚本。
+
 ### 2.3 自动 HTTPS 与 WSS
 
 先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。

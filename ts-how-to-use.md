@@ -93,6 +93,14 @@ export default plugin;
 - 你想验证脚本是否真的被加载
 - 你只需要给某个特殊 path 做小范围改写
 
+脚本访问判定后需要服务静态文件时，配置站点 `script_only: true` 并返回
+`{ upstream: "proxysss://static-site/site-name", rewrite_path: message.ctx.path }`。
+原生匹配、预热和快缓存不会绕过脚本；选择后仍执行站点 Host/path、真实 peer、令牌/签名及 HEAD/Range 规则。
+站点可配置根内单文件 `spa_fallback`，仅在合法目标不存在时回退，目录缺 index 和越界链接不会回退。
+显式错误页决定可携带 400–599 的 `status`：忽略 Range/If-*，只覆盖成功文件响应，不能覆盖授权或文件拒绝；普通直接文件访问不携带此状态。这不自动捕获上游或运行时异常。
+普通代理请求的 `set_headers` 显式值优先于默认 Host 和生成的转发头；`pass_request_headers: false` 不复制访客头，
+`pass_request_body: false` 不复制访客 Content-Length/Type/Encoding/Expect。完整静态配置见 [配置指南](docs/CONFIGURATION.md)。
+
 ## 5. 什么时候该用 YAML，什么时候该用 TS
 
 优先用 YAML：
@@ -397,3 +405,13 @@ hook 应保持同步和快速。它是扩展点，不是业务 worker。
 原生静态站点可通过 hosts/path_prefix 匹配域名和路径，多站点缓存隔离；无需脚本钩子，脚本 API 不变。hosts 不替代鉴权，具体语义见 [CDN 下载](docs/CDN-ORIGIN.md)。
 
 WebDAV/FileCloud 的 Basic 认证、Range 下载和文件路径边界由核心处理；HTTP 入站正文大小/空闲期限与上游流式空闲期限也不需要脚本钩子。新增配置说明统一见 [配置指南](docs/CONFIGURATION.md)，脚本 API 签名保持不变。
+
+## HTTP 授权和响应策略
+
+HTTP RouteDecision 可声明 auth_request 固定 GET 授权、proxysss://response 的 status/response_body/content_type、response_headers（字符串 always，或 value/from_header 加可选 statuses）、cache、forward_headers、pass_request_headers/body 和 request_timeout_ms。网络请求由核心异步执行，QuickJS 不增加 fetch。授权先于路由缓存/静态/主上游，只有 2xx 放行，超时/容量满/跳转均拒绝；401 仅透传 WWW-Authenticate。Header 策略不能修改 framing。request_timeout_ms 覆盖响应头等待和正文空闲预算，WebSocket 仅握手。完整范围、默认值和缓存兼容边界见 docs/CONFIGURATION.md 的“路由授权、响应策略与证书轮换”。
+
+`RouteDecision.cookie_secure: true` 逐个为 Set-Cookie 补 Secure（默认 false），保留重复 cookie、Expires 逗号、HttpOnly 与 SameSite，已有大小写变体的 Secure 不重复添加。上游网络失败生成的 502 也执行路由 response_headers 的状态规则。
+
+`http.redirect_http_to_https` 默认 true；证书域名命中时原生 308 先于脚本。需要脚本保留各站点明文跳转/代理策略时显式 false，不改变 TLS/SNI 和 ACME challenge。
+
+http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。

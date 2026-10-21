@@ -30,12 +30,51 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+/** Native asynchronous authorization; no visitor headers, query or body are copied. */
+export interface AuthRequestPolicy {
+  url: string;
+  /** 1..30000 ms; default 3000. Redirects are not followed. */
+  timeout_ms?: number;
+  /** 400..599; default 503 for network/timeout/capacity/unmapped errors. */
+  failure_status?: number;
+  /** Optional non-success (300..599) to denial (400..599) status mapping. */
+  status_map?: Record<string, number>;
+}
+
+/** The existing native response-cache policy, scoped to this script decision. */
+export interface RouteCachePolicy {
+  enabled?: boolean;
+  behavior?: "respect_origin" | "bypass" | "no_cache" | "override";
+  zone?: string;
+  key_prefix?: string;
+  vary_headers?: string[];
+  ttl_secs?: number;
+  browser_ttl_secs?: number;
+  stale_while_revalidate_secs?: number;
+  stale_if_error_secs?: number;
+  emit_cdn_cache_control?: boolean;
+  statuses?: number[];
+  max_body_bytes?: number;
+  allow_purge?: boolean;
+}
+
+/** String applies to all statuses; object requires exactly one source. */
+export type RouteResponseHeader = string | {
+  value?: string;
+  from_header?: string;
+  /** Omitted = all; [] = none. Nginx non-always add_header needs an explicit status list. */
+  statuses?: number[];
+};
+
 /**
  * Final route decision shape returned to the Rust gateway runtime.
  * 返回给 Rust 网关运行时的最终路由决策结构。
  */
 export interface RouteDecision {
-  /** 主上游目标。TCP/UDP 使用 host:port 或 [IPv6]:port，不带 scheme/路径；HTTP 使用 URL。 */
+  /** 主上游目标。TCP/UDP 使用 host:port 或 [IPv6]:port；HTTP 使用 URL。
+   * proxysss://static-site/<name> 显式选择 script_only 静态站点，仍校验 Host/path、peer、文件授权和 HEAD/Range。
+   * rewrite_path 保留站点 path_prefix 内完整路径；可选 SPA 回退由站点 spa_fallback 配置，仅适用于合法缺失目标。
+   */
   upstream: string;
   /** Optional upstream pool for load balancing. / 可选上游池，用于负载均衡。 */
   upstreams?: string[];
@@ -53,6 +92,23 @@ export interface RouteDecision {
   status?: number;
   /** Optional synthetic content type. / 可选的合成内容类型。 */
   content_type?: string;
+  /** proxysss://response: status 200..599, body <=64 KiB; 204/304 have no body. */
+  response_body?: string;
+  /** Applied to selected route responses; framing headers cannot be changed. */
+  response_headers?: Record<string, RouteResponseHeader>;
+  /** Fixed GET authorization runs before route cache, selected static files or main upstream. */
+  auth_request?: AuthRequestPolicy;
+  cache?: RouteCachePolicy;
+  /** Generate forwarding headers (default true), then apply strip_headers/set_headers. */
+  forward_headers?: boolean;
+  /** Copy visitor headers (default true); explicit set_headers still apply. */
+  pass_request_headers?: boolean;
+  /** Send visitor body (default true); false also removes body metadata headers. */
+  pass_request_body?: boolean;
+  /** Upstream header wait and per-chunk body idle budget; 1..86400000 ms; defaults to global HTTP setting. WS applies it to handshake only. */
+  request_timeout_ms?: number;
+  /** Add Secure to every Set-Cookie independently; preserve duplicates and other attributes. Default false. */
+  cookie_secure?: boolean;
 }
 
 /**

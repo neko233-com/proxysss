@@ -1,6 +1,8 @@
 mod acme;
 mod ai_proxy;
+mod auth_request;
 mod bench;
+mod body_budget;
 mod config;
 mod demo;
 mod filecloud;
@@ -2545,6 +2547,7 @@ mod tests {
             .reverse_proxy
             .routes
             .push(crate::config::ReverseProxyRouteConfig {
+                auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/api".to_string(),
                 hosts: vec!["api.example.com".to_string()],

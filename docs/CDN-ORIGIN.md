@@ -12,6 +12,13 @@ proxysss 可以直接作为 CDN 的静态源站。公开资源使用源站令牌
 
 完整示例见仓库 `examples/static-virtual-hosts.example.yaml`。同一个站点内的多个域名使用相同文件与安全策略；需要独立签名授权时使用不同站点名与密钥。
 
+## 先执行脚本访问判定的静态站点
+
+`script_only: true` 的站点不参加原生选站、预热和 HTTP/1/TLS/H2 快缓存直出；脚本必须显式选择
+`proxysss://static-site/<name>`。其后仍校验配置 Host、path_prefix、真实 peer、源站令牌/签名并复用 HEAD、Range 与目录规则。
+`spa_fallback: index.html` 只把合法且不存在的目标映射到根内 index 文件，现存目录缺 index 保持 403；
+越界/悬空链接和隐藏路径不触发回退。该字段默认不启用，完整语义见 [配置指南](CONFIGURATION.md)。
+
 ## 公开资源作为 CDN 源站
 
 ```yaml

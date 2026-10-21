@@ -1,5 +1,9 @@
 # proxysss
 
+需要先执行脚本访问判定的静态站点设 `script_only: true`，由 `proxysss://static-site/<name>` 显式选择，
+原生匹配和快缓存不会绕过脚本。可选 `spa_fallback` 仅处理合法缺失目标，保留 Host/path、真实 peer、文件授权和 HEAD/Range 检查。
+详见[配置指南](docs/CONFIGURATION.md)。
+
 静态下载支持单段/多段 Range，最多 16 段并合并重叠区间，局部下载不整文件载入。行为边界见 [CDN 下载指南](https://neko233-com.github.io/proxysss/cdn-origin.html)，验证与发布要求见 [Linux 优先验证流程](https://neko233-com.github.io/proxysss/validation.html)。
 
 [English](README.md) · **简体中文** · [使用文档](https://neko233-com.github.io/proxysss/) · [下载安装包](https://github.com/neko233-com/proxysss/releases/latest)
@@ -112,3 +116,5 @@ proxysss service status
 - [从 nginx 迁移](https://neko233-com.github.io/proxysss/nginx-to-proxysss.html) · [从 Caddy 迁移](https://neko233-com.github.io/proxysss/caddy-to-proxysss.html)
 
 本地验证、缓存与安装包使用项目内固定的 `.tmp`、`.cache`、`target`、`dist` 目录。Windows 可运行 `test.cmd`，Docker 场景验证使用 `scripts/verify-docker-scenarios.ps1`；验证容器固定为 `proxysss-verify`，结束后自动删除。
+
+HTTP 路由支持有界异步授权、脚本合成响应和独立路由策略；严格 SNI 与全部证书的校验重载见[配置指南](docs/CONFIGURATION.md#路由授权响应策略与证书轮换)，上线仍须逐路由 canary。

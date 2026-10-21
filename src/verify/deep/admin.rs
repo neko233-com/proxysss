@@ -198,17 +198,18 @@ admin:
             .replace('\\', "/"),
     );
     let config_path = write_config(&root, &yaml)?;
-    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+    let (_gateway, _runner) = spawn_gateway(config_path.clone()).await?;
 
     let client = reqwest::Client::new();
     let upsert_url = format!("http://127.0.0.1:{admin_port}/v1/tls/sni-certificates/upsert");
+    let valid = rcgen::generate_simple_self_signed(vec!["api.internal.test".into()])?;
     let response = client
         .post(&upsert_url)
         .header("Authorization", "Bearer sni-test-token")
         .json(&serde_json::json!({
             "domains": ["api.internal.test"],
-            "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
-            "key_pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            "cert_pem": valid.cert.pem(),
+            "key_pem": valid.key_pair.serialize_pem(),
         }))
         .send()
         .await?;
@@ -239,6 +240,33 @@ admin:
             .map(|v| v.len()),
         Some(1)
     );
+
+    // Invalid independent material cannot publish or replace the effective catalog/config.
+    let before_config = std::fs::read(&config_path)?;
+    let bad_cert = root.join("invalid-certificate.pem");
+    let bad_key = root.join("invalid-key.pem");
+    std::fs::write(
+        &bad_cert,
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+    )?;
+    std::fs::write(
+        &bad_key,
+        "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+    )?;
+    let rejected = client.post(&upsert_url)
+        .header("Authorization", "Bearer sni-test-token")
+        .json(&serde_json::json!({ "domains":["api.internal.test"], "cert_path":bad_cert, "key_path":bad_key }))
+        .send().await?;
+    assert!(!rejected.status().is_success());
+    assert_eq!(std::fs::read(&config_path)?, before_config);
+    let after = client
+        .get(&list_url)
+        .header("Authorization", "Bearer sni-test-token")
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    assert_eq!(after, listed);
 
     cleanup(&root);
     Ok(())

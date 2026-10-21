@@ -229,6 +229,8 @@ proxysss token show
 <p>TCP/UDP 新会话共用 stream 限流、动态黑名单、DDoS 和 allow/deny；UDP 已有数据报不重复扣连接配额。<a href="https://neko233-com.github.io/proxysss/configuration.html#stream-admission">准入与重载边界</a>。</p>
 <p>独立控制任务每秒回收过期 DDoS、admin/monitor 登录失败窗口和动态黑名单，保留活动窗口及封禁，无需开启热重载或健康探测。黑名单查询不会删除并发续封的新值；封禁时长按单调时间计算，超大秒数不导致未来时间点溢出，并发登录失败不重置有效锁定。</p>
 <p>动态黑名单持久化保存原始 UTC 起点与 TTL，重启不续成一小时，损坏的启用快照拒绝启动。管理操作完成原子文件替换后才更新内存/DDoS，失败返回 500；成功响应 persisted 表明是否保存，单 writer 的锁不进入普通准入路径。未持久化的内存封禁同样约束后续 HTTP/AI 请求与新 WS 握手，已有 WS/TCP relay 保留。<a href="https://neko233-com.github.io/proxysss/configuration.html#blacklist-persistence">文件格式、重启与失败语义</a>。</p>
+<section class="panel" id="script-static"><h2>脚本保护的静态文件</h2><p><code>script_only: true</code> 站点只由 <code>proxysss://static-site/&lt;name&gt;</code> 显式选择，原生匹配与快缓存不能绕过脚本；保留 Host/path、真实 peer、文件授权和 HEAD/Range。可选 <code>spa_fallback</code> 仅适用于合法缺失目标，目录缺 index、隐藏路径及越界链接不回退。</p></section>
+<section id="route-auth-response-tls"><h2>路由授权与 TLS 重载</h2><p>原生 auth_request 在缓存和业务上游前异步授权；脚本支持合成状态/响应头和独立路由超时。strict SNI 使用显式域名白名单；证书/私钥整对验证后发布，失败保留旧监听。<a href="https://neko233-com.github.io/proxysss/configuration.html#route-auth-response-tls">配置、默认值与失败边界</a></p></section>
 </main>
   </div>
 

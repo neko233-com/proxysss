@@ -787,6 +787,8 @@ proxysss token show</code></pre>
 <section class="panel" id="sse-response-framing"><h2>SSE 流式响应</h2><p>原始 SSE 转 TLS/HTTP2 时解码 HTTP 分块，不向事件正文混入 chunk 标记，也不等待 keep-alive EOF；已有正文编码保留。<a href="configuration.html#sse-framing">查看可执行 AI 配置和流式边界</a>。</p></section>
 <section class="panel" id="static-virtual-hosts"><h2>静态虚拟主机</h2><p>使用 services.static_sites[].hosts 与 path_prefix 按域名分发资源，多站点预热与连接缓存保持隔离。匹配语法、优先级、重载和鉴权边界统一见 <a href="cdn-origin.html#static-virtual-hosts">CDN 域名隔离指南</a>。</p></section>
 <p>WebDAV 支持可选 Basic 认证和有界 Range 下载，FileCloud 保留一次文件名解码与认证下载私有缓存；HTTP 流和上传的大小、空闲期限见 <a href="configuration.html#http-stream-limits">请求资源边界</a>。完整文件服务语义见 <a href="configuration.html#protocol-examples">配置指南</a>。</p>
+<section class="panel" id="script-static"><h2>需要脚本保护的静态文件</h2><p>用 <code>script_only: true</code> 排除原生选站与快缓存直出，再由脚本显式选择 <code>proxysss://static-site/&lt;name&gt;</code>。安全检查、HEAD/Range 与受限 SPA 回退仍由核心执行。<a href="configuration.html#script-static">配置与边界</a>。</p></section>
+<section id="route-auth-response-tls"><h2>路由授权与 TLS 重载</h2><p>原生 auth_request 在缓存和业务上游前异步授权；脚本支持合成状态/响应头和独立路由超时。strict SNI 使用显式域名白名单；证书/私钥整对验证后发布，失败保留旧监听。<a href="https://neko233-com.github.io/proxysss/configuration.html#route-auth-response-tls">配置、默认值与失败边界</a></p></section>
 </main>
     </div>
 

@@ -7,7 +7,7 @@ proxysss 的配置目标不是“把 nginx 指令重新拼一遍”，而是让�
 - `新手路线`：先复制能跑的 YAML，再理解每一段为什么这样写。
 - `高手路线`：直接定位 `domain_routes`、`reverse_proxy.routes`、`ai_proxy`、`tcp.listeners`、`udp.listeners`、TLS、热重载和性能边界。
 
-以下片段按需合并到同一个 `proxysss.yaml`，合并同名映射而不是重复声明 `services`、`http` 等顶层键。Markdown 与 HTML 的 18 个示例使用真实配置类型校验并逐字段回读，避免无效字段静默失效；占位域名、地址、目录和凭据仍需按部署环境替换。
+以下片段按需合并到同一个 `proxysss.yaml`，合并同名映射而不是重复声明 `services`、`http` 等顶层键。Markdown 与 HTML 的 19 个示例使用真实配置类型校验并逐字段回读，避免无效字段静默失效；占位域名、地址、目录和凭据仍需按部署环境替换。
 
 配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。
 
@@ -211,6 +211,14 @@ services:
       index_files: [index.html, index.htm]
       autoindex: false
 ```
+
+静态站点可设 `script_only: true`（默认 false），只允许脚本显式返回 `upstream: "proxysss://static-site/<name>"` 后进入。
+原生 Host/path 匹配、预热和 HTTP/1/TLS/H2 快缓存都跳过这些站点；脚本先执行访问判定，再复用核心文件授权、真实 peer、HEAD、Range 和目录边界。
+`rewrite_path` 是站点 `path_prefix` 内的完整 URI 路径，未显式替换 query 时保留原 query；选择站点后仍检查其 Host 和路径限制。
+显式错误页跳转可同时指定 `status: 500`（400–599）：忽略 Range/If-*，仅成功读取文件后保留该错误状态；直接访问同一文件仍按普通静态规则处理。这不自动映射上游或运行时异常。
+可选 `spa_fallback: index.html` 仅接受根目录内单个文件名：合法目标既非现存文件也非现存目录时才回退。
+现存目录没有 index 且关闭 autoindex 仍返回 403，越界/悬空链接、隐藏路径及非法路径不会变成 SPA 成功响应。
+与其它本地文件边界相同，root 由可信运维管理，不是抵抗并发本地写入的文件系统沙箱。
 
 ### 2.5 注册中心联动
 
@@ -737,3 +745,54 @@ proxysss token show
 `http.request_body_timeout_ms` 默认 30000 ms，约束客户端上传的每次正文空闲等待（HTTP/3 也用于解析请求头）；`http.max_request_body_bytes` 默认 67108864，超限返回 413、空闲超时返回 408、正文损坏或长度不符返回 400，失败正文不会交给文件写入或反代。FileCloud 的 `/api/upload` 使用其独立 `max_upload_bytes` 上限。上述值必须大于 0，配置重载后供新请求使用。请求正文目前按请求缓冲，这些是单请求上限，并非整个进程的内存预算；大上传应结合实际并发和内存预算配置。
 
 WebDAV 的 OPTIONS 仅列出实际支持的方法；只读配置不会列出写方法。不提供 LOCK、UNLOCK、PROPPATCH 或完整 DAV class 1/2 合规声明。使用需要锁与自定义属性协作的客户端前，应核对其能力要求。
+
+## 路由授权、响应策略与证书轮换
+
+`reverse_proxy.routes[]`、`domain_routes[]` 和 HTTP 脚本决策可配置 `auth_request`：
+`{url, timeout_ms: 3000, failure_status: 503, status_map: {"404": 404}}`。
+URL 必须是可信运维选择的 HTTP(S) 地址，不能含用户密码或 fragment；不要把未经校验的访客值拼入目标。
+核心固定发送 GET，不复制访客 query、头或正文，不跟随重定向，也不读取认证响应正文。
+只有 2xx 放行；401/403 默认保留，401 仅透传 WWW-Authenticate；其余状态按显式 status_map 或 failure_status 拒绝。
+网络失败、超时、超过 128 个共享在途请求均拒绝，配额满时不排队。timeout_ms 范围 1..30000，包含等待响应头；取消网络 future 会释放名额。
+认证在选定路由的缓存、静态文件、主上游和 WebSocket 握手之前执行；原生免策略快路径不会绕过它。
+失败响应强制 private, no-store。未提供任意认证响应头导出或脚本 fetch API。
+
+HTTP 脚本可返回 `upstream: "proxysss://response"`、`status`（200..599）、`response_body`（最多 64 KiB）和 `content_type`；204/304 不发送正文。
+`response_headers` 的字符串值对所有状态生效；对象必须只选 `value` 或 `from_header`，可加 `statuses` 数组（省略为所有状态，空数组为不添加）。
+例如 `{from_header: "x-cache"}` 复制当前响应头。复现 nginx 非 always add_header 时显式使用 `[200,201,204,206,301,302,303,304,307,308]`，不能默认套给错误响应。
+不允许通过该接口修改连接、Content-Length、Transfer-Encoding、Trailer 或 Upgrade framing。
+脚本 `cache` 使用现有原生缓存结构；`forward_headers` 控制生成转发头；`pass_request_headers`、`pass_request_body` 默认 true，false 不复制访客头或正文，显式 set_headers 最后生效。
+`request_timeout_ms`（1..86400000）单独覆盖该 HTTP 路由上游响应头等待和每次正文无进展期限，默认沿用全局值；持续传输不计为总时长超限，WebSocket 只用于握手。
+缓存的现有键和 GET 规则保持原有语义，不宣称完整 nginx proxy_cache_key/HEAD 等价。
+
+`http.tls.reject_unknown_sni` 默认 false；启用后必须配置 certificates[].domains，未知名和无 SNI 在 TLS 握手阶段拒绝。
+白名单来自配置选择器，不从物理证书 SAN 自动扩张；on-demand 证书不能绕过该白名单。
+默认和全部 SNI 证书/私钥都参加热重载指纹。发布配置前逐对解析并核对公私钥，解析后的材料随状态保存，监听启动不重新读取磁盘。
+证书续期若先换 cert 后换 key，中间不匹配时保留旧状态和监听器；完整匹配后下一次自动重载才发布新材料。
+热重载须启用 runtime.hot_reload；替换证书不承诺所有既有 TLS 连接立即重新握手。
+
+脚本仍是 YAML/内建路由之后的扩展层。需要脚本保护的资源必须使用 script_only 静态站点，或避免创建更早命中的开放 YAML 路由。
+脚本初始化失败会保留 YAML fallback；部署前必须测试脚本入口、拒绝规则及真实资源 canary，不能仅以进程启动或 /healthz 判定业务路由就绪。
+
+`RouteDecision.cookie_secure: true` 逐个为 Set-Cookie 补 Secure（默认 false），保留重复 cookie、Expires 逗号、HttpOnly 与 SameSite，已有大小写变体的 Secure 不重复添加。上游网络失败生成的 502 也执行路由 response_headers 的状态规则。
+
+## 聚合请求体预算
+
+`http.max_buffered_request_body_bytes` 默认 0（关闭 admission 限额），可限制同一个 Gateway 的在飞 buffered payload 总字节数。
+HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 共用计数；每个 chunk 复制前预留，预算不足立即 503，不排队，也不执行脚本或业务上游。
+读取失败、超时、取消归还已预留字节；成功的 Bytes 使用持有 RAII reservation 的 owner，所有 clone（包括上游客户端持有的正文）释放后才返还。
+重载只修改限额，不重建在飞计数；降低到已有占用以下不撤销已收正文，后续新增字节拒绝，0 模式也持续计数以支持之后开启。
+例如保留旧站点 1 GiB 单体上限时，可设 max_request_body_bytes=1073741824 与 max_buffered_request_body_bytes=2147483648，另按机器容量留足运行余量。
+该限额衡量 buffered payload，不是进程 RSS 或整个 HTTP/QUIC/TLS buffer 的硬上限；分配器 spare capacity、解析/解码/业务复制和其它状态仍占内存。
+不把此功能宣称为 nginx 磁盘临时文件或端到端 streaming 上传；仍需实际负载与进程内存限制共同验证。
+
+## 明文 HTTP 路由与自动 HTTPS 跳转
+
+http.redirect_http_to_https 默认 true：TLS/ACME 或证书域名命中时沿用原生明文 HTTP→HTTPS 308，保留路径和 query。设为 false 后关闭这层提前跳转，HTTP 继续进入已有 YAML/脚本路由，可显式保留独立的 301/302/代理策略。该开关不改变 TLS listener、strict SNI 或 ACME challenge 处理；需要自动跳转时应保留默认 true。
+
+```yaml
+http:
+  redirect_http_to_https: false
+```
+
+http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。

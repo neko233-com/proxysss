@@ -450,6 +450,7 @@ async fn http3_counts_dispatch_errors_and_rejected_bodies_once() -> Result<()> {
     let unavailable = reserve_port().await?;
     config.http.h3_bind = format!("127.0.0.1:{port}");
     config.http.max_request_body_bytes = 16;
+    config.http.max_buffered_request_body_bytes = 4;
     config.services.reverse_proxy.routes = vec![
         route("proxy", "/", &format!("http://{upstream}")),
         route(
@@ -515,6 +516,32 @@ async fn http3_counts_dispatch_errors_and_rejected_bodies_once() -> Result<()> {
     );
     while stream.recv_data().await?.is_some() {}
     assert_counts(&gateway, count + 1, errors + 1);
+    let mut reserved = gateway.buffered_request_bodies.reservation();
+    reserved.reserve(4).unwrap();
+    let held = reserved.finish(Bytes::from_static(b"1234"));
+    let mut stream = requests
+        .send_request(Request::post("https://localhost/ok").body(())?)
+        .await?;
+    stream.send_data(Bytes::from_static(b"x")).await?;
+    let _ = stream.finish().await;
+    let response = tokio::time::timeout(Duration::from_secs(5), stream.recv_response()).await??;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    while stream.recv_data().await?.is_some() {}
+    assert_eq!(gateway.buffered_request_bodies.used(), 4);
+    drop(held);
+    let mut stream = requests
+        .send_request(Request::post("https://localhost/ok").body(())?)
+        .await?;
+    stream.send_data(Bytes::from_static(b"x")).await?;
+    stream.finish().await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+            .await??
+            .status(),
+        StatusCode::OK
+    );
+    while stream.recv_data().await?.is_some() {}
+    assert_counts(&gateway, count + 3, errors + 2);
     endpoint.close(0_u32.into(), b"test complete");
     Ok(())
 }

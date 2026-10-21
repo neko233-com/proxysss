@@ -891,6 +891,7 @@ pub fn apply_kubernetes_routes(
             port
         );
         let route = DomainRouteConfig {
+            auth_request: None,
             name: mapping.name.clone(),
             domains: mapping.domains.clone(),
             path_prefix: if mapping.path_prefix.trim().is_empty() {

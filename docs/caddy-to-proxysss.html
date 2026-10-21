@@ -228,7 +228,7 @@
     </header>
 
     <main class="content">
-<!-- migration-source: caddy-to-proxysss.md sha256=b5110a4530f81704eb3cdba8c8891b4f1434373617460f613c804da59c189293 body-sha256=b719519588c0099b8e0c82d0510c6a5b869a57788068b3938692cbfe4a47b925 -->
+<!-- migration-source: caddy-to-proxysss.md sha256=1d63ffd1ee17d5fe64a960302a66fd2e1ed801ad02e068c60cbfaf721a3f9878 body-sha256=80c6fe4062d506080cdd2a512d3432f49348bfba34ff2c55037d541b2b00756b -->
 <section class="panel" id="intro">
 <p>本教程把 Caddyfile 中的网站、路径代理和文件服务迁到单个 proxysss.yaml。自动 HTTPS、请求头方向和路径匹配需要单独核对；TCP/UDP 使用原生 listener。</p>
 </section>
@@ -317,6 +317,9 @@
 </code></pre>
 <p>/assets/client.zip 对应 /srv/game-assets/client.zip。多站点按 YAML 首个 hosts/path 匹配项选站；不同根目录的相同 URL 缓存隔离。根站点把 path_prefix 设为 /。目录字段为 root。</p>
 <p>完整下载流式发送并保留背压；GET 支持单段和最多 16 段 Range，HEAD 与条件请求按 HTTP 语义处理。发布采用写新文件后原子替换，避免就地覆盖正在发送的资源。目录浏览默认关闭；回源令牌、签名 URL、授权和缓存规则见 <a href="cdn-origin.html">CDN 下载指南</a>。</p>
+<p>需要先执行脚本判定的文件站点使用 <code>script_only: true</code>，由脚本显式选择 <code>proxysss://static-site/&lt;name&gt;</code>。
+可选单文件 <code>spa_fallback</code> 只对合法缺失目标回退，不覆盖现存目录缺 index、隐藏路径或越界链接；
+Host/path、真实 peer、文件授权和 HEAD/Range 继续执行，原生选站与快缓存不绕过脚本。</p>
 <h3 id="https-wss">2.3 自动 HTTPS 与 WSS</h3>
 <p>先让 A/AAAA 指向网关，并确保公网 443 可达。下面的声明申请证书；还需保留实际反代或静态路由提供业务内容。</p>
 <pre><code class="language-yaml">http:
