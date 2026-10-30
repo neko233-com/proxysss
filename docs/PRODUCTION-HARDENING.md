@@ -2,43 +2,11 @@
 
 This checklist is for high-importance gateway deployments where correctness, latency, and recovery matter more than convenience.
 
-## Release gate
+## 发布与验收
 
-For local maintainer verification, these commands are still useful before promoting a build:
+发布以 Ubuntu 24.04、Debian 12 的功能检查、实际目标环境验收、Windows 功能测试与六平台打包为准；不以性能对比或压测作为发布前提。具体命令与结果边界见 [验证流程](VALIDATION.md)，配置字段见 [配置指南](CONFIGURATION.md)。
 
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo build --release
-```
-
-Performance promotion is Linux-only because proxysss production deployments are Linux gateways. Windows/macOS benchmark scripts are development diagnostics and must not be used as nginx-replacement release evidence.
-
-Default GitHub Actions CI is intentionally packaging-only: it builds and uploads the six release bundles and does not run tests, smoke benchmarks, or performance gates automatically. Treat the commands in this document as manual release/operator validation, not as the current default CI shape.
-
-The v1.3.5 UDP fast path has a current single-scenario diagnostic result on Docker Ubuntu 24: `udp-stream` reached `4.045x` proxysss/nginx with `proxysss 127742.75 ops/s` vs `nginx 31577.33 ops/s`, both with 0 errors. Historical mixed-load UDP rows remain useful as old baselines, but they are not the current UDP fast-path result.
-
-Run the production nginx comparison matrix after Linux host tuning:
-
-```bash
-proxysss tune linux --apply
-scripts/benchmark-all-scenarios.sh
-```
-
-That default gate is mixed-load (`MIXED_MATRIX=1`, `FAST_GATE=0`, `CRITICAL_RATIO=0.97`, `AGGREGATE_RATIO=0.97`). nginx runs the full concurrent wave first, then proxysss runs the same full concurrent wave. The wave enables the realistic nginx-comparable generic gateway shape at once: static small files, static large files, CDN hot-update static files, HTTPS static files, HTTP reverse proxying, generic SSE streaming, WebSocket long connections, game-style long TCP connections, TCP stream proxying, and UDP stream proxying. New API provider routes and KCP/QCP special UDP encapsulations stay supported as product capabilities, but they are excluded from the current performance benchmark matrix. Concurrency is derived from detected CPU cores and weighted by traffic shape; operators should not hand-tune worker counts or per-scenario defaults for release evidence. Official benchmark fixtures and parsers in this flow are Go-based via `scripts/benchmark-helper.go`; do not substitute Python protocol mocks or Python gate helpers in official runs.
-
-The default critical gate is game/realtime oriented but fairness-adjusted: aggregate mixed load plus WebSocket long connections, game TCP, generic TCP, and nginx-comparable UDP default to a `0.97` proxysss/nginx ratio floor, not a blind `>1.0`. A 1-3% gap is acceptable because proxysss includes built-in gateway behavior that nginx commonly needs extra modules, directives, or policy paths to approximate; all functional checks and benchmark error budgets still must pass. Static-small, CDN hot-update, reverse proxy, and generic SSE are part of the same wave and must stay above the soft floor (`MIN_RATIO=0.50`) with low errors. HTTPS small static and static-large remain in the same concurrent wave and report, but are diagnostic by default because TLS/static and large-file sendfile tuning can trade off against small-file/long-connection feedback. For a TLS/static or bulk-transfer release, add `https-static-small` or `static-large` to `CRITICAL_SCENARIOS` and set `runtime.performance.traffic_profile` to the profile under test. For strict head-to-head speed experiments, explicitly set `CRITICAL_RATIO=1.0` or higher and `AGGREGATE_RATIO=1.0` or higher.
-
-Performance optimization is only acceptable when it is side-effect free at the gateway level. A local improvement that slows down, destabilizes, or increases allocation pressure on sibling paths like reverse proxy, SSE, WebSocket, TCP, UDP, or static delivery is a failed optimization unless the tradeoff is explicitly approved and documented. Treat mixed-load regression checks as release criteria, not as optional follow-up.
-
-Use `QUICK=1` only when you need a shorter mixed smoke gate:
-
-```bash
-QUICK=1 scripts/benchmark-all-scenarios.sh
-```
-
-Single-scenario benchmark runs are root-cause diagnostics only. Do not promote a performance build because one isolated module beats nginx while the combined CDN/static/reverse-proxy/SSE/WebSocket/TCP/UDP gateway load does not. Results are written to `.benchmark/runs/all-scenarios/results.json`, `summary.md`, and `summary.html` during the run; default benchmark cleanup removes them afterward unless `KEEP_BENCH_ARTIFACTS=1` or explicit `BENCH_ROOT` is set. The default gate fails on unexpected errors, any default critical stream scenario below `CRITICAL_RATIO=0.97`, non-diagnostic scenarios below `MIN_RATIO`, or aggregate mixed-load ratio below `AGGREGATE_RATIO=0.97`.
+性能对比仅在需要时作为可选诊断执行；历史结果不能作为当前版本的成绩或容量证明。GitHub Actions 负责打包，不能代替本地功能和生产验收。
 
 ## Protocol smoke baselines
 

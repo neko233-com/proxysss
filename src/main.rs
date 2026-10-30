@@ -26,6 +26,7 @@ mod stream_endpoint;
 #[cfg(target_os = "linux")]
 mod stream_reactor;
 mod stream_routes;
+mod traffic_inspect;
 mod ts_transpile;
 
 #[cfg(all(unix, not(target_env = "musl")))]
@@ -115,6 +116,12 @@ enum Commands {
     Status {
         #[arg(long = "local-config", hide = true)]
         config: Option<PathBuf>,
+    },
+    /// Sample local gateway traffic without modifying the running gateway.
+    Traffic {
+        /// Sampling interval in seconds (1–3600).
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval: u64,
     },
     CheckConfig {
         #[arg(long = "local-config", hide = true)]
@@ -1025,6 +1032,11 @@ async fn main() -> Result<()> {
         Commands::Status { config } => {
             init_cli_logging();
             install::background_status(merge_config_arg(global_config.clone(), config))
+        }
+        Commands::Traffic { interval } => {
+            let path = install::resolve_run_config_path(global_config)?;
+            let config = GatewayConfig::load(&path)?;
+            traffic_inspect::run(&config, interval).await
         }
         Commands::CheckConfig { config } => {
             init_cli_logging();

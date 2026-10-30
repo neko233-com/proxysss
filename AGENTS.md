@@ -11,7 +11,7 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 | 配置、重载、脚本 | [配置](docs/CONFIGURATION.md)、[脚本](ts-how-to-use.md)、`proxysss-script.d.ts` |
 | 验证、打包、发布 | [验证流程](docs/VALIDATION.md)、[发布证据](performance-evidence/README.md)、[gh-cli](skills/gh-cli/SKILL.md) |
 
-根文件放常驻规则；架构页描述当前实现；主题页维护详细语义；决策页保存取舍。代码与相关文档同批更新，不能在现状说明中堆叠失效参数或以历史实验作为新提交证据。该组织参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，不引入其运行时或插件框架。
+根文件放常驻规则；[文档索引](docs/README.md) 按读者和主题列出所有入口；架构页描述当前实现；主题页维护详细语义；决策页保存取舍。代码与相关文档同批更新，不能在现状说明中堆叠失效参数或以历史实验作为新提交证据。该组织参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，不引入其运行时或插件框架。
 
 ## 当前验收约束
 
@@ -20,6 +20,8 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 **历史授权：2026-10-21 用户明确要求“没问题就全部发布”，v1.3.10 按 Linux nginx 迁移所需的功能与稳定性发布。** 生产 Linux 的完整功能、真实协议/容量和必要稳定性验收保留，六平台打包仍须通过；当时该版本豁免严格 nginx 性能胜出和跨主机性能证据。Windows 必须完整执行并披露实际结果，本机纯系统 IPv6 UDP loopback 不通不能伪装全绿、转为 IPv4 或 skip 专门双栈用例；不为此修改生产逻辑或系统网络。发布记录见 [v1.3.10 验证说明](docs/RELEASE-1.3.10.md)，不宣称所有平台运行全绿。历史 v1.3.9 授权仍只属于原版本。
 
 允许调整不合理的内部架构，但不能减少现有功能。关联问题集中修复后验证 Ubuntu 24 Docker 功能与本机 Windows `cargo test --locked`；按用户要求先打包上传并完成目标环境功能验收，再封版发布。共享调度器改动必须覆盖就绪重装、背压、半关闭、取消和 fd 复用。
+
+Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 或对应受支持版本运行真实二进制功能验证；发行包须在两个环境启动并检查动态链接依赖，不能仅凭交叉编译、单一发行版或源码推断声称兼容。新增支持范围必须注明具体版本及架构，现有证据不能外推所有版本。
 
 ## Product Direction
 

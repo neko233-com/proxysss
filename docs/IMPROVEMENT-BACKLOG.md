@@ -11,7 +11,7 @@ proxysss already covers the core nginx-replacement surface. The next improvement
 
 ## Performance
 
-- Keep the performance benchmark gate focused on nginx-comparable generic traffic: TLS, HTTP/2, HTTP/3, reverse proxy JSON, generic SSE streaming, WebSocket, TCP, UDP, cache, and compression. KCP/QCP stay in protocol capability and soak validation, not the current nginx head-to-head performance matrix.
+- Keep optional performance diagnostics focused on nginx-comparable generic traffic: TLS, HTTP/2, HTTP/3, reverse proxy JSON, generic SSE streaming, WebSocket, TCP, UDP, cache, and compression. KCP/QCP stay in protocol capability and soak validation, not the current nginx head-to-head performance matrix.
 - Keep a Linux benchmark profile with kernel settings documented: socket backlog, `somaxconn`, `ulimit -n`, ephemeral port range, TCP reuse, UDP receive/send buffers, and QUIC UDP buffers.
 - Add allocation and lock-contention profiles for hot paths: route matching, rate-limit zones, cache lookup, access logs, and upstream health state.
 - Add per-feature overhead reports so operators know what cache, compression, script hooks, debug logging, and admin metrics cost.

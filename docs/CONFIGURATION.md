@@ -566,6 +566,8 @@ JSON `websocket_sessions_total` 和 `websocket_sessions_active` 分别表示进�
 
 域名请求统计默认开启，自动收集站点、路由、证书和只读监控中配置的精确域名；也可显式补充。最多统计 256 个域名，显式配置优先，超出时记录警告；泛域名和未配置的 Host 不会动态创建指标。`domain_stats_enabled: false` 可关闭，独立于 `/metrics` 端点开关。按 HTTP 请求计数，WS/WSS 仅计握手，忽略端口并按域名大小写不敏感匹配。只读监控 `stats` 的 `domain_requests` 和 Prometheus 的 `proxysss_domain_http_requests_total{host="..."}` 是进程内累计值；热重载保留仍在列表中的计数，移除域名、关闭统计或重启进程会丢弃对应累计值。此数值只代表到达 proxysss 的请求，不能代表 CDN 边缘访问量或缓存命中率。
 
+运维可用 `proxysss -c /path/proxysss.yaml traffic --interval 5` 采集两次本机统计，输出 JSON：总体及各域名的请求增量、每秒速率和当前 WebSocket 连接数。间隔为 1–3600 秒；优先使用启用且绑定数字回环地址的管理接口；否则使用配置了精确域名的本机 HTTPS 只读监控，验证证书后连接回环地址。管理 token、监控密码与会话令牌均不输出；采样间隔必须短于监控会话有效期。结果按域名请求量降序排列，采样期间新增或移除的域名不计算；检测到进程变化或计数回退时失败并提示重试。采样只读取现有统计，不记录历史，也不增加转发路径的工作；若要按天查看，请使用 Prometheus 等系统持续采集。
+
 ```yaml
 monitoring:
   domain_stats_enabled: true
@@ -640,7 +642,7 @@ udp:
 
 - TCP 长连接和 UDP 实时流量会拉高并发 socket 数。
 - 这类场景要结合 `proxysss tune linux --apply`、系统 `LimitNOFILE`、`fs.nr_open` / `fs.file-max` 一起看。
-- release gate 不是只看单项压测，而是看 mixed-load 是否仍然稳。
+- 进行性能诊断时应检查混合负载，不以单项结果代表整体表现；压测不是发布前提。
 
 ## 4. 热重载、预热和运维节奏
 
@@ -732,7 +734,7 @@ Windows PowerShell：
 - 不引入明显副作用。
 - 不把某一类流量优化成“特供冠军”。
 - 至少能解释它对 HTTP、SSE、WebSocket、TCP、UDP、静态文件、reload 的影响。
-- 最终以 mixed-load 压测为准，而不是 cherry-pick 单场景截图。
+- 需要性能结论时使用混合负载证据，不能用单场景代替。
 
 ### 5.3 `traffic_profile` 怎么选
 
