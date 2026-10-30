@@ -24,6 +24,18 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
 ```
 
+安装指定的已发布标签（将 `v1.3.10` 换为目标版本）：
+
+```powershell
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.10
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.10
+```
+
+[全部版本及平台安装包](https://github.com/neko233-com/proxysss/releases) · [Git 标签](https://github.com/neko233-com/proxysss/tags)。脚本会初始化配置和服务；Linux 写入 `/usr/local/bin` 时可能需要 sudo。
+
 安装后检查配置与启动状态：
 
 ```bash

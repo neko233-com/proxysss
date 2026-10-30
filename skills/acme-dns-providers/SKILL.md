@@ -79,7 +79,7 @@ http:
 ## Implementation rules
 
 1. TXT name is always `_acme-challenge.{apex}` — use `util::acme_challenge_fqdn`.
-2. Upsert = delete existing matching TXT + create new (avoid stale validation).
+2. 火山引擎为每项挑战创建独立 TXT，仅删除本次返回的记录 ID；根域名和通配符可能共用记录名，不能删除并发验证或其他业务记录。其他 provider 的现状需逐个核实，不能假定它们已有相同并发语义。
 3. Always clean up TXT records after ACME order completes (`gateway.rs`).
 4. Do not add business logic to providers; they only publish/delete DNS TXT.
 5. When adding a provider: new subdirectory, register in `BUILTIN_DNS_PROVIDERS` + `DnsProvider` enum, add alias mapping, add config test, update docs/skills.

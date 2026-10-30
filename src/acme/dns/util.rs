@@ -2,6 +2,39 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 
+/// Resolve explicit environment references only at provider construction time.
+/// The configuration continues to contain the reference rather than the secret.
+pub fn resolve_credentials(
+    credentials: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    credentials
+        .iter()
+        .map(|(key, value)| {
+            let Some(name) = value.strip_prefix("env:") else {
+                return Ok((key.clone(), value.clone()));
+            };
+            if name.is_empty()
+                || !name.chars().enumerate().all(|(index, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (index > 0 && c.is_ascii_digit())
+                })
+            {
+                return Err(anyhow!(
+                    "invalid DNS credential environment variable name for {key}"
+                ));
+            }
+            let secret = std::env::var(name).map_err(|_| {
+                anyhow!("DNS credential environment variable {name} is unavailable")
+            })?;
+            if secret.trim().is_empty() {
+                return Err(anyhow!(
+                    "DNS credential environment variable {name} is empty"
+                ));
+            }
+            Ok((key.clone(), secret))
+        })
+        .collect()
+}
+
 pub fn credential(credentials: &BTreeMap<String, String>, aliases: &[&str]) -> Result<String> {
     for alias in aliases {
         if let Some(value) = credentials
@@ -48,6 +81,28 @@ pub fn fqdn_with_trailing_dot(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_environment_references_are_explicit_and_checked() {
+        let credentials = BTreeMap::from([
+            ("region".to_owned(), "cn-beijing".to_owned()),
+            ("key".to_owned(), "env:PATH".to_owned()),
+        ]);
+        let resolved = resolve_credentials(&credentials).unwrap();
+        assert_eq!(resolved["region"], "cn-beijing");
+        assert_eq!(resolved["key"], std::env::var("PATH").unwrap());
+        assert_eq!(credentials["key"], "env:PATH");
+        for reference in ["env:", "env:INVALID-NAME", "env:9INVALID"] {
+            assert!(
+                resolve_credentials(&BTreeMap::from([("key".into(), reference.into())])).is_err()
+            );
+        }
+        assert!(resolve_credentials(&BTreeMap::from([(
+            "key".into(),
+            "env:PROXYSSS_TEST_MISSING_DNS_SECRET_832715".into()
+        )]))
+        .is_err());
+    }
 
     #[test]
     fn acme_challenge_fqdn_strips_wildcard_prefix() {

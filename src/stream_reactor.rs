@@ -46,6 +46,7 @@ struct SocketPair {
     downstream: TcpStream,
     upstream: TcpStream,
     completion: Option<oneshot::Sender<()>>,
+    websocket_guard: Option<crate::gateway::ActiveWebSocketGuard>,
 }
 
 struct ReactorWorker {
@@ -69,6 +70,7 @@ struct SocketState {
     pending: Option<Vec<u8>>,
     pending_offset: usize,
     completion: Option<oneshot::Sender<()>>,
+    _websocket_guard: Option<crate::gateway::ActiveWebSocketGuard>,
 }
 
 #[derive(Default)]
@@ -160,6 +162,7 @@ fn release_pending_buffer(mut buffer: Vec<u8>) {
 /// descriptors after this succeeds; `dup` keeps the underlying connections
 /// alive without adding descriptors for the lifetime beyond the two owned by
 /// the reactor.
+#[cfg(test)]
 pub(crate) fn dispatch(
     downstream_fd: RawFd,
     upstream_fd: RawFd,
@@ -172,10 +175,12 @@ pub(crate) fn dispatch(
         requested_workers,
         scheduler_nice,
         None,
+        None,
     )
+    .map_err(|(error, _)| error)
 }
 
-/// Like [`dispatch`], but returns a completion receiver for control-plane
+/// Hand off a socket pair and return a completion receiver for control-plane
 /// accounting that must remain active until the tunnel closes.
 pub(crate) fn dispatch_with_completion(
     downstream_fd: RawFd,
@@ -190,8 +195,30 @@ pub(crate) fn dispatch_with_completion(
         requested_workers,
         scheduler_nice,
         Some(sender),
-    )?;
+        None,
+    )
+    .map_err(|(error, _)| error)?;
     Ok(receiver)
+}
+
+/// Transfer the WebSocket lifetime guard to the reactor without spawning a
+/// second task per connection. Return it to the caller if handoff fails.
+pub(crate) fn dispatch_websocket(
+    downstream_fd: RawFd,
+    upstream_fd: RawFd,
+    requested_workers: usize,
+    scheduler_nice: i32,
+    guard: crate::gateway::ActiveWebSocketGuard,
+) -> Result<(), (io::Error, crate::gateway::ActiveWebSocketGuard)> {
+    dispatch_inner(
+        downstream_fd,
+        upstream_fd,
+        requested_workers,
+        scheduler_nice,
+        None,
+        Some(guard),
+    )
+    .map_err(|(error, guard)| (error, guard.expect("websocket guard is returned")))
 }
 
 fn dispatch_inner(
@@ -200,21 +227,31 @@ fn dispatch_inner(
     requested_workers: usize,
     scheduler_nice: i32,
     completion: Option<oneshot::Sender<()>>,
-) -> io::Result<()> {
+    websocket_guard: Option<crate::gateway::ActiveWebSocketGuard>,
+) -> Result<(), (io::Error, Option<crate::gateway::ActiveWebSocketGuard>)> {
+    let downstream = match duplicate_stream(downstream_fd) {
+        Ok(stream) => stream,
+        Err(error) => return Err((error, websocket_guard)),
+    };
+    let upstream = match duplicate_stream(upstream_fd) {
+        Ok(stream) => stream,
+        Err(error) => return Err((error, websocket_guard)),
+    };
     let reactors = REACTORS.get_or_init(|| Reactors::start(requested_workers, scheduler_nice));
-    let downstream = duplicate_stream(downstream_fd)?;
-    let upstream = duplicate_stream(upstream_fd)?;
     let pair = SocketPair {
         downstream,
         upstream,
         completion,
+        websocket_guard,
     };
     let index = reactors.next.fetch_add(1, Ordering::Relaxed) % reactors.workers.len();
     let worker = &reactors.workers[index];
-    worker
-        .registrations
-        .push(pair)
-        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "websocket reactor queue full"))?;
+    if let Err(pair) = worker.registrations.push(pair) {
+        return Err((
+            io::Error::new(io::ErrorKind::WouldBlock, "websocket reactor queue full"),
+            pair.websocket_guard,
+        ));
+    }
     wake(worker.wake_fd);
     Ok(())
 }
@@ -466,6 +503,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
     let downstream_fd = pair.downstream.as_raw_fd();
     let upstream_fd = pair.upstream.as_raw_fd();
     let completion = pair.completion;
+    let websocket_guard = pair.websocket_guard;
     sockets.insert(
         downstream_fd,
         SocketState {
@@ -479,6 +517,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
             pending: None,
             pending_offset: 0,
             completion,
+            _websocket_guard: websocket_guard,
         },
     );
     sockets.insert(
@@ -494,6 +533,7 @@ fn register_pair(epoll_fd: RawFd, sockets: &mut SocketTable, pair: SocketPair) {
             pending: None,
             pending_offset: 0,
             completion: None,
+            _websocket_guard: None,
         },
     );
 
@@ -779,6 +819,7 @@ mod tests {
                 downstream: duplicate_stream(downstream.as_raw_fd()).unwrap(),
                 upstream: duplicate_stream(upstream.as_raw_fd()).unwrap(),
                 completion: None,
+                websocket_guard: None,
             };
             if index == 0 {
                 first_fd = pair.downstream.as_raw_fd();

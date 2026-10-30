@@ -106,8 +106,10 @@ fn static_script_rewrite_preserves_query_and_rejects_non_origin_paths() {
 async fn script_static_rewrite_preserves_authority_without_a_host_header() {
     let root = TestDir::new("script-static-h2-authority");
     std::fs::write(root.join("asset.txt"), "authority fixture").unwrap();
-    let mut config = GatewayConfig::default();
-    config.root_dir = root.to_path_buf();
+    let mut config = GatewayConfig {
+        root_dir: root.to_path_buf(),
+        ..Default::default()
+    };
     config.runtime.performance.enabled = false;
     config.runtime.hot_reload.enabled = false;
     config.runtime.maintenance_state.enabled = false;

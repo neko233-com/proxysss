@@ -224,6 +224,7 @@ fn insecure_wss_client_config(insecure: bool) -> Option<Arc<ClientConfig>> {
     ))
 }
 
+#[allow(clippy::result_large_err)] // Preserve the protocol library error without per-error allocation.
 async fn connect_websocket(
     url: &str,
     insecure_tls_config: Option<Arc<ClientConfig>>,

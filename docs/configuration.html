@@ -726,7 +726,24 @@ udp:
     path_prefix: /_proxysss/monitor
     password: "至少 12 位的独立监控密码"
     session_ttl_secs: 43200
-    hosts: [monitor.example.com]</code></pre><p>管理、只读监控与 /metrics 使用相同 HTTP 统计源。JSON <code>http_requests</code> / Prometheus <code>proxysss_http_requests_total</code> 包含缓存、sendfile、反代、SSE 和 HTTP/1、HTTP/2、HTTP/3；WS/WSS 只计握手，后续消息不重复计数。</p><p>JSON <code>http_errors</code> / Prometheus <code>proxysss_http_errors_total</code> 对网关生成或上游返回的 <strong>4xx 与 5xx 响应</strong>各计一次，例如 404、413、上游 503 和网关 502。它不是纯 5xx 故障指标，也不涵盖所有 socket/正文传输异常；没有形成 HTTP 响应的失败和发送途中中断应结合错误日志检查。</p></article>
+    hosts: [monitor.example.com]</code></pre><p>管理、只读监控与 /metrics 使用相同 HTTP 统计源。JSON <code>http_requests</code> / Prometheus <code>proxysss_http_requests_total</code> 包含缓存、sendfile、反代、SSE 和 HTTP/1、HTTP/2、HTTP/3；WS/WSS 只计握手，后续消息不重复计数。</p><p>JSON <code>http_errors</code> / Prometheus <code>proxysss_http_errors_total</code> 对网关生成或上游返回的 <strong>4xx 与 5xx 响应</strong>各计一次，例如 404、413、上游 503 和网关 502。它不是纯 5xx 故障指标，也不涵盖所有 socket/正文传输异常；没有形成 HTTP 响应的失败和发送途中中断应结合错误日志检查。</p><p>只读 stats 包含网关运行秒数 <code>uptime_seconds</code>、进程 CPU/内存、TCP 会话、UDP 流量、重载、认证失败、脚本错误及 watchdog 计数。<code>ssl.file_validity</code> 与 SNI 条目的同名字段返回证书文件的 <code>not_before</code>、<code>not_after</code> Unix 秒和 <code>valid_now</code>；缺失、超过 1 MiB 或无法解析时为 null。它描述磁盘文件，不代表监听器或云边缘已加载，不暴露文件路径或密钥。</p><p>JSON <code>websocket_sessions_total</code> 和 <code>websocket_sessions_active</code> 分别表示进程启动以来成功升级的 WebSocket 会话数和当前活动会话数；Prometheus 使用对应的 <code>proxysss_websocket_sessions_total</code>、<code>proxysss_websocket_sessions_active</code>。失败握手和普通 TCP 不计入，会话结束后活动数下降，重启后累计数归零。</p><p>启动时签发失败及周期续期的签发失败、重载失败和加载新证书可并发发送到多个飞书机器人渠道。每个渠道失败最多尝试三次，响应丢失可能重复，重启后无持久化重试队列。Webhook 和可选签名密钥通过环境变量提供，更改进程环境需要重启服务。CLI 手动签发也发送结果通知；签发完成表示证书文件已更新，加载成功表示网关已加载证书，均不代表云产品已部署；on-demand 事件不发送通知。</p><p>飞书使用带状态颜色的消息卡片，展示事件、详情、UTC 时间和固定关键词，例如 <code>proxysss SSL certificate_loaded</code>、<code>proxysss SSL cloud_sync_succeeded</code>。可按事件名称、目标名或关键词查找；实际搜索索引取决于飞书客户端。</p><p>云同步成功卡片附带云端证书 ID、证书 SAN 域名（含泛域名）及已配置域名的 HTTPS 核验链接；TLS 验证仅代表发起同步的网络出口。</p><pre><code class="language-yaml">notifications:
+  channels:
+    - name: ops
+      kind: feishu
+      webhook_env: PROXYSSS_FEISHU_WEBHOOK
+      signing_secret_env: PROXYSSS_FEISHU_SIGNING_SECRET</code></pre><p>可按需配置最多 256 个精确域名的访问次数，未列出的 Host 不创建指标；默认列表为空，不增加域名查找。按 HTTP 请求计数，WS/WSS 仅计握手，忽略端口且域名大小写不敏感。只读监控 stats 的 <code>domain_requests</code> 是进程内累计次数映射，Prometheus 对应 <code>proxysss_domain_http_requests_total{host="..."}</code>。热重载保留仍在列表中的计数，移除域名或重启进程会丢弃对应累计值。</p><pre><code class="language-yaml">monitoring:
+  domain_stats_hosts: [api.example.com, cdn.example.com]</code></pre></article>
+<article class="card"><h3>云产品证书同步</h3><p><code>certificate_sync.targets</code> 按目标启停并选择策略；目前实现 <code>volcengine_dcdn</code>。服务每 60 秒检查启用目标的证书变更，失败或部署未完成时重试。导入复用相同证书；成功要求 DCDN 返回 Deployed 且当前网络出口看到的 TLS 叶证书与本地匹配，不能证明全部边缘节点已更新。证书须有效、密钥匹配并覆盖全部域名。失败提醒在同一进程内去重。</p><pre><code class="language-yaml">certificate_sync:
+  targets:
+    - name: example-cdn
+      enabled: true
+      provider: volcengine_dcdn
+      cert_path: ./certs/example.crt
+      key_path: ./certs/example.key
+      domains: [cdn.example.com]
+      project: default
+      access_key_env: PROXYSSS_VOLC_ACCESS_KEY
+      secret_key_env: PROXYSSS_VOLC_SECRET_KEY</code></pre><p><code>aliyun</code>、<code>tencent</code>、<code>aws</code>、<code>azure</code> 是预留策略，尚未实现和验证；启用会报错。</p><p>服务进程及手动命令需要所引用的环境变量，证书目录需允许创建锁文件；不要把密钥写入 YAML 或 Git。<code>proxysss -c /path/to/proxysss.yaml certificate sync</code> 同步所有启用目标，失败或尚未生效时返回非零。关闭目标不会取消已在途的请求。</p><p><code>certificate list</code> 输出无凭据的证书和目标 JSON。手动同步支持重复 <code>--target 名称</code> 或 <code>--all</code>。使用 <code>certificate issue --certificate primary</code> 签发主证书，<code>--certificate additional-1</code> 选择第一个额外证书，重复选项选择多个或使用 <code>--all</code>。DNS-01 通过共享缓存目录中的锁协调跨进程签发，签发成功表示文件更新，网关异步重载、云部署状态另查。HTTP-01 和 TLS-ALPN-01 需要开启写操作和 bearer token 的本机 loopback admin。不同缓存目录或不共享锁的主机不协调。</p><p>每月 1 日 04:00（Asia/Shanghai）可由 systemd timer 调用 oneshot service：<code>OnCalendar=*-*-01 04:00:00 Asia/Shanghai</code>、<code>Persistent=true</code>、<code>AccuracySec=1s</code>。service 的 ExecStart 使用上述命令，通过受限 EnvironmentFile 提供凭据；以 systemd-analyze calendar 检查下次时间。也可由支持时区设置的 cron 调用 <code>0 4 1 * *</code>；普通 cron 不补跑停机期间错过的任务。不能把密钥写入 crontab；定时同步现有证书，不强制新建 ACME 订单。</p></article>
 </div></section>
         <section id="combos" class="panel">
           <div class="section-head">
@@ -788,7 +805,28 @@ services:
       dns:
         provider: cloudflare
         credentials:
-          api_token: "REDACTED"</code></pre>
+          api_token: "REDACTED"</code></pre><p>内建续期按 <code>renew_interval_hours</code> 检查；有效证书距到期超过 30 天时不会新建订单。证书缺失、密钥或域名不匹配、算法变化、自签名或进入到期窗口会申请；管理员仍可手动签发。火山引擎 DNS-01 只清理本次创建的 TXT，保留同名其他记录。</p><p>内建 DNS-01 的 <code>credentials</code> 值可写为 <code>env:变量名</code>，创建 provider 时从服务进程环境读取；变量缺失或为空时签发失败。更改环境变量需要重启服务；外部 <code>acme_dns_external</code> 不使用此语法。</p><p>内建 DNS-01 先发布本订单全部 TXT，再通过公共 DNS-over-HTTPS 检查每个值可见后通知 CA；需要访问阿里公共 DNS 或 Cloudflare 公共 DNS，最长等待 900 秒，失败时清理本次创建的记录并报告错误。不同地区的 DNS 缓存可能仍有传播延迟。</p><p>同一实例需要 ECDSA 和 RSA 两套证书时，可通过 <code>acme.additional</code> 添加独立证书，继承主账户、DNS provider 和检查间隔，使用独立域名、算法和文件路径；<code>certificates</code> 决定 SNI 映射。额外证书要求内建 DNS-01。首次启动可签发缺失文件；热重载新增缺失的 SNI 文件时，先准备文件或重启签发。</p>
+              <pre><code>http:
+  tls:
+    mode: acme_managed
+    acme:
+      challenge: dns01
+      domains: [example.com, "*.example.com"]
+      directory_production: true
+      dns:
+        provider: volcengine
+        credentials:
+          access_key_id: "REDACTED"
+          secret_access_key: "REDACTED"
+      additional:
+        - domains: [example.com, "*.example.com"]
+          cert_path: certs/compat-rsa.crt
+          key_path: certs/compat-rsa.key
+          key_algorithm: rsa2048
+    certificates:
+      - domains: [legacy.example.com]
+        cert_path: certs/compat-rsa.crt
+        key_path: certs/compat-rsa.key</code></pre>
             </article>
 
             <article class="card">
@@ -828,7 +866,7 @@ udp:
           <div class="section-head">
             <div>
               <div class="kicker">Reload + warm-up</div>
-              <h2>热重载与启动预热</h2><p>配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。</p>
+              <h2>热重载与启动预热</h2><p>配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。</p><p><code>proxysss open config</code> 打开默认配置；<code>proxysss -c /path/to/proxysss.yaml open config</code> 打开指定文件。Windows、macOS 和有图形会话的 Linux 使用系统文件关联；无图形 Linux 使用终端中的 <code>VISUAL</code>、<code>EDITOR</code> 或 <code>vi</code>。文件不存在或无交互终端时返回错误，不创建文件或直接输出可能包含密钥的内容。</p>
             </div>
               <p class="subtle">proxysss 在配置加载和热重载后会重新计算路由，读取 service_discovery 映射，预热静态文件缓存或 sendfile 描述符，并为 reverse proxy / AI proxy 预拨 keepalive 池。</p>
           </div>

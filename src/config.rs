@@ -43,6 +43,13 @@ pub struct GatewayConfig {
     pub admin: AdminConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
+    #[serde(default, skip_serializing_if = "NotificationConfig::is_empty")]
+    pub notifications: NotificationConfig,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::certificate_sync::CertificateSyncConfig::is_empty"
+    )]
+    pub certificate_sync: crate::certificate_sync::CertificateSyncConfig,
     #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
@@ -53,6 +60,37 @@ pub struct GatewayConfig {
     pub services: ServicesConfig,
     #[serde(skip)]
     pub root_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationConfig {
+    #[serde(default)]
+    pub channels: Vec<NotificationChannel>,
+}
+
+impl NotificationConfig {
+    fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationChannel {
+    pub name: String,
+    pub kind: NotificationChannelKind,
+    /// Environment variable containing the webhook URL; the URL is never serialized.
+    pub webhook_env: String,
+    /// Optional environment variable containing the Feishu signature secret.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_secret_env: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationChannelKind {
+    Feishu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -262,6 +300,19 @@ pub struct AcmeExternalConfig {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub dns: AcmeDnsExternalConfig,
+    /// Additional managed DNS-01 certificates, sharing this account and DNS provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional: Vec<ManagedAdditionalCertificate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedAdditionalCertificate {
+    pub domains: Vec<String>,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    #[serde(default)]
+    pub key_algorithm: AcmeKeyAlgorithm,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -741,6 +792,9 @@ pub struct MonitoringConfig {
     pub path: String,
     #[serde(default)]
     pub format: MonitoringFormat,
+    /// Exact hostnames to count; empty disables per-domain accounting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_stats_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1407,9 +1461,24 @@ impl GatewayConfig {
 
     pub fn validate(&self) -> Result<()> {
         let mut errors = Vec::<String>::new();
+        crate::certificate_sync::validate(&self.certificate_sync, &mut errors);
         crate::runtime_tuning::validate(&self.runtime.performance, &mut errors);
         if !self.security.mac_deny.is_empty() {
             errors.push("security.mac_deny is unsupported: use services.access_control IP/CIDR rules or a host L2 firewall; MAC addresses do not cross routers".into());
+        }
+        if self.monitoring.domain_stats_hosts.len() > 256 {
+            errors.push("monitoring.domain_stats_hosts supports at most 256 hostnames".into());
+        }
+        let mut domain_stats_names = HashSet::new();
+        for hostname in &self.monitoring.domain_stats_hosts {
+            if !valid_domain_stats_host(hostname)
+                || !domain_stats_names.insert(hostname.to_ascii_lowercase())
+            {
+                errors.push(
+                    "monitoring.domain_stats_hosts requires unique exact ASCII hostnames".into(),
+                );
+                break;
+            }
         }
 
         if self.http.plain_bind.trim().is_empty()
@@ -2055,6 +2124,35 @@ impl GatewayConfig {
             }
         }
 
+        if self.notifications.channels.len() > 16 {
+            errors.push("notifications.channels supports at most 16 channels".to_string());
+        }
+        let mut notification_names = HashSet::new();
+        for (index, channel) in self.notifications.channels.iter().enumerate() {
+            if channel.name.trim().is_empty() || !notification_names.insert(channel.name.trim()) {
+                errors.push(format!(
+                    "notifications.channels.{index}.name must be nonempty and unique"
+                ));
+            }
+            for (key, value) in [
+                ("webhook_env", channel.webhook_env.as_str()),
+                ("signing_secret_env", channel.signing_secret_env.as_str()),
+            ] {
+                if key == "signing_secret_env" && value.is_empty() {
+                    continue;
+                }
+                let mut chars = value.chars();
+                if !chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    errors.push(format!(
+                        "notifications.channels.{index}.{key} must be an environment variable name"
+                    ));
+                }
+            }
+        }
         if self.monitoring.enabled && !self.monitoring.path.starts_with('/') {
             errors.push("monitoring.path must start with '/'".to_string());
         }
@@ -2304,6 +2402,43 @@ impl GatewayConfig {
             TlsMode::SelfSigned => {}
         }
 
+        let additional = &self.http.tls.acme.additional;
+        if !additional.is_empty() && !self.uses_managed_dns01() {
+            errors.push("http.tls.acme.additional requires acme_managed with dns01".to_string());
+        }
+        if additional.len() > 32 {
+            errors.push("http.tls.acme.additional supports at most 32 certificates".to_string());
+        }
+        let mut managed_paths = HashSet::new();
+        managed_paths.insert(self.http.tls.cert_path.clone());
+        managed_paths.insert(self.http.tls.key_path.clone());
+        for (index, certificate) in additional.iter().enumerate() {
+            if certificate.domains.is_empty()
+                || certificate
+                    .domains
+                    .iter()
+                    .any(|domain| domain.trim().is_empty())
+            {
+                errors.push(format!(
+                    "http.tls.acme.additional.{index}.domains cannot be empty"
+                ));
+            }
+            for (name, path) in [
+                ("cert_path", &certificate.cert_path),
+                ("key_path", &certificate.key_path),
+            ] {
+                if path.as_os_str().is_empty() {
+                    errors.push(format!(
+                        "http.tls.acme.additional.{index}.{name} cannot be empty"
+                    ));
+                } else if !managed_paths.insert(path.clone()) {
+                    errors.push(format!(
+                        "http.tls.acme.additional.{index}.{name} must use a distinct path"
+                    ));
+                }
+            }
+        }
+
         for (index, certificate) in self.http.tls.certificates.iter().enumerate() {
             if certificate.domains.is_empty() {
                 errors.push(format!(
@@ -2319,13 +2454,21 @@ impl GatewayConfig {
                     "http.tls.certificates.{index}.domains cannot contain empty items"
                 ));
             }
-            if !certificate.cert_path.exists() {
+            let managed = self.http.tls.mode == TlsMode::AcmeManaged
+                && ((self.http.tls.cert_path == certificate.cert_path
+                    && self.http.tls.key_path == certificate.key_path)
+                    || (self.uses_managed_dns01()
+                        && additional.iter().any(|managed| {
+                            managed.cert_path == certificate.cert_path
+                                && managed.key_path == certificate.key_path
+                        })));
+            if !managed && !certificate.cert_path.exists() {
                 errors.push(format!(
                     "http.tls.certificates.{index}.cert_path does not exist: {}",
                     certificate.cert_path.display()
                 ));
             }
-            if !certificate.key_path.exists() {
+            if !managed && !certificate.key_path.exists() {
                 errors.push(format!(
                     "http.tls.certificates.{index}.key_path does not exist: {}",
                     certificate.key_path.display()
@@ -2406,6 +2549,7 @@ impl GatewayConfig {
         self.normalize_domain_tls(&root_dir);
         self.apply_auto_https();
         self.normalize_acme_dns_config();
+        normalize_vec_lowercase(&mut self.monitoring.domain_stats_hosts);
         self.admin.https.path_prefix =
             normalize_admin_https_path_prefix(&self.admin.https.path_prefix);
         normalize_vec_lowercase(&mut self.admin.https.hosts);
@@ -2421,6 +2565,16 @@ impl GatewayConfig {
         self.http.tls.cert_path = absolutize(&root_dir, &self.http.tls.cert_path);
         self.http.tls.key_path = absolutize(&root_dir, &self.http.tls.key_path);
         self.http.tls.acme.cache_dir = absolutize(&root_dir, &self.http.tls.acme.cache_dir);
+        for target in &mut self.certificate_sync.targets {
+            target.cert_path = absolutize_if_not_empty(&root_dir, &target.cert_path);
+            target.key_path = absolutize_if_not_empty(&root_dir, &target.key_path);
+            normalize_vec_lowercase(&mut target.domains);
+        }
+        for certificate in &mut self.http.tls.acme.additional {
+            normalize_vec_lowercase(&mut certificate.domains);
+            certificate.cert_path = absolutize_if_not_empty(&root_dir, &certificate.cert_path);
+            certificate.key_path = absolutize_if_not_empty(&root_dir, &certificate.key_path);
+        }
         for page in &mut self.http.error_pages.pages {
             page.file_path = absolutize_if_not_empty(&root_dir, &page.file_path);
         }
@@ -2639,6 +2793,8 @@ impl Default for GatewayConfig {
             affinity: AffinityConfig::default(),
             admin: AdminConfig::default(),
             monitoring: MonitoringConfig::default(),
+            notifications: NotificationConfig::default(),
+            certificate_sync: crate::certificate_sync::CertificateSyncConfig::default(),
             security: SecurityConfig::default(),
             kubernetes: KubernetesConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -2760,6 +2916,7 @@ impl Default for AcmeExternalConfig {
             renew_interval_hours: default_acme_renew_hours(),
             extra_args: Vec::new(),
             dns: AcmeDnsExternalConfig::default(),
+            additional: Vec::new(),
         }
     }
 }
@@ -2955,8 +3112,23 @@ impl Default for MonitoringConfig {
             enabled: default_true(),
             path: default_monitoring_path(),
             format: MonitoringFormat::default(),
+            domain_stats_hosts: Vec::new(),
         }
     }
+}
+
+fn valid_domain_stats_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 impl Default for HotReloadConfig {
@@ -4222,6 +4394,74 @@ fn default_ftp_proxy_timeout_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_channels_require_unique_names_and_environment_variable_references() {
+        let mut config = GatewayConfig::default();
+        let channel = NotificationChannel {
+            name: "ops".into(),
+            kind: NotificationChannelKind::Feishu,
+            webhook_env: "PROXYSSS_FEISHU_WEBHOOK".into(),
+            signing_secret_env: String::new(),
+        };
+        config.notifications.channels.push(channel.clone());
+        config.validate().expect("valid environment reference");
+        config.notifications.channels.push(channel);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nonempty and unique"));
+        config.notifications.channels.pop();
+        config.notifications.channels[0].webhook_env = "https://example.com/secret".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("environment variable name"));
+    }
+
+    #[test]
+    fn additional_managed_certificates_allow_missing_sni_files_but_reject_path_collisions() {
+        let mut config = GatewayConfig::default();
+        config.http.tls.mode = TlsMode::AcmeManaged;
+        config.http.tls.acme.challenge = AcmeChallengeType::Dns01;
+        config.http.tls.acme.domains = vec!["example.com".into(), "*.example.com".into()];
+        config.http.tls.acme.dns.provider = "manual".into();
+        config
+            .http
+            .tls
+            .acme
+            .additional
+            .push(ManagedAdditionalCertificate {
+                domains: config.http.tls.acme.domains.clone(),
+                cert_path: PathBuf::from("separate-rsa.crt"),
+                key_path: PathBuf::from("separate-rsa.key"),
+                key_algorithm: AcmeKeyAlgorithm::Rsa2048,
+            });
+        config.http.tls.certificates.push(TlsCertificateConfig {
+            domains: vec!["example.com".into()],
+            cert_path: PathBuf::from("separate-rsa.crt"),
+            key_path: PathBuf::from("separate-rsa.key"),
+        });
+        config
+            .validate()
+            .expect("managed SNI paths can be issued at startup");
+        config.http.tls.acme.additional[0].key_path =
+            config.http.tls.acme.additional[0].cert_path.clone();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must use a distinct path"));
+        config.http.tls.acme.additional[0].key_path = PathBuf::from("separate-rsa.key");
+        config.http.tls.mode = TlsMode::Manual;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires acme_managed with dns01"));
+    }
 
     #[test]
     fn default_admin_credentials_are_root_root() {

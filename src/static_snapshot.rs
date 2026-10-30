@@ -49,6 +49,7 @@ pub(super) fn global_budget() -> &'static Arc<Budget> {
     BUDGET.get_or_init(|| Arc::new(Budget::new(MAX_SNAPSHOT_BYTES)))
 }
 
+#[allow(deprecated)] // Keep compatibility with Rust versions before Atomic::try_update.
 pub(super) fn try_reserve(used: &AtomicU64, bytes: u64, limit: u64) -> bool {
     used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         current.checked_add(bytes).filter(|next| *next <= limit)

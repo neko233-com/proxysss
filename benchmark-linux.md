@@ -204,9 +204,9 @@ PREBUILT_BENCH_HELPER=/opt/benchmark-helper \
 
 原因不是“把差结果藏起来”，而是 GitHub-hosted runner 的 UDP / realtime 噪声太大，且 nginx 没有 KCP/QCP 语义；默认 benchmark 不把错误环境或错误对照组包装成最终裁判。
 
-## 8. 正式 Linux 发布怎么跑
+## 8. 可选 Linux 性能比较
 
-先完成 1x/2x/4x 的全场景 role-isolated 与三机 WSS 原始运行。为对应 tag 写入 `performance-evidence/vX.Y.Z.json`：schema v2 不接受“已胜出”的布尔声明，而是逐场景固化两边的 ops/s、p50/p95/p99 和 errors；验证器要求 proxysss 吞吐严格更高、三个百分位严格更低、两边 0 错误。全场景证据必须列全 static-small、static-large、CDN hot-update、HTTPS static、reverse proxy、generic SSE、WebSocket、game TCP、TCP、UDP；容量还必须记录两边 opened/failed、open rate 和三项握手百分位，限定为 1k-50k 的可复现连接包络。每轮另记录角色隔离、proxysss/nginx 各自的内存 current/peak/每连接成本及无持续增长；proxysss 任何一项均不得超过 nginx 2 倍，并且要带 saturation/equal-load/capacity 原始工件的 URI 和 SHA-256；跨机 WSS 必须记录三个不同的 machine-id hash。`release.yml` 会校验清单的 tag 和 commit，并把它随 release assets 发布；它防止缺少真实证据时误发版本，不能替代对原始工件的人工审计。
+2026-10-30 起正式发布不要求压测或性能清单。需要作严格性能比较时，运行相同资源条件下的全场景隔离和独立三机 WSS 复验，保留原始工件与摘要，并使用 `performance-evidence/README.md` 的验证器核对对应提交。没有实测不能宣称性能胜出、容量达标或跨主机结果。
 
 ```bash
 proxysss tune linux --apply --profile latency --max-connections 200000

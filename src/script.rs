@@ -383,6 +383,7 @@ impl StreamKind {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Script routing avoids an extra allocation per result.
 enum ScriptOutcome {
     Route(RouteDecision),
     Plugins(Vec<ScriptPluginInfo>),

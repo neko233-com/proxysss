@@ -1639,6 +1639,7 @@ impl UdpPruneState {
         }
     }
 
+    #[allow(deprecated)] // Keep compatibility with Rust versions before Atomic::try_update.
     fn try_reserve(self: &Arc<Self>, limit: usize) -> Option<UdpSessionPermit> {
         self.sessions
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
@@ -2531,13 +2532,18 @@ impl Default for PaddedAtomicU64 {
 }
 
 struct GatewayStats {
+    started_at: Instant,
     // Request counters are written by every HTTP data-plane shard. A single
     // global atomic bounces one cache line across all gateway cores and makes
     // metrics collection part of request latency. Each pinned shard owns one
     // padded cell; control-plane threads use the fallback counter.
     http_requests: AtomicU64,
     http_request_shards: [PaddedAtomicU64; DATA_PLANE_STATS_SHARDS],
+    domain_stats_enabled: AtomicBool,
+    domain_stats: ArcSwap<FxHashMap<String, Arc<DomainRequestCounter>>>,
     http_errors: AtomicU64,
+    websocket_sessions_total: AtomicU64,
+    websocket_sessions_active: AtomicU64,
     tcp_sessions_total: AtomicU64,
     tcp_sessions_active: AtomicU64,
     udp_packets_total: AtomicU64,
@@ -2563,9 +2569,14 @@ struct GatewayStats {
 impl Default for GatewayStats {
     fn default() -> Self {
         Self {
+            started_at: Instant::now(),
             http_requests: AtomicU64::new(0),
             http_request_shards: std::array::from_fn(|_| PaddedAtomicU64::default()),
+            domain_stats_enabled: AtomicBool::new(false),
+            domain_stats: ArcSwap::from_pointee(FxHashMap::default()),
             http_errors: AtomicU64::new(0),
+            websocket_sessions_total: AtomicU64::new(0),
+            websocket_sessions_active: AtomicU64::new(0),
             tcp_sessions_total: AtomicU64::new(0),
             tcp_sessions_active: AtomicU64::new(0),
             udp_packets_total: AtomicU64::new(0),
@@ -2584,6 +2595,44 @@ impl Default for GatewayStats {
             warm: AtomicBool::new(false),
             process_metrics: Mutex::new(ProcessMetricsSampler::default()),
         }
+    }
+}
+
+struct DomainRequestCounter {
+    fallback: AtomicU64,
+    shards: [PaddedAtomicU64; DATA_PLANE_STATS_SHARDS],
+}
+
+impl Default for DomainRequestCounter {
+    fn default() -> Self {
+        Self {
+            fallback: AtomicU64::new(0),
+            shards: std::array::from_fn(|_| PaddedAtomicU64::default()),
+        }
+    }
+}
+
+impl DomainRequestCounter {
+    fn increment(&self) {
+        let recorded = DATA_PLANE_STATS_SHARD.with(|shard| {
+            if let Some(index) = shard.get() {
+                self.shards[index].0.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        });
+        if !recorded {
+            self.fallback.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.shards
+            .iter()
+            .fold(self.fallback.load(Ordering::Relaxed), |sum, shard| {
+                sum.saturating_add(shard.0.load(Ordering::Relaxed))
+            })
     }
 }
 
@@ -2616,6 +2665,28 @@ struct HttpRateLimitLease {
 }
 
 struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+pub(crate) struct ActiveWebSocketGuard(Arc<GatewayStats>);
+
+impl ActiveWebSocketGuard {
+    fn enter(stats: Arc<GatewayStats>) -> Self {
+        stats
+            .websocket_sessions_total
+            .fetch_add(1, Ordering::Relaxed);
+        stats
+            .websocket_sessions_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for ActiveWebSocketGuard {
+    fn drop(&mut self) {
+        self.0
+            .websocket_sessions_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
@@ -2829,16 +2900,56 @@ impl Gateway {
         let acme_http_challenges = Arc::new(DashMap::new());
         let acme_tls_alpn_certs = Arc::new(DashMap::new());
 
+        if config.http.tls.mode == TlsMode::AcmeManaged {
+            let _guard = managed_acme_issuance_lock().lock().await;
+            crate::acme::material::recover(&config.http.tls)
+                .context("failed to recover managed certificate installation")?;
+            for extra in &config.http.tls.acme.additional {
+                crate::acme::material::recover(&additional_managed_tls(&config.http.tls, extra))
+                    .context("failed to recover additional managed certificate installation")?;
+            }
+        }
+
         if config.uses_managed_dns01()
             && (!config.http.tls.cert_path.exists() || !config.http.tls.key_path.exists())
         {
-            issue_managed_acme_certificate(
+            let result = issue_managed_acme_certificate(
                 &config.http.tls,
                 &acme_http_challenges,
                 &acme_tls_alpn_certs,
             )
-            .await
-            .context("failed to issue initial managed DNS-01 certificate")?;
+            .await;
+            if result.is_err() {
+                crate::notifications::dispatch(
+                    &config.notifications,
+                    crate::notifications::NotificationEvent::CertificateFailed,
+                    "proxysss 启动时的证书签发失败，网关尚未启动；请查看错误日志。",
+                )
+                .await;
+            }
+            result.context("failed to issue initial managed DNS-01 certificate")?;
+        }
+        if config.uses_managed_dns01() {
+            for additional in &config.http.tls.acme.additional {
+                let tls = additional_managed_tls(&config.http.tls, additional);
+                if !tls.cert_path.exists() || !tls.key_path.exists() {
+                    let result = issue_managed_acme_certificate(
+                        &tls,
+                        &acme_http_challenges,
+                        &acme_tls_alpn_certs,
+                    )
+                    .await;
+                    if result.is_err() {
+                        crate::notifications::dispatch(
+                            &config.notifications,
+                            crate::notifications::NotificationEvent::CertificateFailed,
+                            "proxysss 启动时的额外证书签发失败，网关尚未启动；请查看错误日志。",
+                        )
+                        .await;
+                    }
+                    result.context("failed to issue additional managed DNS-01 certificate")?;
+                }
+            }
         }
 
         prepare_tls_material(&config)?;
@@ -2887,6 +2998,9 @@ impl Gateway {
             auth_requests: crate::auth_request::AuthRequestExecutor::new()?,
             buffered_request_bodies: body_budget,
         });
+        gateway
+            .stats
+            .configure_domain_stats(&gateway.bootstrap_config.monitoring.domain_stats_hosts);
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         gateway.warm_up(&gateway.bootstrap_config).await;
@@ -3105,6 +3219,14 @@ impl Gateway {
                     "managed_acme_renew",
                     |gateway| async { gateway.run_managed_acme_renew_loop().await },
                 );
+                if !self.bootstrap_config.runtime.hot_reload.enabled {
+                    Self::spawn_supervised_task(
+                        &mut tasks,
+                        self.clone(),
+                        "managed_certificate_watch",
+                        |gateway| async { gateway.run_managed_certificate_watch_loop().await },
+                    );
+                }
             }
             TlsMode::AcmeExternal | TlsMode::AcmeDnsExternal => {
                 Self::spawn_supervised_task(
@@ -3116,6 +3238,13 @@ impl Gateway {
             }
             TlsMode::SelfSigned | TlsMode::Manual => {}
         }
+
+        Self::spawn_supervised_task(
+            &mut tasks,
+            self.clone(),
+            "certificate_sync",
+            |gateway| async { gateway.run_certificate_sync_loop().await },
+        );
 
         Self::spawn_supervised_task(
             &mut tasks,
@@ -3323,27 +3452,165 @@ impl Gateway {
         }
     }
 
-    async fn run_managed_acme_renew_loop(self: Arc<Self>) -> Result<()> {
+    async fn run_certificate_sync_loop(self: Arc<Self>) -> Result<()> {
+        let mut successful = std::collections::HashMap::<String, Vec<u8>>::new();
+        let mut alerted = std::collections::HashSet::<String>::new();
         loop {
-            let tls = {
-                let state = self.current_state().await;
-                state.config.http.tls.clone()
-            };
-            match issue_managed_acme_certificate(
-                &tls,
-                &self.acme_http_challenges,
-                &self.acme_tls_alpn_certs,
-            )
-            .await
+            let config = self.current_state().await.config.clone();
+            successful.retain(|name, _| {
+                config
+                    .certificate_sync
+                    .targets
+                    .iter()
+                    .any(|t| t.enabled && &t.name == name)
+            });
+            alerted.retain(|name| {
+                config
+                    .certificate_sync
+                    .targets
+                    .iter()
+                    .any(|t| t.enabled && &t.name == name)
+            });
+            for target in config
+                .certificate_sync
+                .targets
+                .iter()
+                .filter(|target| target.enabled)
             {
-                Ok(()) => {
-                    if let Err(error) = self.reload_from_disk().await {
-                        tracing::warn!(?error, "managed acme issued certificate but reload failed");
-                    } else {
-                        tracing::info!("managed acme certificate refreshed");
+                let key = crate::certificate_sync::change_key(target);
+                if key
+                    .as_ref()
+                    .is_ok_and(|key| successful.get(&target.name) == Some(key))
+                {
+                    continue;
+                }
+                let result = match key {
+                    Ok(key) => crate::certificate_sync::sync_target(target)
+                        .await
+                        .map(|receipt| (key, receipt)),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok((key, receipt)) => {
+                        successful.insert(target.name.clone(), key);
+                        alerted.remove(&target.name);
+                        tracing::info!(target = %target.name, "cloud certificate deployed and TLS verified");
+                        crate::notifications::dispatch_with_links(
+                            &config.notifications,
+                            crate::notifications::NotificationEvent::CloudSyncSucceeded,
+                            &receipt.notification(&target.name),
+                            &receipt.urls,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(target = %target.name, %error, "cloud certificate synchronization incomplete; will retry");
+                        if alerted.insert(target.name.clone()) {
+                            crate::notifications::dispatch(
+                                &config.notifications,
+                                crate::notifications::NotificationEvent::CloudSyncFailed,
+                                &format!(
+                                    "proxysss 云证书同步未完成：{}，将自动重试。",
+                                    target.name
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 }
-                Err(error) => tracing::warn!(?error, "managed acme renewal failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    async fn run_managed_acme_renew_loop(self: Arc<Self>) -> Result<()> {
+        let mut pending_reload = Vec::<Vec<String>>::new();
+        loop {
+            let (tls, notifications) = {
+                let state = self.current_state().await;
+                (
+                    state.config.http.tls.clone(),
+                    state.config.notifications.clone(),
+                )
+            };
+            if pending_reload.is_empty() {
+                let mut certificates = vec![tls.clone()];
+                certificates.extend(
+                    tls.acme
+                        .additional
+                        .iter()
+                        .map(|item| additional_managed_tls(&tls, item)),
+                );
+                for certificate in certificates {
+                    let recovery = {
+                        let _guard = managed_acme_issuance_lock().lock().await;
+                        crate::acme::material::recover(&certificate)
+                    };
+                    match recovery {
+                        Ok(true) => {
+                            pending_reload.push(certificate.acme.domains.clone());
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "managed certificate recovery failed; will retry"
+                            );
+                            continue;
+                        }
+                    }
+                    if managed_certificate_needs_renewal(&certificate) {
+                        match issue_managed_acme_certificate(
+                            &certificate,
+                            &self.acme_http_challenges,
+                            &self.acme_tls_alpn_certs,
+                        )
+                        .await
+                        {
+                            Ok(()) => pending_reload.push(certificate.acme.domains.clone()),
+                            Err(error) => {
+                                tracing::warn!(?error, "managed acme renewal failed");
+                                crate::notifications::dispatch(
+                                    &notifications,
+                                    crate::notifications::NotificationEvent::CertificateFailed,
+                                    &format!(
+                                        "proxysss 证书签发失败：{}。请查看网关错误日志。",
+                                        certificate.acme.domains.join(", ")
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_reload.is_empty() {
+                if let Err(error) = self.reload_from_disk().await {
+                    tracing::warn!(
+                        ?error,
+                        "managed acme issued certificate but reload failed; will retry reload"
+                    );
+                    crate::notifications::dispatch(
+                        &notifications,
+                        crate::notifications::NotificationEvent::CertificateReloadFailed,
+                        "proxysss 证书已签发但重载失败，将按检查间隔重试。请查看网关错误日志。",
+                    )
+                    .await;
+                } else {
+                    tracing::info!("managed acme certificate refreshed");
+                    for domains in pending_reload.drain(..) {
+                        crate::notifications::dispatch(
+                            &notifications,
+                            crate::notifications::NotificationEvent::CertificateLoaded,
+                            &format!(
+                                "proxysss 已加载新证书：{}。云端部署状态需另行确认。",
+                                domains.join(", ")
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
 
             let tls = {
@@ -3352,6 +3619,30 @@ impl Gateway {
             };
             let renew_every = Duration::from_secs(tls.acme.renew_interval_hours.max(1) * 3600);
             tokio::time::sleep(renew_every).await;
+        }
+    }
+
+    async fn run_managed_certificate_watch_loop(self: Arc<Self>) -> Result<()> {
+        // Reconcile once even if a CLI replaced the files before this task started.
+        let mut last = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let config = self.current_state().await.config.clone();
+            let current = match managed_tls_file_fingerprint(&config) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(?error, "managed certificate file check failed");
+                    continue;
+                }
+            };
+            if last != Some(current) {
+                match self.reload_config(config).await {
+                    Ok(()) => last = Some(current),
+                    Err(error) => {
+                        tracing::warn!(?error, "managed certificate reload failed; will retry")
+                    }
+                }
+            }
         }
     }
 
@@ -5054,6 +5345,10 @@ impl Gateway {
 
     async fn reload_from_disk(&self) -> Result<()> {
         let new_config = GatewayConfig::load(&self.config_path)?;
+        self.reload_config(new_config).await
+    }
+
+    async fn reload_config(&self, new_config: GatewayConfig) -> Result<()> {
         if new_config.runtime.performance != self.bootstrap_config.runtime.performance {
             anyhow::bail!("runtime.performance changed; restart required to replace startup workers/socket policy");
         }
@@ -5068,6 +5363,8 @@ impl Gateway {
         self.buffered_request_bodies
             .set_limit(new_config.http.max_buffered_request_body_bytes);
         self.dynamic.store(new_state);
+        self.stats
+            .configure_domain_stats(&new_config.monitoring.domain_stats_hosts);
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
         self.warm_up(&new_config).await;
@@ -5313,6 +5610,9 @@ impl Gateway {
         )
         .await
         .context("managed ACME certificate issuance failed")?;
+        self.reload_config(state.config.clone())
+            .await
+            .context("certificate was issued but the gateway could not reload it")?;
         let tls = self.current_state().await.config.http.tls.clone();
         Ok(serde_json::json!({
             "cert_exists": tls.cert_path.exists(),
@@ -5890,6 +6190,7 @@ impl Gateway {
                 // same keep-alive GET bytes. Once validated, skip UTF-8/header
                 // parsing and route lookup until the revalidation deadline.
                 self.stats.record_http_request();
+                self.stats.record_domain_request(cached.host.as_deref());
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
@@ -5971,6 +6272,7 @@ impl Gateway {
                         .inspect_err(|_| {
                             if !downstream_started {
                                 self.stats.record_http_request();
+                                self.stats.record_domain_request(request.host.as_deref());
                             }
                         })?
                     {
@@ -6093,6 +6395,7 @@ impl Gateway {
                 .filter(|cached| cached.matches(&request))
             {
                 self.stats.record_http_request();
+                self.stats.record_domain_request(request.host);
                 let force_yield = yield_after_sendfile_response && cached.sendfile.is_some();
                 let mid_yield = balanced_sendfile_mid_yield_for_next_response(
                     &mut balanced_sendfile_response_sequence,
@@ -6152,6 +6455,7 @@ impl Gateway {
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
             self.stats.record_http_request();
+            self.stats.record_domain_request(request.host);
             if let Some(cached) = static_response_cache.as_mut().filter(|cached| {
                 cached.identity_matches(&request) && cached.same_payload(&candidate)
             }) {
@@ -6495,6 +6799,7 @@ impl Gateway {
                 &[]
             };
             self.stats.record_http_request();
+            self.stats.record_domain_request(request.host);
             write_static_response_vectored(downstream, header.as_bytes(), response_body)
                 .await
                 .context("failed writing TLS static fast-lane response")?;
@@ -6818,6 +7123,9 @@ impl Gateway {
                     .try_immutable_h2_static_success_fast_path(&request, Some(&connection_cache))
                 {
                     gateway.stats.record_http_request();
+                    gateway
+                        .stats
+                        .record_hyper_domain_request(request.headers(), request.uri());
                     Either::Left(ready(Ok(response)))
                 } else {
                     let gateway = gateway.clone();
@@ -6942,6 +7250,9 @@ impl Gateway {
                                 };
 
                                 gateway.stats.record_http_request();
+                                gateway
+                                    .stats
+                                    .record_hyper_domain_request(request.headers(), request.uri());
                                 let limit = request_body_limit(&body_config.config, request.uri());
                                 let framing = http1_body::response_framing(
                                     request
@@ -8374,6 +8685,8 @@ impl Gateway {
         h2_static_route_cache: Option<&OnceLock<ConnectionH2StaticRouteCache>>,
     ) -> Result<GatewayResponse, Infallible> {
         self.stats.record_http_request();
+        self.stats
+            .record_hyper_domain_request(request.headers(), request.uri());
 
         match self
             .try_http_static_success_fast_path(&request, scheme, h2_static_route_cache)
@@ -10127,6 +10440,7 @@ impl Gateway {
             return Ok(false);
         };
         self.stats.record_http_request();
+        self.stats.record_domain_request(request.host.as_deref());
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
         let mut upstream_io = tokio::time::timeout(timeout, pool.checkout())
             .await
@@ -10338,6 +10652,7 @@ impl Gateway {
         let pool = &prepared.pool;
         let upstream = &prepared.upstream;
         self.stats.record_http_request();
+        self.stats.record_domain_request(request.host.as_deref());
         let mut upstream_io = if lane_upstream
             .as_ref()
             .map(|upstream| upstream.key.as_str() == pool_key.as_str())
@@ -10585,6 +10900,7 @@ impl Gateway {
         // A failed WSS probe may fall back to Hyper before any response. Count
         // only once this path commits; the fallback owns its own accounting.
         self.stats.record_http_request();
+        self.stats.record_domain_request(request.host.as_deref());
         self.stats.record_http_response_status(response_head.status);
         downstream
             .write_all(&response_head.raw_head)
@@ -10622,6 +10938,8 @@ impl Gateway {
             }
             return Ok(true);
         }
+        #[allow(unused_mut)]
+        let mut _websocket_guard = Some(ActiveWebSocketGuard::enter(self.stats.clone()));
         if let Some(leftover) = response_head.leftover {
             if !leftover.is_empty() {
                 downstream
@@ -10643,17 +10961,19 @@ impl Gateway {
             config.runtime.performance.enabled
                 && native_stream_reactor_profile_enabled(config.runtime.performance.traffic_profile)
         }) {
-            match crate::stream_reactor::dispatch(
+            match crate::stream_reactor::dispatch_websocket(
                 downstream_fd,
                 upstream_io.as_raw_fd(),
                 realtime_stream_reactor_workers(),
                 realtime_stream_reactor_nice(),
+                _websocket_guard.take().expect("websocket guard is present"),
             ) {
                 Ok(()) => {
                     *downstream_detached = true;
                     return Ok(true);
                 }
-                Err(error) => {
+                Err((error, guard)) => {
+                    _websocket_guard = Some(guard);
                     tracing::debug!(?error, %remote_addr, "plain WebSocket epoll handoff unavailable; using async relay");
                 }
             }
@@ -10767,11 +11087,13 @@ impl Gateway {
         }
 
         let tunnel_upstream = upstream.clone();
+        let stats = self.stats.clone();
         tokio::spawn(async move {
             let result = async {
                 let upgraded = on_upgrade
                     .await
                     .context("downstream websocket upgrade failed")?;
+                let _websocket_guard = ActiveWebSocketGuard::enter(stats);
                 let mut client = TokioIo::new(upgraded);
                 if let Some(initial_bytes) = leftover {
                     if !initial_bytes.is_empty() {
@@ -11746,6 +12068,66 @@ impl Gateway {
                 dispatch_active_health_alerts(client, &target.settings.alert_webhooks, payload)
                     .await;
             }
+        }
+    }
+}
+
+pub(crate) fn additional_managed_tls(
+    primary: &crate::config::TlsConfig,
+    additional: &crate::config::ManagedAdditionalCertificate,
+) -> crate::config::TlsConfig {
+    let mut tls = primary.clone();
+    tls.cert_path = additional.cert_path.clone();
+    tls.key_path = additional.key_path.clone();
+    tls.acme.domains = additional.domains.clone();
+    tls.acme.key_algorithm = additional.key_algorithm;
+    tls.acme.additional.clear();
+    tls
+}
+
+fn managed_certificate_needs_renewal(tls: &crate::config::TlsConfig) -> bool {
+    use x509_parser::extensions::GeneralName;
+    let usable = || -> Result<bool> {
+        build_certified_key(&tls.cert_path, &tls.key_path)?;
+        let certs = load_certs(&tls.cert_path)?;
+        let cert = certs
+            .first()
+            .ok_or_else(|| anyhow!("missing leaf certificate"))?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+            .map_err(|_| anyhow!("invalid leaf certificate"))?;
+        if parsed.subject() == parsed.issuer() {
+            return Ok(false);
+        }
+        let key_oid = parsed.public_key().algorithm.algorithm.to_id_string();
+        let expected_oid = match tls.acme.key_algorithm {
+            AcmeKeyAlgorithm::EcdsaP256 => "1.2.840.10045.2.1",
+            AcmeKeyAlgorithm::Rsa2048 => "1.2.840.113549.1.1.1",
+        };
+        if key_oid != expected_oid {
+            return Ok(false);
+        }
+        let expires = parsed.validity().not_after.timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if parsed.validity().not_before.timestamp() > now
+            || expires.saturating_sub(now) <= 30 * 86_400
+        {
+            return Ok(false);
+        }
+        let names = parsed
+            .subject_alternative_name()
+            .map_err(|_| anyhow!("invalid certificate subject alternative names"))?
+            .ok_or_else(|| anyhow!("certificate has no subject alternative names"))?;
+        Ok(tls.acme.domains.iter().all(|required| {
+            names.value.general_names.iter().any(|name|
+            matches!(name, GeneralName::DNSName(actual) if actual.eq_ignore_ascii_case(required))
+        )
+        }))
+    };
+    match usable() {
+        Ok(usable) => !usable,
+        Err(error) => {
+            tracing::warn!(?error, "managed certificate requires issuance");
+            true
         }
     }
 }
@@ -14098,6 +14480,46 @@ fn raw_sse_streaming_body(
 }
 
 impl GatewayStats {
+    fn configure_domain_stats(&self, hosts: &[String]) {
+        let previous = self.domain_stats.load();
+        let mut next = FxHashMap::default();
+        for host in hosts {
+            let key = host.to_ascii_lowercase();
+            let counter = previous
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(DomainRequestCounter::default()));
+            next.insert(key, counter);
+        }
+        self.domain_stats.store(Arc::new(next));
+        self.domain_stats_enabled
+            .store(!hosts.is_empty(), Ordering::Release);
+    }
+
+    fn record_domain_request(&self, host: Option<&str>) {
+        if !self.domain_stats_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(host) = host else {
+            return;
+        };
+        let host = host.trim().split(':').next().unwrap_or("");
+        let name = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(host)
+        };
+        if let Some(counter) = self.domain_stats.load().get(name.as_ref()) {
+            counter.increment();
+        }
+    }
+
+    fn record_hyper_domain_request(&self, headers: &HeaderMap, uri: &Uri) {
+        if self.domain_stats_enabled.load(Ordering::Acquire) {
+            self.record_domain_request(Some(request_host(headers, uri).as_ref()));
+        }
+    }
+
     fn record_http_response_status(&self, status: StatusCode) {
         if status.is_client_error() || status.is_server_error() {
             self.http_errors.fetch_add(1, Ordering::Relaxed);
@@ -14128,9 +14550,19 @@ impl GatewayStats {
 
     fn snapshot_json(&self) -> serde_json::Value {
         let process = self.process_snapshot();
+        let domains: BTreeMap<_, _> = self
+            .domain_stats
+            .load()
+            .iter()
+            .map(|(name, counter)| (name.clone(), counter.total()))
+            .collect();
         serde_json::json!({
+            "uptime_seconds": self.started_at.elapsed().as_secs(),
             "http_requests": self.http_requests_total(),
+            "domain_requests": domains,
             "http_errors": self.http_errors.load(Ordering::Relaxed),
+            "websocket_sessions_total": self.websocket_sessions_total.load(Ordering::Relaxed),
+            "websocket_sessions_active": self.websocket_sessions_active.load(Ordering::Relaxed),
             "tcp_sessions_total": self.tcp_sessions_total.load(Ordering::Relaxed),
             "tcp_sessions_active": self.tcp_sessions_active.load(Ordering::Relaxed),
             "udp_packets_total": self.udp_packets_total.load(Ordering::Relaxed),
@@ -14168,6 +14600,11 @@ impl GatewayStats {
                 "proxysss_http_errors_total",
                 "Total HTTP 4xx and 5xx responses handled by the gateway",
                 self.http_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "proxysss_websocket_sessions_total",
+                "WebSocket tunnels successfully upgraded",
+                self.websocket_sessions_total.load(Ordering::Relaxed),
             ),
             (
                 "proxysss_tcp_sessions_total",
@@ -14247,6 +14684,31 @@ impl GatewayStats {
             lines.push(format!("# TYPE {name} counter"));
             lines.push(format!("{name} {value}"));
         }
+        let domains: BTreeMap<_, _> = self
+            .domain_stats
+            .load()
+            .iter()
+            .map(|(name, counter)| (name.clone(), counter.total()))
+            .collect();
+        if !domains.is_empty() {
+            lines.push(
+                "# HELP proxysss_domain_http_requests_total HTTP requests for configured hostnames"
+                    .into(),
+            );
+            lines.push("# TYPE proxysss_domain_http_requests_total counter".into());
+            for (host, count) in domains {
+                lines.push(format!(
+                    "proxysss_domain_http_requests_total{{host=\"{host}\"}} {count}"
+                ));
+            }
+        }
+        lines
+            .push("# HELP proxysss_websocket_sessions_active Active WebSocket tunnels".to_string());
+        lines.push("# TYPE proxysss_websocket_sessions_active gauge".to_string());
+        lines.push(format!(
+            "proxysss_websocket_sessions_active {}",
+            self.websocket_sessions_active.load(Ordering::Relaxed)
+        ));
         lines.push("# HELP proxysss_tcp_sessions_active Active TCP stream sessions".to_string());
         lines.push("# TYPE proxysss_tcp_sessions_active gauge".to_string());
         lines.push(format!(
@@ -15019,6 +15481,20 @@ fn tls_certificate_paths(config: &GatewayConfig) -> Vec<PathBuf> {
     paths
 }
 
+fn managed_tls_file_fingerprint(config: &GatewayConfig) -> Result<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in tls_certificate_paths(config) {
+        if seen.insert(path.clone()) {
+            path.hash(&mut hasher);
+            fs::read(&path)
+                .context("failed to read managed TLS material")?
+                .hash(&mut hasher);
+        }
+    }
+    Ok(hasher.finish())
+}
+
 /// Parsed keys belong to the published state; listeners never re-read a partial renewal.
 struct PreparedTlsMaterial {
     default: Arc<CertifiedKey>,
@@ -15281,11 +15757,23 @@ fn acme_identifier_extension_content(digest: &[u8]) -> Vec<u8> {
     der
 }
 
-async fn issue_managed_acme_certificate(
+fn managed_acme_issuance_lock() -> &'static TokioMutex<()> {
+    static ISSUANCE_LOCK: std::sync::OnceLock<TokioMutex<()>> = std::sync::OnceLock::new();
+    ISSUANCE_LOCK.get_or_init(|| TokioMutex::new(()))
+}
+
+pub(crate) async fn issue_managed_acme_certificate(
     tls: &crate::config::TlsConfig,
     challenges: &DashMap<String, String>,
     tls_alpn_certs: &DashMap<String, Arc<CertifiedKey>>,
 ) -> Result<()> {
+    // Managed orders share account state, challenge maps, and sometimes output
+    // paths. Serialize them across the process, including manual and on-demand
+    // requests, so one order cannot replace another order's challenge material.
+    let _issuance_guard = managed_acme_issuance_lock().lock().await;
+    let _process_guard = acquire_managed_acme_process_lock(&tls.acme.cache_dir)?;
+    crate::acme::material::recover(tls)
+        .context("failed to recover managed certificate installation")?;
     let cache_dir = tls.acme.cache_dir.clone();
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create acme cache dir {}", cache_dir.display()))?;
@@ -15357,17 +15845,22 @@ async fn issue_managed_acme_certificate(
     let dns_provider = if tls.acme.challenge == AcmeChallengeType::Dns01 {
         Some(DnsProvider::create(
             &tls.acme.dns.provider,
-            tls.acme.dns.credentials.clone(),
+            crate::acme::dns::util::resolve_credentials(&tls.acme.dns.credentials)?,
         )?)
     } else {
         None
     };
     let result = async {
+        let mut expected_dns_records = Vec::new();
+        {
         let mut authorizations = order.authorizations();
         while let Some(authz) = authorizations.next().await {
             let mut authz = authz.context("failed to fetch acme authorization")?;
+            if authz.status == instant_acme::AuthorizationStatus::Valid {
+                continue;
+            }
             let identifier = authz.identifier().to_string().to_ascii_lowercase();
-            let mut challenge = match tls.acme.challenge {
+            let challenge = match tls.acme.challenge {
                 AcmeChallengeType::Http01 => authz
                     .challenge(ChallengeType::Http01)
                     .ok_or_else(|| anyhow!("acme server did not offer http-01 challenge"))?,
@@ -15407,13 +15900,33 @@ async fn issue_managed_acme_certificate(
                             format!("failed to publish dns-01 txt record for {fqdn}")
                         })?;
                     inserted_dns_records.push((provider.id().to_string(), handle));
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    expected_dns_records.push((fqdn, txt_value));
                 }
             }
+        }
+        }
+        crate::acme::dns::propagation::wait_for_txt(&expected_dns_records).await?;
+
+        {
+        let mut authorizations = order.authorizations();
+        while let Some(authz) = authorizations.next().await {
+            let mut authz = authz.context("failed to fetch acme authorization")?;
+            if authz.status == instant_acme::AuthorizationStatus::Valid {
+                continue;
+            }
+            let challenge_type = match tls.acme.challenge {
+                AcmeChallengeType::Http01 => ChallengeType::Http01,
+                AcmeChallengeType::TlsAlpn01 => ChallengeType::TlsAlpn01,
+                AcmeChallengeType::Dns01 => ChallengeType::Dns01,
+            };
+            let mut challenge = authz
+                .challenge(challenge_type)
+                .ok_or_else(|| anyhow!("acme server did not offer the configured challenge"))?;
             challenge
                 .set_ready()
                 .await
                 .context("failed to notify acme server that challenge is ready")?;
+        }
         }
 
         let retry = RetryPolicy::default().timeout(Duration::from_secs(120));
@@ -15422,6 +15935,16 @@ async fn issue_managed_acme_certificate(
             .await
             .context("timed out waiting for acme order readiness")?;
         if status != OrderStatus::Ready {
+            let mut authorizations = order.authorizations();
+            while let Some(authz) = authorizations.next().await {
+                if let Ok(authz) = authz {
+                    for challenge in &authz.challenges {
+                        if let Some(problem) = &challenge.error {
+                            tracing::warn!(identifier = %authz.identifier(), problem_type = ?problem.r#type, "ACME authorization failed");
+                        }
+                    }
+                }
+            }
             return Err(anyhow!("acme order ended in unexpected state {status:?}"));
         }
 
@@ -15433,18 +15956,8 @@ async fn issue_managed_acme_certificate(
             .await
             .context("failed to retrieve managed acme certificate")?;
 
-        if let Some(parent) = tls.cert_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        if let Some(parent) = tls.key_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&tls.cert_path, certificate_pem)
-            .with_context(|| format!("failed to write {}", tls.cert_path.display()))?;
-        fs::write(&tls.key_path, private_key_pem)
-            .with_context(|| format!("failed to write {}", tls.key_path.display()))?;
+        crate::acme::material::install(tls, certificate_pem, private_key_pem)
+            .context("failed to install managed certificate pair")?;
 
         Ok::<_, anyhow::Error>(())
     }
@@ -15465,6 +15978,23 @@ async fn issue_managed_acme_certificate(
     }
 
     result
+}
+
+fn acquire_managed_acme_process_lock(cache_dir: &Path) -> Result<std::fs::File> {
+    fs::create_dir_all(cache_dir).context("failed to create managed ACME cache directory")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(cache_dir.join("issuance.lock"))
+        .context("failed to open managed ACME issuance lock")?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .context("managed ACME issuance is already running in another process")?;
+    Ok(file)
 }
 
 async fn finalize_managed_acme_order(
@@ -17904,16 +18434,63 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
     })
 }
 
+fn monitor_certificate_file_validity(path: &Path) -> Option<serde_json::Value> {
+    use std::io::Read as _;
+    const MAX_CERTIFICATE_FILE_BYTES: u64 = 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_CERTIFICATE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CERTIFICATE_FILE_BYTES {
+        return None;
+    }
+    let cert = rustls_pemfile::certs(&mut Cursor::new(bytes))
+        .next()?
+        .ok()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
+    let not_before = parsed.validity().not_before.timestamp();
+    let not_after = parsed.validity().not_after.timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    Some(serde_json::json!({
+        "not_before": not_before,
+        "not_after": not_after,
+        "valid_now": not_before <= now && now < not_after,
+    }))
+}
+
 fn monitor_tls_summary(config: &GatewayConfig) -> serde_json::Value {
     let tls = &config.http.tls;
     let mode = serde_json::to_value(tls.mode).unwrap_or(serde_json::Value::Null);
     let challenge = serde_json::to_value(tls.acme.challenge).unwrap_or(serde_json::Value::Null);
+    let mut validity = HashMap::new();
+    let mut file_validity = |path: &Path| {
+        validity
+            .entry(path.to_path_buf())
+            .or_insert_with(|| monitor_certificate_file_validity(path))
+            .clone()
+    };
+    let primary_validity = file_validity(&tls.cert_path);
+    let sni_certificates = tls
+        .certificates
+        .iter()
+        .map(|cert| {
+            serde_json::json!({
+                "domains": cert.domains,
+                "cert_exists": cert.cert_path.exists(),
+                "key_exists": cert.key_path.exists(),
+                "file_validity": file_validity(&cert.cert_path),
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "mode": mode,
         "challenge": challenge,
         "server_name": tls.server_name,
         "cert_exists": tls.cert_path.exists(),
         "key_exists": tls.key_path.exists(),
+        "file_validity": primary_validity,
         "auto_https": {
             "enabled": tls.auto_https.enabled,
             "domains": tls.auto_https.domains,
@@ -17934,13 +18511,7 @@ fn monitor_tls_summary(config: &GatewayConfig) -> serde_json::Value {
             "max_active_certs": tls.on_demand.max_active_certs,
             "max_issues_per_hour": tls.on_demand.max_issues_per_hour,
         },
-        "sni_certificates": tls.certificates.iter().map(|cert| {
-            serde_json::json!({
-                "domains": cert.domains,
-                "cert_exists": cert.cert_path.exists(),
-                "key_exists": cert.key_path.exists(),
-            })
-        }).collect::<Vec<_>>(),
+        "sni_certificates": sni_certificates,
     })
 }
 
@@ -19815,10 +20386,8 @@ fn configured_stream_listener_route(
             normalized_upstreams.insert(0, upstream.to_string());
         }
         upstream.to_string()
-    } else if let Some(first) = normalized_upstreams.first() {
-        first.clone()
     } else {
-        return None;
+        normalized_upstreams.first()?.clone()
     };
 
     Some(RouteDecision {
@@ -23008,7 +23577,7 @@ impl ChunkedBodyScanner {
                     }
                 }
                 ChunkedScanState::BodyCrLf(seen) => {
-                    let expected = [b'\r', b'\n'];
+                    let expected = b"\r\n";
                     while *seen < 2 && !bytes.is_empty() {
                         if bytes[0] != expected[*seen] {
                             return Err(anyhow!("invalid chunk body terminator"));
@@ -23497,6 +24066,167 @@ fn absolutize_script_path(cwd: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_issuance_waits_for_other_order_before_touching_account_state() -> Result<()> {
+        let root = crate::test_support::TestDir::new("managed-order-serialization");
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, "not a directory")?;
+        let mut tls = crate::config::TlsConfig::default();
+        tls.acme.cache_dir = blocker.join("account");
+        let guard = managed_acme_issuance_lock().lock().await;
+        let mut issue = tokio::spawn(async move {
+            issue_managed_acme_certificate(&tls, &DashMap::new(), &DashMap::new()).await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut issue)
+            .await
+            .is_err());
+        drop(guard);
+        let error = issue.await?.expect_err("invalid account path must fail");
+        assert!(error
+            .to_string()
+            .contains("failed to create managed ACME cache directory"));
+        Ok(())
+    }
+
+    #[test]
+    fn additional_managed_certificate_inherits_dns_but_has_its_own_key_and_paths() {
+        let mut primary = crate::config::TlsConfig::default();
+        primary.acme.dns.provider = "volcengine".into();
+        primary.acme.domains = vec!["primary.example.com".into()];
+        let extra = crate::config::ManagedAdditionalCertificate {
+            domains: vec!["example.com".into(), "*.example.com".into()],
+            cert_path: PathBuf::from("rsa.crt"),
+            key_path: PathBuf::from("rsa.key"),
+            key_algorithm: AcmeKeyAlgorithm::Rsa2048,
+        };
+        let derived = additional_managed_tls(&primary, &extra);
+        assert_eq!(derived.acme.dns.provider, "volcengine");
+        assert_eq!(derived.acme.domains, extra.domains);
+        assert_eq!(derived.acme.key_algorithm, AcmeKeyAlgorithm::Rsa2048);
+        assert_eq!(derived.cert_path, extra.cert_path);
+        assert_eq!(derived.key_path, extra.key_path);
+        assert_eq!(primary.acme.domains, vec!["primary.example.com"]);
+    }
+
+    #[test]
+    fn managed_acme_lock_prevents_concurrent_process_issuance() -> Result<()> {
+        let root = crate::test_support::TestDir::new("managed-acme-process-lock");
+        let first = acquire_managed_acme_process_lock(&root)?;
+        assert!(acquire_managed_acme_process_lock(&root).is_err());
+        drop(first);
+        drop(acquire_managed_acme_process_lock(&root)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_certificate_watch_reloads_without_general_hot_reload() -> Result<()> {
+        crate::verify::harness::ensure_rustls_crypto_provider();
+        let root = crate::test_support::TestDir::new("managed-certificate-watch");
+        let cert_path = root.join("cert.pem");
+        let key_path = root.join("key.pem");
+        let write_pair = || -> Result<()> {
+            let key = KeyPair::generate()?;
+            let cert = CertificateParams::new(vec!["example.com".into()])?.self_signed(&key)?;
+            fs::write(&cert_path, cert.pem())?;
+            fs::write(&key_path, key.serialize_pem())?;
+            Ok(())
+        };
+        write_pair()?;
+        let mut config = GatewayConfig {
+            root_dir: root.to_path_buf(),
+            ..Default::default()
+        };
+        config.http.tls.mode = TlsMode::AcmeManaged;
+        config.http.tls.cert_path = cert_path.clone();
+        config.http.tls.key_path = key_path.clone();
+        config.http.tls.acme.cache_dir = root.join("acme");
+        config.runtime.hot_reload.enabled = false;
+        let gateway = Gateway::from_config(root.join("unused.yaml"), config).await?;
+        let original = gateway.current_state().await.tls_fingerprint.clone();
+        write_pair()?;
+        let task = tokio::spawn(gateway.clone().run_managed_certificate_watch_loop());
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if gateway.current_state().await.tls_fingerprint != original {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("managed certificate was not reloaded")?;
+        task.abort();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn websocket_reactor_failed_handoff_returns_lifetime_guard() {
+        let stats = Arc::new(GatewayStats::default());
+        let guard = ActiveWebSocketGuard::enter(stats.clone());
+        let Err((_error, guard)) = crate::stream_reactor::dispatch_websocket(-1, -1, 1, 0, guard)
+        else {
+            panic!("invalid descriptors must fail");
+        };
+        assert_eq!(stats.websocket_sessions_active.load(Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(stats.websocket_sessions_active.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.websocket_sessions_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn managed_renewal_respects_expiry_domains_and_key_pair() -> Result<()> {
+        crate::verify::harness::ensure_rustls_crypto_provider();
+        let root = crate::test_support::TestDir::new("managed-renewal-window");
+        let mut tls = crate::config::TlsConfig {
+            cert_path: root.join("cert.pem"),
+            key_path: root.join("key.pem"),
+            ..Default::default()
+        };
+        tls.acme.domains = vec!["example.com".into(), "*.example.com".into()];
+        let ca_key = KeyPair::generate()?;
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let write_pair = |days: i64| -> Result<()> {
+            let mut params = CertificateParams::new(tls.acme.domains.clone())?;
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "example.com");
+            params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+            let key = KeyPair::generate()?;
+            let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
+            fs::write(&tls.cert_path, cert.pem())?;
+            fs::write(&tls.key_path, key.serialize_pem())?;
+            Ok(())
+        };
+        assert!(managed_certificate_needs_renewal(&tls));
+        write_pair(60)?;
+        assert!(!managed_certificate_needs_renewal(&tls));
+        let self_signed_key = KeyPair::generate()?;
+        let self_signed =
+            CertificateParams::new(tls.acme.domains.clone())?.self_signed(&self_signed_key)?;
+        fs::write(&tls.cert_path, self_signed.pem())?;
+        fs::write(&tls.key_path, self_signed_key.serialize_pem())?;
+        assert!(managed_certificate_needs_renewal(&tls));
+        write_pair(60)?;
+        let mut changed = tls.clone();
+        changed.acme.domains.push("other.example.com".into());
+        assert!(managed_certificate_needs_renewal(&changed));
+        changed = tls.clone();
+        changed.acme.key_algorithm = AcmeKeyAlgorithm::Rsa2048;
+        assert!(managed_certificate_needs_renewal(&changed));
+        write_pair(20)?;
+        assert!(managed_certificate_needs_renewal(&tls));
+        write_pair(60)?;
+        fs::write(&tls.key_path, KeyPair::generate()?.serialize_pem())?;
+        assert!(managed_certificate_needs_renewal(&tls));
+        Ok(())
+    }
     use crate::config::{
         AdminConfig, AdminMonitorConfig, HttpRateLimitConfig, RateLimitKey, ReverseProxyConfig,
         ReverseProxyRouteConfig, StaticSiteConfig, StreamAffinityConfig, WebDavConfig,
@@ -24593,6 +25323,13 @@ mod tests {
             buffered_request_bodies: crate::body_budget::BufferedBodyBudget::new(0),
         };
         let remote_addr = "203.0.113.10:443".parse().expect("remote address");
+        gateway
+            .stats
+            .configure_domain_stats(&["api.example.com".into()]);
+        gateway
+            .stats
+            .record_domain_request(Some("api.example.com:443"));
+        let _websocket = ActiveWebSocketGuard::enter(gateway.stats.clone());
         let login = gateway
             .serve_monitor_api(
                 Method::POST,
@@ -24656,6 +25393,9 @@ mod tests {
             .to_bytes();
         let summary: serde_json::Value = serde_json::from_slice(&read_body).expect("summary json");
         assert_eq!(summary["schema_version"], 1);
+        assert_eq!(summary["stats"]["domain_requests"]["api.example.com"], 1);
+        assert_eq!(summary["stats"]["websocket_sessions_active"], 1);
+        assert_eq!(summary["stats"]["websocket_sessions_total"], 1);
         assert!(summary["ssl"].get("cert_path").is_none());
     }
 
@@ -24674,6 +25414,29 @@ mod tests {
         assert!(summary.get("cert_path").is_none());
         assert!(summary.get("key_path").is_none());
         assert!(!summary.to_string().contains("should-not-appear"));
+    }
+
+    #[test]
+    fn monitor_certificate_validity_is_bounded_and_redacted() -> Result<()> {
+        let root = crate::test_support::TestDir::new("monitor-cert-validity");
+        let cert_path = root.join("private-cert-name.pem");
+        let key = KeyPair::generate()?;
+        let cert = CertificateParams::new(vec!["example.com".into()])?.self_signed(&key)?;
+        fs::write(&cert_path, cert.pem())?;
+        let mut config = GatewayConfig::default();
+        config.http.tls.cert_path = cert_path.clone();
+        let summary = monitor_tls_summary(&config);
+        assert_eq!(summary["file_validity"]["valid_now"], true);
+        assert!(
+            summary["file_validity"]["not_after"].as_i64().unwrap()
+                > summary["file_validity"]["not_before"].as_i64().unwrap()
+        );
+        assert!(!summary.to_string().contains("private-cert-name"));
+        fs::write(&cert_path, vec![b'x'; 1024 * 1024 + 1])?;
+        assert!(monitor_tls_summary(&config)["file_validity"].is_null());
+        fs::remove_file(&cert_path)?;
+        assert!(monitor_tls_summary(&config)["file_validity"].is_null());
+        Ok(())
     }
 
     #[test]

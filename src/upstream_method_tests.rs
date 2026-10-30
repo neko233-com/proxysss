@@ -218,8 +218,10 @@ async fn route_compression_wire_gzip_identity_sse_range_and_encoded_cache_isolat
             r#"export default {{name:"compression-fixture",access(message){{const p=message.ctx.path;return {{upstream:"http://{address}",upstream_method:message.ctx.method==="HEAD"?"GET":null,compression:{{enabled:true,algorithms:["gzip"],min_length:8,content_types:["text/plain","text/html","text/event-stream"]}},cache:{{enabled:p.indexOf("/encoded")===0,behavior:"override",ttl_secs:30,vary_headers:p.indexOf("/encoded-vary")===0?["Accept-Encoding"]:[]}} }};}} }};"#
         ),
     )?;
-    let mut config = GatewayConfig::default();
-    config.root_dir = root.to_path_buf();
+    let mut config = GatewayConfig {
+        root_dir: root.to_path_buf(),
+        ..Default::default()
+    };
     config.http.tls.cert_path = root.join("cert.pem");
     config.http.tls.key_path = root.join("key.pem");
     config.http.tls_bind.clear();
@@ -530,8 +532,10 @@ async fn actual_h1_h2_h3_head_uses_get_metadata_without_body_and_headers_append_
     }} }};"#
         ),
     )?;
-    let mut config = GatewayConfig::default();
-    config.root_dir = root.to_path_buf();
+    let mut config = GatewayConfig {
+        root_dir: root.to_path_buf(),
+        ..Default::default()
+    };
     config.http.tls.cert_path = root.join("cert.pem");
     config.http.tls.key_path = root.join("key.pem");
     config.http.tls_bind.clear();

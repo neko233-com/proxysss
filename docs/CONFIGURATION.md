@@ -11,6 +11,8 @@ proxysss 的配置目标不是“把 nginx 指令重新拼一遍”，而是让�
 
 配置对象拒绝未知字段，包括禁用服务中的拼写错误和未实现选项；错误会指出配置文件与字段，启动失败，重载则保留正在服务的有效配置。请求头、脚本 env、DNS credentials 与 upstream_weights 是开放映射，可使用自定义键；已有明确支持的别名仍可读取。先运行 proxysss -c proxysss.yaml check-config，再执行重载。
 
+`proxysss open config` 打开默认配置；`proxysss -c /path/to/proxysss.yaml open config` 打开指定文件。Windows、macOS 和有图形会话的 Linux 使用系统文件关联；无图形 Linux 使用终端中的 `VISUAL`、`EDITOR` 或 `vi`。文件不存在或无交互终端时返回错误，不创建文件或直接输出可能包含密钥的内容。
+
 所有例子都基于产品默认值：
 
 - 公网 HTTP 默认端口 `80`
@@ -476,6 +478,35 @@ http:
 
 - `credentials` 是敏感配置；保护文件权限并安全分发，不要把真实 token 放进仓库。示例中的占位符不能用于真实签证，普通配置展示应脱敏。
 - 云厂商 provider 是内建策略工厂的一部分，不要混用旧的外部 `acme.sh` 方式，除非目标厂商还没有内建支持。
+- 内建续期按 `renew_interval_hours` 检查；有效证书距到期超过 30 天时不会新建订单。证书缺失、密钥或域名不匹配、算法变化、自签名或到期窗口内会申请；管理员手动签发仍可显式新建订单。火山引擎 DNS-01 仅清理该次创建的 TXT，保留同名的其他记录。
+- 内建 DNS-01 的 `credentials` 值可写为 `env:变量名`，由服务进程环境在创建 provider 时读取；变量不存在或为空时签发失败。配置里只保留引用，环境变量变更需重启服务。外部 `acme_dns_external` 不使用此语法。
+- 内建 DNS-01 会先发布本订单全部 TXT，再通过公共 DNS-over-HTTPS 检查每个值可见后通知 CA；需要访问阿里公共 DNS 或 Cloudflare 公共 DNS，最长等待 900 秒，失败时清理本次创建的记录并报告错误。不同地区的 DNS 缓存可能仍有传播延迟。
+
+同一实例需要 ECDSA 和 RSA 两套证书时，可以通过 `acme.additional` 添加独立证书。额外证书继承主 ACME 账户、DNS provider 和检查间隔，拥有独立的域名、密钥算法与文件路径；`certificates` 决定哪些 SNI 使用它。额外证书目前要求主模式为内建 DNS-01。首次启动可签发缺失的文件；热重载新增尚未签发的 SNI 文件时，先准备文件或重启以执行首次签发。
+
+```yaml
+http:
+  tls:
+    mode: acme_managed
+    acme:
+      challenge: dns01
+      domains: [example.com, "*.example.com"]
+      directory_production: true
+      dns:
+        provider: volcengine
+        credentials:
+          access_key_id: "REDACTED"
+          secret_access_key: "REDACTED"
+      additional:
+        - domains: [example.com, "*.example.com"]
+          cert_path: certs/compat-rsa.crt
+          key_path: certs/compat-rsa.key
+          key_algorithm: rsa2048
+    certificates:
+      - domains: [legacy.example.com]
+        cert_path: certs/compat-rsa.crt
+        key_path: certs/compat-rsa.key
+```
 
 ### 3.3 管理面 + 自动化
 
@@ -528,6 +559,58 @@ GET /_proxysss/monitor/v1/ssl
 只读监控面拒绝所有非 GET 查询方法，不能使用管理员 bearer token，也不会返回配置文件路径、证书私钥路径或 DNS 凭据。生产环境必须使用真实 HTTPS 证书；不要把这个密码放进 Git、日志、剪贴板或 iCloud 普通数据。
 
 HTTP 统计口径在管理、只读监控与 `/metrics` 中保持一致：JSON `http_requests` / Prometheus `proxysss_http_requests_total` 记录处理的请求，包含缓存、sendfile、反代、SSE 与 HTTP/1、HTTP/2、HTTP/3。WS/WSS 每次握手计一个 HTTP 请求，后续消息不重复计数。JSON `http_errors` / Prometheus `proxysss_http_errors_total` 记录网关生成或上游返回的 **4xx 与 5xx 响应**，同一响应只计一次；404、413、上游 503 和网关 502 都属于该计数。它不是纯 5xx 故障指标，也不表示所有 socket/正文传输异常；尚未形成 HTTP 响应的失败和发送途中中断应结合错误日志检查。
+
+JSON `websocket_sessions_total` 和 `websocket_sessions_active` 分别表示进程启动以来成功升级的 WebSocket 会话数和当前活动会话数；Prometheus 使用对应的 `proxysss_websocket_sessions_total`、`proxysss_websocket_sessions_active`。失败握手和普通 TCP 不计入，会话结束后活动数下降，重启后累计数归零。
+
+只读 `stats` 还包含网关运行秒数 `uptime_seconds`、进程 CPU/内存、TCP 会话、UDP 流量、重载、认证失败、脚本错误和 watchdog 计数；这些累计值在进程重启后重置。`ssl.file_validity` 和各 SNI 条目的 `file_validity` 提供证书文件的 `not_before`、`not_after` Unix 秒及 `valid_now`；缺失、超出 1 MiB 或无法解析时为 null。它描述当前磁盘文件，不保证运行中监听器或云边缘已加载该证书，也不暴露文件路径或密钥。
+
+可按需配置最多 256 个精确域名的访问次数，未列出的 Host 不创建指标；默认列表为空，不增加域名查找。统计按 HTTP 请求计数，WS/WSS 仅计握手，忽略端口并按域名大小写不敏感匹配。只读监控 `stats` 中的 `domain_requests` 是域名到进程内累计次数的映射，Prometheus 对应 `proxysss_domain_http_requests_total{host="..."}`。热重载保留仍在列表中的计数，移除域名或重启进程会丢弃对应累计值。
+
+```yaml
+monitoring:
+  domain_stats_hosts: [api.example.com, cdn.example.com]
+```
+
+启动时、周期续期及 CLI 手动签发的结果、重载失败和网关加载新证书，可发送到多个通知渠道。目前渠道类型为飞书自定义机器人，各渠道并发发送，失败最多尝试三次；响应丢失时可能重复，重启后没有持久化重试队列。Webhook 和可选签名密钥通过环境变量提供，不写入 YAML；更改进程环境需要重启服务。签发完成仅表示证书文件已更新，加载成功表示网关已加载证书，均不代表云产品已部署；on-demand 事件目前不发送通知。
+
+飞书使用带状态颜色的消息卡片，展示事件、详情、UTC 时间和固定关键词，如 `proxysss SSL certificate_loaded`、`proxysss SSL cloud_sync_succeeded`；可按事件名称、目标名或关键词查找，实际搜索索引取决于飞书客户端。
+
+云同步成功卡片附带本次云端证书 ID、证书 SAN 域名（含泛域名）和已配置域名的 HTTPS 核验链接；这些链接访问真实业务域名，证书验证仅代表发起同步的网络出口。
+
+```yaml
+notifications:
+  channels:
+    - name: ops
+      kind: feishu
+      webhook_env: PROXYSSS_FEISHU_WEBHOOK
+      signing_secret_env: PROXYSSS_FEISHU_SIGNING_SECRET
+```
+
+### 3.4.1 云产品证书同步
+
+`certificate_sync.targets` 按目标单独启停并选择策略；目前实现 `volcengine_dcdn`。服务每 60 秒检查启用目标的证书变更，失败或部署尚未完成时重试。导入会复用相同证书；成功要求 DCDN 返回 `Deployed` 且当前网络出口看到的 TLS 叶证书与本地匹配。证书须有效、私钥匹配并覆盖配置的所有域名。该检查只代表当前网络出口，不能证明所有边缘节点已更新。同步可发送到已配置的通知渠道，失败提醒在同一进程内去重。
+
+`aliyun`、`tencent`、`aws` 和 `azure` 是预留策略名称，当前未实现、未验证；只能保留为禁用目标，开启会在配置检查时报错。
+
+```yaml
+certificate_sync:
+  targets:
+    - name: example-cdn
+      enabled: true
+      provider: volcengine_dcdn
+      cert_path: ./certs/example.crt
+      key_path: ./certs/example.key
+      domains: [cdn.example.com]
+      project: default
+      access_key_env: PROXYSSS_VOLC_ACCESS_KEY
+      secret_key_env: PROXYSSS_VOLC_SECRET_KEY
+```
+
+服务进程和手动命令均需提供所引用的环境变量；证书目录需要允许创建锁文件。密钥不应写入 YAML 或 Git。执行 `proxysss -c /path/to/proxysss.yaml certificate sync` 可同步所有启用目标；失败或部署尚未生效时命令返回非零。运行中的任务可能在关闭目标后完成当前请求。
+
+手动触发单个或批量任务：`proxysss -c /path/to/proxysss.yaml certificate list` 输出可选证书和同步目标的 JSON，不包含凭据。`proxysss -c /path/to/proxysss.yaml certificate sync --target cdn` 同步单个目标，重复 `--target` 选择多个，或使用 `--all`；省略选项也同步全部已启用目标。`proxysss -c /path/to/proxysss.yaml certificate issue --certificate primary` 强制签发主证书，`--certificate additional-1` 选择第一个额外证书，重复选项选择多个，`--all` 签发全部；未知名称在开始前报错。额外证书序号按 YAML 顺序确定。DNS-01 手动签发可独立运行，与后台签发通过共享 ACME 缓存目录内的锁避免并发；多台主机仅在共享支持锁的同一缓存目录时才受该锁保护。签发成功只代表文件更新，运行中的网关会异步重载，云部署结果需另查。HTTP-01 / TLS-ALPN-01 需要运行中的本机 loopback admin、显式开启写操作和 bearer token，由网关处理挑战；CLI 会先核对运行中的证书配置。
+
+每月 1 日 04:00（Asia/Shanghai）可由 systemd timer 调用相应 oneshot service：`OnCalendar=*-*-01 04:00:00 Asia/Shanghai`、`Persistent=true`、`AccuracySec=1s`。service 的 `ExecStart` 使用上述命令，并通过受限 `EnvironmentFile` 提供同样的凭据；应以 `systemd-analyze calendar` 检查目标主机的下次时间。也可由支持时区设置的 cron 调用 `0 4 1 * *`；普通 cron 不补跑停机期间错过的任务。不能把密钥写入 crontab；定时同步现有证书，不强制新建 ACME 订单。
 
 ### 3.5 游戏长连接 + UDP 同时接入
 

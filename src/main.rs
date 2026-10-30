@@ -3,6 +3,7 @@ mod ai_proxy;
 mod auth_request;
 mod bench;
 mod body_budget;
+mod certificate_sync;
 mod config;
 mod demo;
 mod filecloud;
@@ -12,6 +13,7 @@ mod install;
 #[cfg(target_os = "linux")]
 mod linux_cpu;
 mod linux_tune;
+mod notifications;
 mod runtime_tuning;
 mod script;
 mod security;
@@ -38,6 +40,8 @@ mod verify;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -137,6 +141,11 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+    /// Trigger a configured cloud certificate synchronization.
+    Certificate {
+        #[command(subcommand)]
+        action: CertificateCommands,
+    },
     Service {
         #[command(subcommand)]
         action: ServiceCommands,
@@ -152,6 +161,11 @@ enum Commands {
     PrintDefaultConfig {
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Yaml)]
         format: ConfigOutputFormat,
+    },
+    /// Open the selected YAML configuration in the desktop or terminal editor.
+    Open {
+        #[command(subcommand)]
+        action: OpenCommands,
     },
     Config {
         #[command(subcommand)]
@@ -187,6 +201,224 @@ enum Commands {
         #[command(subcommand)]
         action: TuneCommands,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum OpenCommands {
+    /// Open the configuration selected by --config (or the normal default).
+    Config,
+}
+
+#[derive(Subcommand, Debug)]
+enum CertificateCommands {
+    /// List certificate selectors and cloud destinations without credentials.
+    List,
+    /// Synchronize enabled destinations; repeat --target to select a batch.
+    Sync {
+        #[arg(long = "target", conflicts_with = "all")]
+        targets: Vec<String>,
+        #[arg(long, conflicts_with = "targets")]
+        all: bool,
+    },
+    /// Issue selected managed certificates, or all of them.
+    Issue {
+        #[arg(
+            long = "certificate",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        certificates: Vec<String>,
+        #[arg(long, conflicts_with = "certificates")]
+        all: bool,
+    },
+}
+
+fn selected_managed_certificates(
+    config: &GatewayConfig,
+    selected: &[String],
+    all: bool,
+) -> Result<Vec<(String, config::TlsConfig)>> {
+    if config.http.tls.mode != config::TlsMode::AcmeManaged {
+        anyhow::bail!("certificate issue requires http.tls.mode=acme_managed");
+    }
+    let tls = &config.http.tls;
+    let mut available = vec![("primary".to_owned(), tls.clone())];
+    available.extend(tls.acme.additional.iter().enumerate().map(|(index, item)| {
+        (
+            format!("additional-{}", index + 1),
+            gateway::additional_managed_tls(tls, item),
+        )
+    }));
+    if !all {
+        if selected.is_empty() {
+            anyhow::bail!("select --all or at least one --certificate");
+        }
+        for name in selected {
+            if !available.iter().any(|(candidate, _)| candidate == name) {
+                anyhow::bail!("managed certificate not found: {name}");
+            }
+        }
+        available.retain(|(name, _)| selected.contains(name));
+    }
+    Ok(available)
+}
+
+async fn issue_selected_certificates(
+    config: &GatewayConfig,
+    selected: &[String],
+    all: bool,
+) -> Result<()> {
+    let certificates = selected_managed_certificates(config, selected, all)?;
+    let mut failed = false;
+    for (name, tls) in certificates {
+        let result = if tls.acme.challenge == config::AcmeChallengeType::Dns01 {
+            gateway::issue_managed_acme_certificate(
+                &tls,
+                &dashmap::DashMap::new(),
+                &dashmap::DashMap::new(),
+            )
+            .await
+        } else {
+            issue_via_loopback_admin(config, &tls).await
+        };
+        match result {
+            Ok(()) => {
+                println!("certificate {name}: issued; the running gateway reloads managed material asynchronously");
+                notifications::dispatch(
+                    &config.notifications,
+                    notifications::NotificationEvent::CertificateIssued,
+                    &format!("proxysss 已签发证书：{name}。网关加载和云部署状态请分别确认。"),
+                )
+                .await;
+            }
+            Err(error) => {
+                eprintln!("certificate {name}: issuance failed: {error:#}");
+                notifications::dispatch(
+                    &config.notifications,
+                    notifications::NotificationEvent::CertificateFailed,
+                    &format!("proxysss 证书签发失败：{name}。请查看网关错误日志。"),
+                )
+                .await;
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        anyhow::bail!("one or more managed certificate issuances failed");
+    }
+    Ok(())
+}
+
+async fn issue_via_loopback_admin(config: &GatewayConfig, tls: &config::TlsConfig) -> Result<()> {
+    let addr: std::net::SocketAddr =
+        config.admin.bind.parse().context(
+            "HTTP-01/TLS-ALPN-01 manual issuance requires a numeric loopback admin bind",
+        )?;
+    if !config.admin.enabled
+        || !config.admin.enable_write_ops
+        || !addr.ip().is_loopback()
+        || config.admin.bearer_token.is_empty()
+    {
+        anyhow::bail!("HTTP-01/TLS-ALPN-01 manual issuance requires a running loopback admin with write operations and a bearer token");
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(1200))
+        .build()?;
+    let base = format!("http://{addr}");
+    let summary: serde_json::Value = client
+        .get(format!("{base}/v1/tls/summary"))
+        .bearer_auth(&config.admin.bearer_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if summary
+        .pointer("/tls/cert_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(tls.cert_path.to_string_lossy().as_ref())
+        || summary.pointer("/tls/acme/domains") != Some(&serde_json::json!(tls.acme.domains))
+        || summary.pointer("/tls/acme/directory_production")
+            != Some(&serde_json::json!(tls.acme.directory_production))
+        || summary.pointer("/tls/key_algorithm")
+            != Some(&serde_json::to_value(tls.acme.key_algorithm)?)
+        || summary.pointer("/tls/challenge") != Some(&serde_json::to_value(tls.acme.challenge)?)
+    {
+        anyhow::bail!("running admin TLS configuration does not match the selected certificate");
+    }
+    client
+        .post(format!("{base}/v1/tls/issue-now"))
+        .bearer_auth(&config.admin.bearer_token)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn open_config(config: Option<PathBuf>) -> Result<()> {
+    let path = install::resolve_run_config_path(config)?;
+    let path = fs::canonicalize(&path)
+        .with_context(|| format!("cannot open configuration {}", path.display()))?;
+    if !path.is_file() {
+        anyhow::bail!("configuration is not a regular file: {}", path.display());
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(&path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(&path);
+        command
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = {
+        let graphical = ["WAYLAND_DISPLAY", "DISPLAY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+        if graphical {
+            let mut command = Command::new("xdg-open");
+            command.arg(&path);
+            command
+        } else {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                anyhow::bail!(
+                    "a terminal is required to edit the configuration without a graphical desktop"
+                );
+            }
+            let editor = std::env::var_os("VISUAL")
+                .filter(|value| !value.is_empty())
+                .or_else(|| std::env::var_os("EDITOR").filter(|value| !value.is_empty()))
+                .unwrap_or_else(|| OsString::from("vi"));
+            let mut command = if Path::new(&editor).is_file() {
+                Command::new(editor)
+            } else {
+                // The editor variable may include simple arguments, such as
+                // `vim -f`. Expansion does not evaluate shell metacharacters.
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("exec $PROXYSSS_EDITOR \"$1\"")
+                    .arg("proxysss")
+                    .env("PROXYSSS_EDITOR", editor);
+                command
+            };
+            command.arg(&path);
+            command
+        }
+    };
+    let status = command
+        .status()
+        .context("failed to start configuration editor")?;
+    if !status.success() {
+        anyhow::bail!("configuration editor exited with {status}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -392,7 +624,15 @@ const CAPABILITY_MATRIX: &[(&str, &str)] = &[
     ),
     (
         "multi-cert sni",
-        "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname",
+        "http.tls.certificates and services.domain_routes[*].ssl manual mode select certs by SNI hostname; managed DNS-01 acme.additional supports separately issued certificate keys",
+    ),
+    (
+        "certificate notifications",
+        "notifications.channels sends certificate and cloud sync events concurrently to Feishu webhooks referenced by environment variables; cloud success requires DCDN status and TLS fingerprint verification",
+    ),
+    (
+        "cloud certificate synchronization",
+        "certificate_sync.targets enables provider strategies; volcengine_dcdn synchronizes changed certificates and proxysss certificate sync supports manual or cron invocation",
     ),
     (
         "zstd/gzip/brotli compression",
@@ -825,6 +1065,65 @@ async fn main() -> Result<()> {
             init_cli_logging();
             install::bootstrap_certs_in_dir(dir, overwrite)
         }
+        Commands::Certificate {
+            action: CertificateCommands::List,
+        } => {
+            let path = install::resolve_run_config_path(global_config)?;
+            let config = GatewayConfig::load(&path)?;
+            let certificates = if config.http.tls.mode == config::TlsMode::AcmeManaged {
+                selected_managed_certificates(&config, &[], true)?
+                    .into_iter().map(|(name, tls)| serde_json::json!({
+                        "name": name, "domains": tls.acme.domains,
+                        "key_algorithm": tls.acme.key_algorithm, "challenge": tls.acme.challenge,
+                        "cert_path": tls.cert_path,
+                    })).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let targets = config
+                .certificate_sync
+                .targets
+                .iter()
+                .map(|target| {
+                    serde_json::json!({
+                        "name": target.name, "enabled": target.enabled, "provider": target.provider,
+                        "domains": target.domains,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"certificates": certificates, "sync_targets": targets})
+                )?
+            );
+            Ok(())
+        }
+        Commands::Certificate {
+            action: CertificateCommands::Sync { targets, all: _ },
+        } => {
+            init_cli_logging();
+            let path = install::resolve_run_config_path(global_config)?;
+            let config = GatewayConfig::load(&path)?;
+            if !config
+                .certificate_sync
+                .targets
+                .iter()
+                .any(|target| target.enabled)
+            {
+                println!("no enabled certificate synchronization targets");
+            }
+            certificate_sync::sync_config(&config.certificate_sync, &config.notifications, &targets)
+                .await
+        }
+        Commands::Certificate {
+            action: CertificateCommands::Issue { certificates, all },
+        } => {
+            init_cli_logging();
+            let path = install::resolve_run_config_path(global_config)?;
+            let config = GatewayConfig::load(&path)?;
+            issue_selected_certificates(&config, &certificates, all).await
+        }
         Commands::Service { action } => match action {
             ServiceCommands::Install { config } => {
                 init_cli_logging();
@@ -863,6 +1162,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Open {
+            action: OpenCommands::Config,
+        } => open_config(global_config),
         Commands::Config { action, config } => {
             init_cli_logging();
             let command_config = merge_config_arg(global_config.clone(), config);
@@ -2936,6 +3238,94 @@ mod tests {
             cli.config_file,
             Some(PathBuf::from("examples/all-scenarios.example.yaml"))
         );
+    }
+
+    #[test]
+    fn certificate_sync_cli_accepts_a_config_path() {
+        let cli =
+            Cli::try_parse_from(["proxysss", "-c", "gateway.yaml", "certificate", "sync"]).unwrap();
+        assert_eq!(cli.config_file, Some(PathBuf::from("gateway.yaml")));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Certificate {
+                action: CertificateCommands::Sync { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn certificate_cli_selects_one_or_a_batch_without_silent_unknown_names() {
+        let cli = Cli::try_parse_from([
+            "proxysss",
+            "certificate",
+            "issue",
+            "--certificate",
+            "primary",
+            "--certificate",
+            "additional-1",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Certificate { action: CertificateCommands::Issue { certificates, all: false } }) if certificates.len() == 2)
+        );
+        assert!(Cli::try_parse_from(["proxysss", "certificate", "issue"]).is_err());
+        assert!(Cli::try_parse_from([
+            "proxysss",
+            "certificate",
+            "sync",
+            "--all",
+            "--target",
+            "example"
+        ])
+        .is_err());
+        let mut config = GatewayConfig::default();
+        config.http.tls.mode = config::TlsMode::AcmeManaged;
+        config
+            .http
+            .tls
+            .acme
+            .additional
+            .push(config::ManagedAdditionalCertificate {
+                domains: vec!["example.com".into()],
+                cert_path: "other.crt".into(),
+                key_path: "other.key".into(),
+                key_algorithm: config::AcmeKeyAlgorithm::Rsa2048,
+            });
+        assert_eq!(
+            selected_managed_certificates(&config, &[], true)
+                .unwrap()
+                .len(),
+            2
+        );
+        let selected =
+            selected_managed_certificates(&config, &["additional-1".into()], false).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].1.acme.key_algorithm,
+            config::AcmeKeyAlgorithm::Rsa2048
+        );
+        assert!(selected_managed_certificates(&config, &["not-found".into()], false).is_err());
+    }
+
+    #[test]
+    fn open_config_accepts_the_global_config_path() {
+        let cli = Cli::try_parse_from(["proxysss", "open", "config", "-c", "custom.yaml"])
+            .expect("open config should accept a selected config");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Open {
+                action: OpenCommands::Config
+            })
+        ));
+        assert_eq!(cli.config_file, Some(PathBuf::from("custom.yaml")));
+    }
+
+    #[test]
+    fn open_config_does_not_create_a_missing_file() {
+        let root = crate::test_support::TestDir::new("open-config-missing");
+        let path = root.join("missing.yaml");
+        assert!(open_config(Some(path.clone())).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

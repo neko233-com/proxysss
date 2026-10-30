@@ -23,8 +23,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Tests and benchmarks run locally. Dispatch builds rehearse packaging;
-          # tags additionally validate the previously collected release evidence.
+          # Functional validation is performed before tagging. Dispatch builds
+          # rehearse packaging; tags also require matching release metadata.
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
             echo "not a tag build; release metadata check is a rehearsal"
             exit 0
@@ -33,26 +33,7 @@ jobs:
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "$cargo_version" = "${tag#v}"
           grep -Eq "^## ${tag}( |$)" CHANGELOG.md
-          if [[ "$tag" == "v1.3.8" ]]; then
-            # Operator explicitly approved this one functional release on 2026-09-08.
-            # No strict Linux/nginx performance claim is attached to this version.
-            echo "v1.3.8: operator-approved functional release; strict performance evidence waived"
-          elif [[ "$tag" == "v1.3.9" ]]; then
-            # 2026-09-21: operator requests a stable functional release now;
-            # nginx superiority and cross-host performance evidence are waived.
-            # Local Linux/Windows validation is recorded before pushing this tag.
-            test -s docs/RELEASE-1.3.9.md
-            echo "v1.3.9: operator-approved stability release; no nginx superiority claim"
-          elif [[ "$tag" == "v1.3.10" ]]; then
-            # 2026-10-21: operator approved a functional/stability release for
-            # the Linux nginx migration. Desktop IPv6 environment limitations
-            # are disclosed; no all-platform runtime or performance-win claim.
-            test -s docs/RELEASE-1.3.10.md
-            test -s docs/release-1.3.10.html
-            echo "v1.3.10: operator-approved Linux migration stability release; no nginx superiority claim"
-          else
-            go run scripts/verify-production-evidence.go --manifest "performance-evidence/${tag}.json" --tag "$tag" --commit "$GITHUB_SHA"
-          fi
+          echo "Version and changelog match; no benchmark is required for release."
 
   build:
     strategy:

@@ -446,6 +446,17 @@
             <p class="subtle">这不是“先背概念再动手”的文档。你应该先有一个能工作的配置，然后再知道为什么它工作。</p>
           </div>
 
+          <h3>一键安装与版本下载</h3>
+          <p>Windows PowerShell 安装最新正式版：</p>
+          <pre><code class="language-powershell">&amp; ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest</code></pre>
+          <p>Linux / macOS 安装最新正式版：</p>
+          <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash</code></pre>
+          <p>安装指定版本时，PowerShell 将 <code>-Version latest</code> 换成 <code>-Version v1.3.10</code>；Shell 在命令末尾添加 <code>-s -- --version v1.3.10</code>，替换为需要的已发布标签。脚本安装二进制并初始化配置和服务；Linux 写入 <code>/usr/local/bin</code> 时可能需要 sudo。</p>
+          <p><a href="https://github.com/neko233-com/proxysss/releases/latest">下载最新版本</a> · <a href="https://github.com/neko233-com/proxysss/releases">查看各版本及平台安装包</a> · <a href="https://github.com/neko233-com/proxysss/tags">查看 Git 标签</a></p>
+          <pre><code>proxysss --version
+proxysss check-config
+proxysss service status</code></pre>
+
           <div class="paths">
             <article class="path">
               <span class="tag beginner">5 分钟可用</span>
@@ -793,7 +804,7 @@ proxysss token show</code></pre>
     </div>
 
     <footer class="footer">
-      <strong>一条团队约束写在这里：</strong> 后续所有性能优化都要压测，而且必须是无副作用优化。generic SSE、静态、HTTP reverse proxy、TCP、UDP 应该一起看；KCP 专用封装不进入 nginx 对照矩阵；严格 Ubuntu Docker 矩阵包含透明 QCP，不能据此声称 QCP 帧终止。
+      <strong>性能验证：</strong> 压测是可选诊断，不是发布门槛。进行性能比较时，应同时观察 generic SSE、静态、HTTP reverse proxy、TCP 与 UDP；KCP 专用封装不进入 nginx 对照矩阵，透明 QCP 转发也不代表 QCP 帧终止。
     </footer>
   </div>
 

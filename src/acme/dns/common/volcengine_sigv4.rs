@@ -22,11 +22,20 @@ pub struct VolcengineSigV4 {
 
 impl VolcengineSigV4 {
     pub fn new(access_key_id: String, secret_access_key: String, region: String) -> Self {
+        Self::for_service(access_key_id, secret_access_key, region, "dns".to_string())
+    }
+
+    pub fn for_service(
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        service: String,
+    ) -> Self {
         Self {
             access_key_id,
             secret_access_key,
             region,
-            service: "dns".to_string(),
+            service,
         }
     }
 
@@ -46,23 +55,39 @@ impl VolcengineSigV4 {
         payload: &[u8],
         content_type: Option<&str>,
     ) -> Result<SignedRequest> {
-        let x_date = x_datetime();
+        self.sign_at(method, host, query, payload, content_type, &x_datetime())
+    }
+
+    fn sign_at(
+        &self,
+        method: &str,
+        host: &str,
+        query: &str,
+        payload: &[u8],
+        content_type: Option<&str>,
+        x_date: &str,
+    ) -> Result<SignedRequest> {
         let date_stamp = &x_date[..8];
         let payload_hash = hex_sha256(payload);
 
-        let mut canonical_headers = format!("host:{host}\nx-date:{x_date}\n");
-        let mut signed_headers = "host;x-date".to_string();
-        if method == "POST" {
-            canonical_headers.push_str(&format!("x-content-sha256:{payload_hash}\n"));
-            signed_headers = "host;x-content-sha256;x-date".to_string();
-            if let Some(content_type) = content_type {
-                canonical_headers.push_str(&format!("content-type:{content_type}\n"));
-                signed_headers = "content-type;host;x-content-sha256;x-date".to_string();
-            }
-        }
+        let (canonical_headers, signed_headers) = match (method, content_type) {
+            ("POST", Some(content_type)) => (
+                format!("content-type:{content_type}\nhost:{host}\nx-content-sha256:{payload_hash}\nx-date:{x_date}\n"),
+                "content-type;host;x-content-sha256;x-date",
+            ),
+            ("POST", None) => (
+                format!("host:{host}\nx-content-sha256:{payload_hash}\nx-date:{x_date}\n"),
+                "host;x-content-sha256;x-date",
+            ),
+            _ => (format!("host:{host}\nx-date:{x_date}\n"), "host;x-date"),
+        };
+        let mut params: Vec<&str> = query.split('&').filter(|part| !part.is_empty()).collect();
+        params.sort_unstable();
+        let canonical_query = params.join("&");
 
-        let canonical_request =
-            format!("{method}\n/\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        let canonical_request = format!(
+            "{method}\n/\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
         let credential_scope = format!("{date_stamp}/{}/{}/request", self.region, self.service);
         let string_to_sign = format!(
             "HMAC-SHA256\n{x_date}\n{credential_scope}\n{}",
@@ -92,7 +117,7 @@ impl VolcengineSigV4 {
                 format!("/?{query}")
             },
             authorization,
-            x_date,
+            x_date: x_date.to_string(),
             content_type: content_type.map(str::to_string),
             content_sha256: if method == "POST" {
                 Some(payload_hash)
@@ -129,44 +154,65 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn x_datetime() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let seconds_per_day = 86_400;
-    let days = now / seconds_per_day;
-    let day_seconds = now % seconds_per_day;
-    let mut year = 1970 + (days / 365);
-    let mut remaining_days = days % 365;
-    while remaining_days >= days_in_year(year) {
-        remaining_days -= days_in_year(year);
-        year += 1;
-    }
-    let mut month = 1;
-    while remaining_days >= days_in_month(year, month) {
-        remaining_days -= days_in_month(year, month);
-        month += 1;
-    }
-    let day = remaining_days + 1;
-    let hour = day_seconds / 3600;
-    let minute = (day_seconds % 3600) / 60;
-    let second = day_seconds % 60;
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+    format_datetime(time::OffsetDateTime::now_utc())
 }
 
-fn days_in_year(year: u64) -> u64 {
-    if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) {
-        366
-    } else {
-        365
-    }
+fn format_datetime(now: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
 }
 
-fn days_in_month(year: u64, month: u64) -> u64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if days_in_year(year) == 366 => 29,
-        _ => 28,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_date_observes_leap_years_and_utc() {
+        for (timestamp, expected) in [
+            (0, "19700101T000000Z"),
+            (1_709_251_200, "20240301T000000Z"),
+            (1_798_761_600, "20270101T000000Z"),
+        ] {
+            assert_eq!(
+                format_datetime(time::OffsetDateTime::from_unix_timestamp(timestamp).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn signatures_use_sorted_query_and_canonical_headers() -> Result<()> {
+        let signer =
+            VolcengineSigV4::new("test-key".into(), "test-secret".into(), "cn-beijing".into());
+        let get = signer.sign_at(
+            "GET",
+            "dns.volcengineapi.com",
+            "Action=ListRecords&Version=2018-08-01&ZID=123&Host=x&Type=TXT",
+            b"",
+            None,
+            "20261030T040000Z",
+        )?;
+        assert!(get.authorization.ends_with(
+            "Signature=929639b2fd92a4eb82dbb92a9fdd40f76dbe2e4bdae878607f5f8fa6c43110be"
+        ));
+        let post = signer.sign_at(
+            "POST",
+            "dns.volcengineapi.com",
+            "Action=CreateRecord&Version=2018-08-01",
+            b"{}",
+            Some("application/json"),
+            "20261030T040000Z",
+        )?;
+        assert!(post.authorization.ends_with(
+            "Signature=dc8d0ea8af32878a06c5ae52f3a32c0df21e5ca7a37d20cd9025e8496e7eb2bd"
+        ));
+        Ok(())
     }
 }

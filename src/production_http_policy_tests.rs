@@ -65,8 +65,10 @@ fn yaml_authorization_is_not_eligible_for_plain_or_websocket_bypass() {
 async fn invalid_certificate_rollover_retains_validated_state_and_listener_keys() {
     let root = crate::verify::harness::temp_root("proxysss-auth-tls-rollover");
     std::fs::create_dir_all(&root).unwrap();
-    let mut config = GatewayConfig::default();
-    config.root_dir = root.clone();
+    let mut config = GatewayConfig {
+        root_dir: root.clone(),
+        ..Default::default()
+    };
     config.runtime.performance.enabled = false;
     config.http.plain_bind = "127.0.0.1:0".into();
     config.http.tls_bind = "127.0.0.1:0".into();
@@ -379,8 +381,10 @@ async fn explicit_http_upgrade_disable_reaches_script_without_changing_tls_sni()
     )
     .unwrap();
     for enabled in [true, false] {
-        let mut config = GatewayConfig::default();
-        config.root_dir = root.to_path_buf();
+        let mut config = GatewayConfig {
+            root_dir: root.to_path_buf(),
+            ..Default::default()
+        };
         config.http.tls.cert_path = root.join("cert.pem");
         config.http.tls.key_path = root.join("key.pem");
         config.http.tls.certificates = vec![TlsCertificateConfig {
@@ -465,8 +469,10 @@ async fn actual_http_error_pages_disabled_and_explicit_script_static_bodies_are_
       return { upstream:"proxysss://response", status:403, response_body:"fixture synthetic body", response_headers:{"X-Always":"kept"} };
     }};"#).unwrap();
     for enabled in [false, true] {
-        let mut config = GatewayConfig::default();
-        config.root_dir = root.to_path_buf();
+        let mut config = GatewayConfig {
+            root_dir: root.to_path_buf(),
+            ..Default::default()
+        };
         config.http.tls.cert_path = root.join("cert.pem");
         config.http.tls.key_path = root.join("key.pem");
         config.http.tls_bind.clear();

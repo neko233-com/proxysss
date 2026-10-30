@@ -35,6 +35,7 @@ fn config(root: &Path) -> GatewayConfig {
     config.load_balance.active_health.enabled = false;
     config.load_balance.passive_health.enabled = false;
     config.affinity.enabled = false;
+    config.monitoring.domain_stats_hosts = vec!["localhost".into(), "127.0.0.1".into()];
     config
 }
 
@@ -51,6 +52,16 @@ fn assert_counts(gateway: &Gateway, requests: u64, errors: u64) {
     let json = gateway.stats.snapshot_json();
     assert_eq!(json["http_requests"], requests);
     assert_eq!(json["http_errors"], errors);
+    let domains = json["domain_requests"]
+        .as_object()
+        .expect("domain counters");
+    assert_eq!(
+        domains
+            .values()
+            .map(|count| count.as_u64().unwrap())
+            .sum::<u64>(),
+        requests
+    );
     let prometheus = gateway.stats.snapshot_prometheus();
     assert!(prometheus
         .lines()
@@ -58,6 +69,32 @@ fn assert_counts(gateway: &Gateway, requests: u64, errors: u64) {
     assert!(prometheus
         .lines()
         .any(|line| line == format!("proxysss_http_errors_total {errors}")));
+    assert!(prometheus.contains("# TYPE proxysss_domain_http_requests_total counter"));
+}
+
+#[test]
+fn domain_statistics_are_bounded_to_configured_hosts_and_survive_reload() {
+    let stats = GatewayStats::default();
+    stats.configure_domain_stats(&["a.example.com".into()]);
+    stats.record_domain_request(Some("A.Example.Com:443"));
+    stats.record_domain_request(Some("unlisted.example.com"));
+    assert_eq!(stats.snapshot_json()["domain_requests"]["a.example.com"], 1);
+    assert_eq!(
+        stats.snapshot_json()["domain_requests"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    stats.configure_domain_stats(&["a.example.com".into(), "b.example.com".into()]);
+    stats.record_domain_request(Some("a.example.com"));
+    assert_eq!(stats.snapshot_json()["domain_requests"]["a.example.com"], 2);
+    stats.configure_domain_stats(&[]);
+    stats.record_domain_request(Some("a.example.com"));
+    assert!(stats.snapshot_json()["domain_requests"]
+        .as_object()
+        .unwrap()
+        .is_empty());
 }
 
 async fn frontend(gateway: Arc<Gateway>, tls: bool, hyper_only: bool) -> (SocketAddr, Task) {
@@ -359,9 +396,20 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
             }
         }
     }));
-    for tls in [false, true] {
+    let mut cases = vec![
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+    ];
+    if cfg!(target_os = "linux") {
+        cases.push((false, false, true));
+    }
+    for (tls, hyper_only, balanced) in cases {
         let root = TestDir::new("http-metrics-websocket");
         let mut config = config(&root);
+        if balanced {
+            config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Balanced;
+        }
         if tls {
             config.http.tls_bind = "127.0.0.1:0".into();
         }
@@ -377,7 +425,7 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
         ];
         let gateway = Gateway::from_config(root.join("proxysss.yaml"), config).await?;
         assert!(gateway.bootstrap_fast_lane.raw_websocket_proxy);
-        let (address, _server) = frontend(gateway.clone(), tls, false).await;
+        let (address, _server) = frontend(gateway.clone(), tls, hyper_only).await;
         let connector = if tls {
             Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_tls(
                 &gateway.bootstrap_config,
@@ -395,6 +443,24 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
         .await?;
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         assert_counts(&gateway, 1, 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gateway
+                .stats
+                .websocket_sessions_active
+                .load(Ordering::Relaxed)
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            gateway
+                .stats
+                .websocket_sessions_total
+                .load(Ordering::Relaxed),
+            1
+        );
         for _ in 0..3 {
             socket
                 .send(tokio_tungstenite::tungstenite::Message::text(
@@ -405,6 +471,18 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
             assert_counts(&gateway, 1, 0);
         }
         let _ = socket.close(None).await;
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gateway
+                .stats
+                .websocket_sessions_active
+                .load(Ordering::Relaxed)
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         let rejected = tokio_tungstenite::connect_async_tls_with_config(
             format!("{scheme}://{address}/reject/error"),
             None,
@@ -424,7 +502,14 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
         )
         .await;
         assert!(failed.is_err());
-        assert_counts(&gateway, 3, if tls { 2 } else { 1 });
+        assert_counts(&gateway, 3, if tls || hyper_only { 2 } else { 1 });
+        assert_eq!(
+            gateway
+                .stats
+                .websocket_sessions_total
+                .load(Ordering::Relaxed),
+            1
+        );
     }
     Ok(())
 }

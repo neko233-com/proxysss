@@ -7,6 +7,7 @@ pub mod common;
 pub mod factory;
 pub mod google;
 pub mod manual;
+pub mod propagation;
 pub mod tencent;
 pub mod types;
 pub mod util;
