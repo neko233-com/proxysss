@@ -3453,17 +3453,9 @@ impl Gateway {
     }
 
     async fn run_certificate_sync_loop(self: Arc<Self>) -> Result<()> {
-        let mut successful = std::collections::HashMap::<String, Vec<u8>>::new();
         let mut alerted = std::collections::HashSet::<String>::new();
         loop {
             let config = self.current_state().await.config.clone();
-            successful.retain(|name, _| {
-                config
-                    .certificate_sync
-                    .targets
-                    .iter()
-                    .any(|t| t.enabled && &t.name == name)
-            });
             alerted.retain(|name| {
                 config
                     .certificate_sync
@@ -3478,11 +3470,10 @@ impl Gateway {
                 .filter(|target| target.enabled)
             {
                 let key = crate::certificate_sync::change_key(target);
-                if key
-                    .as_ref()
-                    .is_ok_and(|key| successful.get(&target.name) == Some(key))
-                {
-                    continue;
+                if let Ok(key) = &key {
+                    if crate::certificate_sync::already_synchronized(target, key).unwrap_or(false) {
+                        continue;
+                    }
                 }
                 let result = match key {
                     Ok(key) => crate::certificate_sync::sync_target(target)
@@ -3491,8 +3482,7 @@ impl Gateway {
                     Err(error) => Err(error),
                 };
                 match result {
-                    Ok((key, receipt)) => {
-                        successful.insert(target.name.clone(), key);
+                    Ok((_key, receipt)) => {
                         alerted.remove(&target.name);
                         tracing::info!(target = %target.name, "cloud certificate deployed and TLS verified");
                         crate::notifications::dispatch_with_links(
@@ -12085,6 +12075,10 @@ pub(crate) fn additional_managed_tls(
     tls
 }
 
+fn managed_renewal_due(expires: i64, now: i64, before_days: u32) -> bool {
+    expires.saturating_sub(now) < i64::from(before_days) * 86_400
+}
+
 fn managed_certificate_needs_renewal(tls: &crate::config::TlsConfig) -> bool {
     use x509_parser::extensions::GeneralName;
     let usable = || -> Result<bool> {
@@ -12109,7 +12103,7 @@ fn managed_certificate_needs_renewal(tls: &crate::config::TlsConfig) -> bool {
         let expires = parsed.validity().not_after.timestamp();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if parsed.validity().not_before.timestamp() > now
-            || expires.saturating_sub(now) <= 30 * 86_400
+            || managed_renewal_due(expires, now, tls.acme.renew_before_days)
         {
             return Ok(false);
         }
@@ -24205,6 +24199,8 @@ mod tests {
             Ok(())
         };
         assert!(managed_certificate_needs_renewal(&tls));
+        assert!(!managed_renewal_due(15 * 86_400, 0, 15));
+        assert!(managed_renewal_due(15 * 86_400 - 1, 0, 15));
         write_pair(60)?;
         assert!(!managed_certificate_needs_renewal(&tls));
         let self_signed_key = KeyPair::generate()?;
@@ -24220,8 +24216,11 @@ mod tests {
         changed = tls.clone();
         changed.acme.key_algorithm = AcmeKeyAlgorithm::Rsa2048;
         assert!(managed_certificate_needs_renewal(&changed));
-        write_pair(20)?;
+        write_pair(14)?;
         assert!(managed_certificate_needs_renewal(&tls));
+        let mut shorter_window = tls.clone();
+        shorter_window.acme.renew_before_days = 10;
+        assert!(!managed_certificate_needs_renewal(&shorter_window));
         write_pair(60)?;
         fs::write(&tls.key_path, KeyPair::generate()?.serialize_pem())?;
         assert!(managed_certificate_needs_renewal(&tls));

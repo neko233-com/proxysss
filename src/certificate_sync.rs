@@ -28,6 +28,8 @@ struct CleanupState {
     pending: BTreeSet<String>,
     #[serde(default)]
     in_flight_domains: BTreeSet<String>,
+    #[serde(default)]
+    successful_key: Option<Vec<u8>>,
 }
 
 fn cleanup_state_path(target: &CertificateSyncTarget) -> Result<PathBuf> {
@@ -74,7 +76,11 @@ fn read_cleanup_state(path: &std::path::Path) -> Result<CleanupState> {
     }
     let state: CleanupState =
         serde_json::from_slice(&bytes).context("invalid cloud cleanup state")?;
-    if state.in_flight_domains.len() > 100
+    if state
+        .successful_key
+        .as_ref()
+        .is_some_and(|key| key.len() != 32)
+        || state.in_flight_domains.len() > 100
         || state
             .in_flight_domains
             .iter()
@@ -577,6 +583,7 @@ fn load_material(target: &CertificateSyncTarget) -> Result<(String, String, Vec<
 
 pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> {
     let _lock = acquire_lock(target)?;
+    let sync_key = change_key(target)?;
     let (certificate, key, fingerprint, certificate_names) = load_material(target)?;
     let access = std::env::var(&target.access_key_env)
         .map_err(|_| anyhow!("cloud access key environment variable is unavailable"))?;
@@ -588,9 +595,11 @@ pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> 
     match target.provider {
         CertificateSyncProvider::VolcengineDcdn => {
             let client = VolcengineDcdn::new(access, secret)?;
-            let id = client.import(&target.project, &certificate, &key).await?;
             let path = cleanup_state_path(target)?;
             let mut state = read_cleanup_state(&path)?;
+            state.successful_key = None;
+            save_cleanup_state(&path, &state)?;
+            let id = client.import(&target.project, &certificate, &key).await?;
             let mut discovery_target = target.clone();
             for name in &state.in_flight_domains {
                 if !discovery_target.domains.contains(name) {
@@ -723,6 +732,12 @@ pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> 
                 }
             }
             state.in_flight_domains.clear();
+            if change_key(target)? != sync_key {
+                return Err(anyhow!(
+                    "certificate synchronization configuration or material changed"
+                ));
+            }
+            state.successful_key = Some(sync_key);
             save_cleanup_state(&path, &state)?;
             Ok(SyncReceipt {
                 certificate_id: id,
@@ -768,7 +783,16 @@ pub fn change_key(target: &CertificateSyncTarget) -> Result<Vec<u8>> {
     let mut hash = Sha256::new();
     hash.update(serde_json::to_vec(target)?);
     hash.update(std::fs::read(&target.cert_path).context("failed to read sync certificate")?);
+    hash.update(std::fs::read(&target.key_path).context("failed to read sync private key")?);
     Ok(hash.finalize().to_vec())
+}
+
+/// Only fully verified deployments with no unfinished cleanup survive a restart.
+pub fn already_synchronized(target: &CertificateSyncTarget, key: &[u8]) -> Result<bool> {
+    let state = read_cleanup_state(&cleanup_state_path(target)?)?;
+    Ok(state.successful_key.as_deref() == Some(key)
+        && state.in_flight_domains.is_empty()
+        && state.pending.is_empty())
 }
 
 pub async fn sync_config(
@@ -949,17 +973,34 @@ secret_key_env: CLOUD_SECRET
         let yaml = "name: example\nenabled: true\nprovider: volcengine_dcdn\ncert_path: example.crt\nkey_path: example.key\ndomains: [www.example.com]\naccess_key_env: TEST_ACCESS\nsecret_key_env: TEST_SECRET\ncleanup_previous: true\n";
         let mut target: CertificateSyncTarget = serde_yaml::from_str(yaml)?;
         target.cert_path = root.join("example.crt");
+        target.key_path = root.join("example.key");
+        std::fs::write(&target.cert_path, b"certificate-a")?;
+        std::fs::write(&target.key_path, b"key-a")?;
+        let first_key = change_key(&target)?;
+        std::fs::write(&target.key_path, b"key-b")?;
+        assert_ne!(change_key(&target)?, first_key);
+        std::fs::write(&target.cert_path, b"certificate-b")?;
+        assert_ne!(change_key(&target)?, first_key);
         let path = cleanup_state_path(&target)?;
         let state = CleanupState {
             owned_current: Some("cert-old".into()),
             pending: ["cert-older".into()].into_iter().collect(),
             in_flight_domains: ["cdn.example.com".into()].into_iter().collect(),
+            successful_key: Some(vec![7; 32]),
         };
         save_cleanup_state(&path, &state)?;
         let restored = read_cleanup_state(&path)?;
         assert_eq!(restored.owned_current.as_deref(), Some("cert-old"));
         assert!(restored.pending.contains("cert-older"));
         assert!(restored.in_flight_domains.contains("cdn.example.com"));
+        assert!(!already_synchronized(&target, &[7; 32])?);
+        let completed = CleanupState {
+            successful_key: Some(vec![7; 32]),
+            ..Default::default()
+        };
+        save_cleanup_state(&path, &completed)?;
+        assert!(already_synchronized(&target, &[7; 32])?);
+        assert!(!already_synchronized(&target, &[8; 32])?);
         target.name = "another-target".into();
         assert_ne!(cleanup_state_path(&target)?, path);
         std::fs::write(&path, b"{invalid")?;

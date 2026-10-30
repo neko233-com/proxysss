@@ -296,6 +296,9 @@ pub struct AcmeExternalConfig {
     pub directory_production: bool,
     #[serde(default = "default_acme_renew_hours")]
     pub renew_interval_hours: u64,
+    /// Managed ACME renewal starts when remaining validity is below this many days.
+    #[serde(default = "default_acme_renew_before_days")]
+    pub renew_before_days: u32,
     #[serde(default)]
     pub extra_args: Vec<String>,
     #[serde(default)]
@@ -2358,6 +2361,11 @@ impl GatewayConfig {
                         "http.tls.acme.renew_interval_hours must be greater than 0".to_string(),
                     );
                 }
+                if !(1..=365).contains(&self.http.tls.acme.renew_before_days) {
+                    errors.push(
+                        "http.tls.acme.renew_before_days must be between 1 and 365".to_string(),
+                    );
+                }
                 if self.uses_managed_dns01() {
                     self.validate_acme_dns_settings(&mut errors);
                 }
@@ -2917,6 +2925,7 @@ impl Default for AcmeExternalConfig {
             key_algorithm: AcmeKeyAlgorithm::default(),
             directory_production: false,
             renew_interval_hours: default_acme_renew_hours(),
+            renew_before_days: default_acme_renew_before_days(),
             extra_args: Vec::new(),
             dns: AcmeDnsExternalConfig::default(),
             additional: Vec::new(),
@@ -3734,7 +3743,11 @@ fn default_acme_cache_dir() -> PathBuf {
 }
 
 fn default_acme_renew_hours() -> u64 {
-    12
+    24
+}
+
+fn default_acme_renew_before_days() -> u32 {
+    15
 }
 
 fn default_on_demand_max_certs() -> usize {

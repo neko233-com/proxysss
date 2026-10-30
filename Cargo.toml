@@ -76,9 +76,9 @@ strip = "symbols"
 inherits = "release"
 lto = false
 codegen-units = 16
-incremental = true
+incremental = false
 strip = "none"
 
 [profile.dev]
-incremental = true
+incremental = false
 codegen-units = 16
