@@ -18,6 +18,8 @@ Windows PowerShell:
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
 ```
 
+For a graphical Windows installation, download `proxysss-windows-amd64.msi` or `proxysss-windows-arm64.msi` from [releases](https://github.com/neko233-com/proxysss/releases/latest). It installs for the current user into `%LOCALAPPDATA%\proxysss` and adds the user PATH. It replaces an existing binary in that directory, repairs on a same-version reinstall, and upgrades older MSI versions; copies elsewhere are not updated. Stop proxysss first; the MSI does not initialize or overwrite YAML or register or restart a service. Run `proxysss init` and `proxysss service install` separately when needed.
+
 Linux / macOS:
 
 ```bash

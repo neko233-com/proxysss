@@ -1,0 +1,22 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="proxysss" Manufacturer="neko233" Version="$(var.ProductVersion)" ProductCode="$(var.ProductCode)"
+           UpgradeCode="{77DB3188-813D-4828-BFCB-7FC6C86396C1}" Scope="perUser">
+    <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of proxysss is already installed." />
+    <SetProperty Id="REINSTALL" Value="ALL" Before="CostInitialize" Condition="Installed AND NOT REMOVE" />
+    <SetProperty Id="REINSTALLMODE" Value="amus" Before="CostInitialize" Condition="NOT REMOVE" />
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="$(var.InstallFolderName)" />
+    </StandardDirectory>
+    <Component Id="ProxysssBinary" Directory="INSTALLFOLDER" Guid="$(var.ComponentGuid)">
+      <File Id="ProxysssExe" Name="proxysss.exe" Source="$(var.BinaryPath)" />
+      <RegistryValue Root="HKCU" Key="Software\neko233\proxysss-msi" Name="Installed"
+                     Type="integer" Value="1" KeyPath="yes" />
+      <Environment Id="ProxysssUserPath" Name="PATH" Action="set" Part="first"
+                   System="no" Permanent="no" Value="[INSTALLFOLDER]" />
+    </Component>
+    <Feature Id="Main" Title="proxysss" Level="1">
+      <ComponentRef Id="ProxysssBinary" />
+    </Feature>
+  </Package>
+</Wix>

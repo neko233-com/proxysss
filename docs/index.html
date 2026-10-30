@@ -447,6 +447,7 @@
           </div>
 
           <h3>一键安装与版本下载</h3>
+          <p>Windows 也可从<a href="https://github.com/neko233-com/proxysss/releases/latest">最新版本下载</a>对应架构的 MSI 双击安装。MSI 安装到当前用户的 <code>%LOCALAPPDATA%\proxysss</code> 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前先停止 proxysss。MSI 不初始化或覆盖 YAML，也不注册或重启服务；首次使用可手动执行 <code>proxysss init</code> 和 <code>proxysss service install</code>。</p>
           <p>Windows PowerShell 安装最新正式版：</p>
           <pre><code class="language-powershell">&amp; ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest</code></pre>
           <p>Linux / macOS 安装最新正式版：</p>

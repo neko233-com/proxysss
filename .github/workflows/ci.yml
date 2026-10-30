@@ -72,6 +72,22 @@ jobs:
         shell: pwsh
         run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}' -Asset '${{ matrix.asset }}'
 
+      - name: Build Windows MSI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP/wix"
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          ./scripts/package-msi.ps1 -Target '${{ matrix.target }}' -Wix "$env:RUNNER_TEMP/wix/wix.exe"
+
+      - name: Upload Windows MSI
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: msi-${{ matrix.target }}
+          path: dist/*.msi
+          if-no-files-found: error
+
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:

@@ -18,6 +18,8 @@ Windows PowerShell：
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
 ```
 
+也可在 [版本下载页面](https://github.com/neko233-com/proxysss/releases/latest) 下载与电脑架构对应的 `proxysss-windows-amd64.msi` 或 `proxysss-windows-arm64.msi` 双击安装。MSI 安装到当前用户的 `%LOCALAPPDATA%\proxysss` 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前请停止正在运行的 proxysss；MSI 不初始化或覆盖 YAML，也不注册或重启服务。首次使用可手动运行 `proxysss init`、`proxysss service install`。
+
 Linux / macOS：
 
 ```bash
