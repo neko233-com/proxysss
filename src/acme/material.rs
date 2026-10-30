@@ -72,7 +72,7 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn replace_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
+pub(crate) fn replace_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

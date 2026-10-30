@@ -6,12 +6,113 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::acme::dns::common::VolcengineSigV4;
 
 const CERT_HOST: &str = "certificate-service.volcengineapi.com";
 const DCDN_HOST: &str = "open.volcengineapi.com";
+
+#[derive(Clone, Debug)]
+struct DcdnBinding {
+    domain: String,
+    certificate_id: String,
+    status: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupState {
+    owned_current: Option<String>,
+    pending: BTreeSet<String>,
+    #[serde(default)]
+    in_flight_domains: BTreeSet<String>,
+}
+
+fn cleanup_state_path(target: &CertificateSyncTarget) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let parent = target
+        .cert_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid certificate path"))?;
+    let mut hash = Sha256::new();
+    hash.update(target.cert_path.to_string_lossy().as_bytes());
+    hash.update([0]);
+    hash.update(target.project.as_bytes());
+    hash.update([0]);
+    hash.update(target.name.as_bytes());
+    let digest = hash.finalize();
+    let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(parent.join(format!(".proxysss-cloud-cleanup-{suffix}.json")))
+}
+
+fn valid_certificate_id(id: &str) -> bool {
+    id.starts_with("cert-")
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn read_cleanup_state(path: &std::path::Path) -> Result<CleanupState> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CleanupState::default())
+        }
+        Err(error) => return Err(error).context("cannot read cloud cleanup state"),
+    };
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(anyhow!("cloud cleanup state must not be a symbolic link"));
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(anyhow!("cloud cleanup state is too large"));
+    }
+    let state: CleanupState =
+        serde_json::from_slice(&bytes).context("invalid cloud cleanup state")?;
+    if state.in_flight_domains.len() > 100
+        || state
+            .in_flight_domains
+            .iter()
+            .any(|name| !valid_sync_domain(name))
+        || state.pending.len() > 100
+        || state.pending.iter().any(|id| !valid_certificate_id(id))
+        || state
+            .owned_current
+            .as_deref()
+            .is_some_and(|id| !valid_certificate_id(id))
+    {
+        return Err(anyhow!("invalid cloud cleanup state"));
+    }
+    Ok(state)
+}
+
+fn save_cleanup_state(path: &std::path::Path, state: &CleanupState) -> Result<()> {
+    crate::acme::material::replace_file(path, &serde_json::to_string(state)?, 0o600)
+        .context("cannot save cloud cleanup state")
+}
+
+fn certificate_covers_domain(names: &[String], domain: &str) -> bool {
+    names.iter().any(|name| {
+        name.eq_ignore_ascii_case(domain)
+            || name.strip_prefix("*.").is_some_and(|suffix| {
+                domain.split_once('.').is_some_and(|(left, rest)| {
+                    !left.is_empty() && rest.eq_ignore_ascii_case(suffix)
+                })
+            })
+    })
+}
+
+fn valid_sync_domain(name: &str) -> bool {
+    !name.contains('*')
+        && !name.contains(':')
+        && !name.ends_with('.')
+        && matches!(url::Host::parse(name), Ok(url::Host::Domain(_)))
+}
 
 pub struct SyncReceipt {
     pub certificate_id: String,
@@ -56,6 +157,9 @@ pub struct CertificateSyncTarget {
     pub secret_key_env: String,
     #[serde(default = "default_project")]
     pub project: String,
+    /// Opt in to deleting previously recorded, proxysss-owned certificates after verified replacement.
+    #[serde(default)]
+    pub cleanup_previous: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +202,7 @@ pub fn validate(config: &CertificateSyncConfig, errors: &mut Vec<String>) {
         }
         if target.domains.is_empty()
             || target.domains.len() > 100
-            || target.domains.iter().any(|name| {
-                name.contains('*')
-                    || name.contains(':')
-                    || name.ends_with('.')
-                    || !matches!(url::Host::parse(name), Ok(url::Host::Domain(_)))
-            })
+            || target.domains.iter().any(|name| !valid_sync_domain(name))
         {
             errors.push(format!(
                 "certificate_sync.targets.{index}.domains must contain 1-100 DNS hostnames"
@@ -253,13 +352,80 @@ impl VolcengineDcdn {
         check_success("CreateCertBind", status, &body)
     }
 
+    async fn managed_certificate(
+        &self,
+        project: &str,
+        certificate_id: &str,
+    ) -> Result<Option<bool>> {
+        let (status, body) = self.request(
+            &self.certificate_signer, &self.certificate_url, CERT_HOST,
+            "CertificateGetInstanceList", "2024-10-01",
+            &json!({"InstanceIds": [certificate_id], "ProjectName": project, "PageNumber": 1, "PageSize": 10}),
+        ).await?;
+        check_success("CertificateGetInstanceList", status, &body)?;
+        let instances = body
+            .pointer("/Result/Instances")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("cloud certificate list is missing instances"))?;
+        if instances.len() > 1 {
+            return Err(anyhow!("cloud certificate identity is ambiguous"));
+        }
+        let Some(instance) = instances.first() else {
+            return Ok(None);
+        };
+        if instance.get("InstanceId").and_then(Value::as_str) != Some(certificate_id) {
+            return Err(anyhow!("cloud certificate identity does not match"));
+        }
+        Ok(Some(
+            instance.get("Tag").and_then(Value::as_str) == Some("proxysss")
+                && instance.get("InstanceType").and_then(Value::as_str) == Some("Imported")
+                && instance.get("ProjectName").and_then(Value::as_str) == Some(project),
+        ))
+    }
+
+    async fn delete_certificate(&self, certificate_id: &str) -> Result<()> {
+        let (status, body) = self
+            .request(
+                &self.certificate_signer,
+                &self.certificate_url,
+                CERT_HOST,
+                "CertificateDeleteInstance",
+                "2024-10-01",
+                &json!({"InstanceId": certificate_id}),
+            )
+            .await?;
+        if body
+            .pointer("/ResponseMetadata/Error/Code")
+            .and_then(Value::as_str)
+            == Some("NotFound.CertificateInstance")
+        {
+            return Ok(());
+        }
+        check_success("CertificateDeleteInstance", status, &body)
+    }
+
     pub async fn binding_status(
         &self,
         project: &str,
         certificate_id: &str,
         domain: &str,
     ) -> Result<Option<String>> {
-        let payload = json!({"SearchKey":domain,"ProjectName":[project]});
+        Ok(self
+            .list_bindings(project, domain)
+            .await?
+            .into_iter()
+            .find(|entry| {
+                entry.domain.eq_ignore_ascii_case(domain) && entry.certificate_id == certificate_id
+            })
+            .map(|entry| entry.status))
+    }
+
+    async fn list_bindings(&self, project: &str, search: &str) -> Result<Vec<DcdnBinding>> {
+        let payload = if project.is_empty() {
+            json!({"SearchKey":search})
+        } else {
+            json!({"SearchKey":search,"ProjectName":[project]})
+        };
         let (status, body) = self
             .request(
                 &self.dcdn_signer,
@@ -275,18 +441,82 @@ impl VolcengineDcdn {
             .pointer("/Result/BindList")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("cloud ListCertBind returned no binding list"))?;
-        Ok(bindings
+        bindings
             .iter()
-            .find(|entry| {
-                entry
-                    .get("DomainName")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(domain))
-                    && entry.get("CertId").and_then(Value::as_str) == Some(certificate_id)
+            .map(|entry| {
+                Ok(DcdnBinding {
+                    domain: entry
+                        .get("DomainName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("cloud binding lacks domain"))?
+                        .to_ascii_lowercase(),
+                    certificate_id: entry
+                        .get("CertId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("cloud binding lacks certificate id"))?
+                        .to_owned(),
+                    status: entry
+                        .get("DeployStatus")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("cloud binding lacks deployment status"))?
+                        .to_owned(),
+                })
             })
-            .and_then(|entry| entry.get("DeployStatus").and_then(Value::as_str))
-            .map(str::to_owned))
+            .collect()
     }
+}
+
+async fn discover_bound_domains(
+    client: &VolcengineDcdn,
+    target: &CertificateSyncTarget,
+    certificate_names: &[String],
+) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+    let mut domains = BTreeSet::new();
+    let mut old_ids = BTreeSet::new();
+    let mut observed = BTreeMap::new();
+    for configured in &target.domains {
+        let name = configured.to_ascii_lowercase();
+        domains.insert(name.clone());
+        for binding in client.list_bindings(&target.project, &name).await? {
+            if binding.domain == name {
+                if binding.certificate_id.is_empty() {
+                    return Err(anyhow!("cloud binding has an empty certificate id"));
+                }
+                if observed
+                    .insert(name.clone(), binding.certificate_id.clone())
+                    .is_some_and(|previous| previous != binding.certificate_id)
+                {
+                    return Err(anyhow!("cloud domain has conflicting certificate bindings"));
+                }
+                old_ids.insert(binding.certificate_id);
+            }
+        }
+    }
+    for old_id in old_ids {
+        for binding in client.list_bindings(&target.project, &old_id).await? {
+            if binding.certificate_id != old_id {
+                continue;
+            }
+            if !valid_sync_domain(&binding.domain)
+                || !certificate_covers_domain(certificate_names, &binding.domain)
+            {
+                return Err(anyhow!(
+                    "existing certificate binding is not covered by the new certificate"
+                ));
+            }
+            if observed
+                .insert(binding.domain.clone(), old_id.clone())
+                .is_some_and(|previous| previous != old_id)
+            {
+                return Err(anyhow!("cloud domain has conflicting certificate bindings"));
+            }
+            domains.insert(binding.domain);
+            if domains.len() > 100 {
+                return Err(anyhow!("cloud certificate has more than 100 bound domains"));
+            }
+        }
+    }
+    Ok((domains.into_iter().collect(), observed))
 }
 
 fn load_material(target: &CertificateSyncTarget) -> Result<(String, String, Vec<u8>, Vec<String>)> {
@@ -326,17 +556,7 @@ fn load_material(target: &CertificateSyncTarget) -> Result<(String, String, Vec<
         })
         .collect::<Vec<_>>();
     for domain in &target.domains {
-        let covered = sans.value.general_names.iter().any(|entry| match entry {
-            GeneralName::DNSName(name) if name.eq_ignore_ascii_case(domain) => true,
-            GeneralName::DNSName(name) if name.starts_with("*.") => {
-                let suffix = &name[2..];
-                domain.split_once('.').is_some_and(|(left, rest)| {
-                    !left.is_empty() && rest.eq_ignore_ascii_case(suffix)
-                })
-            }
-            _ => false,
-        });
-        if !covered {
+        if !certificate_covers_domain(&certificate_names, domain) {
             return Err(anyhow!(
                 "sync certificate does not cover configured domain {domain}"
             ));
@@ -369,17 +589,57 @@ pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> 
         CertificateSyncProvider::VolcengineDcdn => {
             let client = VolcengineDcdn::new(access, secret)?;
             let id = client.import(&target.project, &certificate, &key).await?;
+            let path = cleanup_state_path(target)?;
+            let mut state = read_cleanup_state(&path)?;
+            let mut discovery_target = target.clone();
+            for name in &state.in_flight_domains {
+                if !discovery_target.domains.contains(name) {
+                    discovery_target.domains.push(name.clone());
+                }
+            }
+            if discovery_target.domains.len() > 100
+                || discovery_target
+                    .domains
+                    .iter()
+                    .any(|name| !certificate_covers_domain(&certificate_names, name))
+            {
+                return Err(anyhow!(
+                    "pending cloud domains exceed limits or are not covered by the new certificate"
+                ));
+            }
+            let (domains, observed) =
+                discover_bound_domains(&client, &discovery_target, &certificate_names).await?;
+            state.in_flight_domains = domains.iter().cloned().collect();
+            if target.cleanup_previous {
+                if let Some(previous) = state.owned_current.as_ref() {
+                    if previous != &id && observed.values().any(|value| value == previous) {
+                        state.pending.insert(previous.clone());
+                    }
+                }
+            }
+            save_cleanup_state(&path, &state)?;
             let mut unbound = Vec::new();
-            for domain in &target.domains {
-                let status = client.binding_status(&target.project, &id, domain).await?;
-                if status.is_none() {
+            for domain in &domains {
+                let current: BTreeSet<_> = client
+                    .list_bindings(&target.project, domain)
+                    .await?
+                    .into_iter()
+                    .filter(|entry| &entry.domain == domain)
+                    .map(|entry| entry.certificate_id)
+                    .collect();
+                if current.len() > 1 || current.iter().next() != observed.get(domain) {
+                    return Err(anyhow!(
+                        "cloud binding changed during certificate discovery"
+                    ));
+                }
+                if current.iter().next() != Some(&id) {
                     unbound.push(domain.clone());
                 }
             }
             if !unbound.is_empty() {
                 client.bind(&id, &unbound).await?;
             }
-            for domain in &target.domains {
+            for domain in &domains {
                 if client
                     .binding_status(&target.project, &id, domain)
                     .await?
@@ -395,7 +655,7 @@ pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> 
                 .tls_info(true)
                 .build()
                 .context("failed to construct cloud TLS verifier")?;
-            for domain in &target.domains {
+            for domain in &domains {
                 let response = verifier
                     .head(format!("https://{domain}/"))
                     .send()
@@ -422,11 +682,52 @@ pub async fn sync_target(target: &CertificateSyncTarget) -> Result<SyncReceipt> 
                     "source certificate changed during cloud synchronization"
                 ));
             }
+            if target.cleanup_previous {
+                if !valid_certificate_id(&id)
+                    || client.managed_certificate(&target.project, &id).await? != Some(true)
+                {
+                    return Err(anyhow!("new cloud certificate ownership cannot be verified; old certificates retained"));
+                }
+                state.owned_current = Some(id.clone());
+                save_cleanup_state(&path, &state)?;
+                for previous in state.pending.clone() {
+                    if previous != id {
+                        match client
+                            .managed_certificate(&target.project, &previous)
+                            .await?
+                        {
+                            None => {}
+                            Some(false) => {
+                                return Err(anyhow!(
+                                    "old certificate ownership cannot be verified; retained"
+                                ))
+                            }
+                            Some(true) => {
+                                if client
+                                    .list_bindings("", &previous)
+                                    .await?
+                                    .iter()
+                                    .any(|binding| binding.certificate_id == previous)
+                                {
+                                    return Err(anyhow!(
+                                        "old certificate is still bound to a DCDN domain; retained"
+                                    ));
+                                }
+                                // Certificate Center rejects deletion while other cloud resources remain linked.
+                                client.delete_certificate(&previous).await?;
+                            }
+                        }
+                    }
+                    state.pending.remove(&previous);
+                    save_cleanup_state(&path, &state)?;
+                }
+            }
+            state.in_flight_domains.clear();
+            save_cleanup_state(&path, &state)?;
             Ok(SyncReceipt {
                 certificate_id: id,
                 certificate_names,
-                urls: target
-                    .domains
+                urls: domains
                     .iter()
                     .map(|domain| format!("https://{domain}/"))
                     .collect(),
@@ -642,6 +943,32 @@ secret_key_env: CLOUD_SECRET
         Ok(())
     }
 
+    #[test]
+    fn cleanup_state_is_durable_bounded_and_scoped_to_target() -> Result<()> {
+        let root = crate::test_support::TestDir::new("cloud-cleanup-state");
+        let yaml = "name: example\nenabled: true\nprovider: volcengine_dcdn\ncert_path: example.crt\nkey_path: example.key\ndomains: [www.example.com]\naccess_key_env: TEST_ACCESS\nsecret_key_env: TEST_SECRET\ncleanup_previous: true\n";
+        let mut target: CertificateSyncTarget = serde_yaml::from_str(yaml)?;
+        target.cert_path = root.join("example.crt");
+        let path = cleanup_state_path(&target)?;
+        let state = CleanupState {
+            owned_current: Some("cert-old".into()),
+            pending: ["cert-older".into()].into_iter().collect(),
+            in_flight_domains: ["cdn.example.com".into()].into_iter().collect(),
+        };
+        save_cleanup_state(&path, &state)?;
+        let restored = read_cleanup_state(&path)?;
+        assert_eq!(restored.owned_current.as_deref(), Some("cert-old"));
+        assert!(restored.pending.contains("cert-older"));
+        assert!(restored.in_flight_domains.contains("cdn.example.com"));
+        target.name = "another-target".into();
+        assert_ne!(cleanup_state_path(&target)?, path);
+        std::fs::write(&path, b"{invalid")?;
+        assert!(read_cleanup_state(&path).is_err());
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1])?;
+        assert!(read_cleanup_state(&path).is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn selected_sync_rejects_unknown_targets_before_any_cloud_request() {
         assert!(sync_config(
@@ -651,6 +978,68 @@ secret_key_env: CLOUD_SECRET
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn dcdn_discovers_only_domains_using_the_same_certificate() -> Result<()> {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::{service::service_fn, Request, Response};
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(
+                        |request: Request<hyper::body::Incoming>| async move {
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            let payload: Value = serde_json::from_slice(&body).unwrap();
+                            let bindings = if payload["SearchKey"] == "one.example.com" {
+                                json!([{ "DomainName": "one.example.com", "CertId": "old", "DeployStatus": "Deployed" }])
+                            } else {
+                                assert_eq!(payload["SearchKey"], "old");
+                                json!([
+                                    { "DomainName": "one.example.com", "CertId": "old", "DeployStatus": "Deployed" },
+                                    { "DomainName": "two.example.com", "CertId": "old", "DeployStatus": "Deployed" },
+                                    { "DomainName": "other.example.com", "CertId": "unrelated", "DeployStatus": "Deployed" }
+                                ])
+                            };
+                            Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                            json!({"ResponseMetadata": {}, "Result": {"BindList": bindings}}).to_string(),
+                        ))))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(false)
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let mut client = VolcengineDcdn::new("test-ak".into(), "test-sk".into())?;
+        client.dcdn_url = format!("http://{address}");
+        let target: CertificateSyncTarget = serde_yaml::from_str(
+            "name: test\nenabled: true\nprovider: volcengine_dcdn\ncert_path: a\nkey_path: b\ndomains: [one.example.com]\naccess_key_env: TEST_ACCESS\nsecret_key_env: TEST_SECRET\n",
+        )?;
+        assert_eq!(
+            discover_bound_domains(&client, &target, &["*.example.com".into()])
+                .await?
+                .0,
+            vec!["one.example.com", "two.example.com"]
+        );
+        assert!(
+            discover_bound_domains(&client, &target, &["one.example.com".into()])
+                .await
+                .is_err()
+        );
+        server.await?;
+        assert!(!certificate_covers_domain(
+            &["*.example.com".into()],
+            "deep.two.example.com"
+        ));
+        Ok(())
     }
 
     #[test]
@@ -674,6 +1063,7 @@ secret_key_env: CLOUD_SECRET
             access_key_env: "TEST_ACCESS".into(),
             secret_key_env: "TEST_SECRET".into(),
             project: "default".into(),
+            cleanup_previous: false,
         };
         let (_, _, _, names) = load_material(&target)?;
         assert!(names.iter().any(|name| name == "*.example.com"));

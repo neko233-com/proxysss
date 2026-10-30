@@ -564,10 +564,11 @@ JSON `websocket_sessions_total` 和 `websocket_sessions_active` 分别表示进�
 
 只读 `stats` 还包含网关运行秒数 `uptime_seconds`、进程 CPU/内存、TCP 会话、UDP 流量、重载、认证失败、脚本错误和 watchdog 计数；这些累计值在进程重启后重置。`ssl.file_validity` 和各 SNI 条目的 `file_validity` 提供证书文件的 `not_before`、`not_after` Unix 秒及 `valid_now`；缺失、超出 1 MiB 或无法解析时为 null。它描述当前磁盘文件，不保证运行中监听器或云边缘已加载该证书，也不暴露文件路径或密钥。
 
-可按需配置最多 256 个精确域名的访问次数，未列出的 Host 不创建指标；默认列表为空，不增加域名查找。统计按 HTTP 请求计数，WS/WSS 仅计握手，忽略端口并按域名大小写不敏感匹配。只读监控 `stats` 中的 `domain_requests` 是域名到进程内累计次数的映射，Prometheus 对应 `proxysss_domain_http_requests_total{host="..."}`。热重载保留仍在列表中的计数，移除域名或重启进程会丢弃对应累计值。
+域名请求统计默认开启，自动收集站点、路由、证书和只读监控中配置的精确域名；也可显式补充。最多统计 256 个域名，显式配置优先，超出时记录警告；泛域名和未配置的 Host 不会动态创建指标。`domain_stats_enabled: false` 可关闭，独立于 `/metrics` 端点开关。按 HTTP 请求计数，WS/WSS 仅计握手，忽略端口并按域名大小写不敏感匹配。只读监控 `stats` 的 `domain_requests` 和 Prometheus 的 `proxysss_domain_http_requests_total{host="..."}` 是进程内累计值；热重载保留仍在列表中的计数，移除域名、关闭统计或重启进程会丢弃对应累计值。此数值只代表到达 proxysss 的请求，不能代表 CDN 边缘访问量或缓存命中率。
 
 ```yaml
 monitoring:
+  domain_stats_enabled: true
   domain_stats_hosts: [api.example.com, cdn.example.com]
 ```
 
@@ -575,7 +576,7 @@ monitoring:
 
 飞书使用带状态颜色的消息卡片，展示事件、详情、UTC 时间和固定关键词，如 `proxysss SSL certificate_loaded`、`proxysss SSL cloud_sync_succeeded`；可按事件名称、目标名或关键词查找，实际搜索索引取决于飞书客户端。
 
-云同步成功卡片附带本次云端证书 ID、证书 SAN 域名（含泛域名）和已配置域名的 HTTPS 核验链接；这些链接访问真实业务域名，证书验证仅代表发起同步的网络出口。
+云同步成功卡片附带本次云端证书 ID、证书 SAN 域名（含泛域名）和实际同步域名的 HTTPS 核验链接；这些链接访问真实业务域名，证书验证仅代表发起同步的网络出口。
 
 ```yaml
 notifications:
@@ -589,6 +590,8 @@ notifications:
 ### 3.4.1 云产品证书同步
 
 `certificate_sync.targets` 按目标单独启停并选择策略；目前实现 `volcengine_dcdn`。服务每 60 秒检查启用目标的证书变更，失败或部署尚未完成时重试。导入会复用相同证书；成功要求 DCDN 返回 `Deployed` 且当前网络出口看到的 TLS 叶证书与本地匹配。证书须有效、私钥匹配并覆盖配置的所有域名。该检查只代表当前网络出口，不能证明所有边缘节点已更新。同步可发送到已配置的通知渠道，失败提醒在同一进程内去重。
+
+每个配置域名也是发现入口：同步会查询该域名当前证书，并在同一项目中找出仍绑定该证书的其他 DCDN 域名；所有发现的域名都必须由新证书覆盖，冲突、不可覆盖或总数超过 100 时停止。提交前重新检查绑定是否变化；火山 API 没有条件更新，仍无法完全排除检查后并发修改。其他云产品及手工安装的服务器不会自动发现。`cleanup_previous: true` 可选自动清理本目标记录的旧 proxysss 证书，只有新证书全部部署和出口核验成功、旧实例身份可验证且无 DCDN 绑定时才尝试删除；火山证书中心仍会拒绝删除关联云资源的实例。外部服务器手工使用无法发现，开启前需自行确认；首次启用不删除未记录的旧实例。失败保留状态并重试。权限和清理边界见 [火山引擎-自动化所需权限](火山引擎-自动化所需权限.md)。
 
 `aliyun`、`tencent`、`aws` 和 `azure` 是预留策略名称，当前未实现、未验证；只能保留为禁用目标，开启会在配置检查时报错。
 
@@ -604,11 +607,12 @@ certificate_sync:
       project: default
       access_key_env: PROXYSSS_VOLC_ACCESS_KEY
       secret_key_env: PROXYSSS_VOLC_SECRET_KEY
+      cleanup_previous: false
 ```
 
 服务进程和手动命令均需提供所引用的环境变量；证书目录需要允许创建锁文件。密钥不应写入 YAML 或 Git。执行 `proxysss -c /path/to/proxysss.yaml certificate sync` 可同步所有启用目标；失败或部署尚未生效时命令返回非零。运行中的任务可能在关闭目标后完成当前请求。
 
-手动触发单个或批量任务：`proxysss -c /path/to/proxysss.yaml certificate list` 输出可选证书和同步目标的 JSON，不包含凭据。`proxysss -c /path/to/proxysss.yaml certificate sync --target cdn` 同步单个目标，重复 `--target` 选择多个，或使用 `--all`；省略选项也同步全部已启用目标。`proxysss -c /path/to/proxysss.yaml certificate issue --certificate primary` 强制签发主证书，`--certificate additional-1` 选择第一个额外证书，重复选项选择多个，`--all` 签发全部；未知名称在开始前报错。额外证书序号按 YAML 顺序确定。DNS-01 手动签发可独立运行，与后台签发通过共享 ACME 缓存目录内的锁避免并发；多台主机仅在共享支持锁的同一缓存目录时才受该锁保护。签发成功只代表文件更新，运行中的网关会异步重载，云部署结果需另查。HTTP-01 / TLS-ALPN-01 需要运行中的本机 loopback admin、显式开启写操作和 bearer token，由网关处理挑战；CLI 会先核对运行中的证书配置。
+手动触发单个或批量任务：`proxysss -c /path/to/proxysss.yaml certificate list` 输出证书目录、证书与密钥文件路径、ACME 状态目录、文件是否存在及证书有效期，以及同步目标的 JSON；不会输出密钥内容或凭据。路径仅供本地运维查看，不进入只读监控 API。`proxysss -c /path/to/proxysss.yaml certificate sync --target cdn` 同步单个目标，重复 `--target` 选择多个，或使用 `--all`；省略选项也同步全部已启用目标。`proxysss -c /path/to/proxysss.yaml certificate issue --certificate primary` 强制签发主证书，`--certificate additional-1` 选择第一个额外证书，重复选项选择多个，`--all` 签发全部；未知名称在开始前报错。额外证书序号按 YAML 顺序确定。DNS-01 手动签发可独立运行，与后台签发通过共享 ACME 缓存目录内的锁避免并发；多台主机仅在共享支持锁的同一缓存目录时才受该锁保护。签发成功只代表文件更新，运行中的网关会异步重载，云部署结果需另查。HTTP-01 / TLS-ALPN-01 需要运行中的本机 loopback admin、显式开启写操作和 bearer token，由网关处理挑战；CLI 会先核对运行中的证书配置。
 
 每月 1 日 04:00（Asia/Shanghai）可由 systemd timer 调用相应 oneshot service：`OnCalendar=*-*-01 04:00:00 Asia/Shanghai`、`Persistent=true`、`AccuracySec=1s`。service 的 `ExecStart` 使用上述命令，并通过受限 `EnvironmentFile` 提供同样的凭据；应以 `systemd-analyze calendar` 检查目标主机的下次时间。也可由支持时区设置的 cron 调用 `0 4 1 * *`；普通 cron 不补跑停机期间错过的任务。不能把密钥写入 crontab；定时同步现有证书，不强制新建 ACME 订单。
 

@@ -1076,9 +1076,28 @@ async fn main() -> Result<()> {
                         "name": name, "domains": tls.acme.domains,
                         "key_algorithm": tls.acme.key_algorithm, "challenge": tls.acme.challenge,
                         "cert_path": tls.cert_path,
+                        "key_path": tls.key_path,
+                        "certificate_directory": tls.cert_path.parent(),
+                        "acme_state_directory": tls.acme.cache_dir,
+                        "cert_exists": tls.cert_path.exists(), "key_exists": tls.key_path.exists(),
+                        "file_validity": gateway::monitor_certificate_file_validity(&tls.cert_path),
                     })).collect::<Vec<_>>()
             } else {
-                Vec::new()
+                let tls = &config.http.tls;
+                let mut items = vec![serde_json::json!({
+                    "name": "primary", "cert_path": tls.cert_path, "key_path": tls.key_path,
+                    "certificate_directory": tls.cert_path.parent(),
+                    "cert_exists": tls.cert_path.exists(), "key_exists": tls.key_path.exists(),
+                    "file_validity": gateway::monitor_certificate_file_validity(&tls.cert_path),
+                })];
+                items.extend(tls.certificates.iter().enumerate().map(|(index, cert)| serde_json::json!({
+                    "name": format!("sni-{}", index + 1), "domains": cert.domains,
+                    "cert_path": cert.cert_path, "key_path": cert.key_path,
+                    "certificate_directory": cert.cert_path.parent(),
+                    "cert_exists": cert.cert_path.exists(), "key_exists": cert.key_path.exists(),
+                    "file_validity": gateway::monitor_certificate_file_validity(&cert.cert_path),
+                })));
+                items
             };
             let targets = config
                 .certificate_sync
@@ -1094,7 +1113,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"certificates": certificates, "sync_targets": targets})
+                    &serde_json::json!({"config_path": path, "tls_mode": config.http.tls.mode, "certificates": certificates, "sync_targets": targets})
                 )?
             );
             Ok(())

@@ -792,7 +792,10 @@ pub struct MonitoringConfig {
     pub path: String,
     #[serde(default)]
     pub format: MonitoringFormat,
-    /// Exact hostnames to count; empty disables per-domain accounting.
+    /// Enable bounded per-domain accounting independently of the metrics endpoint.
+    #[serde(default = "default_true")]
+    pub domain_stats_enabled: bool,
+    /// Additional exact hostnames to count, given priority over discovered hosts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_stats_hosts: Vec<String>,
 }
@@ -3112,8 +3115,70 @@ impl Default for MonitoringConfig {
             enabled: default_true(),
             path: default_monitoring_path(),
             format: MonitoringFormat::default(),
+            domain_stats_enabled: true,
             domain_stats_hosts: Vec::new(),
         }
+    }
+}
+
+impl GatewayConfig {
+    /// Build the finite host set on the control plane, never from request traffic.
+    pub(crate) fn domain_stats_hosts(&self) -> Vec<String> {
+        if !self.monitoring.domain_stats_enabled {
+            return Vec::new();
+        }
+        let mut hosts = Vec::new();
+        let mut seen = HashSet::new();
+        let mut truncated = false;
+        let mut add = |host: &str| {
+            let host = host.to_ascii_lowercase();
+            if valid_domain_stats_host(&host) && seen.insert(host.clone()) {
+                if hosts.len() < 256 {
+                    hosts.push(host);
+                } else {
+                    truncated = true;
+                }
+            }
+        };
+        for host in &self.monitoring.domain_stats_hosts {
+            add(host);
+        }
+        for site in &self.services.static_sites {
+            for host in &site.hosts {
+                add(host);
+            }
+        }
+        for route in &self.services.domain_routes {
+            for host in &route.domains {
+                add(host);
+            }
+        }
+        for route in &self.services.reverse_proxy.routes {
+            for host in &route.hosts {
+                add(host);
+            }
+        }
+        for route in &self.services.ai_proxy.routes {
+            add(&route.match_host);
+        }
+        for cert in &self.http.tls.certificates {
+            for host in &cert.domains {
+                add(host);
+            }
+        }
+        for host in &self.http.tls.auto_https.domains {
+            add(host);
+        }
+        for host in &self.http.tls.acme.domains {
+            add(host);
+        }
+        for host in &self.admin.monitor.hosts {
+            add(host);
+        }
+        if truncated {
+            tracing::warn!("domain statistics limited to 256 configured hostnames");
+        }
+        hosts
     }
 }
 

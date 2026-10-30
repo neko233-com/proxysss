@@ -3000,7 +3000,7 @@ impl Gateway {
         });
         gateway
             .stats
-            .configure_domain_stats(&gateway.bootstrap_config.monitoring.domain_stats_hosts);
+            .configure_domain_stats(&gateway.bootstrap_config.domain_stats_hosts());
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         gateway.warm_up(&gateway.bootstrap_config).await;
@@ -5364,7 +5364,7 @@ impl Gateway {
             .set_limit(new_config.http.max_buffered_request_body_bytes);
         self.dynamic.store(new_state);
         self.stats
-            .configure_domain_stats(&new_config.monitoring.domain_stats_hosts);
+            .configure_domain_stats(&new_config.domain_stats_hosts());
         self.load_persisted_manual_upstream_state(&new_config)?;
         self.prune_raw_http_pools(&new_config);
         self.warm_up(&new_config).await;
@@ -18434,7 +18434,7 @@ fn tls_admin_summary(config: &GatewayConfig) -> serde_json::Value {
     })
 }
 
-fn monitor_certificate_file_validity(path: &Path) -> Option<serde_json::Value> {
+pub(crate) fn monitor_certificate_file_validity(path: &Path) -> Option<serde_json::Value> {
     use std::io::Read as _;
     const MAX_CERTIFICATE_FILE_BYTES: u64 = 1024 * 1024;
     let mut bytes = Vec::new();

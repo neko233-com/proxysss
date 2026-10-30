@@ -73,6 +73,25 @@ fn assert_counts(gateway: &Gateway, requests: u64, errors: u64) {
 }
 
 #[test]
+fn domain_statistics_discover_bounded_hosts_and_can_be_disabled() {
+    let mut config = GatewayConfig::default();
+    assert!(config.monitoring.domain_stats_enabled);
+    config.monitoring.domain_stats_hosts = vec!["explicit.example.com".into()];
+    config.http.tls.acme.domains = vec!["*.example.com".into(), "Origin.Example.com".into()];
+    let initial = config.domain_stats_hosts();
+    assert_eq!(initial, ["explicit.example.com", "origin.example.com"]);
+    config.http.tls.auto_https.domains = (0..300).map(|i| format!("h{i}.example.com")).collect();
+    let hosts = config.domain_stats_hosts();
+    assert_eq!(hosts.len(), 256);
+    assert_eq!(hosts[0], "explicit.example.com");
+    assert!(!hosts.iter().any(|host| host.contains('*')));
+    config.monitoring.domain_stats_enabled = false;
+    assert!(config.domain_stats_hosts().is_empty());
+    let default: crate::config::MonitoringConfig = serde_yaml::from_str("{}").unwrap();
+    assert!(default.domain_stats_enabled);
+}
+
+#[test]
 fn domain_statistics_are_bounded_to_configured_hosts_and_survive_reload() {
     let stats = GatewayStats::default();
     stats.configure_domain_stats(&["a.example.com".into()]);
