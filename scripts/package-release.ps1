@@ -35,10 +35,19 @@ try {
         & tar -czf $pending -C $stage .
         if ($LASTEXITCODE -ne 0) { throw 'Release archive failed.' }
     }
-    $entries = & tar -tf $pending
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release archive.' }
+    if ($windowsTarget) {
+        # Windows tar.exe can reject valid UTF-8 ZIP names under a legacy codepage.
+        # Read ZIP metadata with .NET so Chinese documentation is checked faithfully.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($pending)
+        try { $entries = @($archive.Entries | ForEach-Object { $_.FullName }) }
+        finally { $archive.Dispose() }
+    } else {
+        $entries = & tar -tf $pending
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release archive.' }
+    }
     $entries = $entries | ForEach-Object { $_ -replace '^\./', '' }
-    foreach ($required in @($binary,'README.md','README-CN.md','docs/site.css','docs/site.js','templates/admin.html','templates/admin.css','templates/docs.html','CHANGELOG.md','docs/cdn-origin.html','docs/security-performance.html','templates/cdn-origin.example.yaml','examples/security-performance.example.yaml','scripts/install.sh','scripts/install.ps1')) {
+    foreach ($required in @($binary,'README.md','README-CN.md','docs/site.css','docs/site.js','docs/火山引擎-自动化所需权限.md','templates/admin.html','templates/admin.css','templates/docs.html','CHANGELOG.md','docs/cdn-origin.html','docs/security-performance.html','templates/cdn-origin.example.yaml','examples/security-performance.example.yaml','scripts/install.sh','scripts/install.ps1')) {
         if ($entries -notcontains $required) { throw "Release archive is missing $required" }
     }
     if ($entries -match '(^|/)(\.git|\.ssh|\.cache|\.tmp|target|logs)(/|$)|(^|/)proxysss\.yaml$') {
