@@ -6,4 +6,6 @@
 
 `gamer-static-share.plist` 和 `examples/macos-static-share.example.yaml` 承载同一 Mac 的 `50200` 文件服务，数据目录位于服务账号的 `~/.local/share/proxysss-share`。历史桌面目录作为指向该数据目录的路径别名，既有上传路径继续使用同一份文件，不存在双写。迁移目录前确认同一文件系统、无活动句柄，迁移后验证目录浏览和实际文件的 Range 下载；系统服务只运行 ProxySSS。
 
-现场验收检查实际的 `/api/health`、认证 WebSocket 握手、文件服务以及对应的 `launchctl` 状态，不能只以进程存在作为成功依据。配置热重载已启用；公网 TLS `20101` 仍需受信任证书与实际端到端验收。
+`gamer-wss.plist` 和 `wss-proxysss.yaml` 将 `20101` 转发到同机 BuildWorld，使用迁入 `~/.local/share/proxysss-wss` 的原有证书和私钥。该证书为自签、缺少 DNS SAN，不受常规浏览器信任；正式公网访问仍需更换覆盖目标域名且受信任的证书。未经证书更新，不把忽略 TLS 校验的连接当作正式公网验收。
+
+现场验收检查实际的 `/api/health`、认证 WebSocket 握手、文件服务以及对应的 `launchctl` 状态，不能只以进程存在作为成功依据。配置热重载已启用。

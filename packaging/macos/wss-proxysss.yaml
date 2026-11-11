@@ -1,0 +1,30 @@
+# 仅适用于 192.168.110.42；历史自签证书不代表浏览器或公网受信。
+http:
+  plain_bind: 127.0.0.1:0
+  tls_bind: 0.0.0.0:20101
+  h3_bind: 127.0.0.1:0
+  redirect_http_to_https: false
+  tls:
+    mode: manual
+    cert_path: /Users/gamer/.local/share/proxysss-wss/certificate.pem
+    key_path: /Users/gamer/.local/share/proxysss-wss/private.key
+    server_name: pokopoko.net
+    generate_self_signed_if_missing: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: true
+    interval_ms: 1500
+  maintenance_state:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: true
+    path: /api/health
+services:
+  reverse_proxy:
+    routes:
+      - name: buildworld-wss
+        path_prefix: /
+        upstream: http://127.0.0.1:8080
