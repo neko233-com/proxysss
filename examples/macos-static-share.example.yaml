@@ -1,0 +1,23 @@
+# 192.168.110.42 的单机文件服务，数据目录随机器配置维护。
+http:
+  plain_bind: 0.0.0.0:50200
+  tls_bind: 127.0.0.1:0
+  h3_bind: 127.0.0.1:0
+  redirect_http_to_https: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: true
+    interval_ms: 1500
+  maintenance_state:
+    enabled: false
+services:
+  static_sites:
+    - name: mac-file-share
+      path_prefix: /
+      root: /Users/gamer/.local/share/proxysss-share
+      index_files: [index.html, index.htm]
+      autoindex: true
+      hide_dotfiles: false
+      autoindex_max_entries: 10000
