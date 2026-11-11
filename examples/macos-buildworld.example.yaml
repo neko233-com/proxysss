@@ -1,0 +1,25 @@
+# Mac 内网 BuildWorld 入口。20101 的旧证书未获公共信任，需独立配置正式 TLS。
+# 运行目录应由服务账号持有，以便生成仅回环访问的临时 TLS 证书和日志。
+http:
+  plain_bind: 0.0.0.0:8888
+  tls_bind: 127.0.0.1:0
+  h3_bind: 127.0.0.1:0
+  redirect_http_to_https: false
+admin:
+  enabled: false
+runtime:
+  hot_reload:
+    enabled: true
+    interval_ms: 1500
+  maintenance_state:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: true
+    path: /api/health
+services:
+  reverse_proxy:
+    routes:
+      - name: buildworld
+        path_prefix: /
+        upstream: http://127.0.0.1:8080
