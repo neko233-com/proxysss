@@ -52,13 +52,47 @@ p99 中位：1KB 静态 2.038 → 2.023 ms，64KB 2.047 → 2.034 ms，反向代
 | SHA256 | `2676D108AE73AA49344ED5D83E139DF5A42810A827FD2B1F8CA5CB32264AF934` |
 | 版本输出 | `proxysss 1.3.14` |
 
-以上为本地候选；GitHub Release 正式附件在发布后单独核验。
+以上为本地候选构建。正式 GitHub Release 附件已于 2026-11-22 发布并完成下载核验。
 
-## 6. 发布门禁状态
+## 6. 正式 Release 资产验收
+
+Release：`https://github.com/neko233-com/proxysss/releases/tag/v1.3.14`，tag `v1.3.14` 指向 main 提交 `a602b21`；状态为 Latest、非 Draft、非 Prerelease，published `2026-11-21T21:45:23Z`。8 个附件均已下载并确认 SHA256 与 GitHub API `digest` 一致。
+
+| 附件 | 大小（bytes） | SHA256 |
+| --- | ---: | --- |
+| `proxysss-linux-amd64.tar.gz` | 10,350,538 | `d408b40bb3d202c516d855d828a2190341fb1ddfeddf295eb5464d8dfc61d40b` |
+| `proxysss-linux-arm64.tar.gz` | 9,285,575 | `5617579a38c9287b058574462d8acf3520b78fe7e6367f76b9f07b6721e38522` |
+| `proxysss-windows-amd64.zip` | 9,439,716 | `f9122b00c47b6fb1c7d25758d41dc2a0a9e5a7ffb61b84c704e99f67455064e8` |
+| `proxysss-windows-arm64.zip` | 9,061,944 | `63597389cbe57d2d90e02a5b4260b5294df77fcd2acd7d19e16554d2d455b267` |
+| `proxysss-darwin-amd64.tar.gz` | 9,614,615 | `fab3c5036ed481a3b86c9962fb9aa2105f645502fbf84c31faf2d989a18cd41b` |
+| `proxysss-darwin-arm64.tar.gz` | 8,746,160 | `98737a9509a59158ccda902c3ad109515d0c6315a4206bde34e57051e7f1425e` |
+| `proxysss-windows-amd64.msi` | 7,360,512 | `06d4833bff588751fa418590e52b0f07941aafe2e2708cf261ac20ed5c3814a2` |
+| `proxysss-windows-arm64.msi` | 6,860,800 | `f851aeafc3348570d1ab378c9023449dcadc947baedcab81911d12ec12d863b6` |
+
+正式 Linux 二进制：
+
+| 项 | x64 | arm64 |
+| --- | --- | --- |
+| 文件大小 | 23,965,336 bytes | 18,979,440 bytes |
+| 链接形态 | `ELF 64-bit LSB pie executable`, `static-pie linked` | `ELF 64-bit LSB executable`, `statically linked` |
+| `NEEDED` / `INTERP` | 均无 | 均无 |
+| BuildID | `88a53ff10dc11cb0628b975c52921b4673043006` | `dac671d758daf4dcc483f79d915b8110fd3d7814` |
+| 二进制 SHA256 | `b315a64bfe38729945acc3a5d4780bf98ed8aaf1ee819d276aeae9ae69025dbe` | `4c4e14fcb5e6e8d8d30ffea49eb95f52b320c871e960564b1cd18ba983592727` |
+| 版本输出 | `proxysss 1.3.14` | `proxysss 1.3.14`（QEMU） |
+
+验收结果：
+
+- 正式 x64 归档在 Debian 12、Rocky Linux 9、AlmaLinux 9、Ubuntu 24.04、Alpine 3.20 五个最小容器均通过 HTTP 200、Range 206、HEAD 200、HTTPS 200；Ubuntu 24.04 额外通过 HTTP/2 `2:200`。
+- 正式 arm64 在 `qemu-aarch64-static` 下通过同等 HTTP/Range/HEAD/HTTPS 检查，并通过 HTTP/2 `2:200`。
+- Debian 12 使用归档内 `scripts/install.sh --version v1.3.14 --skip-init --no-service-restart` 从 GitHub 公开地址真实下载安装成功，`/usr/local/bin/proxysss --version` 输出 `proxysss 1.3.14`；`proxysss init` 与 `check-config` 通过。
+- Windows x64 zip 内 exe 输出 `proxysss 1.3.14`，PE AMD64；arm64 zip 内 PE ARM64。两个 MSI 均用 `msiexec /a` 管理安装成功，x64 MSI 内 exe 可运行，arm64 MSI 内为 ARM64 PE。
+- macOS x64 / arm64 归档内 `proxysss` 与 `install.sh` 均为 0755；二进制分别为 Mach-O x86_64 / arm64，大小 21,359,584 / 18,078,736 bytes。当前验收机为 Windows，未在本机执行 macOS 二进制；macOS CI 构建 success。
+
+## 7. 发布门禁状态
 
 - 测试前缓存清理：通过，脚本真实探针验证 `target/`、`.benchmark/`、根目录 `tmp-*` 均被删除。
 - Windows 功能测试：通过，425/0。
 - Linux musl 功能测试：通过，454/0。
-- 静态链接：通过，`static-pie`，无 `NEEDED` / `INTERP`。
+- 静态链接：通过，x64 `static-pie`、arm64 `statically linked`，均无 `NEEDED` / `INTERP`。
 - 性能复验：通过，1KB 静态 +1.78%，反向代理 +1.19%，64KB 在噪声内。
-- 六平台打包与 GitHub Release：发布后核验。
+- 六平台打包与 GitHub Release：通过；8 个附件 SHA256 与 API digest 一致，Linux 五发行版与 Debian 安装验收通过。
