@@ -18,16 +18,51 @@
 - `cargo clippy --locked --workspace --all-targets -- -D warnings` 通过；`cargo fmt --all -- --check` 通过。
 - 文档链接校验与 Go 文档/基准辅助测试通过。
 
-## 二进制身份
+## 本地候选二进制身份
 
 | 平台 | 文件大小 | 链接形态 | SHA256 |
 | --- | ---: | --- | --- |
 | Linux x86_64 musl | 23,358,936 bytes | `ELF 64-bit LSB pie executable`, `static-pie linked`，无 `NEEDED` / `INTERP` | `9fad3d63cb982369cd06b6b572cdfc07f0bfc4c50a978ebeeca60f83e82d6400` |
 | Linux aarch64 musl | 18,926,016 bytes | `ELF 64-bit LSB executable`, `statically linked`，无动态段 | `ea8e9c48843a41ff20ddc4e6c9feb547fb5347e240a6f03bd4cc14fe35ad9a41` |
 
-x86_64 产物 BuildID 为 `2a646436b62f0c2f13be1ce8ccabfbcc4cea17b7`；`proxysss --version` 输出 `proxysss 1.3.13`。以上摘要属于本地最终构建候选；GitHub Release 实际附件须在发布后重新下载、核对摘要并安装验证。
+x86_64 产物 BuildID 为 `2a646436b62f0c2f13be1ce8ccabfbcc4cea17b7`；`proxysss --version` 输出 `proxysss 1.3.13`。以上摘要属于本地最终构建候选，不能代替 GitHub Release 正式附件。
 
-## 跨发行版启动结果
+## GitHub Release 实际附件验收（已完成）
+
+2026-11-22 03:58 CST 发布 `v1.3.13`，页面为 <https://github.com/neko233-com/proxysss/releases/tag/v1.3.13>，`gh release list` 显示为 Latest。tag 指向 `9db4f53`；Release workflow `44942784323` 成功，PR CI `44938896247` 与 main CI `44940521644` 的六平台构建均成功。
+
+正式附件共 8 个，全部下载回本地后与 GitHub API `digest` 逐项比对一致：
+
+| 附件 | 大小 | SHA256 |
+| --- | ---: | --- |
+| `proxysss-linux-amd64.tar.gz` | 10,328,184 bytes | `A8B7CDA3999BE78867DABA9F95F37EA3CEADE5D5513E3534D03F9CB4AD2E5A75` |
+| `proxysss-linux-arm64.tar.gz` | 9,274,850 bytes | `43270CEA7765D8413739D53982E66579E11CC0A7D77136E41DFD8035FA1AE302` |
+| `proxysss-windows-amd64.zip` | 9,427,226 bytes | `1E0090605092ABDA57E77E9AEC870A37066A2633EC1B56084D034053015F2EAA` |
+| `proxysss-windows-arm64.zip` | 9,049,307 bytes | `830B1047FF84A8DCB96AF55A5E22A9AA08049AEFDED6BE2BE4DFB2D314D98013` |
+| `proxysss-darwin-amd64.tar.gz` | 9,604,123 bytes | `5CF3A6CE3A2463BD493EB03794AC958B8DAA2091B1B0DD4EC2AA21310A916137` |
+| `proxysss-darwin-arm64.tar.gz` | 8,735,943 bytes | `6EB5882B483A2FCE18C08FF3CB4E6377D97876C446E9CBA850146B2E6072F480` |
+| `proxysss-windows-amd64.msi` | 7,364,608 bytes | `F055DADC45B939550AAA91452F818BE330B0A655DAB714A13BCB100DB61D5A7F` |
+| `proxysss-windows-arm64.msi` | 6,860,800 bytes | `CAA3AA008194F47110F02E11F8922CE884F91B43BEFA89F1B23D50EB38100DB5` |
+
+正式 Linux 归档解包后，`proxysss` 与 `scripts/install.sh` 均为 `-rwxr-xr-x`，不依赖 Windows 侧权限修补。归档内二进制身份如下：
+
+| 平台 | 文件大小 | 链接形态 | BuildID | SHA256 |
+| --- | ---: | --- | --- | --- |
+| Linux x86_64 musl | 23,965,336 bytes | `ELF 64-bit LSB pie executable`, `static-pie linked` | `2947d03abdaf17d138ad7ad34d4cb1f662453784` | `7c947768d65e1657963d990115adba2282e7bff9d0e2de9fae8d55931379f63c` |
+| Linux aarch64 musl | 18,979,440 bytes | `ELF 64-bit LSB executable`, `statically linked` | `d9f1dea88b593f7eb18e895a62cb8b4e8ad5d273` | `a8e2610de2c79894280ac7bdfce99b88f9ad56ea5d5ffff6311084c2ce342d94` |
+
+## 正式附件运行验收
+
+- `readelf -d` 对 x86_64 与 aarch64 均无 `NEEDED`，`readelf -l` 均无 `INTERP`；`file` 分别报告 `static-pie linked` 与 `statically linked`；`ldd` 分别报告 `statically linked` 与 `not a dynamic executable`。
+- 正式 x86_64 归档在 Debian 12、Rocky Linux 9、AlmaLinux 9、Ubuntu 24.04、Alpine 3.20 五个最小容器中真实启动，均返回 `PASS http=200 https=200 h2=2 range=206 head=200 metrics=200 admin_healthz=200`。
+- 正式 aarch64 归档通过 `qemu-aarch64-static` 执行同等启动与协议冒烟，返回同一串 PASS 指标；这不等于真实 arm64 物理机性能或全部硬件兼容性。
+- Debian 12 干净容器用归档内官方 `scripts/install.sh --version v1.3.13 --skip-init --no-service-restart` 完成真实下载与安装：公开下载地址可用，`/usr/local/bin/proxysss --version` 为 `proxysss 1.3.13`，安装后的文件为 `static-pie linked`。容器无 systemd，因此 `service install` 打印了预期的 user daemon 重载提示，但安装步骤正常完成。
+- 同一正式 x86_64 二进制在 Debian 12 执行 `proxysss init` 与 `check-config`：自动生成证书和 `~/.config/proxysss/proxysss.yaml`，配置检查通过。
+- 正式 `proxysss-windows-amd64.zip` 解包后 `proxysss.exe --version` 输出 `proxysss 1.3.13`，PE 架构为 AMD64；`proxysss-windows-arm64.zip` 内 `proxysss.exe` PE 架构为 ARM64。
+- 两个正式 MSI 均以 `msiexec /a` 管理安装模式成功解包，产品版本 1.3.13；x64 MSI 解包出的 `proxysss.exe` 可直接运行并输出 `proxysss 1.3.13`，arm64 MSI 内 `proxysss.exe` PE 架构为 ARM64。
+- 两个 macOS 归档内 `proxysss` 与 `scripts/install.sh` 权限均为 `-rwxr-xr-x`，二进制大小分别为 21,359,584 / 18,078,736 bytes；macOS 构建在 CI 中通过。当前验收机为 Windows，未声称 macOS 二进制已在本机运行。
+
+## 本地候选跨发行版启动结果
 
 同一 x86_64 静态二进制在以下最小环境真实启动，均返回：
 
@@ -43,15 +78,15 @@ PASS http=200 https=200 h2=2 range=206 head=200 metrics=200 admin_healthz=200
 
 aarch64 产物通过 `qemu-aarch64-static` 执行同等启动与协议冒烟，也返回同一串 PASS 指标。QEMU 结果证明静态加载与运行时路径，不等同于真实 arm64 物理机性能或全部硬件兼容性。
 
-## 发布后必须完成
+## 发布门禁状态
 
-tag 工作流生成的资产下载后，必须再次执行：
+- 静态链接门禁：通过。x86_64/aarch64 正式二进制均无 `NEEDED` 与 `INTERP`。
+- Linux 全量功能：通过，`454 passed / 0 failed`。
+- 五发行版启动：通过，正式 x86_64 附件全部返回同一串 PASS 指标。
+- arm64 运行路径：通过 QEMU 同等冒烟。
+- Windows 快速测试：通过，`425 passed / 0 failed`；正式 zip 与 MSI 均完成架构/版本验收。
+- 六平台打包：通过，8 个正式附件全部可下载且 SHA256 一致。
+- 发布后真实安装：通过，Debian 12 使用官方 `install.sh` 安装并运行 `proxysss 1.3.13`。
+- 新增性能测试与 nginx 对比：按用户授权未执行，不宣称性能胜出。
 
-```bash
-readelf -d proxysss   # 不得出现 NEEDED
-readelf -l proxysss   # 不得出现 INTERP
-file proxysss         # statically linked 或 static-pie linked
-sha256sum proxysss
-```
-
-然后在 Debian 12 干净容器中用官方归档完成安装、启动和 HTTP/HTTPS/HTTP2/Range/HEAD/metrics 冒烟。只有下载后的官方附件通过，才可宣称发布成功；排队、构建中或仅有 tag 不等于交付完成。
+v1.3.13 已满足本次发布要求。
