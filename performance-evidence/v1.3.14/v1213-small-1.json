@@ -1,0 +1,12 @@
+{
+  "url": "http://127.0.0.1:18080/small.bin",
+  "workers": 16,
+  "seconds": 10,
+  "requests": 195488,
+  "errors": 0,
+  "rps": 19548.8,
+  "p50_ms": 1.005,
+  "p95_ms": 1.515,
+  "p99_ms": 2.034,
+  "max_ms": 5.78
+}

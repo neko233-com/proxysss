@@ -6,6 +6,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+& (Join-Path $PSScriptRoot 'clean-test-cache.ps1')
 Initialize-ProjectArtifacts
 $repoRoot = $script:ProjectRoot
 $container = 'proxysss-verify'

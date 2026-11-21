@@ -87,14 +87,18 @@ pub fn percent_decode_path(value: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        crate::test_support::temp_base().join(format!("proxysss-filecloud-{nanos}"))
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        crate::test_support::temp_base().join(format!("proxysss-filecloud-{nanos}-{sequence}"))
     }
 
     #[test]

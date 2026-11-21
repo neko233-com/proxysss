@@ -6,6 +6,16 @@
 
 Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
+## 0. 测试前缓存清理（强制）
+
+任何功能测试、Docker 验证、基准测试或打包前，必须先清空项目历史构建与测试缓存：
+
+```powershell
+pwsh -NoProfile -File scripts/clean-test-cache.ps1
+```
+
+Linux 使用 `bash scripts/clean-test-cache.sh`。脚本只清理项目内的 `target/`、`.benchmark/`、`.cache/`、`.tmp/`、`dist/`、根目录测试产物、benchmark 日志和本项目自建 Docker 验证容器/卷，不会执行全局 `docker system prune`。`verify-local.ps1`、`verify-deep.ps1`、`verify-e2e.ps1`、`verify-docker-scenarios.ps1`、`run-all-verify.ps1`、`benchmark-gateways.ps1` 已内置开始前清理；直接运行 `cargo test` 时必须手动执行。测试结束确认 `target/` 与 `.benchmark/` 合计低于 5 GB，避免项目再次增长到 100 GB 级。
+
 ## 1. Ubuntu 24 LTS 功能检查
 
 Windows Docker Desktop 在 PowerShell 运行：
@@ -38,7 +48,7 @@ tag 前还必须把同一构建产物放进 Debian 12、Rocky Linux 9 / AlmaLinu
 
 ## 2. Linux 混合性能（可选诊断）
 
-在干净提交上执行；Windows 必须使用 Git Bash。保存原始工件，不能让默认清理删除证据或共享构建缓存：
+在干净提交上执行；Windows 必须使用 Git Bash。仅在明确需要发布证据时设置 `KEEP_BENCH_ARTIFACTS=1` 保存原始工件，证据收集后立即清理 `.benchmark/`；默认测试前清理会删除上一轮缓存：
 
 ```bash
 KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \

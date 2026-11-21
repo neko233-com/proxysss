@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.14 - 2026-11-22
+
+测试与发布缓存治理版本；运行时转发行为不变。
+
+- 新增 `scripts/clean-test-cache.ps1` / `scripts/clean-test-cache.sh`，测试前强制清空项目本地 `target/`、`.benchmark/`、`.cache/`、`.tmp/`、`dist/`、根目录测试产物、benchmark 日志和本项目自建 Docker 验证容器/卷。
+- `verify-local.ps1`、`verify-deep.ps1`、`verify-e2e.ps1`、`verify-docker-scenarios.ps1`、`run-all-verify.ps1`、`benchmark-gateways.ps1` 已内置开始前清理；测试结束校验 `target/` 与 `.benchmark/` 低于 5 GB，避免项目再次增长到 100 GB 级。
+- `AGENTS.md`、`docs/VALIDATION.md` 与 HTML 验证页写入强制缓存清理规则；`KEEP_BENCH_ARTIFACTS=1` 只允许单次发布证据保留，收集后立即清理。
+- 修复 `filecloud::path` 测试临时目录命名碰撞导致的偶发失败；不改变运行时路径边界逻辑。
+- 干净环境复验：Windows `425 passed / 0 failed`，Linux musl `454 passed / 0 failed`；v1.3.14 静态二进制的单核小文件、反向代理中位吞吐略高于 v1.3.13，大文件差异在重复样本噪声内。
+
 ## v1.3.13 - 2026-11-22
 
 Linux release 资产改为完全静态的 musl 构建，修复 Debian 12、Rocky Linux 9、AlmaLinux 9 等旧 glibc 发行版无法启动的问题。

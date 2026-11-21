@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $repoRoot
 try {
+    & (Join-Path $PSScriptRoot 'clean-test-cache.ps1')
     Write-Host "==> cargo fmt --check" -ForegroundColor Cyan
     cargo fmt --all -- --check
 
