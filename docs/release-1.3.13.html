@@ -1,6 +1,6 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>v1.3.13 全静态 Linux 发布验证 · proxysss</title><link rel="stylesheet" href="site.css?v=dd4c9e6ec34a"></head><body><div class="shell"><nav class="topbar"><a href="index.html">文档首页</a><a href="validation.html">验证流程</a><a href="validation.html#static-release">静态发布检查</a></nav><main class="panel"><h1>v1.3.13 全静态 Linux 发布验证</h1>
 <p>2026-11-22 用户要求 Linux release 二进制不要依赖 glibc，并减少环境依赖、保持高性能。v1.3.13 将 Linux 资产切换为完全静态的 musl 构建，修复 Debian 12（glibc 2.36）、Rocky Linux 9 / AlmaLinux 9（glibc 2.34）等环境无法启动旧二进制的问题。</p>
-<p>本次用户明确授权不新增性能测试与 nginx 对比，因此不宣称性能胜出、跨主机性能或容量达标。静态链接、Linux 全量功能、跨发行版真实启动、Windows 快速测试、六平台打包和发布后真实安装仍是发布门槛。</p>
+<p>本次用户明确授权发布门禁不要求新增性能测试与 nginx 对比，因此不宣称性能胜出、跨主机性能或容量达标。静态链接、Linux 全量功能、跨发行版真实启动、Windows 快速测试、六平台打包和发布后真实安装仍是发布门槛。发布完成后补充了 v1.3.12 → v1.3.13 同机对照，作为“静态化是否牺牲性能”的可复现说明，结果见下文“发布后性能对照”。</p>
 <h2>发布形态</h2>
 <ul><li>Linux 目标固定为 <code>x86_64-unknown-linux-musl</code> 与 <code>aarch64-unknown-linux-musl</code>，资产名保持 <code>proxysss-linux-amd64.tar.gz</code> / <code>proxysss-linux-arm64.tar.gz</code>。</li><li>musl 构建启用 <code>mimalloc</code> 全局分配器；glibc/macOS 构建继续使用 <code>tikv-jemallocator</code>，避免为了可移植性牺牲分配性能。</li><li>构建产物不链接宿主 glibc、<code>ld-linux</code>、OpenSSL、zlib 或其他共享库。打包脚本硬断言 <code>readelf -d</code> 无 <code>NEEDED</code>、<code>readelf -l</code> 无 <code>INTERP</code>、<code>file</code> 报告 <code>statically linked</code> 或 <code>static-pie linked</code>。</li><li>CI、release 与 deploy 的 Linux 矩阵同步使用 musl；Linux runner 安装 <code>musl-tools</code>，aarch64 将 <code>musl-gcc</code> 暴露为 <code>aarch64-linux-musl-gcc</code>。Windows、macOS、MSI 和资产命名流程不变。</li></ul>
 <h2>源码与本地验证</h2>
@@ -19,8 +19,20 @@
 <h2>本地候选跨发行版启动结果</h2>
 <p>同一本地 x86_64 静态二进制在以下最小环境真实启动，均返回 <code>PASS http=200 https=200 h2=2 range=206 head=200 metrics=200 admin_healthz=200</code>：Debian 12 <code>debian:bookworm-slim</code>、Rocky Linux 9 <code>rockylinux:9</code>、AlmaLinux 9 <code>almalinux:9</code>、Ubuntu 24.04 <code>ubuntu:24.04</code>、Alpine 3.20 <code>alpine:3.20</code>。</p>
 <p>本地 aarch64 产物通过 <code>qemu-aarch64-static</code> 执行同等启动与协议冒烟，也返回同一串 PASS 指标。上述本地结果用于 tag 前预检；正式附件在发布后已重复同等验收。</p>
+<h2>发布后性能对照（补充说明，不构成发布门禁）</h2>
+<p>用户在 v1.3.13 发布时授权不做新增性能测试。发布后为回答“零 glibc 静态化是否牺牲性能”，补做了 v1.3.12（官方 glibc 动态二进制）与 v1.3.13（官方 static-pie musl + mimalloc 二进制）的同机对照。原始 JSON 保存在本地 <code>.tmp/perf-results/</code>，负载器为 Go 原生 HTTP/1.1 keep-alive 客户端；结果只说明本机同配额差异，不构成 nginx 对比或跨主机证据。</p>
+<table><thead><tr><th>测试条件</th><th>值</th></tr></thead><tbody><tr><td>主机</td><td>AMD Ryzen 9 7900X3D，24 logical CPUs，64GB RAM</td></tr><tr><td>虚拟化</td><td>Docker Desktop VM，2 CPUs</td></tr><tr><td>网关容器</td><td>Ubuntu 24.04，<code>linux/amd64</code>，<code>--cpus=1</code> 或 <code>--cpus=2</code>，<code>--memory=2g</code></td></tr><tr><td>版本</td><td>v1.3.12 官方 glibc 动态；v1.3.13 官方 static-pie musl + mimalloc</td></tr><tr><td>配置</td><td><code>runtime.performance.enabled=false</code>，admin 关闭，日志 warn/error，访问日志关闭</td></tr><tr><td>负载</td><td>1KB <code>small.bin</code>、64KB <code>large.bin</code>；3s warmup + 10s 测量；HTTP/1.1 keep-alive，16 workers</td></tr></tbody></table>
+<h3>单核静态（小文件 5 轮、大文件 3 轮，取中位）</h3>
+<table><thead><tr><th>场景</th><th>v1.3.12</th><th>v1.3.13</th><th>吞吐变化</th><th>p50</th><th>p99</th></tr></thead><tbody><tr><td>1KB 静态</td><td>20,001 RPS</td><td>20,071 RPS</td><td>+0.35%</td><td>1.01 → 1.01 ms</td><td>2.04 → 2.03 ms</td></tr><tr><td>64KB 静态</td><td>15,012 RPS</td><td>15,100 RPS</td><td>+0.59%</td><td>1.06 → 1.06 ms</td><td>2.04 → 2.04 ms</td></tr></tbody></table>
+<h3>双核静态与反向代理（取中位）</h3>
+<table><thead><tr><th>场景</th><th>v1.3.12</th><th>v1.3.13</th><th>吞吐变化</th></tr></thead><tbody><tr><td>1KB 静态</td><td>20,079 RPS</td><td>20,137 RPS</td><td>+0.29%</td></tr><tr><td>64KB 静态</td><td>15,121 RPS</td><td>14,978 RPS</td><td>-0.95%</td></tr><tr><td>1KB 反向代理</td><td>9,220 RPS</td><td>9,110 RPS</td><td>-1.19%</td></tr></tbody></table>
+<p>双核 64KB 样本分布在 14,575–15,233 RPS，反向代理样本分布在 8,789–9,417 RPS，上述差异未超出重复样本波动；反向代理 p50 保持 3.66–3.70 ms。</p>
+<h3>启动与内存</h3>
+<table><thead><tr><th>指标</th><th>v1.3.12</th><th>v1.3.13</th></tr></thead><tbody><tr><td>容器启动到首个 HTTP 200（5 次中位）</td><td>35 ms</td><td>36 ms</td></tr><tr><td>空闲 cgroup <code>memory.current</code>（3 次中位）</td><td>8.07 MB</td><td>19.81 MB</td></tr><tr><td>设置 <code>MIMALLOC_ARENA_EAGER_COMMIT=0</code> 后</td><td>—</td><td>8.00 MB，吞吐与默认持平</td></tr></tbody></table>
+<p>mimalloc 默认 arena 采用 eager commit。对内存敏感的小型 VPS，可在服务环境设置 <code>MIMALLOC_ARENA_EAGER_COMMIT=0</code>；实测静态与反向代理吞吐不变，cgroup 常驻回到 v1.3.12 水平。该选项属于运行时调优，默认安装不强制改写环境。</p>
+<p>结论：零 glibc 静态化没有造成吞吐或 p50 回退；单核受限下 1KB/64KB 静态中位分别 +0.35%/+0.59%，双核与反向代理差异落在重复样本噪声带内。这是边际收益和“没有为兼容性牺牲性能”的证据，不是全面超越 nginx 或跨主机容量证明，不改变本次发布不以性能胜出为门禁的授权口径。</p>
 <h2>发布门禁状态</h2>
-<ul><li>静态链接门禁：通过。x86_64/aarch64 正式二进制均无 <code>NEEDED</code> 与 <code>INTERP</code>。</li><li>Linux 全量功能：通过，<code>454 passed / 0 failed</code>。</li><li>五发行版启动：通过，正式 x86_64 附件全部返回同一串 PASS 指标。</li><li>arm64 运行路径：通过 QEMU 同等冒烟。</li><li>Windows 快速测试：通过，<code>425 passed / 0 failed</code>；正式 zip 与 MSI 均完成架构/版本验收。</li><li>六平台打包：通过，8 个正式附件全部可下载且 SHA256 一致。</li><li>发布后真实安装：通过，Debian 12 使用官方 <code>install.sh</code> 安装并运行 <code>proxysss 1.3.13</code>。</li><li>新增性能测试与 nginx 对比：按用户授权未执行，不宣称性能胜出。</li></ul>
+<ul><li>静态链接门禁：通过。x86_64/aarch64 正式二进制均无 <code>NEEDED</code> 与 <code>INTERP</code>。</li><li>Linux 全量功能：通过，<code>454 passed / 0 failed</code>。</li><li>五发行版启动：通过，正式 x86_64 附件全部返回同一串 PASS 指标。</li><li>arm64 运行路径：通过 QEMU 同等冒烟。</li><li>Windows 快速测试：通过，<code>425 passed / 0 failed</code>；正式 zip 与 MSI 均完成架构/版本验收。</li><li>六平台打包：通过，8 个正式附件全部可下载且 SHA256 一致。</li><li>发布后真实安装：通过，Debian 12 使用官方 <code>install.sh</code> 安装并运行 <code>proxysss 1.3.13</code>。</li><li>新增性能测试与 nginx 对比：发布门禁未要求，发布后已补充 v1.3.12 → v1.3.13 同机对照，结果见上文；不宣称 nginx 胜出或跨主机性能。</li></ul>
 <p>v1.3.13 已满足本次发布要求。</p>
 <p><a href="validation.html#static-release">查看静态链接与跨发行版验收流程</a></p>
 </main></div></body></html>
