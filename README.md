@@ -10,6 +10,8 @@ Static downloads support bounded single and multipart byte ranges, coalescing up
 
 One Rust binary and one YAML file for websites, APIs, and realtime connections. proxysss is a general-purpose gateway designed to replace nginx. Optional embedded TypeScript scripts and plugins handle application-specific extensions.
 
+Linux release packages are fully static musl builds for `x86_64` and `aarch64`, using the mimalloc allocator. They do not require glibc, `ld-linux`, OpenSSL, zlib, or any extra distribution package, so the same archive runs on Debian 12, Rocky Linux 9 / AlmaLinux 9, Ubuntu 24.04, Alpine, and minimal container images. Only a modern Linux kernel is required; runtime tuning still detects and adapts to the host distribution.
+
 ## Install and run in the background
 
 Windows PowerShell:

@@ -21,6 +21,7 @@ Require-Command gh
 
 $assets = @(
     "proxysss-windows-amd64.zip",
+    "proxysss-windows-arm64.zip",
     "proxysss-linux-amd64.tar.gz",
     "proxysss-linux-arm64.tar.gz",
     "proxysss-darwin-amd64.tar.gz",

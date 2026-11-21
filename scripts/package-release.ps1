@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory)][ValidateSet('x86_64-pc-windows-msvc','aarch64-pc-windows-msvc','x86_64-unknown-linux-gnu','aarch64-unknown-linux-gnu','x86_64-apple-darwin','aarch64-apple-darwin')][string]$Target,
+    [Parameter(Mandatory)][ValidateSet('x86_64-pc-windows-msvc','aarch64-pc-windows-msvc','x86_64-unknown-linux-musl','aarch64-unknown-linux-musl','x86_64-apple-darwin','aarch64-apple-darwin')][string]$Target,
     [Parameter(Mandatory)][ValidatePattern('^(proxysss|deploy)-(windows|linux|darwin)-(amd64|arm64)\.(zip|tar\.gz)$')][string]$Asset
 )
 $ErrorActionPreference = 'Stop'
@@ -9,6 +9,24 @@ if ($windowsTarget -ne $Asset.EndsWith('.zip')) { throw 'Archive format must mat
 $binary = if ($windowsTarget) { 'proxysss.exe' } else { 'proxysss' }
 $source = Get-ProjectArtifactPath "target/$Target/release/$binary"
 if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing release binary: $source" }
+if ($Target.EndsWith('-linux-musl')) {
+    # Linux release assets must run without a host glibc or dynamic loader.
+    $readelf = Get-Command readelf -ErrorAction SilentlyContinue
+    if (-not $readelf) { throw 'readelf is required to verify static Linux release binaries.' }
+    $dynamic = & $readelf.Source -d $source 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "readelf failed on $source" }
+    if ($dynamic -match 'NEEDED') { throw "Linux release binary has dynamic dependencies:`n$dynamic" }
+    $headers = & $readelf.Source -l $source 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "readelf program headers failed on $source" }
+    if ($headers -match 'INTERP') { throw 'Linux release binary requests a dynamic interpreter.' }
+    $file = Get-Command file -ErrorAction SilentlyContinue
+    if ($file) {
+        $fileInfo = & $file.Source $source 2>&1
+        if ($LASTEXITCODE -ne 0 -or ($fileInfo | Out-String) -notmatch 'statically linked|static-pie linked') {
+            throw "Linux release binary is not statically linked: $fileInfo"
+        }
+    }
+}
 $lockPath = Get-ProjectArtifactPath '.tmp/release-package.lock'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lockPath) | Out-Null
 $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
@@ -24,6 +42,14 @@ try {
     }
     $stamp = [DateTime]::SpecifyKind([DateTime]'2000-01-01', [DateTimeKind]::Utc)
     Get-ChildItem -LiteralPath $stage -Recurse -Force | ForEach-Object { $_.LastWriteTimeUtc = $stamp }
+    # GitHub's Linux runners package native tar members, but a local Windows
+    # rehearsal cannot represent Unix modes. Set them explicitly when chmod is
+    # available so official Linux archives always carry 0755 executables.
+    if (-not $windowsTarget -and (Get-Command chmod -ErrorAction SilentlyContinue)) {
+        & chmod 755 (Join-Path $stage $binary)
+        & chmod 755 (Join-Path $stage 'scripts/install.sh')
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to set executable permissions in the release stage.' }
+    }
     $pending = Get-ProjectArtifactPath ".tmp/$Asset"
     $output = Get-ProjectArtifactPath "dist/$Asset"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $output) | Out-Null

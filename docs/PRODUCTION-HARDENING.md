@@ -4,7 +4,7 @@ This checklist is for high-importance gateway deployments where correctness, lat
 
 ## 发布与验收
 
-发布以 Ubuntu 24.04、Debian 12 的功能检查、实际目标环境验收、Windows 功能测试与六平台打包为准；不以性能对比或压测作为发布前提。具体命令与结果边界见 [验证流程](VALIDATION.md)，配置字段见 [配置指南](CONFIGURATION.md)。
+发布以 Ubuntu 24.04、Debian 12、Rocky Linux 9 / AlmaLinux 9 与 Alpine 的功能检查、实际目标环境验收、Windows 功能测试与六平台打包为准；Linux 资产是完全静态 musl 构建，不依赖宿主 glibc。不以性能对比或压测作为发布前提。具体命令与结果边界见 [验证流程](VALIDATION.md#11-静态-linux-发布二进制)，配置字段见 [配置指南](CONFIGURATION.md)。
 
 性能对比仅在需要时作为可选诊断执行；历史结果不能作为当前版本的成绩或容量证明。GitHub Actions 负责打包，不能代替本地功能和生产验收。
 

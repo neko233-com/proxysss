@@ -2,7 +2,9 @@
 
 2026-10-30 用户要求取消上线前压测门槛：正式发布以功能测试、目标环境验收和六平台打包为准，不要求性能胜出或三机性能证据。性能测试保留为可选诊断；未实测的性能或容量不得声称已达标。历史 v1.3.10 的实际验证见 [版本记录](RELEASE-1.3.10.md) / [HTML](release-1.3.10.html)。
 
-Linux 发布同时验证 Ubuntu 24.04 和 Debian 12：在各环境检查发布二进制的动态依赖、启动网关，并通过真实监听器验证受影响功能。记录发行版、版本、架构、二进制摘要及命令结果；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
+2026-11-22 用户要求 Linux release 二进制不再依赖宿主 glibc，并以更少环境依赖的方式发布。v1.3.13 使用完全静态 musl 构建；本次不要求新增性能测试，但静态链接检查、Linux 全量功能、Debian 12 / Rocky/Alma 9 / Ubuntu 24.04 / Alpine 实际启动、Windows 快速测试、六平台打包和发布后真实安装必须通过。详见 [v1.3.13 验证说明](RELEASE-1.3.13.md) / [HTML](release-1.3.13.html)。
+
+Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
 ## 1. Ubuntu 24 LTS 功能检查
 
@@ -21,6 +23,18 @@ CPU 功能探针 `scripts/verify-linux-cpu/main.go` 随 Docker 功能检查运�
 同一入口也运行 `scripts/benchmark-helper_test.go`，保护性能报告、原始样本汇总和门槛判定；这些 Go 验证只在本地执行，不加入 GitHub Actions。
 
 下载验收包括 GET/HEAD、单段/多段 Range、后缀与开放区间、重叠合并、越界、条件响应、鉴权顺序、超大文件局部读取和截断错误。协议测试应穿过真实监听器，覆盖 HTTP/1.1、HTTP/2 与 TLS。长连接检查双向背压、半关闭、断连清理、超时、重载和 UDP association 上限。现有套件不等于任意第三方客户端、真实云 DNS/ACME 或所有故障组合已验收。
+
+### 1.1 静态 Linux 发布二进制
+
+Linux 发布资产固定使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`，目标文件不得包含 glibc、`ld-linux`、OpenSSL 或其他宿主共享库。`scripts/package-release.ps1` 对每个 Linux 归档执行以下断言，任一失败即拒绝打包：
+
+```bash
+readelf -d proxysss   # 不得出现 NEEDED
+readelf -l proxysss   # 不得出现 INTERP
+file proxysss         # 必须包含 statically linked 或 static-pie linked
+```
+
+tag 前还必须把同一构建产物放进 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04 与 Alpine 容器，实际启动网关并完成 HTTP 静态响应、HTTPS、HTTP/2、Range、HEAD、metrics 与管理 healthz；只做 `--version` 不足以证明运行正常。Linux 资源名保持 `proxysss-linux-amd64.tar.gz` / `proxysss-linux-arm64.tar.gz`，升级安装器无需改下载地址。musl 构建启用 `mimalloc`，glibc/macOS 构建继续使用 `jemalloc`。本次静态发布不包含新增性能对比，不能用便携性替代性能证据。
 
 ## 2. Linux 混合性能（可选诊断）
 
