@@ -7,6 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+& (Join-Path $PSScriptRoot 'clean-test-cache.ps1')
 
 if ($Quick) {
     $Concurrency = 128

@@ -5,7 +5,7 @@ function Get-ProjectArtifactPath([string]$RelativePath) {
     if ([IO.Path]::IsPathRooted($RelativePath) -or $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
         throw "Artifact path must be relative to the project: $RelativePath"
     }
-    if ($RelativePath -notmatch '^(\.tmp|\.cache|target|dist|\.benchmark)[\\/].+') {
+    if ($RelativePath -notmatch '^(\.tmp|\.cache|target|dist|\.benchmark)([\\/].+)?$') {
         throw "Artifact path must be a child of a known artifact directory: $RelativePath"
     }
     $path = [IO.Path]::GetFullPath((Join-Path $script:ProjectRoot $RelativePath))

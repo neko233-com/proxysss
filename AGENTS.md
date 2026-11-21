@@ -171,6 +171,26 @@ must skip the site; only an explicit `proxysss://static-site/<name>` script deci
 Host/path, peer and authorization checks. `spa_fallback` is a single root-contained file and applies only to safe
 missing targets, never existing directories without index, hidden paths, dangling links or root escapes.
 
+## 测试缓存与磁盘预算（强制）
+
+**每次测试前必须清空之前的全部项目构建缓存和测试缓存。** 直接执行 `cargo test`、`cargo build`、`cargo clippy`、Docker 场景验证、基准测试、`verify-*` 或打包发布前，先运行：
+
+```powershell
+pwsh -NoProfile -File scripts/clean-test-cache.ps1
+```
+
+Linux 使用：
+
+```bash
+bash scripts/clean-test-cache.sh
+```
+
+- 清理范围是项目本地的 `target/`、`.benchmark/`、`.cache/`、`.tmp/`、`dist/`、根目录 `tmp-*` / `.tmp-*` 测试产物、benchmark 日志，以及本项目自建的 Docker 验证容器和卷；不得保留上一轮 100 GB 级 `target`/`.benchmark` 再开测。
+- `scripts/verify-local.ps1`、`verify-deep.ps1`、`verify-e2e.ps1`、`verify-docker-scenarios.ps1`、`run-all-verify.ps1`、`benchmark-gateways.ps1` 已内置开始前清理；直接 `cargo test` 或手动 `cargo build` 时必须先显式执行清理脚本。
+- 每次测试或基准结束后，`target/` 与 `.benchmark/` 合计必须低于 5 GB；超过即视为本轮验证失败，必须立即清理后再继续。不得让项目缓存接近 100 GB。
+- `KEEP_BENCH_ARTIFACTS=1` 只能为一次明确需要保留的发布证据使用；证据收集完成立即清理，不得长期堆积在 `.benchmark/`。
+- 清理脚本只删除项目绝对路径内的可丢弃状态，并拒绝链接越界；禁止用 `docker system prune`、全局 Cargo 缓存删除等操作影响其他项目。
+
 ## Hot Reload Boundaries
 
 **Hot-reloadable (fingerprinted):**

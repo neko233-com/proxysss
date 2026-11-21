@@ -18,6 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+& (Join-Path $PSScriptRoot 'clean-test-cache.ps1')
 Initialize-ProjectArtifacts
 $startedAt = Get-Date
 

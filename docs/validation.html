@@ -1,6 +1,8 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证与发布 · proxysss</title><link rel="stylesheet" href="site.css?v=dd4c9e6ec34a"></head><body><div class="shell"><nav class="topbar"><a href="index.html">文档首页</a><a href="architecture.html">架构</a><a href="cdn-origin.html">CDN 下载</a></nav><main class="panel"><h1 id="section">验证与发布流程</h1><p>2026-10-30 用户要求取消上线前压测门槛：正式发布以功能测试、目标环境验收和六平台打包为准，不要求性能胜出或三机性能证据。性能测试保留为可选诊断；未实测的性能或容量不得声称已达标。历史记录见 <a href="release-1.3.10.html">v1.3.10 验证记录</a>。</p>
 <p>2026-11-22 用户要求 Linux release 二进制不再依赖宿主 glibc，并以更少环境依赖的方式发布。v1.3.13 使用完全静态 musl 构建；本次不要求新增性能测试，但静态链接检查、Linux 全量功能、Debian 12 / Rocky/Alma 9 / Ubuntu 24.04 / Alpine 实际启动、Windows 快速测试、六平台打包和发布后真实安装必须通过。详见 <a href="release-1.3.13.html">v1.3.13 验证说明</a>。</p>
 <p>Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、<code>readelf</code>/<code>file</code> 结果及命令输出；某环境成功不能外推其他版本或架构。生产目标另做实际验收。</p>
+<h2 id="test-cache">0. 测试前缓存清理（强制）</h2>
+<p><strong>任何功能测试、Docker 验证、基准测试或打包前，必须先清空项目历史构建与测试缓存。</strong> Windows 运行 <code>pwsh -NoProfile -File scripts/clean-test-cache.ps1</code>，Linux 运行 <code>bash scripts/clean-test-cache.sh</code>。脚本只清理项目内的 <code>target/</code>、<code>.benchmark/</code>、<code>.cache/</code>、<code>.tmp/</code>、<code>dist/</code>、根目录测试产物、benchmark 日志和本项目自建 Docker 验证容器/卷，不会执行全局 <code>docker system prune</code>。<code>verify-local.ps1</code>、<code>verify-deep.ps1</code>、<code>verify-e2e.ps1</code>、<code>verify-docker-scenarios.ps1</code>、<code>run-all-verify.ps1</code>、<code>benchmark-gateways.ps1</code> 已内置开始前清理；直接运行 <code>cargo test</code> 时必须手动执行。测试结束确认 <code>target/</code> 与 <code>.benchmark/</code> 合计低于 5 GB，避免项目再次增长到 100 GB 级。</p>
 <h2 id="ubuntu-24-lts">1. Ubuntu 24 LTS 功能检查</h2>
 <p>Windows Docker Desktop 在 PowerShell 运行：</p>
 <pre><code class="language-powershell">.\scripts\verify-docker-scenarios.ps1
@@ -14,7 +16,7 @@
 <p>Linux 发布资产固定使用 <code>x86_64-unknown-linux-musl</code> / <code>aarch64-unknown-linux-musl</code>，目标文件不得包含 glibc、<code>ld-linux</code>、OpenSSL 或其他宿主共享库。打包脚本对每个 Linux 归档执行硬断言：<code>readelf -d</code> 无 <code>NEEDED</code>、<code>readelf -l</code> 无 <code>INTERP</code>、<code>file</code> 报告 <code>statically linked</code> 或 <code>static-pie linked</code>；任一失败即拒绝出包。</p>
 <p>tag 前还必须把同一构建产物放进 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04 与 Alpine 容器，实际启动网关并完成 HTTP 静态响应、HTTPS、HTTP/2、Range、HEAD、metrics 与管理 healthz；只做 <code>--version</code> 不足以证明运行正常。Linux 资源名保持 <code>proxysss-linux-amd64.tar.gz</code> / <code>proxysss-linux-arm64.tar.gz</code>，升级安装器无需改下载地址。musl 构建启用 <code>mimalloc</code>，glibc/macOS 构建继续使用 <code>jemalloc</code>。本次不包含新增性能对比。</p>
 <h2 id="linux">2. Linux 混合性能（可选诊断）</h2>
-<p>在干净提交上执行；Windows 必须使用 Git Bash。保存原始工件，不能让默认清理删除证据或共享构建缓存：</p>
+<p>在干净提交上执行；Windows 必须使用 Git Bash。仅在明确需要发布证据时设置 <code>KEEP_BENCH_ARTIFACTS=1</code> 保存原始工件，证据收集后立即清理 <code>.benchmark/</code>；默认测试前清理会删除上一轮缓存：</p>
 <pre><code class="language-bash">KEEP_BENCH_ARTIFACTS=1 REUSE_BENCH_IMAGE=1 \
   bash scripts/benchmark-ubuntu24-amd64-docker.sh
 </code></pre>

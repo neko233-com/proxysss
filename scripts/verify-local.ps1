@@ -5,6 +5,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'project-artifacts.ps1')
+# Strict disk hygiene: every verification starts from a clean project-local
+# build/test cache. target/ and .benchmark/ can otherwise retain 100 GB+.
+& (Join-Path $PSScriptRoot 'clean-test-cache.ps1')
 Initialize-ProjectArtifacts
 $lockPath = Get-ProjectArtifactPath '.tmp/verify-local.lock'
 try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
@@ -54,4 +57,9 @@ try {
 } finally {
     Pop-Location
     $lock.Dispose()
+    try {
+        & (Join-Path $PSScriptRoot 'clean-test-cache.ps1') -KeepTmp -KeepDist
+    } catch {
+        Write-Warning "Post-verification cache cleanup failed: $($_.Exception.Message)"
+    }
 }

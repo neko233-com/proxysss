@@ -1,0 +1,12 @@
+{
+  "url": "http://127.0.0.1:18080/large.bin",
+  "workers": 16,
+  "seconds": 10,
+  "requests": 149992,
+  "errors": 0,
+  "rps": 14999.2,
+  "p50_ms": 1.057,
+  "p95_ms": 1.612,
+  "p99_ms": 2.069,
+  "max_ms": 6.553
+}
