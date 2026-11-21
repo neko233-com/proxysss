@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.13 - 2026-11-22
+
+Linux release 资产改为完全静态的 musl 构建，修复 Debian 12、Rocky Linux 9、AlmaLinux 9 等旧 glibc 发行版无法启动的问题。
+
+- `proxysss-linux-amd64.tar.gz` / `proxysss-linux-arm64.tar.gz` 改用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`，不依赖宿主 glibc、`ld-linux`、OpenSSL、zlib 或额外发行版软件包；下载地址与安装器参数不变。
+- musl 构建启用 `mimalloc` 全局分配器，保留高并发转发与脚本路径的分配性能；glibc/macOS 构建继续使用 `jemalloc`。
+- 打包脚本对 Linux 资产硬断言 `readelf -d` 无 `NEEDED`、`readelf -l` 无 `INTERP`、`file` 为 `statically linked` 或 `static-pie linked`，不满足即拒绝出包。
+- CI、release 与 deploy 工作流的 Linux 目标同步切换为 musl，并安装对应工具链；六平台资产名称和 MSI 流程保持不变。
+- 同一 x86_64 静态二进制已在 Debian 12、Rocky Linux 9、AlmaLinux 9、Ubuntu 24.04、Alpine 3.20 启动并通过 HTTP、HTTPS、HTTP/2、Range、HEAD、metrics 与管理 healthz 冒烟；aarch64 通过 QEMU 执行同等检查。
+- 本次按用户授权不新增性能测试或 nginx 对比，不以便携性替代性能证据；功能测试、跨发行版启动、Windows 测试与发布后真实安装仍为发布门槛。
+
 ## v1.3.12 - 2026-10-30
 
 - 新增 `proxysss traffic`，按需读取本机管理接口，以有界快照计算域名请求增量和速率，展示当前 WebSocket 连接数；不增加转发路径的统计开销。

@@ -29,6 +29,7 @@
 | 后续改进 | [IMPROVEMENT-BACKLOG.md](IMPROVEMENT-BACKLOG.md) | 待办 |
 | v1.3.9 验证记录 | [HTML](release-1.3.9.html)、[RELEASE-1.3.9.md](RELEASE-1.3.9.md) | 历史证据 |
 | v1.3.10 验证记录 | [HTML](release-1.3.10.html)、[RELEASE-1.3.10.md](RELEASE-1.3.10.md) | 历史证据 |
+| v1.3.13 静态发布记录 | [HTML](release-1.3.13.html)、[RELEASE-1.3.13.md](RELEASE-1.3.13.md) | 静态 musl 与跨发行版证据 |
 | 版本变化 | [CHANGELOG.md](../CHANGELOG.md) | 历史记录 |
 
 `site.css`、`site.js` 和 `404.html` 是文档站资源，不承载独立产品契约。维护规则参考 [DeepSeek Harness 文档规范](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/AGENTS.md)，但使用本项目的 HTML、Markdown、示例和检查工具，不引入其运行时。

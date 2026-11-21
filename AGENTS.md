@@ -21,7 +21,9 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 允许调整不合理的内部架构，但不能减少现有功能。关联问题集中修复后验证 Ubuntu 24 Docker 功能与本机 Windows `cargo test --locked`；按用户要求先打包上传并完成目标环境功能验收，再封版发布。共享调度器改动必须覆盖就绪重装、背压、半关闭、取消和 fd 复用。
 
-Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 或对应受支持版本运行真实二进制功能验证；发行包须在两个环境启动并检查动态链接依赖，不能仅凭交叉编译、单一发行版或源码推断声称兼容。新增支持范围必须注明具体版本及架构，现有证据不能外推所有版本。
+**Linux 发布二进制必须零 glibc 依赖。2026-11-22 起，Linux release 资产统一使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态构建，musl 构建启用 `mimalloc`，不得回退到宿主 glibc 的动态二进制。** 发布前必须确认 `readelf -d` 无 `NEEDED`、`readelf -l` 无 `INTERP`、`file` 显示 `statically linked` 或 `static-pie linked`，并在 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04、Alpine 上实际启动并完成 HTTP/HTTPS 冒烟。该约束同时适用于 CI 打包预演与 tag 发布；新增 Linux 依赖必须静态链接或直接拒绝，不能把宿主发行版库当作运行前提。
+
+Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 或对应受支持版本运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
 ## Product Direction
 
@@ -106,6 +108,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Static sites should participate in config-load optimization: after loading config, eligible hot index/top-level static files are preloaded into the bounded cache or have sendfile descriptors prepared according to `runtime.performance.traffic_profile`.
 - Config load and hot reload must trigger a fast self-optimization warm-up before listeners serve traffic: preload hot static files into the bounded fast-lane cache, prebuild reusable HTTP/1 keep-alive bytes for eligible small objects, and pre-dial a small bounded pair of reverse-proxy/AI-proxy upstream keepalive sockets per deduplicated pool. Do not bulk pre-dial sockets on the startup runtime and then use them as long-lived data-shard lanes; Tokio socket registration remains tied to the creating reactor and cross-runtime ownership regresses latency. Numeric upstream IPs must be parsed once into `SocketAddr` instead of repeating string address resolution on every cold connect. Warm-up reruns after every reload, and `/healthz` exposes a `warm` readiness flag. Benchmarks should start only after warm-up.
 - Hot-path relay and datagram loops must reuse buffers from bounded, lock-free pools (`ByteBufferPool`) instead of allocating per request/datagram, to cap allocation churn at 100k-1M concurrent sockets while keeping resident pool memory bounded and leak-free (surplus buffers are freed on return). Pair high socket counts with `fs.nr_open`/`fs.file-max` sysctl ceilings and a high systemd `LimitNOFILE`.
+- Linux release builds must remain fully static (`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`) and use `mimalloc` on musl so the portability gain does not trade away allocator throughput. Keep `tikv-jemallocator` for glibc/macOS builds. Do not add a Linux release target that links the runner's `ld-linux`/glibc, OpenSSL, zlib, or another host-shared library.
 - Architecture should favor extensibility without putting hot-path traffic behind unnecessary dynamic dispatch, allocation, serialization, or script calls.
 - TypeScript scripting is a required product surface, and it is implemented as a single `proxysss` binary with an embedded TypeScript-capable engine (QuickJS via `rquickjs`, TypeScript stripped in-process with `swc_ts_fast_strip`) executing inside the process with hot reload. There is no external `deno`/`node`/`tsc` dependency, no bundled `deno.exe`, and no sidecar runtime directory — those are removed legacy states. See `specs/embedded-ts-runtime.md`.
 
@@ -139,6 +142,7 @@ Do **not** describe proxysss as "more business gateway than nginx". Describe it 
 - **Workflow JavaScript actions must target Node.js 24 LTS or newer.** Use `actions/upload-artifact@v6` and `actions/download-artifact@v6` (or later). Do not add `actions/*-artifact@v4` or other Node 20 actions without upgrading.
 - **Release tags require matching version and changelog.** Before pushing `vX.Y.Z`, ensure `CHANGELOG.md` contains `## vX.Y.Z` and `Cargo.toml` version matches. Run functional and target-environment verification before release; benchmark evidence is optional and must not be invented. GitHub Actions validates release metadata and packages six platforms. All release bundles include the binary, changelog, Chinese HTML documentation, configuration examples/templates, script declarations, and install scripts; `scripts/package-release.ps1` cleans fixed project-local staging and atomically replaces each archive.
 - **Historical v1.3.8 exception, 2026-09-08:** the user authorized a functional release after local functional checks and six-platform packaging; it is not a strict nginx performance win.
+- **本次静态发布授权，2026-11-22：** v1.3.13 按用户要求切换为完全静态 musl Linux 发布包；豁免新增性能测试和 nginx 对比，但不豁免静态链接检查、Linux 全量功能测试、跨发行版启动验证、Windows 快速测试、六平台打包和发布后真实安装验证。记录见 [v1.3.13 验证说明](docs/RELEASE-1.3.13.md)。
 - **本次稳定发布授权，2026-09-21：** v1.3.9 按上述最新用户要求豁免严格性能胜出和跨主机性能证据；本地 Ubuntu 功能、混合负载稳定性、本机 Windows 测试和六平台打包仍须通过。记录见 [v1.3.9 验证说明](docs/RELEASE-1.3.9.md)。
 - **历史 Linux 迁移稳定发布授权，2026-10-21：** v1.3.10 的验证记录与 Windows 环境限制按实际结果公开，不将其称为全平台运行验收。
 

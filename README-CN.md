@@ -10,6 +10,8 @@
 
 一个 Rust 二进制、一份 YAML，完成网站、API 与实时连接的网关工作。proxysss 面向 nginx 同级通用网关场景；需要业务逻辑时，再使用内置 TypeScript 脚本和插件扩展。
 
+Linux 安装包是完全静态的 musl 构建（`x86_64` / `aarch64`，启用 `mimalloc` 分配器），不依赖 glibc、`ld-linux`、OpenSSL、zlib 或额外发行版软件包。同一份归档可直接运行在 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04、Alpine 和最小化容器中，只需要现代 Linux 内核；运行时性能适配仍会识别发行版并按能力降级。
+
 ## 安装与后台运行
 
 Windows PowerShell：
