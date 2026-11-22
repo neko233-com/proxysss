@@ -88,8 +88,12 @@ try {
         # Windows bsdtar produces a smaller ZIP than Compress-Archive and
         # completes roughly twice as fast for the full documentation bundle.
         # Expand-Archive accepts the resulting ./ prefixed entries.
-        & tar -a -c -f $pending -C $stage .
-        if ($LASTEXITCODE -ne 0) { throw 'Release archive failed.' }
+        # Resolve System32\tar.exe explicitly: CI runners may put Git's GNU
+        # tar (no ZIP writer) ahead of bsdtar on PATH.
+        $bsdtar = Join-Path $env:SystemRoot 'System32\tar.exe'
+        if (-not (Test-Path -LiteralPath $bsdtar)) { throw 'Windows bsdtar (System32\tar.exe) is required to build the release ZIP.' }
+        $tarOut = & $bsdtar -a -c -f $pending -C $stage . 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Release archive failed.`n$tarOut" }
     } else {
         # Preserve the native Unix executable bit; stage timestamps are stable.
         & tar -czf $pending -C $stage .
