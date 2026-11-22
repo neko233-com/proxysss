@@ -15,6 +15,7 @@ use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithHtt
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, TracerProvider as SdkTracerProvider};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::runtime;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
@@ -131,7 +132,7 @@ where
             .build()
             .context("failed to build OTLP span exporter")?;
         let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
+            .with_batch_exporter(exporter, runtime::Tokio)
             .with_sampler(Sampler::TraceIdRatioBased(config.sample_ratio.clamp(0.0, 1.0)))
             .with_id_generator(RandomIdGenerator::default())
             .with_resource(resource.clone())
@@ -149,7 +150,7 @@ where
             .with_headers(headers)
             .build()
             .context("failed to build OTLP metric exporter")?;
-        let reader = PeriodicReader::builder(exporter)
+        let reader = PeriodicReader::builder(exporter, runtime::Tokio)
             .with_interval(interval)
             .build();
         let provider = SdkMeterProvider::builder()
