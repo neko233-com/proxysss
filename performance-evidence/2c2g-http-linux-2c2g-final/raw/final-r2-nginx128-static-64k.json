@@ -1,0 +1,15 @@
+{
+  "label": "nginx128-static-64k-r2",
+  "url": "http://127.0.0.1:19080/large.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 162306,
+  "errors": 0,
+  "rps": 32461.2,
+  "mib_per_sec": 2028.825,
+  "p50_ms": 1.337,
+  "p95_ms": 5.028,
+  "p99_ms": 7.961,
+  "avg_ms": 1.9685102768844034
+}

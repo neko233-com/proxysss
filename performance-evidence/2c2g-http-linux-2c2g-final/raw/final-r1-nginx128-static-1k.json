@@ -1,0 +1,15 @@
+{
+  "label": "nginx128-static-1k-r1",
+  "url": "http://127.0.0.1:19080/small.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 236362,
+  "errors": 0,
+  "rps": 47272.4,
+  "mib_per_sec": 46.164453125,
+  "p50_ms": 0.979,
+  "p95_ms": 3.865,
+  "p99_ms": 5.584,
+  "avg_ms": 1.351578358619406
+}

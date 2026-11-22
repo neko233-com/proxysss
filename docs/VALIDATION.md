@@ -16,6 +16,43 @@ pwsh -NoProfile -File scripts/clean-test-cache.ps1
 
 Linux 使用 `bash scripts/clean-test-cache.sh`。脚本只清理项目内的 `target/`、`.benchmark/`、`.cache/`、`.tmp/`、`dist/`、根目录测试产物、benchmark 日志和本项目自建 Docker 验证容器/卷，不会执行全局 `docker system prune`。`verify-local.ps1`、`verify-deep.ps1`、`verify-e2e.ps1`、`verify-docker-scenarios.ps1`、`run-all-verify.ps1`、`benchmark-gateways.ps1` 已内置开始前清理；直接运行 `cargo test` 时必须手动执行。测试结束确认 `target/` 与 `.benchmark/` 合计低于 5 GB，避免项目再次增长到 100 GB 级。
 
+Linux 本机或容器测试可设置 `PROXYSSS_TEST_TEMP_BASE=<绝对路径>`，夹具会落到 `<base>/tests`；用于把临时文件放在项目外原生卷，避免 Windows 共享 v9fs 的瞬时 `ENODATA`。脚本拒绝相对路径。
+
+## 0.1 Debian 12 / Ubuntu 24 超快验收
+
+已有当前候选 Linux 静态二进制后，分钟级双发行版入口：
+
+```powershell
+pwsh -NoProfile -File scripts/verify-debian-ubuntu-fast.ps1 -Binary .tmp/perf/v1315/proxysss
+```
+
+脚本先检查 `readelf -d` 无 `NEEDED`、`readelf -l` 无 `INTERP`，再分别在 `debian:bookworm-slim` 与 `ubuntu:24.04` 容器启动真实二进制，断言 `--version`、`check-config`、HTTP 200、HEAD 200、Range 206/100 字节、HTTPS 200、管理 `/healthz` 200。默认容器 `1 CPU / 512 MiB`，宿主端口 18081/18443/17977，结束后清理 `bench-verify-*`；不替代完整功能矩阵，也不把某发行版成功外推到其他版本或架构。
+
+v1.3.15 本轮结果：
+
+```text
+PASS Debian 12: proxysss 1.3.15; HTTP/HTTPS/Range/HEAD/healthz OK
+PASS Ubuntu 24.04 LTS: proxysss 1.3.15; HTTP/HTTPS/Range/HEAD/healthz OK
+FAST VERIFY PASS in 3.4s
+```
+
+## 0.2 Linux 2C2G HTTP 对照
+
+Linux 真机最终证据：Ubuntu 22.04.5 LTS，2 vCPU（cgroup `cpu.max=200000 100000`），单个网关进程 `prlimit --as=2147483648`；nginx 1.28.0 源码构建，2 worker、`reuseport`、`sendfile`、`open_file_cache`、upstream `keepalive 128`、默认 `proxy_buffering`。两侧同一后端与 Go 负载器，64 条预连接、2 秒预热 + 5 秒测量、3 轮交替顺序、每请求校验状态与正文长度。
+
+| 场景 | nginx 1.28 RPS | proxysss RPS | 比率 |
+| --- | ---: | ---: | ---: |
+| 1 KiB 静态 | 47,272.4 | 51,894.0 | 1.098x |
+| 64 KiB 静态 | 32,375.4 | 37,247.4 | 1.150x |
+| 1 KiB 反代 | 28,334.4 | 51,399.2 | 1.814x |
+| 三项等权合计 | 107,982.2 | 140,540.6 | 1.302x |
+
+2,888,924 次响应零错误；三个场景的吞吐中位数均高于 nginx。原始 JSON、配置、`run-final.sh` 与 `env.txt` 位于 `performance-evidence/2c2g-http-linux-2c2g-final/`。
+
+2 GiB 是每进程虚拟地址空间上限，不是严格 2 GiB cgroup 内存限制：沙箱 `memory.max` 只读为 4 GiB，proxysss RSS 约 17 MiB。结果是单机 loopback、声明配置下的证据，不是跨主机、真实网卡或严格全协议混合负载结论。
+
+Windows Docker 的 `scripts/bench-2c2g-http.ps1 -Binary <Linux二进制> -Tag <标签>` 保留为同机诊断入口：默认网关 2 CPU / 2 GiB、后端 1 CPU / 512 MiB、64 条预连接、3 轮中位；Docker Desktop 端口转发和共享文件系统会改变数值，不能作为跨主机或生产性能证据。
+
 ## 1. Ubuntu 24 LTS 功能检查
 
 Windows Docker Desktop 在 PowerShell 运行：

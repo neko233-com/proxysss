@@ -1,0 +1,15 @@
+{
+  "label": "proxysss-static-1k-r2",
+  "url": "http://127.0.0.1:19080/small.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 259470,
+  "errors": 0,
+  "rps": 51894,
+  "mib_per_sec": 50.677734375,
+  "p50_ms": 0.891,
+  "p95_ms": 3.464,
+  "p99_ms": 5.115,
+  "avg_ms": 1.2313859906732956
+}

@@ -103,7 +103,7 @@ Linux 的 `config performance` 用 `linux_cpu.allowed_cpu_ids` 展示启动允�
 
 Windows/macOS 保持现有运行时调度，平台 enabled=false 关闭对应平台新增 socket 设置；基础异步 I/O 和监听器配置的 TCP_NODELAY 仍保留。`tcp_keepalive_secs: 0` 跳过 keepalive 设置；缓冲为 0 跳过对应 setsockopt。正数缓冲上限 16 MiB，内核可进一步限制实际值；不要给大量连接盲目分配大缓冲。keepalive idle 上限 86400 秒，interval 范围 1–3600 秒。
 
-启动时记录计划、OS 版本、参数探测成功/失败和 UDP 实际缓冲值；运行时设置失败首次记录告警，保留 OS 回退。能力探测不等于性能证明。`small` 偏向小文件与实时反馈，`bulk` 偏向大文件流式/零拷贝，`balanced` 同时准备两种静态路径；根据真实混合流量选择。
+启动时记录计划、OS 版本、参数探测成功/失败和 UDP 实际缓冲值；运行时设置失败首次记录告警，保留 OS 回退。能力探测不等于性能证明。`small` 偏向小文件与实时反馈，32 KiB 以下缓存完整响应、32 KiB 及以上完整 GET 使用同步 sendfile；`bulk` 偏向大文件流式/零拷贝，`balanced` 同时准备两种静态路径；根据真实混合流量选择。Linux 数据核预算为 2 时，`small` 的明文 HTTP 使用每核 pinned 单线程 runtime 和四个 `SO_REUSEPORT` 接受队列；其他核数保留共享 runtime。
 
 ## 生效边界和验证
 

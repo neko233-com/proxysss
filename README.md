@@ -28,14 +28,14 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
 ```
 
-To install a particular published tag, replace `v1.3.10` with the desired version:
+To install a particular published tag, replace `v1.3.15` with the desired version:
 
 ```powershell
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.10
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.15
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.10
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.15
 ```
 
 Browse [release downloads](https://github.com/neko233-com/proxysss/releases) and [Git tags](https://github.com/neko233-com/proxysss/tags). The installers initialize configuration and service; Linux installation to `/usr/local/bin` may require sudo.

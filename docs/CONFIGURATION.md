@@ -745,7 +745,7 @@ runtime:
     traffic_profile: small
 ```
 
-- `small`：优先小文件、SSE、HTTP2、频繁 flush、交互式流量。
+- `small`：优先小文件、SSE、HTTP2、频繁 flush、交互式流量。小于 32 KiB 的静态完整响应走有界正文缓存；32 KiB 及以上在 HTTP owner 内同步 sendfile，不启用大文件 reactor。Linux 数据核预算为 2 时，明文 HTTP 使用每核 pinned 单线程 runtime 和四个 `SO_REUSEPORT` 接受队列。
 - `balanced`：静态大文件与实时连接混合负载的可选配置，须按实际混合矩阵验证；产品默认仍为 `small`。
 - `bulk`：明显偏大文件传输、下载分发、零拷贝吞吐优先。
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.15 - 2026-11-22
+
+2C2G 双核调度与静态 sendfile 分界版本；发布仍以功能验证、目标环境验收和六平台打包为准。
+
+- Linux 数据核预算为 2 且 `traffic_profile: small` 时，明文 HTTP 使用每核 pinned 单线程 runtime，并在每个 runtime 上建立两个 `SO_REUSEPORT` 接受队列，降低双核长连接跨核迁移和稀疏放置抖动；1 核及其他核数保留共享 runtime。
+- `small` 静态对象改为 32 KiB 分界：更小对象缓存完整 HTTP/1 keep-alive 响应，32 KiB 及以上完整 GET 在 HTTP owner 内同步 sendfile，避免 64 KiB 正文缓存的一次用户态拷贝；`balanced`/`bulk` 的大文件 sendfile reactor 不变。
+- sendfile 空闲 fd 池按每个数据核 32 个、最高 256 个预留，双核容量 64；64 条 keep-alive 的 64 KiB 静态响应不再逐次经 procfs 重开，池耗尽仍保留版本锚点语义。
+- 新增 Go 快负载器 `scripts/bench-fast-http.go`，按 worker 独立连接、预连接重试、固定测量截止和每轮原始 JSON，避免 Docker Desktop 端口转发突发连接导致 0 结果或迟到样本污染 RPS。
+- 新增 `scripts/bench-2c2g-http.ps1`：2 CPU / 2 GiB 网关、1 CPU / 512 MiB 后端、64 条预连接、3 轮中位，覆盖 1 KiB 静态、64 KiB 静态和 1 KiB 反代；新增 `scripts/verify-debian-ubuntu-fast.ps1`，秒级检查 Debian 12 与 Ubuntu 24.04 的真实静态二进制、HTTP/HTTPS/Range/HEAD/healthz。
+- Linux 真机 2 vCPU + 每进程 2 GiB 地址空间、nginx 1.28.0 默认 buffering 对照：三轮中位静态 1 KiB `47,272.4 vs 51,894.0`（1.098x）、静态 64 KiB `32,375.4 vs 37,247.4`（1.150x）、1 KiB 反代 `28,334.4 vs 51,399.2`（1.814x），三项等权合计 **1.302x**，2,888,924 次响应零错误。原始 JSON、环境与限制见 `performance-evidence/2c2g-http-linux-2c2g-final/`。
+- Debian 12 与 Ubuntu 24.04 快速验收通过（`1.3.15`，3.4 秒）；Windows `425 passed / 0 failed`，Linux musl `454 passed / 0 failed`。测试夹具支持项目目录外的 `PROXYSSS_TEST_TEMP_BASE`，并修复相对根路径测试对 cwd 的隐含假设。
+
 ## v1.3.14 - 2026-11-22
 
 测试与发布缓存治理版本；运行时转发行为不变。

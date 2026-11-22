@@ -65,6 +65,23 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
 
+    fn relative_from(path: &Path, base: &Path) -> PathBuf {
+        let mut path_components = path.components().peekable();
+        let mut base_components = base.components().peekable();
+        while path_components.peek() == base_components.peek() {
+            path_components.next();
+            base_components.next();
+        }
+        let mut relative = PathBuf::new();
+        for _ in base_components {
+            relative.push("..");
+        }
+        for component in path_components {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
     #[test]
     fn boundary_supports_missing_roots_and_relative_config_paths() {
         let fixture = TestDir::new("filesystem-boundary");
@@ -72,8 +89,8 @@ mod tests {
         assert!(confined_path(&root, &root.join("nested/file")).is_ok());
         assert!(confined_path(&root, &fixture.join("sibling")).is_err());
         let cwd = std::env::current_dir().unwrap();
-        let relative = root.strip_prefix(&cwd).unwrap();
-        assert!(confined_path(relative, &relative.join("new/file")).is_ok());
+        let relative = relative_from(&root, &cwd);
+        assert!(confined_path(&relative, &relative.join("new/file")).is_ok());
     }
 
     #[cfg(unix)]

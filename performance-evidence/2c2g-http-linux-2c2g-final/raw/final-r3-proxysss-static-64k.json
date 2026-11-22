@@ -1,0 +1,15 @@
+{
+  "label": "proxysss-static-64k-r3",
+  "url": "http://127.0.0.1:19080/large.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 189066,
+  "errors": 0,
+  "rps": 37813.2,
+  "mib_per_sec": 2363.325,
+  "p50_ms": 1.337,
+  "p95_ms": 4.493,
+  "p99_ms": 6.373,
+  "avg_ms": 1.690482551066823
+}

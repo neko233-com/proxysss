@@ -1,0 +1,26 @@
+http:
+  plain_bind: 127.0.0.1:19080
+  tls_bind: ''
+  h3_bind: ''
+logging:
+  level: error
+  access_log: false
+  access_log_path: /tmp/bench2c2g/logs/proxysss-access.log
+  error_log_path: /tmp/bench2c2g/logs/proxysss-error.log
+admin:
+  enabled: false
+runtime:
+  performance:
+    enabled: true
+    traffic_profile: small
+services:
+  static_sites:
+    - name: bench
+      path_prefix: /
+      root: /tmp/bench2c2g/www
+      index_files: [index.html]
+  reverse_proxy:
+    routes:
+      - name: rp
+        path_prefix: /rp
+        upstream: http://127.0.0.1:19081

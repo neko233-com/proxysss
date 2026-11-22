@@ -1772,7 +1772,9 @@ impl HyperBody for GatewayBody {
     }
 }
 const STATIC_STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(test)]
 const STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const STATIC_SENDFILE_SMALL_THRESHOLD_BYTES: u64 = 32 * 1024;
 const STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const STATIC_SENDFILE_SMALL_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
@@ -2104,7 +2106,10 @@ pub(crate) fn configure_runtime_performance(config: &GatewayConfig) -> linux_tun
         let _ = RUNTIME_SOCKET_TUNE_LEVEL.set(plan.socket_level);
         SHARDED_PLAIN_HTTP_DATA_RUNTIMES.store(
             config.runtime.performance.enabled
-                && sharded_plain_http_runtime_profile(config.runtime.performance.traffic_profile),
+                && sharded_plain_http_runtime_profile(
+                    config.runtime.performance.traffic_profile,
+                    cpus.data_plane_workers,
+                ),
             Ordering::Relaxed,
         );
         SHARED_TLS_DATA_RUNTIMES.store(
@@ -2295,8 +2300,11 @@ struct StaticSendfilePool {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl StaticSendfilePool {
     fn new(file: std::fs::File) -> Self {
+        // One idle descriptor per concurrent keep-alive connection avoids
+        // reopening through procfs on every 64 KiB sendfile response. The
+        // anchor still pins the inode; pool exhaustion remains version-safe.
         let capacity = adaptive_data_plane_workers(1)
-            .saturating_mul(8)
+            .saturating_mul(32)
             .clamp(1, 256);
         Self::with_capacity(file, capacity)
     }
@@ -6831,7 +6839,7 @@ impl Gateway {
             self.on_demand_trigger.clone(),
             default_tls_alpn_protocols(),
         )?));
-        let base_worker_count = plain_http_accept_worker_count(&self.bootstrap_config);
+        let base_worker_count = tls_http_accept_worker_count(&self.bootstrap_config);
         let max_worker_count =
             if cfg!(target_os = "linux") && self.bootstrap_config.runtime.performance.enabled {
                 adaptive_data_plane_workers(1)
@@ -13107,7 +13115,7 @@ fn static_sendfile_fast_path_threshold_bytes(config: &GatewayConfig) -> u64 {
     match config.runtime.performance.traffic_profile {
         RuntimePerformanceTrafficProfile::Bulk => 0,
         RuntimePerformanceTrafficProfile::Balanced => STATIC_SENDFILE_BALANCED_THRESHOLD_BYTES,
-        RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES,
+        RuntimePerformanceTrafficProfile::Small => STATIC_SENDFILE_SMALL_THRESHOLD_BYTES,
     }
 }
 
@@ -14084,7 +14092,32 @@ fn plain_http_accept_worker_count(config: &GatewayConfig) -> usize {
     if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
         return 1;
     }
-    http_data_plane_workers_for(adaptive_data_plane_workers(1))
+    plain_http_accept_worker_count_for(
+        config.runtime.performance.traffic_profile,
+        adaptive_data_plane_workers(1),
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn plain_http_accept_worker_count_for(
+    profile: RuntimePerformanceTrafficProfile,
+    cores: usize,
+) -> usize {
+    let cores = cores.max(1);
+    if matches!(profile, RuntimePerformanceTrafficProfile::Small) && cores == 2 {
+        // Two pinned runtimes plus two SO_REUSEPORT queues can still receive a
+        // skewed share of long-lived keep-alive connections. Four queues halve
+        // the per-runtime hash-placement variance without adding runtimes.
+        return 4;
+    }
+    http_data_plane_workers_for(cores)
+}
+
+fn tls_http_accept_worker_count(config: &GatewayConfig) -> usize {
+    if !cfg!(target_os = "linux") || !config.runtime.performance.enabled {
+        return 1;
+    }
+    adaptive_data_plane_workers(1)
 }
 
 fn udp_listener_worker_count(config: &GatewayConfig) -> usize {
@@ -14164,8 +14197,19 @@ fn http_data_plane_workers_for(cores: usize) -> usize {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn sharded_plain_http_runtime_profile(profile: RuntimePerformanceTrafficProfile) -> bool {
+fn sharded_plain_http_runtime_profile(
+    profile: RuntimePerformanceTrafficProfile,
+    data_plane_workers: usize,
+) -> bool {
+    // A two-core host cannot amortize unified-runtime work stealing for
+    // long-lived HTTP/1 keep-alive connections: migrating ready tasks between
+    // both cores caused cross-core wake churn and halved small-file throughput
+    // in the 2C2G comparison. Keep the shared small runtime where it has enough
+    // cores to absorb sparse SO_REUSEPORT placement, but give tiny Linux
+    // gateways one pinned HTTP shard per core. Explicit balanced/bulk profiles
+    // retain their existing sharding rules.
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
+        || (matches!(profile, RuntimePerformanceTrafficProfile::Small) && data_plane_workers == 2)
 }
 
 fn plain_http_runtime_shard_count_for(cores: usize, sharded: bool) -> usize {
@@ -26250,14 +26294,45 @@ mod tests {
         assert_eq!(tls_http_runtime_workers_for(8, 8), 1);
         assert_eq!(tls_http_runtime_workers_for(96, 8), 12);
         assert!(!sharded_plain_http_runtime_profile(
-            RuntimePerformanceTrafficProfile::Small
+            RuntimePerformanceTrafficProfile::Small,
+            1
         ));
         assert!(sharded_plain_http_runtime_profile(
-            RuntimePerformanceTrafficProfile::Balanced
+            RuntimePerformanceTrafficProfile::Small,
+            2
         ));
         assert!(!sharded_plain_http_runtime_profile(
-            RuntimePerformanceTrafficProfile::Bulk
+            RuntimePerformanceTrafficProfile::Small,
+            4
         ));
+        assert!(sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced,
+            2
+        ));
+        assert!(sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Balanced,
+            8
+        ));
+        assert!(!sharded_plain_http_runtime_profile(
+            RuntimePerformanceTrafficProfile::Bulk,
+            2
+        ));
+        assert_eq!(
+            plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Small, 1),
+            1
+        );
+        assert_eq!(
+            plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Small, 2),
+            4
+        );
+        assert_eq!(
+            plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Small, 4),
+            4
+        );
+        assert_eq!(
+            plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Balanced, 8),
+            8
+        );
         assert_eq!(plain_http_runtime_shard_count_for(8, false), 1);
         assert_eq!(plain_http_runtime_shard_count_for(8, true), 8);
         assert_eq!(
@@ -26328,7 +26403,7 @@ mod tests {
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Small;
         assert_eq!(
             static_sendfile_fast_path_threshold_bytes(&config),
-            STATIC_SENDFILE_FAST_PATH_THRESHOLD_BYTES
+            STATIC_SENDFILE_SMALL_THRESHOLD_BYTES
         );
         config.runtime.performance.traffic_profile = RuntimePerformanceTrafficProfile::Balanced;
         assert_eq!(

@@ -66,7 +66,7 @@ WebDAV PROPFIND 支持 Depth 0/1，以流式 XML 返回目录，不积累全部�
 
 完整流式与 Range 下载在打开文件后核对其版本，发现元数据与所开文件不一致时失败，不拼接不同发布版本。完整流式正文和非 Linux 明文文件复制都严格限制到声明长度：文件增长不会发送多余字节，提前 EOF 是正文错误；HTTP/3 因而重置失败流而非发送成功 FIN。背压和取消仍由读取方控制，不增加预读生产任务。
 
-Linux sendfile 池每个版本保留一个锚点描述符。预热和池耗尽时通过 /proc/self/fd 重新打开该锚点，以取得同一 inode 的独立文件描述符；路径被替换或删除后仍发送原版本。procfs 不可用时复制锚点并继续使用显式发送偏移，保持正确性。空闲池仍有固定容量，多余归还立即关闭；额外锚点随旧缓存及最后一个响应释放。这不是不可变文件系统快照，就地覆盖仍需运维避免。
+Linux sendfile 池每个版本保留一个锚点描述符。预热和池耗尽时通过 /proc/self/fd 重新打开该锚点，以取得同一 inode 的独立文件描述符；路径被替换或删除后仍发送原版本。procfs 不可用时复制锚点并继续使用显式发送偏移，保持正确性。空闲池按每个数据核 32 个 fd、最高 256 个预留；双核 64 条 keep-alive 不需要逐响应经 procfs 重开。多余归还立即关闭；额外锚点随旧缓存及最后一个响应释放。这不是不可变文件系统快照，就地覆盖仍需运维避免。
 
 明文 HTTP/1 连接缓存每次命中都检查单调时间上的 2 秒 freshness，不按请求次数推迟检查。低频复用同一连接仍会触发共享后台重验证，不能因尚未积累 256 次访问而长期保留旧版本；过期不等于每次同步 stat，文件刷新仍由现有控制运行时合并执行。
 
@@ -104,11 +104,11 @@ MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与
 
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
-| small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime | TCP/WebSocket/UDP 同运行时，可 work stealing | 热小对象缓存；sendfile 稀疏时 8 MiB、超过数据核数时 2 MiB 切片 |
+| small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime；数据核预算为 2 时明文 HTTP 改为每核独立单线程 runtime，避免双核 work stealing 的跨核唤醒抖动 | TCP/WebSocket/UDP 同运行时，可 work stealing | 32 KiB 以下热小对象缓存并预构建 keep-alive 响应；32 KiB 及以上完整响应在 HTTP owner 内同步 sendfile，不启用大文件 reactor |
 | balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 按数据核预算建立 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
-balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。
+balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。数据核预算为 2 时，small 的明文 HTTP 改用每核 pinned 单线程 runtime，并建立四个 `SO_REUSEPORT` 接受队列；这是对双核长连接跨核迁移抖动与稀疏放置的局部修正，其他核数仍保留共享 runtime。small 的静态对象在 32 KiB 处分界：更小的热对象使用缓存完整响应，更大的完整 GET 走同步 sendfile；2C2G 对照中同步 sendfile 比全量正文缓存更省一次用户态拷贝，而大文件 reactor 仍只属于 balanced/bulk。
 
 balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 

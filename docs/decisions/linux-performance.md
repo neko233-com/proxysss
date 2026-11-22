@@ -2,6 +2,18 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
+## 2026-11-22：2C2G 双核明文 HTTP shard 与 small 静态 sendfile 分界
+
+Linux 真机（Ubuntu 22.04.5 LTS，2 vCPU `cpu.max=200000 100000`，单个网关 `prlimit --as=2147483648`）最终对照 nginx 1.28.0：64 条预连接、2 秒预热 + 5 秒测量、3 轮交替顺序、每请求校验状态和正文长度。原始 JSON、配置与 `run-final.sh` 保存在 `performance-evidence/2c2g-http-linux-2c2g-final/`。
+
+`small` 原先在双核上使用共享多线程 data runtime，长连接在核间 work stealing；因此只对 Linux 数据核预算为 2 的 `small` 启用每核 pinned 单线程 runtime，并在每个 runtime 上建立两个 `SO_REUSEPORT` 接受队列（总计四个）。三核及以上仍共享 runtime，避免为每个核固定单线程而失去稀疏放置吸收能力；1 核继续沿用共享 runtime。2 队列和 8 队列实测更差，不恢复。
+
+`small` 静态分界从大范围正文缓存改为 32 KiB：更小对象继续使用预构建 HTTP/1 keep-alive 完整响应；32 KiB 及以上完整 GET 在 HTTP owner 内同步 sendfile，不启用大文件 reactor。`balanced`/`bulk` 的 reactor 既有规则不变；把 64 KiB 流量整体切到 reactor 的历史实验明显更差。sendfile fd 池按每数据核 32 个、最高 256 个预留，双核容量 64，避免 64 条 keep-alive 逐响应经 procfs 重开，池耗尽仍保留版本锚点语义。
+
+最终三轮中位：nginx 静态 1 KiB 47,272.4、静态 64 KiB 32,375.4、反代 28,334.4 RPS；proxysss 分别为 51,894.0、37,247.4、51,399.2 RPS。即 1.098x、1.150x、1.814x，三项等权合计 **1.302x**；2,888,924 次成功响应、0 错误。三个场景吞吐均高于本轮 nginx 1.28 默认 buffering 对照。
+
+这是单机 loopback、2 vCPU、每进程 2 GiB 地址空间的证据；2 GiB 是 `prlimit --as` 上限，不是严格 cgroup 内存限制（沙箱 `memory.max` 只读为 4 GiB，proxysss RSS 约 17 MiB）。Windows Docker 的早期 1.20x 只保留为同机诊断，不再作为本版本性能结论，也不能外推跨主机或全协议混合负载。
+
 ## 2026-09-21：黑名单持久化与可变准入修复，Linux 性能仍未达标
 
 提交 a58e2ff 保留封禁原始 UTC 起点、纳秒和 TTL，重启扣除停机时间；损坏快照拒绝启动。管理增删由单个阻塞 worker 串行保存完整快照，文件同步、关闭、替换成功后才发布内存和 DDoS，失败返回 500；调用方取消后已接受的 worker 继续持有执行责任。自动封禁和普通准入不等待控制锁。另修复关闭磁盘持久化时内存封禁被 HTTP/AI/WS 免策略反代绕过：admin 或热重载开启的部署经过当前请求策略链。

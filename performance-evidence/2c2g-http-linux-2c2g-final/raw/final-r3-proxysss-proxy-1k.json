@@ -1,0 +1,15 @@
+{
+  "label": "proxysss-proxy-1k-r3",
+  "url": "http://127.0.0.1:19080/rp/small.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 262402,
+  "errors": 0,
+  "rps": 52480.4,
+  "mib_per_sec": 51.250390625,
+  "p50_ms": 0.865,
+  "p95_ms": 3.507,
+  "p99_ms": 5.201,
+  "avg_ms": 1.218292436795451
+}

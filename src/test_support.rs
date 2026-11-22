@@ -2,7 +2,11 @@
 use std::path::PathBuf;
 
 pub fn temp_base() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp/tests");
+    let path = std::env::var_os("PROXYSSS_TEST_TEMP_BASE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join("tests"))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp/tests"));
     std::fs::create_dir_all(&path).expect("create project-local test directory");
     path
 }

@@ -1,0 +1,15 @@
+{
+  "label": "nginx128-proxy-1k-r2",
+  "url": "http://127.0.0.1:19080/rp/small.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 140979,
+  "errors": 0,
+  "rps": 28195.8,
+  "mib_per_sec": 27.5349609375,
+  "p50_ms": 2.002,
+  "p95_ms": 4.707,
+  "p99_ms": 7.092,
+  "avg_ms": 2.2676971889430337
+}
