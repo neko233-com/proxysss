@@ -104,11 +104,11 @@ MQTT TCP、TLS SNI 透传、MQTT WebSocket、CoAP、游戏语音、KCP 风格与
 
 | traffic_profile | HTTP/TLS | 实时流与 UDP | 静态文件 |
 | --- | --- | --- | --- |
-| small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime；数据核预算为 2 时明文 HTTP 改为每核独立单线程 runtime，避免双核 work stealing 的跨核唤醒抖动 | TCP/WebSocket/UDP 同运行时，可 work stealing | 32 KiB 以下热小对象缓存并预构建 keep-alive 响应；32 KiB 及以上完整响应在 HTTP owner 内同步 sendfile，不启用大文件 reactor |
+| small（默认） | HTTP/1、TLS/H2 共用按数据核预算扩展 worker 的 Tokio runtime；数据核预算为 2 时明文 HTTP 使用共享 Tokio runtime 和两个 `SO_REUSEPORT` 接受队列；pinned 四队列已被独立双容器复测推翻 | TCP/WebSocket/UDP 同运行时，可 work stealing | 32 KiB 以下热小对象缓存并预构建 keep-alive 响应；32 KiB 及以上完整响应在 HTTP owner 内同步 sendfile，不启用大文件 reactor |
 | balanced | 明文 HTTP 每核独立单线程 runtime；TLS/H2 在 nice 5 有界运行时 | 无策略 TCP/明文 WebSocket 按数据核预算建立 nice 3 soft-affinity epoll owner；UDP 用 ceil(cores/2) nice 3 Tokio worker；WSS 留在 TLS runtime | 按活跃传输压力选择 HTTP owner 或预热 sendfile reactor |
 | bulk | 优先大流传输 | 显式 bulk TCP 可使用 splice | 优先 sendfile 描述符，可持续使用 reactor |
 
-balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。数据核预算为 2 时，small 的明文 HTTP 改用每核 pinned 单线程 runtime，并建立四个 `SO_REUSEPORT` 接受队列；这是对双核长连接跨核迁移抖动与稀疏放置的局部修正，其他核数仍保留共享 runtime。small 的静态对象在 32 KiB 处分界：更小的热对象使用缓存完整响应，更大的完整 GET 走同步 sendfile；2C2G 对照中同步 sendfile 比全量正文缓存更省一次用户态拷贝，而大文件 reactor 仍只属于 balanced/bulk。
+balanced 实时 owner 仅在真正阻塞后的请求 tick 短探测：1–16 对连接一次、17–32 对两次、超过 32 对依赖 epoll；上游回复和持续就绪流量不额外自旋。small 保留 64-poll relay 公平边界，shared UDP 每 4 包让出。数据核预算为 2 时，small 的明文 HTTP 使用共享 Tokio runtime 和两个 `SO_REUSEPORT` 接受队列；v1.3.15 的每核 pinned 四队列在独立双容器中被 64 条 keep-alive 的 accept 放置偏斜拖慢，单核打满而另一核空闲，已撤回。1 核与 3 核及以上同样保留共享 runtime。small 的静态对象在 32 KiB 处分界：更小的热对象使用缓存完整响应，更大的完整 GET 走同步 sendfile；2C2G 对照中同步 sendfile 比全量正文缓存更省一次用户态拷贝，而大文件 reactor 仍只属于 balanced/bulk。
 
 balanced 大于等于 8 MiB 的对象，仅在活跃传输大于数据核数且不超过每核四条时用 reactor；其他压力区间直接 sendfile。每核不超过两条时选均匀分布的半数预热 owner，更高压力恢复全部 owner。独立文件描述符从有界池借还；EAGAIN 保存进度并形成背压。静态 sendfile 不设置 SO_SNDBUF，保留 Linux 发送缓冲自动调优；手动设置再写回数字不能清除用户锁，会影响同一 keep-alive 连接后续下载。reactor 提前清除 TCP_CORK 后通知 owner，避免重复 syscall。
 
@@ -312,3 +312,5 @@ HTTP/1、HTTP/2、HTTP/3 与管理 HTTP 共用计数；每个 chunk 复制前预
 HEAD 不读取正文计算压后长度：协商压缩时设置 GET 对应编码、删除未知派生长度，identity 保留原长度。压缩表征及其 HEAD 元数据将强 ETag 弱化，已有弱标签不重复处理，identity/206/已有编码保留原 ETag。
 
 未知/大表示的合格 MIME 仍保留 Accept-Encoding Vary，但保持流式并返回不可变换资格；HEAD 不宣称本次 GET 实际不会执行的编码。已知低于 min_length 的表示不增加该 Vary。
+
+

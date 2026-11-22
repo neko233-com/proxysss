@@ -39,8 +39,9 @@ user-invocable: true
 
 ## Project Notes
 - The repo currently keeps default CI packaging-only. Rust quality checks and benchmark/smoke jobs are manual unless a user explicitly asks to add them back.
-- Use `macos-15-intel` for x86_64 macOS builds and `macos-latest` for arm64 unless a workflow needs a narrower label.
+- Default release workflows use `macos-latest` (arm64). macOS Intel is source-build only; do not add `macos-15-intel` unless the user explicitly asks to restore the Intel asset.
 - Keep package artifact names and release asset names aligned across CI, deploy, and release workflows.
 
 ## References
 - [Validation commands](./references/validation.md)
+

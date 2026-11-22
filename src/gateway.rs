@@ -14102,14 +14102,8 @@ fn plain_http_accept_worker_count_for(
     profile: RuntimePerformanceTrafficProfile,
     cores: usize,
 ) -> usize {
-    let cores = cores.max(1);
-    if matches!(profile, RuntimePerformanceTrafficProfile::Small) && cores == 2 {
-        // Two pinned runtimes plus two SO_REUSEPORT queues can still receive a
-        // skewed share of long-lived keep-alive connections. Four queues halve
-        // the per-runtime hash-placement variance without adding runtimes.
-        return 4;
-    }
-    http_data_plane_workers_for(cores)
+    let _ = profile;
+    http_data_plane_workers_for(cores.max(1))
 }
 
 fn tls_http_accept_worker_count(config: &GatewayConfig) -> usize {
@@ -14200,15 +14194,15 @@ fn sharded_plain_http_runtime_profile(
     profile: RuntimePerformanceTrafficProfile,
     data_plane_workers: usize,
 ) -> bool {
-    // A two-core host cannot amortize unified-runtime work stealing for
-    // long-lived HTTP/1 keep-alive connections: migrating ready tasks between
-    // both cores caused cross-core wake churn and halved small-file throughput
-    // in the 2C2G comparison. Keep the shared small runtime where it has enough
-    // cores to absorb sparse SO_REUSEPORT placement, but give tiny Linux
-    // gateways one pinned HTTP shard per core. Explicit balanced/bulk profiles
-    // retain their existing sharding rules.
+    // Two independent 2C2G containers behind a bridge showed that pinned
+    // single-thread HTTP shards cannot rebalance uneven SO_REUSEPORT placement:
+    // 64 keep-alive clients could strand most work on one core while both cores
+    // were idle in aggregate. A shared runtime lets the two workers steal ready
+    // connections and nearly doubled reverse-proxy throughput. Keep only the
+    // explicit balanced profile sharded; small and bulk stay shared so tiny
+    // Linux gateways do not depend on accept-queue skew.
+    let _ = data_plane_workers;
     matches!(profile, RuntimePerformanceTrafficProfile::Balanced)
-        || (matches!(profile, RuntimePerformanceTrafficProfile::Small) && data_plane_workers == 2)
 }
 
 fn plain_http_runtime_shard_count_for(cores: usize, sharded: bool) -> usize {
@@ -26296,7 +26290,7 @@ mod tests {
             RuntimePerformanceTrafficProfile::Small,
             1
         ));
-        assert!(sharded_plain_http_runtime_profile(
+        assert!(!sharded_plain_http_runtime_profile(
             RuntimePerformanceTrafficProfile::Small,
             2
         ));
@@ -26322,7 +26316,7 @@ mod tests {
         );
         assert_eq!(
             plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Small, 2),
-            4
+            2
         );
         assert_eq!(
             plain_http_accept_worker_count_for(RuntimePerformanceTrafficProfile::Small, 4),

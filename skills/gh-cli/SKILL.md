@@ -26,7 +26,7 @@ gh release list -R neko233-com/proxysss --limit 5
 
 | Workflow | File | Purpose |
 | --- | --- | --- |
-| `ci` | `.github/workflows/ci.yml` | six-platform release bundle packaging only; tests run locally |
+| `ci` | `.github/workflows/ci.yml` | release asset matrix packaging only (5 assets); tests run locally |
 | `deploy` | `.github/workflows/deploy.yml` | package bundles |
 | `release` | `.github/workflows/release.yml` | tag builds + GitHub Release assets |
 
@@ -62,14 +62,15 @@ gh run list -R neko233-com/proxysss --workflow=release.yml --limit 3
 gh release view vX.Y.Z -R neko233-com/proxysss
 ```
 
-Verify all six assets exist:
+Verify all five assets exist:
 
 - `proxysss-windows-amd64.zip`
-- `proxysss-windows-arm64.zip`
+- `proxysss-windows-amd64.msi`
 - `proxysss-linux-amd64.tar.gz`
 - `proxysss-linux-arm64.tar.gz`
-- `proxysss-darwin-amd64.tar.gz`
 - `proxysss-darwin-arm64.tar.gz`
+
+Intel macOS and Windows ARM64 are source-build targets; they are not default release assets.
 
 If `publish` fails on `Extract current changelog`, the tagged commit is missing `## vX.Y.Z` in `CHANGELOG.md`. Fix the changelog on `main`, bump version if needed, commit, then push a **new** tag on that commit (do not rely on rerunning an old tag).
 
@@ -104,3 +105,4 @@ When reporting Actions status to the user, include:
 
 - `.github/skills/github-actions/SKILL.md` — edit and validate workflow YAML locally
 - `skills/proxysss-install/SKILL.md` — install released binaries after a green release run
+

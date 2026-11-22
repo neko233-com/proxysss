@@ -20,7 +20,7 @@ Windows PowerShell:
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
 ```
 
-For a graphical Windows installation, download `proxysss-windows-amd64.msi` or `proxysss-windows-arm64.msi` from [releases](https://github.com/neko233-com/proxysss/releases/latest). It installs for the current user into `%LOCALAPPDATA%\proxysss` and adds the user PATH. It replaces an existing binary in that directory, repairs on a same-version reinstall, and upgrades older MSI versions; copies elsewhere are not updated. Stop proxysss first; the MSI does not initialize or overwrite YAML or register or restart a service. Run `proxysss init` and `proxysss service install` separately when needed.
+For a graphical Windows installation, download `proxysss-windows-amd64.msi` from [releases](https://github.com/neko233-com/proxysss/releases/latest). It installs for the current user into `%LOCALAPPDATA%\proxysss` and adds the user PATH. It replaces an existing binary in that directory, repairs on a same-version reinstall, and upgrades older MSI versions; copies elsewhere are not updated. Stop proxysss first; the MSI does not initialize or overwrite YAML or register or restart a service. Run `proxysss init` and `proxysss service install` separately when needed. Windows ARM64 and Intel macOS are source-build targets; they are not part of the five default release assets.
 
 Linux / macOS:
 
@@ -28,14 +28,14 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
 ```
 
-To install a particular published tag, replace `v1.3.15` with the desired version:
+To install a particular published tag, replace `v1.3.16` with the desired version:
 
 ```powershell
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.15
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.16
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.15
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.16
 ```
 
 Browse [release downloads](https://github.com/neko233-com/proxysss/releases) and [Git tags](https://github.com/neko233-com/proxysss/tags). The installers initialize configuration and service; Linux installation to `/usr/local/bin` may require sudo.
@@ -154,3 +154,6 @@ Local validation, caches and packages use fixed project-local `.tmp`, `.cache`, 
 HTTP route authorization is bounded and asynchronous; script responses and per-route policies execute in the native gateway. Strict SNI and validated all-certificate reload are opt-in. See [configuration](docs/CONFIGURATION.md#路由授权响应策略与证书轮换) for defaults and failure boundaries.
 Scripts may explicitly override ordinary upstream methods and append independent response fields. HEAD-to-GET forwarding preserves GET metadata without a frontend body; HEAD caching remains bypassed.
 Omitted route compression inherits the global policy. Eligible known-length entities up to 4 MiB may be buffered for compression; unknown/larger upstream responses stream, while SSE, ranges and existing encodings are not transformed. See configuration for Vary and encoded-cache boundaries; this is not full nginx streaming-gzip equivalence.
+
+
+

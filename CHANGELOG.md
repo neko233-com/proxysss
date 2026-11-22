@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.16 - 2026-11-22
+
+独立双容器 2C2G 复测与发布包可移植性版本；撤回 v1.3.15 的 pinned 四队列，发布资产收缩为 5 个。
+
+- Linux 数据核预算为 2 的 `small` 明文 HTTP 改为共享 Tokio runtime + 两个 `SO_REUSEPORT` 队列；pinned 四队列在独立服务器/客户端容器中被 64 条 keep-alive 的 accept 放置偏斜拖慢，单核打满而另一核空闲。
+- 独立 Docker bridge 双容器正式三轮（2 秒预热 + 5 秒测量、64 条预连接、每请求校验状态与正文长度）：静态 1 KiB 73,955 vs 88,555（1.197x）、静态 64 KiB 44,072 vs 54,208（1.230x）、1 KiB 反代 43,933 vs 88,490（2.014x），三项等权 1.428x，5,690,455 次响应 0 错误；原始 JSON 见 `performance-evidence/2c2g-http-docker-two-host-two-host-final/`。
+- Linux release 继续使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态构建，硬检查无 `NEEDED` / `INTERP`；同一 x86_64 二进制在 Debian 12、Ubuntu 24.04、Rocky 9.9、AlmaLinux 9.9、Alpine 3.21 启动并通过 HTTP/HTTPS/Range/HEAD/healthz 冒烟。
+- Windows release 使用 `-C target-feature=+crt-static`，打包脚本用 `dumpbin /dependents` 拒绝 `VCRUNTIME*`、`MSVCP*`、`ucrtbase.dll`、`api-ms-win-crt-*`；不再要求用户安装 VC++ Redistributable。
+- Windows ZIP 改用系统 `tar.exe`（bsdtar）替代 `Compress-Archive`，同一完整文档包体积约小 3%、耗时约减半；修复 `install.ps1` 的计划任务查询未定义变量。
+- 发布资产收缩为 5 个：Linux amd64/arm64、macOS arm64、Windows amd64 ZIP/MSI；macOS Intel 与 Windows ARM64 不再默认发版，需要时从源码构建。Linux 静态 musl 已跨发行版通用，但仍按 CPU 架构区分。
+- 验证：Linux `454 passed / 0 failed`；Windows `425 passed / 0 failed`；Linux 最终二进制为 static-pie、无 `NEEDED` / `INTERP`。
+
 ## v1.3.15 - 2026-11-22
 
 2C2G 双核调度与静态 sendfile 分界版本；发布仍以功能验证、目标环境验收和六平台打包为准。
@@ -525,3 +537,4 @@ Linux release 资产改为完全静态的 musl 构建，修复 Debian 12、Rocky
 - Added TS/JS script routing through Deno.
 - Added plugin load/unload/list support through admin API and CLI.
 - Added load balancing, passive health checks, retries, affinity routing, config hot reload, admin console, service install, and installer scripts.
+

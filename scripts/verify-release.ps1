@@ -21,10 +21,9 @@ Require-Command gh
 
 $assets = @(
     "proxysss-windows-amd64.zip",
-    "proxysss-windows-arm64.zip",
+    "proxysss-windows-amd64.msi",
     "proxysss-linux-amd64.tar.gz",
     "proxysss-linux-arm64.tar.gz",
-    "proxysss-darwin-amd64.tar.gz",
     "proxysss-darwin-arm64.tar.gz"
 )
 
@@ -122,3 +121,4 @@ if ($PreviousVersion) {
 }
 
 Write-Host "Release install checks OK."
+

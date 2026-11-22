@@ -447,12 +447,12 @@
           </div>
 
           <h3>一键安装与版本下载</h3>
-          <p>Windows 也可从<a href="https://github.com/neko233-com/proxysss/releases/latest">最新版本下载</a>对应架构的 MSI 双击安装。MSI 安装到当前用户的 <code>%LOCALAPPDATA%\proxysss</code> 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前先停止 proxysss。MSI 不初始化或覆盖 YAML，也不注册或重启服务；首次使用可手动执行 <code>proxysss init</code> 和 <code>proxysss service install</code>。</p>
+          <p>Windows 也可从<a href="https://github.com/neko233-com/proxysss/releases/latest">最新版本下载</a>Windows x86_64 的 MSI 双击安装。MSI 安装到当前用户的 <code>%LOCALAPPDATA%\proxysss</code> 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前先停止 proxysss。MSI 不初始化或覆盖 YAML，也不注册或重启服务；首次使用可手动执行 <code>proxysss init</code> 和 <code>proxysss service install</code>。</p>
           <p>Windows PowerShell 安装最新正式版：</p>
           <pre><code class="language-powershell">&amp; ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest</code></pre>
           <p>Linux / macOS 安装最新正式版：</p>
           <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash</code></pre>
-          <p>安装指定版本时，PowerShell 将 <code>-Version latest</code> 换成 <code>-Version v1.3.15</code>；Shell 在命令末尾添加 <code>-s -- --version v1.3.15</code>，替换为需要的已发布标签。脚本安装二进制并初始化配置和服务；Linux 写入 <code>/usr/local/bin</code> 时可能需要 sudo。</p>
+          <p>安装指定版本时，PowerShell 将 <code>-Version latest</code> 换成 <code>-Version v1.3.16</code>；Shell 在命令末尾添加 <code>-s -- --version v1.3.16</code>，替换为需要的已发布标签。脚本安装二进制并初始化配置和服务；Linux 写入 <code>/usr/local/bin</code> 时可能需要 sudo。</p>
           <p><a href="https://github.com/neko233-com/proxysss/releases/latest">下载最新版本</a> · <a href="https://github.com/neko233-com/proxysss/releases">查看各版本及平台安装包</a> · <a href="https://github.com/neko233-com/proxysss/tags">查看 Git 标签</a></p>
           <pre><code>proxysss --version
 proxysss check-config
@@ -795,7 +795,7 @@ proxysss token show</code></pre>
       <section class="panel" id="cdn-origin-security"><h2>CDN 回源与安全目录服务</h2><p><code>services.static_sites</code> 支持回源令牌、TCP 对端 CIDR、短期 HMAC-SHA256 签名 URL、站点限流和缓存控制。鉴权先于文件缓存、HEAD、Range 与 304；签名资源返回 <code>no-store</code>。目录索引默认关闭，显式开启后支持大小、GMT 时间、安全链接和条目上限；默认隐藏点文件并检查真实路径边界。</p><p>源站令牌只鉴别 CDN，访客防盗刷和缓存命中时的授权须在 CDN 边缘执行。<a href="cdn-origin.html">阅读完整配置、签名算法与幂等验证说明 →</a></p></section>
 <section class="panel" id="security-platform-controls"><h2>安全开关与 Windows/macOS/Linux 适配</h2><p><code>proxysss config security</code> 输出安全开关、默认值和中文建议；CDN 鉴权与 FTP 策略可独立停用，保留规则。<code>proxysss config performance</code> 只读探测系统版本、I/O 后端和 socket 参数。Windows/macOS 保留 TCP 自动调节，并提供 keepalive、有界 UDP 缓冲；Linux 延续发行版与 CPU 自适应策略。Windows/macOS 保持现有调度，系统适配只作用于 socket；Linux 保留 CPU 自适应数据运行时。runtime.performance 在启动时固定，修改后需重启。</p><p>Docker 验证固定使用 <code>proxysss-verify</code>，运行前后清理同名项目容器，报告覆盖写入项目内固定目录。<a href="security-performance.html">查看完整配置、安全建议和验证边界</a></p></section>
 <section class="panel" id="console-and-docs"><h2>管理后台与内置文档</h2><p>默认在 <code>http://127.0.0.1:7777/</code> 查看运行状态。后台使用中文导航、表格与表单，原始 JSON 位于可折叠的诊断区。配置写入和配置展示默认关闭。管理监听器与公共监听器均提供 <code>/docs.html</code>；文档模板、样式和交互脚本嵌入单个二进制。</p><p>Windows 使用隐藏启动器注册登录自启动。英文与中文安装说明分别位于仓库的 README.md 和 README-CN.md；详细配置见<a href="configuration.html">配置指南</a>。</p></section>
-<section class="panel" id="linux-static-release"><h2>Linux 全静态发布包</h2><p>Linux 版 <code>proxysss-linux-amd64.tar.gz</code> / <code>proxysss-linux-arm64.tar.gz</code> 使用 musl 完全静态构建并启用 <code>mimalloc</code>，不依赖 glibc、<code>ld-linux</code>、OpenSSL、zlib 或额外发行版软件包。同一二进制可在 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04、Alpine 与最小容器中启动；打包脚本用 <code>readelf</code> 拒绝任何 <code>NEEDED</code> 或 <code>INTERP</code>。</p><p><a href="release-1.3.15.html">v1.3.15 发布说明</a> · <a href="validation.html#static-release">静态链接与跨发行版验收</a></p></section>
+<section class="panel" id="linux-static-release"><h2>Linux 全静态发布包</h2><p>Linux 版 <code>proxysss-linux-amd64.tar.gz</code> / <code>proxysss-linux-arm64.tar.gz</code> 使用 musl 完全静态构建并启用 <code>mimalloc</code>，不依赖 glibc、<code>ld-linux</code>、OpenSSL、zlib 或额外发行版软件包。同一二进制可在 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04、Alpine 与最小容器中启动；打包脚本用 <code>readelf</code> 拒绝任何 <code>NEEDED</code> 或 <code>INTERP</code>。</p><p><a href="release-1.3.16.html">v1.3.16 发布说明</a> · <a href="validation.html#static-release">静态链接与跨发行版验收</a></p></section>
 <section class="panel" id="complex-downloads"><h2>游戏资源与复杂下载</h2><p>原生静态服务支持单段和最多 16 段 Range，合并重叠区间并流式发送 multipart/byteranges。HEAD 忽略 Range；条件失败返回 412，全部越界返回 416。大文件局部读取不载入整文件，取消释放资源。脚本 API 无需变化。</p><p><a href="cdn-origin.html#complex-downloads">下载语义与限制</a> · <a href="validation.html">Linux 优先验证与发布流程</a></p></section>
 <section class="panel" id="sse-response-framing"><h2>SSE 流式响应</h2><p>原始 SSE 转 TLS/HTTP2 时解码 HTTP 分块，不向事件正文混入 chunk 标记，也不等待 keep-alive EOF；已有正文编码保留。<a href="configuration.html#sse-framing">查看可执行 AI 配置和流式边界</a>。</p></section>
 <section class="panel" id="static-virtual-hosts"><h2>静态虚拟主机</h2><p>使用 services.static_sites[].hosts 与 path_prefix 按域名分发资源，多站点预热与连接缓存保持隔离。匹配语法、优先级、重载和鉴权边界统一见 <a href="cdn-origin.html#static-virtual-hosts">CDN 域名隔离指南</a>。</p></section>
@@ -814,3 +814,4 @@ proxysss token show</code></pre>
 <script src="site.js?v=a6853f3b77dd" defer></script>
 </body>
 </html>
+

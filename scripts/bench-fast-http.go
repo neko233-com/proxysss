@@ -42,6 +42,7 @@ func main() {
 		warmupSecs   = flag.Int("warmup", 1, "warmup seconds")
 		durationSecs = flag.Int("duration", 3, "measurement seconds")
 		expected     = flag.Int("expected-bytes", 0, "required response body bytes; 0 disables")
+		prewarmMs    = flag.Int("prewarm-timeout-ms", 30000, "prewarm deadline in milliseconds")
 		out          = flag.String("out", "", "optional JSON output path")
 	)
 	flag.Parse()
@@ -49,8 +50,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "missing -url")
 		os.Exit(2)
 	}
-	if *workers < 1 || *durationSecs < 1 || *warmupSecs < 0 {
-		fmt.Fprintln(os.Stderr, "invalid workers/warmup/duration")
+	if *workers < 1 || *durationSecs < 1 || *warmupSecs < 0 || *prewarmMs < 1 {
+		fmt.Fprintln(os.Stderr, "invalid workers/warmup/duration/prewarm-timeout-ms")
 		os.Exit(2)
 	}
 
@@ -164,7 +165,7 @@ func main() {
 		for i := range pending {
 			pending[i] = i
 		}
-		deadline := time.Now().Add(30 * time.Second)
+		deadline := time.Now().Add(time.Duration(*prewarmMs) * time.Millisecond)
 		for len(pending) > 0 && time.Now().Before(deadline) {
 			next := make([]int, 0, len(pending))
 			var lastErr error

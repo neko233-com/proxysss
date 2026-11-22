@@ -937,7 +937,7 @@ scripts/benchmark-ubuntu24-amd64-docker.sh</code></pre>
 
             <article class="card">
               <span class="tag expert">traffic_profile</span>
-              <p class="subtle"><code>small</code> 适合小文件、SSE、HTTP2、小包 flush；小于 32 KiB 的静态完整响应走正文缓存，32 KiB 及以上在 HTTP owner 内同步 sendfile。Linux 数据核预算为 2 时明文 HTTP 使用每核 pinned runtime 与四个 <code>SO_REUSEPORT</code> 队列。<code>small</code> 是产品默认，<code>balanced</code> 是大文件与实时流量混合时的可选配置，<code>bulk</code> 适合明显偏大文件和下载分发。</p>
+              <p class="subtle"><code>small</code> 适合小文件、SSE、HTTP2、小包 flush；小于 32 KiB 的静态完整响应走正文缓存，32 KiB 及以上在 HTTP owner 内同步 sendfile。Linux 数据核预算为 2 时明文 HTTP 使用共享 Tokio runtime 与两个 <code>SO_REUSEPORT</code> 队列；pinned 四队列已被独立双容器复测推翻。<code>small</code> 是产品默认，<code>balanced</code> 是大文件与实时流量混合时的可选配置，<code>bulk</code> 适合明显偏大文件和下载分发。</p>
               <pre><code>runtime:
   performance:
     enabled: true
@@ -1024,3 +1024,4 @@ proxysss token show</code></pre>
 <script src="site.js?v=a6853f3b77dd" defer></script>
 </body>
 </html>
+

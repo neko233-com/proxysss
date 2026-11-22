@@ -147,6 +147,7 @@ function Test-ServiceEntryExists {
     $getScheduledTask = Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue
     if ($null -ne $getScheduledTask) {
         try {
+            $task = Get-ScheduledTask -TaskName $BinaryName -ErrorAction SilentlyContinue
             $taskFound = ($null -ne $task)
         } catch {
         }

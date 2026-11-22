@@ -745,7 +745,7 @@ runtime:
     traffic_profile: small
 ```
 
-- `small`：优先小文件、SSE、HTTP2、频繁 flush、交互式流量。小于 32 KiB 的静态完整响应走有界正文缓存；32 KiB 及以上在 HTTP owner 内同步 sendfile，不启用大文件 reactor。Linux 数据核预算为 2 时，明文 HTTP 使用每核 pinned 单线程 runtime 和四个 `SO_REUSEPORT` 接受队列。
+- `small`：优先小文件、SSE、HTTP2、频繁 flush、交互式流量。小于 32 KiB 的静态完整响应走有界正文缓存；32 KiB 及以上在 HTTP owner 内同步 sendfile，不启用大文件 reactor。Linux 数据核预算为 2 时，明文 HTTP 使用共享 Tokio runtime 和两个 `SO_REUSEPORT` 接受队列；pinned 四队列已被独立双容器复测推翻。
 - `balanced`：静态大文件与实时连接混合负载的可选配置，须按实际混合矩阵验证；产品默认仍为 `small`。
 - `bulk`：明显偏大文件传输、下载分发、零拷贝吞吐优先。
 
@@ -890,3 +890,4 @@ http:
 ```
 
 http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。
+

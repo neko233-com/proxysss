@@ -1,5 +1,7 @@
 # v1.3.15 双核调度、静态 sendfile 分界与 Linux 2C2G 对照
 
+> v1.3.16 独立双容器复测已推翻本文的 pinned 四队列结论；当前实现为共享 Tokio runtime + 两个 `SO_REUSEPORT` 队列。本文保留为历史记录。
+
 2026-11-22 用户要求继续优化 proxysss、修复不合理点，在 Debian 12 与 Ubuntu 24.04 LTS 上快速验证，并希望在 2C2G 限制下总体性能高于 nginx；全部落地后按既有授权直接发布。v1.3.15 只调整 Linux 双核明文 HTTP 调度、`small` 静态对象分界和对应测试夹具，不改变协议语义。对应 [HTML 记录](release-1.3.15.html) 同步维护。
 
 ## 1. 双核调度修正
@@ -72,3 +74,4 @@ FAST VERIFY PASS in 3.4s
 ## 6. 发布资产与限制
 
 发布前重新构建 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态产物，执行静态链接检查、Debian 12 / Ubuntu 24.04 冒烟、六平台打包、GitHub Release 和资产验收。本文档不以同机 loopback 数据替代生产跨主机证据；2 GiB 口径明确为地址空间限制，不包装成严格 cgroup 内存测试。
+

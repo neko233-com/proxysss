@@ -15,7 +15,7 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 ## 当前验收约束
 
-**2026-10-30 用户要求取消上线前压测门槛。** 发布以功能验证、目标环境真实验收及六平台打包为准，不要求性能胜出、混合负载压测或三机性能证据。性能实验保留为可选诊断；未实测不得声称性能胜出或容量达标。
+**2026-10-30 用户要求取消上线前压测门槛。** 发布以功能验证、目标环境真实验收及发布资产矩阵打包为准，不要求性能胜出、混合负载压测或三机性能证据。性能实验保留为可选诊断；未实测不得声称性能胜出或容量达标。
 
 **历史授权：2026-10-21 用户明确要求“没问题就全部发布”，v1.3.10 按 Linux nginx 迁移所需的功能与稳定性发布。** 生产 Linux 的完整功能、真实协议/容量和必要稳定性验收保留，六平台打包仍须通过；当时该版本豁免严格 nginx 性能胜出和跨主机性能证据。Windows 必须完整执行并披露实际结果，本机纯系统 IPv6 UDP loopback 不通不能伪装全绿、转为 IPv4 或 skip 专门双栈用例；不为此修改生产逻辑或系统网络。发布记录见 [v1.3.10 验证说明](docs/RELEASE-1.3.10.md)，不宣称所有平台运行全绿。历史 v1.3.9 授权仍只属于原版本。
 
@@ -86,7 +86,11 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - Legacy compatibility is not a product constraint unless the user explicitly asks for it. Prefer clean, high-performance, maintainable designs over preserving old internal shapes.
 - Performance remains a core product concern: production performance claims require Linux evidence because proxysss targets real Linux gateway deployments. Aim to match or exceed nginx on Ubuntu/Linux after `proxysss tune linux`; benchmarking is optional for release.
 - Linux data-plane concurrency must adapt automatically to detected CPU cores. Do not hard-code small worker caps for HTTP accept loops, TCP stream accept loops, UDP datagram workers, or stream runtimes; higher-core hosts should get proportionally more accept/runtime parallelism without operator config.
-- 在数据核预算为 2 的 Linux 主机上，`small` profile 的明文 HTTP 必须使用每核 pinned 单线程 runtime 和四个 `SO_REUSEPORT` 接受队列，不能让双核长连接在共享 work-stealing runtime 上反复跨核迁移；1 核与 3 核及以上仍保留共享 runtime。`small` 静态以 32 KiB 分界：更小对象缓存完整响应，更大完整 GET 在 HTTP owner 内同步 sendfile，不启用大文件 reactor。2C2G 对照入口为 `scripts/bench-2c2g-http.ps1`（Docker 同机诊断）和 `performance-evidence/2c2g-http-linux-2c2g-final/run-final.sh`（Linux 真机）；Debian/Ubuntu 快速验收为 `scripts/verify-debian-ubuntu-fast.ps1`。Linux 真机 2 vCPU + 每进程 2 GiB 地址空间、nginx 1.28 默认 buffering 的三轮中位为静态 1 KiB 1.098x、静态 64 KiB 1.150x、1 KiB 反代 1.814x，三项等权 1.302x；原始 JSON 与环境说明在同目录。Docker 同机数据、单机 loopback 和地址空间上限都不能冒充跨主机、严格 cgroup 内存或全协议混合性能证据。
+- Linux 数据核预算为 2 时，`small` profile 的明文 HTTP 必须使用共享 Tokio runtime 和两个 `SO_REUSEPORT` 接受队列；1 核与 3 核及以上同样保留共享 runtime。v1.3.15 的每核 pinned runtime + 四队列已被独立双容器复测推翻：64 条 keep-alive 的 `SO_REUSEPORT` 放置偏斜无法在 pinned shard 间重平衡；共享 runtime 以两个队列接近线性扩展。`small` 静态仍以 32 KiB 分界：更小对象缓存完整响应，更大完整 GET 在 HTTP owner 内同步 sendfile，不启用大文件 reactor。`balanced` 保留每核独立 runtime。2C2G 正式入口为 `scripts/bench-2c2g-docker-two-host.ps1`，用两个独立 Linux 容器（各 2 CPU / 2 GiB）和 bridge 网络，一台服务器、一台客户端；`scripts/bench-2c2g-http.ps1` 与旧 `2c2g-http-linux-2c2g-final/` 只是单机 loopback 诊断，不能冒充双机证据。2C2G 对照入口为 `scripts/bench-2c2g-http.ps1`（Docker 同机诊断）和 `performance-evidence/2c2g-http-linux-2c2g-final/run-final.sh`（Linux 真机）；Debian/Ubuntu 快速验收为 `scripts/verify-debian-ubuntu-fast.ps1`。Linux 真机 2 vCPU + 每进程 2 GiB 地址空间、nginx 1.28 默认 buffering 的三轮中位为静态 1 KiB 1.098x、静态 64 KiB 1.150x、1 KiB 反代 1.814x，三项等权 1.302x；原始 JSON 与环境说明在同目录。Docker 同机数据、单机 loopback 和地址空间上限都不能冒充跨主机、严格 cgroup 内存或全协议混合性能证据。
+- Docker 双容器正式三轮中位（2 秒预热 + 5 秒测量、64 条预连接、每请求校验状态和正文长度）：静态 1 KiB `73,955 vs 88,555`（1.197x）、静态 64 KiB `44,072 vs 54,208`（1.230x）、1 KiB 反代 `43,933 vs 88,490`（2.014x），共 5,690,455 次成功响应、0 错误。证据在 `performance-evidence/2c2g-http-docker-two-host-two-host-final/`。这是 Docker bridge 双容器，不是物理双机或跨主机生产证据，不能外推全协议混合负载。
+- Windows release 必须用 `-C target-feature=+crt-static` 构建，不得依赖用户安装 VC++ Redistributable；`scripts/package-release.ps1` 用 `dumpbin /dependents` 拒绝 `VCRUNTIME`、`MSVCP`、`ucrtbase`、`api-ms-win-crt-*`。Linux release 继续使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态构建，并硬断言无 `NEEDED`、无 `INTERP`。
+- Windows ZIP 使用 Windows 自带 `tar -a`（bsdtar）替代 `Compress-Archive`：同一完整文档包实测体积约小 3%、耗时约减半；`scripts/install.ps1` 的 `Test-ServiceEntryExists` 必须真正查询计划任务，不得引用未定义变量。发布前仍须验证 ZIP 解包、`proxysss.exe --version` 和静态 CRT 导入表。
+- 2026-11-22 v1.3.16 发布资产收缩为 5 个：`proxysss-linux-amd64.tar.gz`、`proxysss-linux-arm64.tar.gz`、`proxysss-darwin-arm64.tar.gz`、`proxysss-windows-amd64.zip`、`proxysss-windows-amd64.msi`。macOS Intel 与 Windows ARM64 不再默认发版，需要时从源码构建；Linux 静态 musl 已跨发行版通用，但仍按 CPU 架构区分，不按发行版分别发版。`ci.yml`、`deploy.yml`、`release.yml` 的 Windows 目标都必须设置 `RUSTFLAGS=-C target-feature=+crt-static`。
 - Linux CPU 资源在数据线程绑核前记录：保留启动 taskset/cpuset 范围，并按可检测的 cgroup quota 限制数据核预算；所有协议共用该快照，不能从已绑核 worker 重算或扩展到外层 cgroup。具体预算与检查输出维护在架构页。
 - Linux 调度、sendfile、H2 与实时 relay 的当前职责见 [架构](docs/ARCHITECTURE.md)；修改前阅读 [性能决策记录](docs/decisions/linux-performance.md)。历史已拒绝实验不得恢复为默认值；任何替代方案须重新证明完整混合负载无回归。
 - UDP 会话清理必须按实例身份删除，不能让旧 reader/发送失败误删同地址的新 association；本地 TTL 缓存必须尊重共享刷新。混合性能逐轮原始输出不得互相覆盖，错误分类与网络计数器用于诊断，不能从汇总错误数猜测原因，详见架构与验证指南。
@@ -163,7 +167,7 @@ proxysss config reload-plan
 proxysss config nginx-parity --format yaml
 ```
 
-验证顺序：Ubuntu 24 LTS Docker 功能 → Windows 功能 → 打包上传目标环境并验证 → push/tag/六平台打包/发布。可选性能实验的方法见 [验证指南](docs/VALIDATION.md)；有性能声明时保留与声明匹配的真实证据，禁止清理整个共享 benchmark/cache。
+验证顺序：Ubuntu 24 LTS Docker 功能 → Windows 功能 → 打包上传目标环境并验证 → push/tag/五资产打包/发布。可选性能实验的方法见 [验证指南](docs/VALIDATION.md)；有性能声明时保留与声明匹配的真实证据，禁止清理整个共享 benchmark/cache。
 
 ## Script-gated static invariant
 
@@ -270,3 +274,6 @@ HTTP auth_request 必须在路由缓存/静态/主上游前执行，失败拒绝
 脚本 upstream_method 只改变普通回源方法，不改变访客 ctx.method、固定 GET 授权或 WS；HEAD 转 GET 保留元数据但前端无正文。响应头 append 保留重复字段和状态规则，不合并 Set-Cookie。路由 compression 省略时继承全局；仅已知长度≤4 MiB 的合格表示为压缩缓冲，SSE/206/已有编码不变换，未知或大响应继续流式。Vary 保留上游 token，非 identity 源站表示缺少 Accept-Encoding 缓存维度时不得存储；不宣称完整 nginx 流式 gzip 等价。
 
 请求体 aggregate budget 属于 Gateway 生命周期，reload 不得 reset。H1/H2/H3 chunk 复制前预留，Bytes 所有 clone 最后释放后才退款；不要在 dispatch 返回但上游仍持有 body 时提前释放。
+
+
+

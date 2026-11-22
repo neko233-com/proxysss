@@ -1,8 +1,8 @@
 # 验证与发布流程
 
-2026-10-30 用户要求取消上线前压测门槛：正式发布以功能测试、目标环境验收和六平台打包为准，不要求性能胜出或三机性能证据。性能测试保留为可选诊断；未实测的性能或容量不得声称已达标。历史 v1.3.10 的实际验证见 [版本记录](RELEASE-1.3.10.md) / [HTML](release-1.3.10.html)。
+2026-10-30 用户要求取消上线前压测门槛：正式发布以功能测试、目标环境验收和发布资产矩阵打包为准，不要求性能胜出或三机性能证据。性能测试保留为可选诊断；未实测的性能或容量不得声称已达标。历史 v1.3.10 的实际验证见 [版本记录](RELEASE-1.3.10.md) / [HTML](release-1.3.10.html)。
 
-2026-11-22 用户要求 Linux release 二进制不再依赖宿主 glibc，并以更少环境依赖的方式发布。v1.3.13 使用完全静态 musl 构建；本次不要求新增性能测试，但静态链接检查、Linux 全量功能、Debian 12 / Rocky/Alma 9 / Ubuntu 24.04 / Alpine 实际启动、Windows 快速测试、六平台打包和发布后真实安装必须通过。详见 [v1.3.13 验证说明](RELEASE-1.3.13.md) / [HTML](release-1.3.13.html)。
+2026-11-22 用户要求 Linux release 二进制不再依赖宿主 glibc，并以更少环境依赖的方式发布。v1.3.13 使用完全静态 musl 构建；本次不要求新增性能测试，但静态链接检查、Linux 全量功能、Debian 12 / Rocky/Alma 9 / Ubuntu 24.04 / Alpine 实际启动、Windows 快速测试、发布资产矩阵打包和发布后真实安装必须通过。详见 [v1.3.13 验证说明](RELEASE-1.3.13.md) / [HTML](release-1.3.13.html)。
 
 Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
@@ -36,7 +36,29 @@ PASS Ubuntu 24.04 LTS: proxysss 1.3.15; HTTP/HTTPS/Range/HEAD/healthz OK
 FAST VERIFY PASS in 3.4s
 ```
 
-## 0.2 Linux 2C2G HTTP 对照
+## 0.2 独立双容器 2C2G HTTP 对照
+
+2026-11-22 用户否决单机 loopback、Windows host client 和 Docker published-port 数据，要求两台独立 Linux 容器各 2 CPU / 2 GiB，一台服务器、一台客户端，经 bridge 网络压测。正式入口：
+
+```powershell
+pwsh -NoProfile -File scripts/bench-2c2g-docker-two-host.ps1 -Binary <Linux二进制>
+```
+
+服务器容器使用 `nginx:1.28`，后端 nginx 与候选网关同容器（19080/19081），不发布宿主端口；客户端容器为 `debian:bookworm-slim`，Go HTTP/1.1 负载器 64 条预连接，`GOMAXPROCS=2`。每轮 2 秒预热 + 5 秒测量，3 轮交替候选顺序，每请求校验状态与正文长度。两侧实测 `cpu.max=200000 100000`、`memory.max=2147483648`。
+
+| 场景 | nginx RPS | proxysss RPS | 比率 | nginx p50 / p95 / p99 ms | proxysss p50 / p95 / p99 ms |
+| --- | ---: | ---: | ---: | --- | --- |
+| static-1k | 73,955 | 88,555 | 1.197x | 0.784 / 2.282 / 3.206 | 0.620 / 1.891 / 2.621 |
+| static-64k | 44,072 | 54,208 | 1.230x | 1.397 / 3.774 / 4.773 | 1.071 / 2.960 / 3.909 |
+| proxy-1k | 43,933 | 88,490 | 2.014x | 1.216 / 2.171 / 20.549 | 0.641 / 2.022 / 2.921 |
+
+三项等权合计 nginx `161,960`、proxysss `231,253`，**1.428x**；5,690,455 次成功响应、0 错误。原始 JSON、环境与汇总在 `performance-evidence/2c2g-http-docker-two-host-two-host-final/`。
+
+该结果推翻了 v1.3.15 的每核 pinned 四队列：同二进制双容器只有 0.851x / 1.024x / 1.214x，放置偏斜把单核打满而另一核空闲。当前实现为共享 Tokio runtime + 两个 `SO_REUSEPORT` 队列，仅 `balanced` 保留每核独立 runtime。
+
+这是 Docker bridge 双容器证据，不是物理双机或跨主机生产证据，不能外推 TLS/H2、WebSocket、TCP、UDP 或全协议混合负载。
+
+## 0.2.1 单机 loopback 历史对照
 
 Linux 真机最终证据：Ubuntu 22.04.5 LTS，2 vCPU（cgroup `cpu.max=200000 100000`），单个网关进程 `prlimit --as=2147483648`；nginx 1.28.0 源码构建，2 worker、`reuseport`、`sendfile`、`open_file_cache`、upstream `keepalive 128`、默认 `proxy_buffering`。两侧同一后端与 Go 负载器，64 条预连接、2 秒预热 + 5 秒测量、3 轮交替顺序、每请求校验状态与正文长度。
 
@@ -124,12 +146,14 @@ WSS 容量必须证明连接在整个空闲持有期后仍可用。bench websock
 
 ## 4. Push 与发布
 
-使用 [gh-cli 技能](../skills/gh-cli/SKILL.md)，检查实际 Actions 状态。CI 只做六平台打包，禁止云端功能测试和性能 benchmark。Node.js action 使用 24 LTS 或更高，artifact action 至少 v6。
+使用 [gh-cli 技能](../skills/gh-cli/SKILL.md)，检查实际 Actions 状态。CI 只做发布资产矩阵打包，禁止云端功能测试和性能 benchmark。Node.js action 使用 24 LTS 或更高，artifact action 至少 v6。
 
-正式版本的 `Cargo.toml` 版本与 `CHANGELOG.md` 标签章节须匹配。先完成 Linux 和 Windows 功能验证，按部署要求打包上传并核验目标环境，再推送 tag；六平台打包和 GitHub Release 附件均实际核验后才能报告发布完成。性能证据不再是发布门槛；如作性能比较，应保留可审计原始工件并如实说明环境与限制。
+正式版本的 `Cargo.toml` 版本与 `CHANGELOG.md` 标签章节须匹配。先完成 Linux 和 Windows 功能验证，按部署要求打包上传并核验目标环境，再推送 tag；发布资产矩阵打包和 GitHub Release 附件均实际核验后才能报告发布完成。性能证据不再是发布门槛；如作性能比较，应保留可审计原始工件并如实说明环境与限制。
 
 ## 诊断发生器瓶颈
 
 先区分网关与客户端资源，再解释接近 1.0 的比值。3efde31 的一次独立 CPU 观察器诊断固定网关/后端/客户端为 4/6/12 核，四个观察器另占 CPU 22–23。18 波全混合、54 个角色窗口的 25 ms 线程采样中，大文件客户端饱和运行时间约 964–993 ms/秒，接近其单核上限；CDN 约 780–941 ms/秒，仍不足以断定每种负载都受客户端限制。等负载 CDN 双 worker 累计调度等待约 212–245 ms/秒，网关 native realtime owner 约 21–28 ms/秒；多个线程等待可重叠，不能当作某次请求的延迟。
 
 该诊断使用固定旧发生器与二进制，窗口边界滞后最多 27.3 ms；退出线程保留最后可见样本，计数可能低估。完整计数、覆盖时间、源码和角色隔离信息保存在本地 `.benchmark/goal-rolecpu-3ef/`，不作为发布通过证据。发生器改为流式消费和独立连接池后必须重建双方数据，不能把发生器变化归为网关优化收益。
+
+

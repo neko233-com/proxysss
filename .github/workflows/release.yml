@@ -45,31 +45,25 @@ jobs:
             asset: proxysss-windows-amd64.zip
             binary: proxysss.exe
             use_xwin: false
-          - runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            asset: proxysss-windows-arm64.zip
-            binary: proxysss.exe
-            use_xwin: false
+            rustflags: -C target-feature=+crt-static
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: proxysss-linux-amd64.tar.gz
             binary: proxysss
             use_xwin: false
+            rustflags: ''
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: proxysss-linux-arm64.tar.gz
             binary: proxysss
             use_xwin: false
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: proxysss-darwin-amd64.tar.gz
-            binary: proxysss
-            use_xwin: false
+            rustflags: ''
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: proxysss-darwin-arm64.tar.gz
             binary: proxysss
             use_xwin: false
+            rustflags: ''
 
     runs-on: ${{ matrix.runner }}
 
@@ -98,6 +92,8 @@ jobs:
           fi
 
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package complete release bundle

@@ -2,7 +2,14 @@
 
 本页保存从原根 AGENTS.md 移出的性能约束与历史测量说明，供修改调度、sendfile 和实时 relay 前查阅。历史比值没有本次提交的原始工件，不构成当前性能结论；当前机制以 [架构](../ARCHITECTURE.md) 和源码为准，新的优化仍须通过 [完整混合验证](../VALIDATION.md)。
 
-## 2026-11-22：2C2G 双核明文 HTTP shard 与 small 静态 sendfile 分界
+## 2026-11-22：独立双容器 2C2G 推翻 pinned 四队列
+
+用户否决单机 loopback、Windows host client 和 Docker published-port 数据，要求两台独立 Linux 容器（各 2 CPU / 2 GiB）经 bridge 网络压测。服务器容器同时跑 nginx 后端与候选网关，客户端容器跑 Go HTTP/1.1 负载器，64 条预连接，3 轮交替，2 秒预热 + 5 秒测量。正式结果 static-1k `73,955 vs 88,555`（1.197x）、static-64k `44,072 vs 54,208`（1.230x）、proxy-1k `43,933 vs 88,490`（2.014x），三项等权 1.428x，5,690,455 次响应 0 错误。
+
+关键反证：同一 v1.3.15 二进制在双容器下 pinned 四队列只有 0.851x / 1.024x / 1.214x；`SO_REUSEPORT` 把 64 条长连接偏斜到单个 pinned shard 后，该 shard 无法把 ready 任务迁到空闲核。共享 runtime + 四队列为 0.985x / 1.174x / 1.415x，共享 runtime + 两队列为 1.114x / 1.370x / 1.686x。最终采用共享 runtime + 两个 `SO_REUSEPORT` 队列；仅 `balanced` 保留每核独立 runtime。`small` 32 KiB 静态分界、同步 sendfile、fd 池和版本锚点不变。
+
+证据在 `performance-evidence/2c2g-http-docker-two-host-two-host-final/`。这是 Docker bridge 双容器，不是物理双机或跨主机生产证据，不能外推 TLS/H2、WebSocket、TCP、UDP 或全协议混合负载。
+## 2026-11-22：2C2G 双核明文 HTTP shard 与 small 静态 sendfile 分界（历史单机 loopback，已被 v1.3.16 推翻）
 
 Linux 真机（Ubuntu 22.04.5 LTS，2 vCPU `cpu.max=200000 100000`，单个网关 `prlimit --as=2147483648`）最终对照 nginx 1.28.0：64 条预连接、2 秒预热 + 5 秒测量、3 轮交替顺序、每请求校验状态和正文长度。原始 JSON、配置与 `run-final.sh` 保存在 `performance-evidence/2c2g-http-linux-2c2g-final/`。
 
@@ -241,3 +248,4 @@ Ubuntu 24 amd64 Docker、6 核 gateway、角色隔离的 1×/2×/4× 全混合�
 候选 cb5f4df 将非密集 direct sendfile 改为每 2 MiB 让出，移除按源端口及每三次响应选择让出的状态；超过每核四条活跃传输时保留 16 MiB 与 EAGAIN 边界，reactor 的完整响应事件预算不变。333 项 Linux 测试、格式与 Clippy 通过，但 Ubuntu 24 amd64 Docker 标准 6/6/12 核全混合 1×/2×/4× 验证失败（18 秒活跃、180 秒矩阵 wall）。198 条原始样本零错误；大文件吞吐比为 0.702/0.637/0.722，仍未胜出。静态 HTTP p99 改善，但 2× 游戏 TCP p50/p95 比为 1.191/1.137，WebSocket p95/p99 在 2× 为 1.119/1.018、4× 为 1.132/1.115，不能接受局部改善伴随长连接延迟退步。
 
 4× cgroup current/peak 为 proxysss 84430848/283869184、nginx 208941056/381706240 bytes；内存通过不能抵消性能失败。候选已撤回。基线自身也未全过，两次矩阵的参考吞吐与等负载目标有变化，不能把单轮比值变化当作精确因果证据；下一次应整批检查 HTTP/direct sendfile 与实时 owner 调度关系，不重复单独缩小直接发送切片。诊断工件 `.benchmark/goal-rolecpu-768/`，候选工件 `.benchmark/direct-ubuntu24-amd64/goal-direct-fair-2m/`。
+

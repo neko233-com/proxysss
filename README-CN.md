@@ -20,7 +20,7 @@ Windows PowerShell：
 & ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version latest
 ```
 
-也可在 [版本下载页面](https://github.com/neko233-com/proxysss/releases/latest) 下载与电脑架构对应的 `proxysss-windows-amd64.msi` 或 `proxysss-windows-arm64.msi` 双击安装。MSI 安装到当前用户的 `%LOCALAPPDATA%\proxysss` 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前请停止正在运行的 proxysss；MSI 不初始化或覆盖 YAML，也不注册或重启服务。首次使用可手动运行 `proxysss init`、`proxysss service install`。
+也可在 [版本下载页面](https://github.com/neko233-com/proxysss/releases/latest) 下载 `proxysss-windows-amd64.msi` 双击安装；Windows ARM64 需要时从源码构建。MSI 安装到当前用户的 `%LOCALAPPDATA%\proxysss` 并添加用户 PATH；会替换该目录已有程序，同版本再次运行会修复，新版本会升级；其他目录中的副本不会更新。安装前请停止正在运行的 proxysss；MSI 不初始化或覆盖 YAML，也不注册或重启服务。首次使用可手动运行 `proxysss init`、`proxysss service install`。
 
 Linux / macOS：
 
@@ -28,14 +28,14 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash
 ```
 
-安装指定的已发布标签（将 `v1.3.15` 换为目标版本）：
+安装指定的已发布标签（将 `v1.3.16` 换为目标版本）：
 
 ```powershell
-& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.15
+& ([ScriptBlock]::Create((irm https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1))) -Action install -Version v1.3.16
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.15
+curl -fsSL https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh | bash -s -- --version v1.3.16
 ```
 
 [全部版本及平台安装包](https://github.com/neko233-com/proxysss/releases) · [Git 标签](https://github.com/neko233-com/proxysss/tags)。脚本会初始化配置和服务；Linux 写入 `/usr/local/bin` 时可能需要 sudo。
@@ -136,3 +136,5 @@ proxysss service status
 HTTP 路由支持有界异步授权、脚本合成响应和独立路由策略；严格 SNI 与全部证书的校验重载见[配置指南](docs/CONFIGURATION.md#路由授权响应策略与证书轮换)，上线仍须逐路由 canary。
 脚本可显式覆盖普通回源方法，并追加独立响应头；HEAD 转 GET 回源保留 GET 元数据且前端无正文，HEAD 缓存仍 bypass。
 路由压缩省略时继承全局，只缓冲已知长度≤4 MiB 的合格表示；未知/大响应继续流式，SSE、Range 和已有编码不变换。Vary 与源站编码缓存隔离的边界见配置指南，不宣称完整 nginx 流式 gzip 等价。
+
+

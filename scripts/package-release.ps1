@@ -27,6 +27,36 @@ if ($Target.EndsWith('-linux-musl')) {
         }
     }
 }
+if ($windowsTarget) {
+    # Windows release bundles must not require a separately installed VC++
+    # redistributable. Build them with -C target-feature=+crt-static and reject
+    # any surviving VCRUNTIME/MSVCP/UCRT import before packaging.
+    $dumpbinPath = $null
+    $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+    if ($dumpbin) { $dumpbinPath = $dumpbin.Source }
+    if (-not $dumpbinPath) {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (Test-Path -LiteralPath $vswhere) {
+            foreach ($pattern in @(
+                'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe',
+                'VC\Tools\MSVC\**\bin\Hostarm64\arm64\dumpbin.exe'
+            )) {
+                $found = & $vswhere -latest -find $pattern 2>$null | Select-Object -First 1
+                if ($found) { $found = $found.Trim() }
+                if ($found -and (Test-Path -LiteralPath $found)) {
+                    $dumpbinPath = $found
+                    break
+                }
+            }
+        }
+    }
+    if (-not $dumpbinPath) { throw 'dumpbin is required to verify the Windows runtime dependencies.' }
+    $deps = & $dumpbinPath /dependents $source 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "dumpbin failed on $source`n$deps" }
+    if ($deps -match '(?i)(VCRUNTIME\d*\.dll|MSVCP\d*\.dll|ucrtbase\.dll|api-ms-win-crt-[^\s]+\.dll)') {
+        throw "Windows release binary still imports a redistributable runtime:`n$deps"
+    }
+}
 $lockPath = Get-ProjectArtifactPath '.tmp/release-package.lock'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lockPath) | Out-Null
 $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
@@ -55,7 +85,11 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $output) | Out-Null
     if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force }
     if ($windowsTarget) {
-        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $pending
+        # Windows bsdtar produces a smaller ZIP than Compress-Archive and
+        # completes roughly twice as fast for the full documentation bundle.
+        # Expand-Archive accepts the resulting ./ prefixed entries.
+        & tar -a -c -f $pending -C $stage .
+        if ($LASTEXITCODE -ne 0) { throw 'Release archive failed.' }
     } else {
         # Preserve the native Unix executable bit; stage timestamps are stable.
         & tar -czf $pending -C $stage .
