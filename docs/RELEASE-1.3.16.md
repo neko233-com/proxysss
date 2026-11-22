@@ -68,7 +68,7 @@ v1.3.15 的同机 loopback 结论是：双核 `small` 使用每核 pinned 单线
 - Linux release 继续使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`，`mimalloc` 分配器；打包脚本硬检查 `readelf -d` 无 `NEEDED`、`readelf -l` 无 `INTERP`、`file` 为 `statically linked` / `static-pie linked`。
 - 同一 x86_64 最终二进制（SHA-256 `0a1e51e7…`）已在 Debian 12、Ubuntu 24.04、Rocky Linux 9、AlmaLinux 9、Alpine 3.21 的官方容器 rootfs（WSL chroot，非 Docker daemon）中启动，五发行版全部通过：`--version`、默认欢迎页 GET 200、真实静态文件 HEAD 200、Range 206 + 100 字节、`/healthz` 200、自签 HTTPS GET 200。默认 `/` 是生成的 welcome 响应，不支持 Range，Range 断言针对注入的静态站点文件。
 - Windows release 使用 `-C target-feature=+crt-static`；`package-release.ps1` 用 `dumpbin /dependents` 拒绝 `VCRUNTIME*`、`MSVCP*`、`ucrtbase.dll`、`api-ms-win-crt-*`。CI 和 deploy 与 release 使用同一 `rustflags`。
-- Windows ZIP 使用系统 `tar.exe`（bsdtar）替代 `Compress-Archive`：同一完整文档包实测 9,119,155 B / 0.75s 对 9,415,196 B / 1.43s，体积约小 3%、耗时约减半。打包脚本显式调用 `System32\tar.exe`：CI runner 的 PATH 可能把 Git 自带 GNU tar（不支持写 ZIP）排在 bsdtar 前面，v1.3.16 首次 CI 预演即因此失败，修复后重跑。
+- Windows ZIP 改用 PowerShell 内置 .NET `System.IO.Compression.ZipArchive`（Optimal 压缩）生成，不再调用系统 `tar.exe`：彻底消除对宿主 bsdtar/GNU tar 版本与 PATH 的强依赖，系统/runner 镜像升级不影响打包。UTF-8 中文文件名与确定性时间戳（2000-01-01）由 .NET 忠实写入，完整文档包本地实测约 77ms。v1.3.16 前两次 CI 预演因 runner 上 bsdtar 静默 exit 1 失败，重构后不再依赖外部归档二进制。
 - `scripts/install.ps1` 的 `Test-ServiceEntryExists` 真正查询计划任务，不再引用未定义变量。
 
 ## 6. 测试与发布门禁

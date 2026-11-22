@@ -8,7 +8,7 @@
 - 独立 Docker bridge 双容器正式三轮（2 秒预热 + 5 秒测量、64 条预连接、每请求校验状态与正文长度）：静态 1 KiB 73,955 vs 88,555（1.197x）、静态 64 KiB 44,072 vs 54,208（1.230x）、1 KiB 反代 43,933 vs 88,490（2.014x），三项等权 1.428x，5,690,455 次响应 0 错误；原始 JSON 见 `performance-evidence/2c2g-http-docker-two-host-two-host-final/`。
 - Linux release 继续使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态构建，硬检查无 `NEEDED` / `INTERP`；同一 x86_64 二进制在 Debian 12、Ubuntu 24.04、Rocky 9.9、AlmaLinux 9.9、Alpine 3.21 启动并通过 HTTP/HTTPS/Range/HEAD/healthz 冒烟。
 - Windows release 使用 `-C target-feature=+crt-static`，打包脚本用 `dumpbin /dependents` 拒绝 `VCRUNTIME*`、`MSVCP*`、`ucrtbase.dll`、`api-ms-win-crt-*`；不再要求用户安装 VC++ Redistributable。
-- Windows ZIP 改用系统 `tar.exe`（bsdtar）替代 `Compress-Archive`，同一完整文档包体积约小 3%、耗时约减半；修复 `install.ps1` 的计划任务查询未定义变量。
+- Windows ZIP 改用 PowerShell 内置 .NET `ZipArchive`（Optimal）生成，不再依赖系统 `tar.exe`/bsdtar，消除宿主归档工具版本与 PATH 强依赖；修复 `install.ps1` 的计划任务查询未定义变量。
 - 发布资产收缩为 5 个：Linux amd64/arm64、macOS arm64、Windows amd64 ZIP/MSI；macOS Intel 与 Windows ARM64 不再默认发版，需要时从源码构建。Linux 静态 musl 已跨发行版通用，但仍按 CPU 架构区分。
 - 验证：Linux `454 passed / 0 failed`；Windows `425 passed / 0 failed`；Linux 最终二进制为 static-pie、无 `NEEDED` / `INTERP`。
 

@@ -84,25 +84,32 @@ try {
     $output = Get-ProjectArtifactPath "dist/$Asset"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $output) | Out-Null
     if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
     if ($windowsTarget) {
-        # Windows bsdtar produces a smaller ZIP than Compress-Archive and
-        # completes roughly twice as fast for the full documentation bundle.
-        # Expand-Archive accepts the resulting ./ prefixed entries.
-        # Resolve System32\tar.exe explicitly: CI runners may put Git's GNU
-        # tar (no ZIP writer) ahead of bsdtar on PATH.
-        $bsdtar = Join-Path $env:SystemRoot 'System32\tar.exe'
-        if (-not (Test-Path -LiteralPath $bsdtar)) { throw 'Windows bsdtar (System32\tar.exe) is required to build the release ZIP.' }
-        $tarOut = & $bsdtar -a -c -f $pending -C $stage . 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Release archive failed.`n$tarOut" }
+        # Build the ZIP with the in-box .NET ZipArchive API: no external tar,
+        # no PATH resolution, no dependence on the host bsdtar/GNU-tar version.
+        # This survives Windows/runner image upgrades and writes UTF-8 entry
+        # names (Chinese docs) and deterministic timestamps faithfully.
+        $stageFull = (Resolve-Path -LiteralPath $stage).Path.TrimEnd('\')
+        $zip = [IO.Compression.ZipFile]::Open($pending, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {
+                $rel = $file.FullName.Substring($stageFull.Length + 1).Replace('\', '/')
+                $entry = $zip.CreateEntry($rel, [IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [DateTimeOffset]::new($file.LastWriteTimeUtc)
+                $src = [IO.File]::OpenRead($file.FullName)
+                try { $dst = $entry.Open(); try { $src.CopyTo($dst) } finally { $dst.Dispose() } }
+                finally { $src.Dispose() }
+            }
+        }
+        finally { $zip.Dispose() }
     } else {
         # Preserve the native Unix executable bit; stage timestamps are stable.
         & tar -czf $pending -C $stage .
         if ($LASTEXITCODE -ne 0) { throw 'Release archive failed.' }
     }
     if ($windowsTarget) {
-        # Windows tar.exe can reject valid UTF-8 ZIP names under a legacy codepage.
         # Read ZIP metadata with .NET so Chinese documentation is checked faithfully.
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
         $archive = [IO.Compression.ZipFile]::OpenRead($pending)
         try { $entries = @($archive.Entries | ForEach-Object { $_.FullName }) }
         finally { $archive.Dispose() }
