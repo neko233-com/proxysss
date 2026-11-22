@@ -23,6 +23,8 @@ proxysss 是可扩展的通用网关；核心协议和普通转发保持原生 R
 
 **Linux 发布二进制必须零 glibc 依赖。2026-11-22 起，Linux release 资产统一使用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 完全静态构建，musl 构建启用 `mimalloc`，不得回退到宿主 glibc 的动态二进制。** 发布前必须确认 `readelf -d` 无 `NEEDED`、`readelf -l` 无 `INTERP`、`file` 显示 `statically linked` 或 `static-pie linked`，并在 Debian 12、Rocky Linux 9 / AlmaLinux 9、Ubuntu 24.04、Alpine 上实际启动并完成 HTTP/HTTPS 冒烟。该约束同时适用于 CI 打包预演与 tag 发布；新增 Linux 依赖必须静态链接或直接拒绝，不能把宿主发行版库当作运行前提。
 
+**新增依赖优先纯 Rust crate，避免 C 共享库依赖（2026-11-23）。** 选库时优先无 `-sys`/无宿主共享库绑定的实现：解包用纯 Rust `tar` + `flate2`（rust_backend/miniz_oxide）+ `zip`（仅 `deflate`，不启用 bzip2/zstd/aes 等可能拉 C 库的 feature），HTTP 用已有 reqwest/rustls，不引入 curl/OpenSSL/zlib 动态绑定。确需编译 C/asm 的 crate（如 `aws-lc-rs`、`ring`、`mimalloc`）必须能静态编入 musl 二进制并通过 `readelf` 无 `NEEDED`/`INTERP` 断言，否则拒绝。锁文件只做最小增量解析（保留既有版本，仅新增所需 crate），禁止用 `cargo generate-lockfile`/无参 `cargo update` 全量重解析升级整棵依赖树。
+
 Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 或对应受支持版本运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
 ## Product Direction

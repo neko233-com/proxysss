@@ -4069,6 +4069,153 @@ impl Gateway {
                     "ssl": monitor_tls_summary(&state.config),
                 }),
             )),
+            "/v1/version" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "service": "proxysss",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "server_time": server_time,
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                }),
+            )),
+            "/v1/system" => {
+                let stats = self.stats.snapshot_json();
+                Ok(monitor_json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": 1,
+                        "server_time": server_time,
+                        "warm": self.stats.warm.load(Ordering::Relaxed),
+                        "os": std::env::consts::OS,
+                        "arch": std::env::consts::ARCH,
+                        "uptime_seconds": stats["uptime_seconds"],
+                        "process": stats["process"],
+                        "reload_success_total": stats["reload_success_total"],
+                        "reload_failure_total": stats["reload_failure_total"],
+                        "watchdog_heartbeat_total": stats["watchdog_heartbeat_total"],
+                        "critical_task_failures_total": stats["critical_task_failures_total"],
+                    }),
+                ))
+            }
+            "/v1/traffic" => {
+                let stats = self.stats.snapshot_json();
+                Ok(monitor_json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": 1,
+                        "server_time": server_time,
+                        "http_requests": stats["http_requests"],
+                        "domain_requests": stats["domain_requests"],
+                        "http_errors": stats["http_errors"],
+                        "websocket": {
+                            "total": stats["websocket_sessions_total"],
+                            "active": stats["websocket_sessions_active"],
+                        },
+                        "tcp": {
+                            "total": stats["tcp_sessions_total"],
+                            "active": stats["tcp_sessions_active"],
+                        },
+                        "udp": {
+                            "packets_total": stats["udp_packets_total"],
+                            "bytes_total": stats["udp_bytes_total"],
+                        },
+                        "blocked_requests_total": stats["blocked_requests_total"],
+                        "ddos_bans_total": stats["ddos_bans_total"],
+                    }),
+                ))
+            }
+            "/v1/upstreams" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "inventory": monitor_upstream_views(&state.config),
+                }),
+            )),
+            "/v1/routes" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "routes": monitor_route_views(&state.config),
+                }),
+            )),
+            "/v1/listeners" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "listeners": monitor_listener_views(&state.config),
+                }),
+            )),
+            "/v1/certificates" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "ssl": monitor_tls_summary(&state.config),
+                }),
+            )),
+            "/v1/alerts" => {
+                let stats = self.stats.snapshot_json();
+                Ok(monitor_json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": 1,
+                        "server_time": server_time,
+                        "health": monitor_alert_views(&stats),
+                    }),
+                ))
+            }
+            "/v1/observability" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "config": monitor_observability_views(&state.config),
+                }),
+            )),
+            "/v1/endpoints" => Ok(monitor_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "schema_version": 1,
+                    "server_time": server_time,
+                    "catalog": monitor_endpoint_catalog(),
+                }),
+            )),
+            "/v1/overview" => {
+                let stats = self.stats.snapshot_json();
+                let routes = monitor_route_views(&state.config);
+                let alerts = monitor_alert_views(&stats);
+                Ok(monitor_json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": 1,
+                        "service": "proxysss",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "server_time": server_time,
+                        "warm": self.stats.warm.load(Ordering::Relaxed),
+                        "stats": stats,
+                        "ssl": monitor_tls_summary(&state.config),
+                        "route_counts": routes["counts"],
+                        "alerts": alerts,
+                        "observability": monitor_observability_views(&state.config),
+                    }),
+                ))
+            }
             _ => Ok(monitor_json_response(
                 StatusCode::NOT_FOUND,
                 serde_json::json!({"ok": false, "error": "monitor endpoint not found"}),
@@ -18489,6 +18636,227 @@ pub(crate) fn monitor_certificate_file_validity(path: &Path) -> Option<serde_jso
         "not_after": not_after,
         "valid_now": not_before <= now && now < not_after,
     }))
+}
+
+/// Curated, secret-free routing projection for the read-only monitor API.
+fn monitor_route_views(config: &GatewayConfig) -> serde_json::Value {
+    fn pick(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for key in keys {
+            if let Some(field) = value.get(*key) {
+                map.insert((*key).to_string(), field.clone());
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+    let reverse_proxy = serde_json::to_value(&config.services.reverse_proxy.routes)
+        .unwrap_or_default()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|route| {
+            pick(
+                route,
+                &["name", "hosts", "path_prefix", "upstream", "upstreams", "strip_prefix"],
+            )
+        })
+        .collect::<Vec<_>>();
+    let domain_routes = serde_json::to_value(&config.services.domain_routes)
+        .unwrap_or_default()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|route| {
+            pick(
+                route,
+                &["name", "domains", "path_prefix", "upstream", "upstreams", "strip_prefix"],
+            )
+        })
+        .collect::<Vec<_>>();
+    let static_sites = serde_json::to_value(&config.services.static_sites)
+        .unwrap_or_default()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|site| pick(site, &["name", "hosts", "path_prefix", "root", "autoindex"]))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "reverse_proxy": reverse_proxy,
+        "domain_routes": domain_routes,
+        "static_sites": static_sites,
+        "counts": {
+            "reverse_proxy": reverse_proxy.len(),
+            "domain_routes": domain_routes.len(),
+            "static_sites": static_sites.len(),
+        }
+    })
+}
+
+/// Aggregated upstream inventory (address -> weight + referencing routes/listeners).
+fn monitor_upstream_views(config: &GatewayConfig) -> serde_json::Value {
+    let mut inventory: std::collections::BTreeMap<String, (u32, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    let mut add = |address: &str, weight: u32, source: String| {
+        if address.trim().is_empty() {
+            return;
+        }
+        let entry = inventory
+            .entry(address.to_string())
+            .or_insert((weight, Vec::new()));
+        if !entry.1.contains(&source) {
+            entry.1.push(source);
+        }
+    };
+    for route in &config.services.reverse_proxy.routes {
+        let source = format!("route:{}", route.name);
+        let weight = route.upstream_weights.get(&route.upstream).copied().unwrap_or(1);
+        add(&route.upstream, weight, source.clone());
+        for upstream in &route.upstreams {
+            let weight = route.upstream_weights.get(upstream).copied().unwrap_or(1);
+            add(upstream, weight, source.clone());
+        }
+    }
+    for route in &config.services.domain_routes {
+        let source = format!("domain:{}", route.name);
+        let weight = route.upstream_weights.get(&route.upstream).copied().unwrap_or(1);
+        add(&route.upstream, weight, source.clone());
+        for upstream in &route.upstreams {
+            let weight = route.upstream_weights.get(upstream).copied().unwrap_or(1);
+            add(upstream, weight, source.clone());
+        }
+    }
+    for listener in &config.tcp.listeners {
+        let source = format!("tcp:{}", listener.name);
+        add(&listener.upstream, 1, source.clone());
+        for upstream in &listener.upstreams {
+            add(upstream, 1, source.clone());
+        }
+    }
+    for listener in &config.udp.listeners {
+        let source = format!("udp:{}", listener.name);
+        add(&listener.upstream, 1, source.clone());
+        for upstream in &listener.upstreams {
+            add(upstream, 1, source.clone());
+        }
+    }
+    let upstreams = inventory
+        .iter()
+        .map(|(address, (weight, sources))| {
+            serde_json::json!({"address": address, "weight": weight, "sources": sources})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"upstreams": upstreams, "total": upstreams.len()})
+}
+
+/// Listener inventory (TCP/UDP plus admin/monitor control-plane binds).
+fn monitor_listener_views(config: &GatewayConfig) -> serde_json::Value {
+    let tcp = serde_json::to_value(&config.tcp.listeners).unwrap_or_default();
+    let udp = serde_json::to_value(&config.udp.listeners).unwrap_or_default();
+    serde_json::json!({
+        "tcp": tcp,
+        "udp": udp,
+        "admin": {
+            "enabled": config.admin.enabled,
+            "bind": config.admin.bind,
+            "https_enabled": config.admin.https.enabled,
+            "monitor_enabled": config.admin.monitor.enabled,
+        },
+        "counts": {
+            "tcp": config.tcp.listeners.len(),
+            "udp": config.udp.listeners.len(),
+        }
+    })
+}
+
+/// Derived health alerts from cumulative counters (read-only, no mutation).
+fn monitor_alert_views(stats: &serde_json::Value) -> serde_json::Value {
+    let counter = |key: &str| stats.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut alerts: Vec<serde_json::Value> = Vec::new();
+    let mut push = |level: &str, code: &str, message: &str, value: u64| {
+        alerts.push(serde_json::json!({
+            "level": level, "code": code, "message": message, "value": value,
+        }));
+    };
+    if counter("critical_task_failures_total") > 0 {
+        push("critical", "critical_task_failure", "critical background task failures detected", counter("critical_task_failures_total"));
+    }
+    if counter("reload_failure_total") > 0 {
+        push("warning", "reload_failure", "configuration reload failures detected", counter("reload_failure_total"));
+    }
+    if counter("ddos_bans_total") > 0 {
+        push("warning", "ddos_ban", "DDoS bans have been issued", counter("ddos_bans_total"));
+    }
+    if counter("script_fail_total") > 0 {
+        push("warning", "script_failure", "script execution failures detected", counter("script_fail_total"));
+    }
+    if counter("admin_auth_fail_total") > 0 {
+        push("info", "admin_auth_fail", "admin authentication failures recorded", counter("admin_auth_fail_total"));
+    }
+    if counter("monitor_auth_fail_total") > 0 {
+        push("info", "monitor_auth_fail", "monitor authentication failures recorded", counter("monitor_auth_fail_total"));
+    }
+    let healthy = !alerts.iter().any(|alert| alert["level"] == "critical");
+    serde_json::json!({"alerts": alerts, "healthy": healthy, "alert_count": alerts.len()})
+}
+
+/// Non-secret observability/monitoring configuration projection.
+fn monitor_observability_views(config: &GatewayConfig) -> serde_json::Value {
+    let otel = &config.observability;
+    serde_json::json!({
+        "observability": {
+            "enabled": otel.enabled,
+            "protocol": serde_json::to_value(otel.protocol).unwrap_or_default(),
+            "endpoint": otel.endpoint,
+            "service_name": otel.service_name,
+            "environment": otel.environment,
+            "sample_ratio": otel.sample_ratio,
+            "traces_enabled": otel.traces_enabled,
+            "metrics_enabled": otel.metrics_enabled,
+            "export_interval_secs": otel.export_interval_secs,
+            "timeout_secs": otel.timeout_secs,
+            "header_count": otel.headers.len(),
+            "resource_attribute_count": otel.resource_attributes.len(),
+        },
+        "monitoring": {
+            "enabled": config.monitoring.enabled,
+            "path": config.monitoring.path,
+            "format": serde_json::to_value(config.monitoring.format).unwrap_or_default(),
+            "domain_stats_enabled": config.monitoring.domain_stats_enabled,
+        },
+        "telemetry_disabled_by_env": crate::observability::telemetry_disabled_by_env(),
+    })
+}
+
+/// Self-describing endpoint catalog for mobile/desktop client discovery.
+fn monitor_endpoint_catalog() -> serde_json::Value {
+    let entries = [
+        ("POST", "/v1/login", "Exchange monitor password for a read-only Bearer session"),
+        ("GET", "/v1/health", "Liveness and warm state"),
+        ("GET", "/v1/version", "Build version, OS and architecture"),
+        ("GET", "/v1/summary", "Aggregate stats plus TLS summary"),
+        ("GET", "/v1/overview", "Single-call dashboard payload for mobile home screen"),
+        ("GET", "/v1/stats", "Full cumulative gateway counters"),
+        ("GET", "/v1/system", "Process CPU/memory, uptime, reload and watchdog health"),
+        ("GET", "/v1/traffic", "HTTP/domain/WebSocket/TCP/UDP traffic breakdown"),
+        ("GET", "/v1/upstreams", "Aggregated upstream inventory with weights"),
+        ("GET", "/v1/routes", "Reverse-proxy, domain and static-site routing table"),
+        ("GET", "/v1/listeners", "TCP/UDP listeners and control-plane binds"),
+        ("GET", "/v1/ssl", "TLS mode, certificate existence and validity"),
+        ("GET", "/v1/certificates", "Certificate inventory and expiry validity"),
+        ("GET", "/v1/alerts", "Derived health alerts from counters"),
+        ("GET", "/v1/observability", "OpenTelemetry and metrics configuration state"),
+        ("GET", "/v1/endpoints", "This endpoint catalog"),
+    ];
+    let endpoints = entries
+        .iter()
+        .map(|(method, path, description)| {
+            serde_json::json!({"method": method, "path": path, "description": description})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"endpoints": endpoints, "total": endpoints.len(), "scope": "monitor:read"})
 }
 
 fn monitor_tls_summary(config: &GatewayConfig) -> serde_json::Value {
