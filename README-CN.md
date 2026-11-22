@@ -120,9 +120,13 @@ proxysss config performance      # 本机系统与 socket 适配
 proxysss config watched-scripts  # 参与热重载的脚本
 proxysss config nginx-parity --format yaml
 proxysss service status
+proxysss update --check          # 检查最新版本
+proxysss update                  # 原生自更新到最新稳定版（镜像自动加速）
 ```
 
-日志默认为 `logs/access.log` 与 `logs/error.log`，默认级别 `info`。安全策略与性能参数应依据部署场景调整：[安全与系统适配指南](https://neko233-com.github.io/proxysss/security-performance.html)。性能测试在本地 Linux 执行；GitHub Actions 仅负责发布材料校验与六平台打包。功能发布不自动代表取得严格领先 nginx 的性能证据。
+自更新为进程内原生能力，不依赖 curl/bash/PowerShell/系统 tar；`update.mirror: auto` 自动在 GitHub 源地址与加速镜像间选最快可达者。每日自动更新默认关闭，开启后按本地时区每天 `04:00` 检查一次（`update.auto_update`、`update.check_time`，重启生效）。
+
+日志默认为 `logs/access.log` 与 `logs/error.log`，默认级别 `info`。安全策略与性能参数应依据部署场景调整：[安全与系统适配指南](https://neko233-com.github.io/proxysss/security-performance.html)。性能测试在本地 Linux 执行；GitHub Actions 仅负责发布材料校验与五资产打包。功能发布不自动代表取得严格领先 nginx 的性能证据。
 
 ## 继续阅读
 

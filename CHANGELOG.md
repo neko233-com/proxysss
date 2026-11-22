@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.17 - 2026-11-23
+
+原生自更新版本：手动更新与可选每日自动更新，镜像加速自动选择，零外部工具依赖。
+
+- 新增进程内原生自更新 `src/self_update.rs`：`proxysss update`（`--check` 只检查、`--mirror` 指定源）与 `proxysss switch-version` 不再依赖 curl/bash/PowerShell 或宿主 tar，全部用 reqwest/rustls + 纯 Rust `tar`/`flate2`/`zip` 解包，系统升级不会破坏更新路径。
+- 下载源自动选择：`mirror: auto` 对 GitHub 源地址与内置加速镜像（gh-proxy.com、ghproxy.net、gh.llkk.cc）做有界测速，选最快可达者；支持 `origin`/`mirror`/自定义镜像基址，自定义镜像失败自动回退源地址。
+- 更新安全：下载后先解包出二进制并在本机实际执行 `--version` 校验版本与可运行性，再原子替换当前可执行文件（Unix rename 覆盖运行中 inode；Windows 先改名运行中镜像再写入新文件，失败回滚），最后按需重启 background/systemd/launchd 实例。
+- 新增 `update` 配置段：`auto_update` 默认 `false`；开启后按 `check_time`（默认本地 `04:00`）每天检查一次，`auto_apply` 默认自动应用、`restart_after_apply` 默认重启。`update.auto_update` 为重启生效项。
+- 验证：Linux musl 全量测试通过；新增自更新单元测试覆盖资产矩阵、版本比较、镜像候选排序、检查时间解析与次日滚动、tar.gz/zip 解包回环。
+
 ## v1.3.16 - 2026-11-22
 
 独立双容器 2C2G 复测与发布包可移植性版本；撤回 v1.3.15 的 pinned 四队列，发布资产收缩为 5 个。

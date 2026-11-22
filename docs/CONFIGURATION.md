@@ -683,6 +683,7 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - TCP / UDP listener bind 集合
 - `http.tls.mode`
 - 日志路径和级别核心设置
+- `update.auto_update`、`update.check_time`（每日自动更新调度在启动时建立）
 
 ### 4.3 Windows 后台自启动
 
@@ -696,6 +697,35 @@ proxysss service stop
 ```
 
 如果旧计划任务曾经以 `HighestAvailable` 权限创建，普通 PowerShell 可能无法删除它；只需用“以管理员身份运行”的 PowerShell 执行一次 `proxysss service install`，之后保持 HKCU Run 单一入口即可。`service status` 会提示重复入口或仍有弹窗风险的旧任务。
+
+### 4.4 自更新：手动与每日自动
+
+更新是进程内原生能力，不依赖 curl、bash、PowerShell 或系统 tar：用内置 HTTP 客户端检查 GitHub release，用纯 Rust 解包 tar.gz/zip，先在本机实际运行候选二进制 `--version` 校验，再原子替换当前可执行文件并按需重启实例。因此系统或运行环境升级不会破坏更新路径。
+
+手动更新：
+
+```bash
+proxysss update --check          # 只看当前/最新版本，不下载
+proxysss update                  # 更新到最新稳定版并重启运行中的实例
+proxysss update --version 1.3.17 --no-service-restart
+proxysss update --mirror origin  # 强制走 GitHub 源地址
+proxysss switch-version 1.3.16 --allow-downgrade
+```
+
+下载源由 `update.mirror` 控制：`auto`（默认）对 GitHub 源地址与内置加速镜像测速，选最快可达者；`origin` 只走源地址；`mirror` 只走加速镜像；也可以填自定义镜像基址（失败自动回退源地址）。`update.mirrors` 可追加自有镜像。
+
+每日自动更新默认关闭。开启后按主机本地时区在 `check_time`（默认 `04:00`）每天检查一次：
+
+```yaml
+update:
+  auto_update: true        # 默认 false；开启每日自动检查
+  check_time: "04:00"      # 本地 HH:MM
+  mirror: auto             # auto | origin | mirror | 自定义镜像基址
+  auto_apply: true         # 发现新版自动下载应用；false 仅提示
+  restart_after_apply: true
+```
+
+`auto_update` 与 `check_time` 改动需重启生效。自动更新会在低峰时段替换二进制并重启网关；生产环境若不希望自动重启，可设 `auto_apply: false` 只接收提示，或 `restart_after_apply: false` 自行择机重启。
 
 ## 5. 性能建议要这样理解
 

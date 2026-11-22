@@ -120,7 +120,11 @@ proxysss config performance
 proxysss config watched-scripts
 proxysss config nginx-parity --format yaml
 proxysss service status
+proxysss update --check          # report the latest release
+proxysss update                  # native self-update to latest stable (auto mirror)
 ```
+
+Self-update runs in-process with no curl/bash/PowerShell/system-tar dependency; `update.mirror: auto` picks the fastest reachable source between GitHub origin and accelerator mirrors. Daily auto-update is off by default; when enabled it checks once per day at local `04:00` (`update.auto_update`, `update.check_time`, restart-required).
 
 Access and error logs default to `logs/access.log` and `logs/error.log`, with level `info`. Security and performance settings include defaults and recommendations in the [security and platform guide](https://neko233-com.github.io/proxysss/security-performance.html).
 

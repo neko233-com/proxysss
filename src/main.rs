@@ -14,10 +14,12 @@ mod install;
 mod linux_cpu;
 mod linux_tune;
 mod notifications;
+mod observability;
 mod runtime_tuning;
 mod script;
 mod security;
 mod security_guidance;
+mod self_update;
 #[cfg(target_os = "linux")]
 mod sendfile_reactor;
 mod static_hosts;
@@ -55,7 +57,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use config::{GatewayConfig, LogFormat, LoggingConfig, DEFAULT_ADMIN_BEARER_TOKEN};
+use config::{GatewayConfig, LogFormat, LoggingConfig, ObservabilityConfig, DEFAULT_ADMIN_BEARER_TOKEN};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::json;
@@ -90,6 +92,14 @@ enum Commands {
         no_service_restart: bool,
         #[arg(long, default_value_t = false)]
         skip_init: bool,
+        /// Only report the latest version; do not download or apply.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Download source: auto, origin, mirror, or a custom mirror base URL.
+        #[arg(long)]
+        mirror: Option<String>,
+        #[arg(long = "local-config", hide = true)]
+        config: Option<PathBuf>,
     },
     SwitchVersion {
         version: String,
@@ -99,6 +109,10 @@ enum Commands {
         no_service_restart: bool,
         #[arg(long, default_value_t = false)]
         skip_init: bool,
+        #[arg(long)]
+        mirror: Option<String>,
+        #[arg(long = "local-config", hide = true)]
+        config: Option<PathBuf>,
     },
     Start {
         #[arg(long = "local-config", hide = true)]
@@ -979,7 +993,11 @@ async fn main() -> Result<()> {
                 install::resolve_run_config_path(merge_config_arg(global_config, config))?;
             let gateway_config = GatewayConfig::load(&config_path)?;
 
-            init_logging(&gateway_config.logging, &gateway_config.root_dir)?;
+            init_logging(
+                &gateway_config.logging,
+                &gateway_config.root_dir,
+                &gateway_config.observability,
+            )?;
             let runtime_tune_plan = gateway::configure_runtime_performance(&gateway_config);
             emit_startup_banner(&config_path, &gateway_config);
             emit_runtime_tune_plan(
@@ -989,6 +1007,11 @@ async fn main() -> Result<()> {
             for warning in gateway_config.warnings() {
                 tracing::warn!(warning, "configuration warning");
             }
+
+            self_update::spawn_auto_update(
+                gateway_config.update.clone(),
+                Some(config_path.clone()),
+            );
 
             tracing::info!(config = %config_path.display(), "starting gateway");
             gateway::Gateway::from_config(config_path, gateway_config)
@@ -1000,19 +1023,48 @@ async fn main() -> Result<()> {
             version,
             no_service_restart,
             skip_init,
-        } => run_installer_command("update", &version, false, no_service_restart, skip_init),
+            check,
+            mirror,
+            config,
+        } => {
+            let _ = skip_init; // native updater preserves the existing config/layout
+            init_cli_logging();
+            let (update_cfg, cfg_path) =
+                load_update_settings(merge_config_arg(global_config.clone(), config))?;
+            let opts = self_update::UpdateOptions {
+                version,
+                allow_downgrade: false,
+                check_only: check,
+                restart: !no_service_restart,
+                mirror,
+                config_path: cfg_path,
+            };
+            self_update::run_update(&update_cfg, opts).await?;
+            Ok(())
+        }
         Commands::SwitchVersion {
             version,
             allow_downgrade,
             no_service_restart,
             skip_init,
-        } => run_installer_command(
-            "install",
-            &version,
-            allow_downgrade,
-            no_service_restart,
-            skip_init,
-        ),
+            mirror,
+            config,
+        } => {
+            let _ = skip_init;
+            init_cli_logging();
+            let (update_cfg, cfg_path) =
+                load_update_settings(merge_config_arg(global_config.clone(), config))?;
+            let opts = self_update::UpdateOptions {
+                version,
+                allow_downgrade,
+                check_only: false,
+                restart: !no_service_restart,
+                mirror,
+                config_path: cfg_path,
+            };
+            self_update::run_update(&update_cfg, opts).await?;
+            Ok(())
+        }
         Commands::Start { config } => {
             init_cli_logging();
             install::start_background(merge_config_arg(global_config.clone(), config))
@@ -2198,6 +2250,7 @@ fn render_reload_plan(config: &GatewayConfig) -> String {
 }
 
 static LOG_GUARDS: OnceLock<Vec<tracing_appender::non_blocking::WorkerGuard>> = OnceLock::new();
+static OTEL_GUARD: OnceLock<observability::TelemetryGuard> = OnceLock::new();
 
 fn print_capabilities() {
     println!("proxysss capability matrix");
@@ -2348,104 +2401,23 @@ fn run_script_runtime(
     result
 }
 
-fn run_installer_command(
-    action: &str,
-    version: &str,
-    allow_downgrade: bool,
-    no_service_restart: bool,
-    skip_init: bool,
-) -> Result<()> {
-    init_cli_logging();
-    let script_url = match std::env::consts::OS {
-        "windows" => {
-            "https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.ps1"
+/// Load self-update settings from the resolved config file, falling back to
+/// defaults when no config exists or it cannot be parsed (manual update must
+/// work even on a fresh or broken layout). Also returns the resolved config path
+/// so a running instance can be restarted after apply.
+fn load_update_settings(
+    config: Option<PathBuf>,
+) -> Result<(config::UpdateConfig, Option<PathBuf>)> {
+    let path = install::resolve_run_config_path(config)?;
+    if path.exists() {
+        match GatewayConfig::load(&path) {
+            Ok(cfg) => return Ok((cfg.update, Some(path))),
+            Err(err) => {
+                tracing::warn!(error = %err, "update: config unreadable, using defaults");
+            }
         }
-        "linux" | "macos" => {
-            "https://raw.githubusercontent.com/neko233-com/proxysss/main/scripts/install.sh"
-        }
-        os => return Err(anyhow::anyhow!("unsupported update os {os}")),
-    };
-
-    if std::env::consts::OS == "windows" {
-        let mut command = Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                "& ([ScriptBlock]::Create((irm '{}'))) -Action {} -Version {}{}{}{}",
-                script_url,
-                powershell_escape_arg(action),
-                powershell_escape_arg(version),
-                if allow_downgrade {
-                    " -AllowDowngrade"
-                } else {
-                    ""
-                },
-                if no_service_restart {
-                    " -NoServiceRestart"
-                } else {
-                    ""
-                },
-                if skip_init { " -SkipInit" } else { "" },
-            ),
-        ]);
-        return run_inherited(command, "run Windows installer");
     }
-
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(format!(
-        "curl -fsSL '{}' | bash -s -- --action {} --version {}{}{}{}",
-        script_url,
-        sh_escape_arg(action),
-        sh_escape_arg(version),
-        if allow_downgrade {
-            " --allow-downgrade"
-        } else {
-            ""
-        },
-        if no_service_restart {
-            " --no-service-restart"
-        } else {
-            ""
-        },
-        if skip_init { " --skip-init" } else { "" },
-    ));
-    run_inherited(command, "run Unix installer")
-}
-
-fn powershell_escape_arg(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
-    }
-}
-
-fn sh_escape_arg(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-fn run_inherited(mut command: Command, description: &str) -> Result<()> {
-    let status = command
-        .status()
-        .map_err(|error| anyhow::anyhow!("failed to {description}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{description} failed with {status}"))
-    }
+    Ok((config::UpdateConfig::default(), None))
 }
 
 fn normalize_plugin_module_path(value: &str) -> Result<String> {
@@ -2548,10 +2520,14 @@ fn init_cli_logging() {
         error_log_path: PathBuf::new(),
         ..LoggingConfig::default()
     };
-    let _ = init_logging(&logging, Path::new("."));
+    let _ = init_logging(&logging, Path::new("."), &ObservabilityConfig::default());
 }
 
-fn init_logging(logging: &LoggingConfig, root_dir: &Path) -> Result<()> {
+fn init_logging(
+    logging: &LoggingConfig,
+    root_dir: &Path,
+    observability: &ObservabilityConfig,
+) -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(logging.filter.as_str()));
 
@@ -2584,104 +2560,36 @@ fn init_logging(logging: &LoggingConfig, root_dir: &Path) -> Result<()> {
         metadata.level() == &tracing::Level::WARN || metadata.level() == &tracing::Level::ERROR
     });
 
-    match (logging.format, access_writer, error_writer) {
-        (LogFormat::Plain, Some(access), Some(error)) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().compact())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(access)
-                        .with_filter(access_filter),
-                )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(error)
-                        .with_filter(error_filter),
-                )
-                .init();
-        }
-        (LogFormat::Plain, Some(access), None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().compact())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(access)
-                        .with_filter(access_filter),
-                )
-                .init();
-        }
-        (LogFormat::Plain, None, Some(error)) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().compact())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(error)
-                        .with_filter(error_filter),
-                )
-                .init();
-        }
-        (LogFormat::Plain, None, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().compact())
-                .init();
-        }
-        (LogFormat::Json, Some(access), Some(error)) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(access)
-                        .with_filter(access_filter),
-                )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(error)
-                        .with_filter(error_filter),
-                )
-                .init();
-        }
-        (LogFormat::Json, Some(access), None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(access)
-                        .with_filter(access_filter),
-                )
-                .init();
-        }
-        (LogFormat::Json, None, Some(error)) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_writer(error)
-                        .with_filter(error_filter),
-                )
-                .init();
-        }
-        (LogFormat::Json, None, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().json())
-                .init();
-        }
-    }
+    // Compose the console layer plus optional access/error file layers and the
+    // optional OpenTelemetry layer uniformly (boxed), instead of an 8-arm match.
+    let fmt_layer: Box<dyn Layer<_> + Send + Sync> = match logging.format {
+        LogFormat::Plain => tracing_subscriber::fmt::layer().compact().boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
+    };
+    let access_layer = access_writer.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer)
+            .with_filter(access_filter)
+            .boxed()
+    });
+    let error_layer = error_writer.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer)
+            .with_filter(error_filter)
+            .boxed()
+    });
+    let (otel_layer, otel_guard) = observability::layer(observability)?;
+    let _ = OTEL_GUARD.set(otel_guard);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(access_layer)
+        .with(error_layer)
+        .with(otel_layer)
+        .init();
 
     let _ = LOG_GUARDS.set(guards);
     Ok(())

@@ -43,6 +43,10 @@ pub struct GatewayConfig {
     pub admin: AdminConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
+    #[serde(default, skip_serializing_if = "ObservabilityConfig::is_disabled")]
+    pub observability: ObservabilityConfig,
+    #[serde(default, skip_serializing_if = "UpdateConfig::is_disabled")]
+    pub update: UpdateConfig,
     #[serde(default, skip_serializing_if = "NotificationConfig::is_empty")]
     pub notifications: NotificationConfig,
     #[serde(
@@ -801,6 +805,167 @@ pub struct MonitoringConfig {
     /// Additional exact hostnames to count, given priority over discovered hosts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_stats_hosts: Vec<String>,
+}
+
+/// OpenTelemetry export protocol. `http` (OTLP/HTTP, default) reuses the reqwest
+/// stack; `grpc` is reserved for collectors that only accept OTLP/gRPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OtelProtocol {
+    #[default]
+    Http,
+    Grpc,
+}
+
+/// OpenTelemetry performance observability. Disabled by default and never
+/// enabled for benchmarks (`proxysss bench` does not initialize telemetry, and
+/// `PROXYSSS_DISABLE_TELEMETRY=1` forces it off for load-test runs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Master switch for OTLP export of traces and metrics.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub protocol: OtelProtocol,
+    /// OTLP collector endpoint (http default :4318, grpc :4317).
+    #[serde(default = "default_otel_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_otel_service_name")]
+    pub service_name: String,
+    #[serde(default = "default_otel_service_version")]
+    pub service_version: String,
+    #[serde(default = "default_otel_environment")]
+    pub environment: String,
+    /// Trace sampling ratio in [0.0, 1.0]; 1.0 exports every trace.
+    #[serde(default = "default_otel_sample_ratio")]
+    pub sample_ratio: f64,
+    #[serde(default = "default_otel_export_interval_secs")]
+    pub export_interval_secs: u64,
+    #[serde(default = "default_otel_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub traces_enabled: bool,
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+    /// Extra OTLP headers (e.g. authorization); values may use ${ENV_VAR}.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Extra resource attributes attached to all exported telemetry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_attributes: BTreeMap<String, String>,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: OtelProtocol::default(),
+            endpoint: default_otel_endpoint(),
+            service_name: default_otel_service_name(),
+            service_version: default_otel_service_version(),
+            environment: default_otel_environment(),
+            sample_ratio: default_otel_sample_ratio(),
+            export_interval_secs: default_otel_export_interval_secs(),
+            timeout_secs: default_otel_timeout_secs(),
+            traces_enabled: true,
+            metrics_enabled: true,
+            headers: BTreeMap::new(),
+            resource_attributes: BTreeMap::new(),
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
+fn default_otel_endpoint() -> String {
+    "http://127.0.0.1:4318".to_string()
+}
+fn default_otel_service_name() -> String {
+    "proxysss".to_string()
+}
+fn default_otel_service_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+fn default_otel_environment() -> String {
+    "production".to_string()
+}
+fn default_otel_sample_ratio() -> f64 {
+    1.0
+}
+fn default_otel_export_interval_secs() -> u64 {
+    15
+}
+fn default_otel_timeout_secs() -> u64 {
+    10
+}
+
+/// Self-update settings. Manual `proxysss update` always works; the scheduled
+/// auto-update loop is opt-in (`auto_update: false` by default) and checks once
+/// per day at `check_time` in the host's local timezone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Master switch for the daily background auto-update loop. Default off.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Local daily check time, `HH:MM` 24-hour. Default `04:00`.
+    #[serde(default = "default_update_check_time")]
+    pub check_time: String,
+    /// Download source policy: `auto` (probe origin + mirrors, pick fastest
+    /// reachable), `origin` (github.com only), `mirror` (accelerators only),
+    /// or a custom mirror base URL. Default `auto`.
+    #[serde(default = "default_update_mirror")]
+    pub mirror: String,
+    /// Optional extra mirror base URLs prepended to the built-in accelerators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+    /// GitHub `owner/repo` to update from.
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// When auto-update finds a newer release, download and apply it. If false,
+    /// only log that an update is available. Default true.
+    #[serde(default = "default_true")]
+    pub auto_apply: bool,
+    /// Restart a running background/service instance after applying. Default true.
+    #[serde(default = "default_true")]
+    pub restart_after_apply: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_update: false,
+            check_time: default_update_check_time(),
+            mirror: default_update_mirror(),
+            mirrors: Vec::new(),
+            repo: default_update_repo(),
+            auto_apply: true,
+            restart_after_apply: true,
+        }
+    }
+}
+
+impl UpdateConfig {
+    fn is_disabled(&self) -> bool {
+        !self.auto_update
+    }
+}
+
+fn default_update_check_time() -> String {
+    "04:00".to_string()
+}
+
+fn default_update_mirror() -> String {
+    "auto".to_string()
+}
+
+fn default_update_repo() -> String {
+    "neko233-com/proxysss".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2163,6 +2328,24 @@ impl GatewayConfig {
             errors.push("monitoring.path must start with '/'".to_string());
         }
 
+        if self.observability.enabled {
+            if self.observability.endpoint.trim().is_empty() {
+                errors.push("observability.endpoint must not be empty when enabled".to_string());
+            }
+            if !(0.0..=1.0).contains(&self.observability.sample_ratio) {
+                errors.push("observability.sample_ratio must be within [0.0, 1.0]".to_string());
+            }
+            if self.observability.export_interval_secs == 0 {
+                errors.push("observability.export_interval_secs must be greater than 0".to_string());
+            }
+            if self.observability.protocol == OtelProtocol::Grpc {
+                errors.push(
+                    "observability.protocol=grpc is reserved but not yet implemented; use protocol: http"
+                        .to_string(),
+                );
+            }
+        }
+
         if self.affinity.sticky_ttl_secs == 0 {
             errors.push("affinity.sticky_ttl_secs must be greater than 0".to_string());
         }
@@ -2804,6 +2987,8 @@ impl Default for GatewayConfig {
             affinity: AffinityConfig::default(),
             admin: AdminConfig::default(),
             monitoring: MonitoringConfig::default(),
+            observability: ObservabilityConfig::default(),
+            update: UpdateConfig::default(),
             notifications: NotificationConfig::default(),
             certificate_sync: crate::certificate_sync::CertificateSyncConfig::default(),
             security: SecurityConfig::default(),
