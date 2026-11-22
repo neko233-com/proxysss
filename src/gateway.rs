@@ -14098,7 +14098,6 @@ fn plain_http_accept_worker_count(config: &GatewayConfig) -> usize {
     )
 }
 
-#[cfg(any(test, target_os = "linux"))]
 fn plain_http_accept_worker_count_for(
     profile: RuntimePerformanceTrafficProfile,
     cores: usize,
