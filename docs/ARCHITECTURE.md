@@ -174,6 +174,10 @@ QuickJS 与 swc_ts_fast_strip 内嵌进程，无外部 Node/Deno/tsc。routeHttp
 
 自更新（`src/self_update.rs`）是控制面/运维能力，不进入请求转发热路径。手动 `proxysss update`/`switch-version` 与可选每日自动更新共用同一原生流程：reqwest/rustls 检查 GitHub `releases/latest`（API 失败回退 releases 重定向，镜像可代理），按当前 OS/CPU 选择发布资产；`mirror: auto` 对源地址与内置加速镜像做有界 ranged-GET 测速，选最快可达者，自定义镜像失败回退源地址。下载用纯 Rust `tar`/`flate2`/`zip` 解包出二进制，先写临时文件并在本机实际执行 `--version` 校验版本与可运行性，再原子替换当前可执行文件：Unix 以同目录临时文件 fsync 后 rename 覆盖运行中 inode；Windows 先把运行中镜像改名 aside 再写入新文件，写入失败回滚原镜像。最后按需重启 systemd user 服务、launchd 或 background 实例。每日调度在 `update.auto_update=true` 时于启动建立，按主机本地时区在 `check_time`（默认 04:00）触发，进程退出即终止；该开关与检查时间为重启生效项，不参与热重载。整个路径不依赖 curl/bash/PowerShell/宿主 tar，避免系统环境升级破坏更新。
 
+## 可观测性导出
+
+OpenTelemetry 可观测性（`src/observability.rs`）是 config-gated 的控制面/诊断能力，不进入请求转发热路径。`observability.enabled=true` 时在启动初始化 tracing/metrics 两个 SDK provider，经 OTLP/HTTP（复用 reqwest/rustls 栈，纯 Rust prost/protobuf，不引入 gRPC/tonic）批量导出到 collector；`TelemetryGuard` 持有 provider 生命周期并在进程退出时 flush。默认关闭，`proxysss bench` 永不初始化，`PROXYSSS_DISABLE_TELEMETRY=1` 强制关闭，避免污染基准。`protocol: grpc` 仅预留、选择即报错。`headers`/`resource_attributes` 在导出时展开 `${ENV_VAR}`，密钥不落 YAML/日志。otel 依赖钉到与实现匹配的 0.28 系，runtime 由 `rt-tokio` feature 选择；该段启动期初始化，改动重启生效，不参与热重载。
+
 ## 流式协议与入站正文边界
 
 HTTP/1 原始上游响应使用共享分帧校验：拒绝冲突 Content-Length、TE/CL 共存和不支持的 Transfer-Encoding；跳过有界数量的信息响应，再转发最终响应。chunked 扫描先确认片段边界，再发送有效前缀，不把尾随的另一响应混入正文；固定长度或 chunked 提前 EOF 作为失败关闭，异常连接不能回池。

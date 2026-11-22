@@ -450,6 +450,8 @@
           <a href="#protocol-examples">协议与服务示例</a><a href="#combos">常用组合</a>
           <a href="#reload">热重载和预热</a>
           <a href="#windows-startup">Windows 后台启动</a>
+          <a href="#self-update">自更新</a>
+          <a href="#observability">可观测性</a>
           <a href="#performance">性能建议</a>
           <a href="#ops">排障命令</a>
           <a href="#mistakes">常见误区</a>
@@ -935,6 +937,32 @@ proxysss switch-version 1.3.16 --allow-downgrade</code></pre>
   auto_apply: true         # 发现新版自动应用；false 仅提示
   restart_after_apply: true</code></pre>
           <p class="subtle">自动更新默认关闭，开启后按主机本地时区每天在 <code>check_time</code> 检查一次。<code>auto_update</code> 与 <code>check_time</code> 改动需重启生效。生产若不希望自动重启，可设 <code>auto_apply: false</code> 只接收提示，或 <code>restart_after_apply: false</code> 自行择机重启。</p>
+        </section>
+
+        <section id="observability" class="panel">
+          <div class="section-head">
+            <div>
+              <div class="kicker">Observability</div>
+              <h2>OpenTelemetry 可观测性（默认关闭）</h2>
+            </div>
+            <p class="subtle"><code>observability</code> 把 trace 与 metrics 通过 OTLP/HTTP 导出到 collector，复用现有 reqwest/rustls 栈，不引入 gRPC/tonic 重依赖。整段默认关闭，基准测试永不启用：<code>proxysss bench</code> 不初始化 telemetry，<code>PROXYSSS_DISABLE_TELEMETRY=1</code> 强制关闭。<code>protocol: grpc</code> 为预留项，当前选择会明确报错，请用 <code>http</code>。</p>
+          </div>
+          <pre><code class="language-yaml">observability:
+  enabled: true                  # 默认 false
+  protocol: http                 # http（OTLP/HTTP，默认）| grpc（预留，未实现）
+  endpoint: "http://127.0.0.1:4318"
+  service_name: proxysss
+  environment: production
+  sample_ratio: 1.0              # [0.0, 1.0]，1.0 全量导出
+  export_interval_secs: 15
+  timeout_secs: 10
+  traces_enabled: true
+  metrics_enabled: true
+  headers:                       # 值支持 ${ENV_VAR}，密钥不写进 YAML
+    authorization: "${OTLP_TOKEN}"
+  resource_attributes:
+    deployment.region: "${REGION}"</code></pre>
+          <p class="subtle"><code>service_version</code> 默认取当前二进制版本。<code>headers</code> 与 <code>resource_attributes</code> 的值在导出时展开 <code>${ENV_VAR}</code>，认证密钥只引用进程环境。该段为启动期初始化，改动需重启生效。</p>
         </section>
 
         <section id="performance" class="panel">

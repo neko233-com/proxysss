@@ -53,6 +53,7 @@ Keep these invariants aligned across code, docs, examples, tests, and generated 
 - `proxysss certificate list` 列出无凭据的签发及同步目标；`certificate issue --certificate/--all` 和 `certificate sync --target/--all` 支持单项与批量手动执行。DNS-01 签发共享缓存目录的进程锁；非 DNS 挑战由已授权的本地管理面处理。云同步成功通知携带证书 ID、SAN 与 HTTPS 核验链接；阿里云、腾讯云、AWS、Azure 的云部署策略仅预留，未实现时不得启用或宣称支持。
 - CLI output must stay easy for agents to inspect quickly through commands such as `proxysss config explain`, `proxysss config capabilities`, `proxysss config routes`, `proxysss config reload-plan`, and `proxysss config nginx-parity`.
 - 自更新是进程内原生能力（`src/self_update.rs`）：`proxysss update [--check] [--mirror auto|origin|mirror|<url>]` 与 `proxysss switch-version` 用 reqwest/rustls 检查 GitHub release、纯 Rust `tar`/`flate2`/`zip` 解包，不依赖 curl/bash/PowerShell/宿主 tar。`mirror: auto` 对源地址与内置加速镜像测速选最快可达者，自定义镜像失败回退源地址。下载后必须先在本机执行候选二进制 `--version` 校验，再原子替换（Unix rename；Windows 改名运行中镜像后写入并支持回滚），最后按需重启 background/systemd/launchd。`update.auto_update` 默认 false，开启后按本地 `check_time`（默认 04:00）每日检查；该开关与检查时间为重启生效项。新增平台资产或镜像策略须同步配置/架构文档与测试。
+- OpenTelemetry 可观测性是 config-gated 可选面（`src/observability.rs` + `observability` 配置段）：trace/metrics 经 OTLP/HTTP 导出，复用 reqwest/rustls，不引入 gRPC/tonic；默认 `enabled=false`，`proxysss bench` 永不初始化，`PROXYSSS_DISABLE_TELEMETRY=1` 强制关闭。`protocol: grpc` 仅预留、选择即报错。`headers`/`resource_attributes` 值展开 `${ENV_VAR}`，密钥不写 YAML/日志。otel 依赖钉到与实现匹配的 0.28 系（`with_batch_exporter`/`PeriodicReader::builder` 单参，runtime 由 `rt-tokio` feature 选择），升级须同步 API 与锁文件并保持 musl 静态零 C 动态依赖。该段启动期初始化，改动重启生效。
 - FTP, WebDAV, HTTP, HTTPS, HTTP/2, HTTP/3, WebSocket, TCP, UDP, static/reverse-proxy style behavior, logging, reload, and service operation are nginx-parity requirements, not optional marketing text.
 - Static asset serving must cover HTML, CSS, JS, images, fonts, audio/video, CDN-origin assets, large-file streaming, and byte `Range` resumable downloads.
 - 静态 hosts/path 按 YAML 首个匹配项选站；多站点预热、H2 和连接缓存必须按站点隔离，同路径不得串根目录。单站点无 hosts 的默认快路径保持原有性能，改动必须覆盖 Host 切换、Range、sendfile 与热重载撤销域名。
@@ -219,6 +220,7 @@ bash scripts/clean-test-cache.sh
 - `logging.format`, `logging.filter`, `logging.level`
 - `logging.access_log_path`, `logging.error_log_path`
 - `update.auto_update`, `update.check_time`（每日自动更新调度在启动时建立）
+- `observability.*`（OTLP 导出层在启动时初始化）
 
 ## Development Rules
 

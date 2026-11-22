@@ -13,10 +13,8 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::runtime;
-use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, TracerProvider as SdkTracerProvider};
 use opentelemetry_sdk::Resource;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
@@ -78,6 +76,7 @@ fn resolve_env(value: &str) -> String {
 
 fn build_resource(config: &ObservabilityConfig) -> Resource {
     let mut attrs = vec![
+        KeyValue::new("service.name", config.service_name.clone()),
         KeyValue::new("service.version", config.service_version.clone()),
         KeyValue::new("deployment.environment.name", config.environment.clone()),
         KeyValue::new("telemetry.sdk.name", "opentelemetry"),
@@ -86,10 +85,7 @@ fn build_resource(config: &ObservabilityConfig) -> Resource {
     for (key, value) in &config.resource_attributes {
         attrs.push(KeyValue::new(key.clone(), resolve_env(value)));
     }
-    Resource::builder()
-        .with_service_name(config.service_name.clone())
-        .with_attributes(attrs)
-        .build()
+    Resource::new(attrs)
 }
 
 fn http_headers(config: &ObservabilityConfig) -> HashMap<String, String> {
@@ -135,7 +131,7 @@ where
             .build()
             .context("failed to build OTLP span exporter")?;
         let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(exporter, runtime::Tokio)
+            .with_batch_exporter(exporter)
             .with_sampler(Sampler::TraceIdRatioBased(config.sample_ratio.clamp(0.0, 1.0)))
             .with_id_generator(RandomIdGenerator::default())
             .with_resource(resource.clone())
@@ -153,7 +149,7 @@ where
             .with_headers(headers)
             .build()
             .context("failed to build OTLP metric exporter")?;
-        let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+        let reader = PeriodicReader::builder(exporter)
             .with_interval(interval)
             .build();
         let provider = SdkMeterProvider::builder()

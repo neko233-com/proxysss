@@ -684,6 +684,7 @@ proxysss 在配置加载和热重载后会做几件关键事：
 - `http.tls.mode`
 - 日志路径和级别核心设置
 - `update.auto_update`、`update.check_time`（每日自动更新调度在启动时建立）
+- `observability.*`（OTLP 导出层在启动时初始化）
 
 ### 4.3 Windows 后台自启动
 
@@ -726,6 +727,30 @@ update:
 ```
 
 `auto_update` 与 `check_time` 改动需重启生效。自动更新会在低峰时段替换二进制并重启网关；生产环境若不希望自动重启，可设 `auto_apply: false` 只接收提示，或 `restart_after_apply: false` 自行择机重启。
+
+### 4.5 OpenTelemetry 可观测性（默认关闭）
+
+`observability` 把网关的 trace 与 metrics 通过 OTLP/HTTP 导出到 collector，复用现有 reqwest/rustls 栈，不引入 gRPC/tonic 重依赖。整段默认关闭，且基准测试永不启用：`proxysss bench` 不初始化 telemetry，设置 `PROXYSSS_DISABLE_TELEMETRY=1` 可强制关闭。`protocol: grpc` 为预留项，当前选择会明确报错，请用 `http`。
+
+```yaml
+observability:
+  enabled: true                  # 默认 false
+  protocol: http                 # http（OTLP/HTTP，默认）| grpc（预留，未实现）
+  endpoint: "http://127.0.0.1:4318"
+  service_name: proxysss
+  environment: production
+  sample_ratio: 1.0              # [0.0, 1.0]，1.0 全量导出
+  export_interval_secs: 15
+  timeout_secs: 10
+  traces_enabled: true
+  metrics_enabled: true
+  headers:                       # 值支持 ${ENV_VAR}，密钥不写进 YAML
+    authorization: "${OTLP_TOKEN}"
+  resource_attributes:
+    deployment.region: "${REGION}"
+```
+
+`service_version` 默认取当前二进制版本。`headers` 与 `resource_attributes` 的值在导出时展开 `${ENV_VAR}`，因此认证密钥只引用进程环境。该段为启动期初始化，改动需重启生效。
 
 ## 5. 性能建议要这样理解
 
