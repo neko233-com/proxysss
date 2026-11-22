@@ -8818,8 +8818,21 @@ impl Gateway {
         remote_addr: SocketAddr,
         scheme: &'static str,
     ) -> Result<GatewayResponse, Infallible> {
-        self.handle_hyper_request_with_h2_cache(request, remote_addr, scheme, None)
-            .await
+        // Per-request tracing span: exported via OpenTelemetry when observability
+        // is enabled (config-gated, never initialized for benchmarks). Span
+        // duration captures end-to-end request latency for performance monitoring.
+        let span = tracing::info_span!(
+            "http_request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            scheme = scheme,
+            remote_addr = %remote_addr,
+        );
+        tracing::Instrument::instrument(
+            self.handle_hyper_request_with_h2_cache(request, remote_addr, scheme, None),
+            span,
+        )
+        .await
     }
 
     async fn handle_hyper_request_with_h2_cache(
