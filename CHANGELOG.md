@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.20 - 2026-11-23
+
+- 生产级审计修复 v1.3.19 全部新增面：`real_ip` 改为 nginx 口径（从右向左跳过 trusted CIDR，`recursive` 控制是否继续递归），PROXY v2 分段到达重试有界，三条免策略快路径在 `real_ip` 启用时强制关闭，access 日志统一记录还原后的客户端地址。
+- 路由优先级修正：最长匹配的 reverse/domain/AI 前缀现在优先于 catch-all 静态站（策略链、Basic 挑战、缓存键与快路径同口径），修复 mirror/limit_rate/error_pages 被静态站遮蔽、请求根本不到上游的生产缺陷；附回归测试。
+- `limit_rate` 将被背压扣住的帧字节计入已发送预算，令牌桶不再低估实际出线字节；大正文保持流式不整包缓冲。
+- `mirror` 增加全局 1024 在途上限与逐请求 `timeout_ms`（默认 5s），镜像上游挂死不再累积任务。
+- `auth_basic` 增加原子前置开关：全站未启用时请求入口零额外 await；启用状态热重载同步。
+- 预压缩 304 响应改用原始 Content-Type，与 200 表示一致。
+- OCSP 装订补全生产链路：新增 `src/ocsp.rs`（手写 DER 子集 + 既有 sha1/reqwest，零新增依赖），配置 `ocsp_stapling=true` 且无 file 时按证书 AIA 自动抓取、校验 responder 签名与 certID/status，后台按 nextUpdate/2（300s–24h 钳制）经热重载优雅换装订，失败 300s 重试；live responder 实测通过。
+- TLS 0-RTT 真正处理 early data：会话恢复时把 early data 作为请求前缀喂入解析，前缀已含完整请求头时不再阻塞等待 post-handshake 流；启用 early_data 时改用有状态 session ticket（rustls 自定义 stateless ticketer 会静默禁用 0-RTT）。openssl 真实 0-RTT 客户端实测 Early data accepted + 200。
+- 性能证据更正与本轮对照：历史“反代 2.014x/1.814x”实为 catch-all 静态误路由下的静态快路径成绩（与静态 1KiB 几乎同值），不再作为反代证据。修正路由后 2C2G Docker 双容器（关闭 hot_reload/主动健康/重试，与 nginx 默认对齐）三轮中位：静态 1KiB 1.044x、静态 64KiB 1.246x、真实反代 1KiB 0.736x，0 错误；反代热路径优化列为后续专项，本轮不宣称反代胜出。证据见 `performance-evidence/2c2g-http-docker-two-host-v1320-audit2/`。
+- 验证：musl 全量 482 通过 0 失败；static-pie、readelf 无 NEEDED/INTERP；Debian 12 / Ubuntu 24.04 / Rocky 9 / Alpine 3.21 容器启动与 welcome 200 全绿；auth/预压缩/try_files/404/限速/real_ip/mirror/0-RTT/OCSP 功能冒烟通过。Windows 本机无 MSVC 未编译，由 CI crt-static 打包覆盖并如实披露。
 ## v1.3.19 - 2026-11-23
 
 nginx parity 补全面：预压缩静态、auth_basic、try_files、路由级 error_page、limit_rate、mirror、PROXY protocol v1/v2 + real_ip、OCSP stapling、TLS 0-RTT。全部默认关闭，不改变现有默认行为；明确不做 FastCGI/PHP。
