@@ -6,9 +6,12 @@
 //! `PROXYSSS_DISABLE_TELEMETRY=1` forces it off for load-test runs.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use opentelemetry::metrics::Histogram;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig};
@@ -53,6 +56,59 @@ pub fn telemetry_disabled_by_env() -> bool {
         std::env::var("PROXYSSS_DISABLE_TELEMETRY").as_deref(),
         Ok("1") | Ok("true") | Ok("yes") | Ok("on")
     )
+}
+
+static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+static GATEWAY_METRICS: OnceLock<GatewayMetrics> = OnceLock::new();
+
+/// Hot-path metric instruments. Created only when `observability.metrics_enabled`
+/// is on; the gateway checks [`gateway_metrics`] once per request and skips all
+/// recording when it returns `None` (benchmarks pay nothing).
+pub struct GatewayMetrics {
+    request_duration: Histogram<f64>,
+}
+
+/// Whether the OTel meter provider is live (observable stats registration gate).
+pub fn metrics_enabled() -> bool {
+    METRICS_ENABLED.load(Ordering::Acquire)
+}
+
+/// Hot-path instruments, or `None` when metrics are disabled.
+pub fn gateway_metrics() -> Option<&'static GatewayMetrics> {
+    GATEWAY_METRICS.get()
+}
+
+impl GatewayMetrics {
+    /// Record one finished HTTP request. Attribute cardinality is bounded:
+    /// method is normalized to the standard token set (semconv `_OTHER`),
+    /// scheme is `http`/`https`, and the gateway only emits standard status codes.
+    pub fn record_http_request(
+        &self,
+        method: &str,
+        scheme: &'static str,
+        status: u16,
+        elapsed: Duration,
+    ) {
+        let method: &'static str = match method {
+            "GET" => "GET",
+            "POST" => "POST",
+            "PUT" => "PUT",
+            "DELETE" => "DELETE",
+            "HEAD" => "HEAD",
+            "OPTIONS" => "OPTIONS",
+            "PATCH" => "PATCH",
+            "TRACE" => "TRACE",
+            "CONNECT" => "CONNECT",
+            _ => "_OTHER",
+        };
+        let attributes = [
+            KeyValue::new("http.request.method", method),
+            KeyValue::new("url.scheme", scheme),
+            KeyValue::new("http.response.status_code", i64::from(status)),
+        ];
+        self.request_duration
+            .record(elapsed.as_secs_f64(), &attributes);
+    }
 }
 
 fn resolve_env(value: &str) -> String {
@@ -157,6 +213,20 @@ where
             .with_reader(reader)
             .with_resource(resource)
             .build();
+        // Publish the provider globally so the gateway can register observable
+        // stat instruments and hot-path histograms against it.
+        opentelemetry::global::set_meter_provider(provider.clone());
+        METRICS_ENABLED.store(true, Ordering::Release);
+        let meter = opentelemetry::global::meter("proxysss");
+        let request_duration = meter
+            .f64_histogram("http.server.request.duration")
+            .with_description("End-to-end HTTP request duration at the gateway")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ])
+            .build();
+        let _ = GATEWAY_METRICS.set(GatewayMetrics { request_duration });
         Some(provider)
     } else {
         None

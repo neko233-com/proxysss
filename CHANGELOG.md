@@ -14,6 +14,15 @@ nginx parity 补全面：预压缩静态、auth_basic、try_files、路由级 er
 - 验证：WSL Alpine musl 全量 `cargo test --locked` 通过（含新增模块单元测试）；Windows 本机因缺 MSVC 链接环境未跑编译/测试，如实披露，Windows 由 CI 六平台打包覆盖。
 # Changelog
 
+## v1.3.18 - 2026-11-23
+
+OTel 生产级业务指标版本：性能监控从"仅 traces"补全为指标 + 链路完整对外导出。
+
+- 新增热路径直方图 `http.server.request.duration`（秒；semconv 属性 `http.request.method`/`url.scheme`/`http.response.status_code`；method 归一化到标准集合、其余记 `_OTHER`，基数有界；自定义桶 1ms–60s）。observability 关闭时每请求零记录开销，压测路径不受影响。
+- 网关既有原子统计注册为 22 个 OTel observable 指标：请求/错误/WebSocket/TCP/UDP/reload/admin/monitor/script/拦截/DDoS/关键任务/watchdog/uptime/进程 CPU/内存。回调只在 SDK 导出周期执行，热路径零开销；进程 CPU 为差值采样，每周期缓存一次快照供 CPU 与内存回调共享，避免互相拉偏。
+- `SdkMeterProvider` 注册为全局 meter provider（此前仅由 guard 持有，业务 instrument 无法创建，OTLP metrics 只有 SDK 自指标）；`http_request` 请求 span 覆盖全部 HTTP/HTTPS 入口。
+- 验证：musl `--locked` 编译通过；OTLP/HTTP 本地冒烟确认 traces（`http_request` span）与业务指标同批导出，monitor API 15 端点全 200、无 token 401；Linux 资产 static-pie、无 `NEEDED`/`INTERP`。
+
 ## v1.3.17 - 2026-11-23
 
 原生自更新版本：手动更新与可选每日自动更新，镜像加速自动选择，零外部工具依赖。

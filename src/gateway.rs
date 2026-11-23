@@ -2673,6 +2673,7 @@ struct ProcessMetricsSample {
     cpu_time_secs: f64,
 }
 
+#[derive(Clone, Copy)]
 struct ProcessMetricsSnapshot {
     pid: u32,
     cpu_percent: Option<f64>,
@@ -3027,6 +3028,7 @@ impl Gateway {
         gateway
             .stats
             .configure_domain_stats(&gateway.bootstrap_config.domain_stats_hosts());
+        gateway.stats.register_otel_metrics();
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         gateway.warm_up(&gateway.bootstrap_config).await;
@@ -8868,8 +8870,35 @@ impl Gateway {
         remote_addr: SocketAddr,
         scheme: &'static str,
     ) -> Result<GatewayResponse, Infallible> {
-        self.handle_hyper_request_with_h2_cache(request, remote_addr, scheme, None)
-            .await
+        // Per-request tracing span: exported via OpenTelemetry when observability
+        // is enabled (config-gated, never initialized for benchmarks). Span
+        // duration captures end-to-end request latency for performance monitoring.
+        let span = tracing::info_span!(
+            "http_request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            scheme = scheme,
+            remote_addr = %remote_addr,
+        );
+        let metrics = crate::observability::gateway_metrics();
+        let started = metrics.map(|_| Instant::now());
+        let method = metrics.map(|_| request.method().clone());
+        let response = tracing::Instrument::instrument(
+            self.handle_hyper_request_with_h2_cache(request, remote_addr, scheme, None),
+            span,
+        )
+        .await;
+        if let (Some(metrics), Some(started), Some(method), Ok(finished)) =
+            (metrics, started, method, response.as_ref())
+        {
+            metrics.record_http_request(
+                method.as_str(),
+                scheme,
+                finished.status().as_u16(),
+                started.elapsed(),
+            );
+        }
+        response
     }
 
     async fn handle_hyper_request_with_h2_cache(
@@ -14837,6 +14866,149 @@ impl GatewayStats {
             self.http_requests.load(Ordering::Relaxed),
             |total, shard| total.saturating_add(shard.0.load(Ordering::Relaxed)),
         )
+    }
+
+    /// Register the gateway's existing atomic stats as OpenTelemetry observable
+    /// instruments. Callbacks run on the SDK export cycle, never on the request
+    /// hot path, so this adds zero per-request cost. No-op unless the OTel meter
+    /// provider is live (`observability.enabled` + `metrics_enabled`).
+    fn register_otel_metrics(self: &Arc<Self>) {
+        if !crate::observability::metrics_enabled() {
+            return;
+        }
+        let meter = opentelemetry::global::meter("proxysss");
+        macro_rules! obs_counter {
+            ($name:expr, $desc:expr, $field:ident) => {{
+                let stats = Arc::clone(self);
+                meter
+                    .u64_observable_counter($name)
+                    .with_description($desc)
+                    .with_callback(move |observer| {
+                        observer.observe(stats.$field.load(Ordering::Relaxed), &[])
+                    })
+                    .build();
+            }};
+        }
+        macro_rules! obs_gauge {
+            ($name:expr, $desc:expr, $field:ident) => {{
+                let stats = Arc::clone(self);
+                meter
+                    .u64_observable_gauge($name)
+                    .with_description($desc)
+                    .with_callback(move |observer| {
+                        observer.observe(stats.$field.load(Ordering::Relaxed), &[])
+                    })
+                    .build();
+            }};
+        }
+        {
+            let stats = Arc::clone(self);
+            meter
+                .u64_observable_counter("proxysss.http.requests")
+                .with_description("Total HTTP requests handled by the gateway")
+                .with_callback(move |observer| observer.observe(stats.http_requests_total(), &[]))
+                .build();
+        }
+        obs_counter!("proxysss.http.errors", "Total HTTP 4xx/5xx responses", http_errors);
+        obs_counter!(
+            "proxysss.websocket.sessions",
+            "WebSocket tunnels successfully upgraded",
+            websocket_sessions_total
+        );
+        obs_gauge!(
+            "proxysss.websocket.sessions.active",
+            "Active WebSocket tunnels",
+            websocket_sessions_active
+        );
+        obs_counter!("proxysss.tcp.sessions", "TCP proxy sessions accepted", tcp_sessions_total);
+        obs_gauge!(
+            "proxysss.tcp.sessions.active",
+            "Active TCP proxy sessions",
+            tcp_sessions_active
+        );
+        obs_counter!("proxysss.udp.packets", "UDP packets forwarded", udp_packets_total);
+        obs_counter!("proxysss.udp.bytes", "UDP bytes forwarded", udp_bytes_total);
+        obs_counter!("proxysss.reload.success", "Successful config reloads", reload_success_total);
+        obs_counter!("proxysss.reload.failure", "Failed config reloads", reload_failure_total);
+        obs_counter!("proxysss.admin.requests", "Admin API requests", admin_requests_total);
+        obs_counter!("proxysss.admin.auth_fail", "Admin API auth failures", admin_auth_fail_total);
+        obs_counter!("proxysss.monitor.requests", "Monitor API requests", monitor_requests_total);
+        obs_counter!(
+            "proxysss.monitor.auth_fail",
+            "Monitor API auth failures",
+            monitor_auth_fail_total
+        );
+        obs_counter!("proxysss.script.fail", "Script hook failures", script_fail_total);
+        obs_counter!(
+            "proxysss.blocked.requests",
+            "Requests blocked by security rules",
+            blocked_requests_total
+        );
+        obs_counter!("proxysss.ddos.bans", "DDoS guard bans issued", ddos_bans_total);
+        obs_counter!(
+            "proxysss.critical_task.failures",
+            "Critical background task failures",
+            critical_task_failures_total
+        );
+        obs_counter!("proxysss.watchdog.heartbeat", "Watchdog heartbeats", watchdog_heartbeat_total);
+        {
+            let stats = Arc::clone(self);
+            meter
+                .u64_observable_gauge("proxysss.uptime")
+                .with_description("Gateway uptime")
+                .with_unit("s")
+                .with_callback(move |observer| {
+                    observer.observe(stats.started_at.elapsed().as_secs(), &[])
+                })
+                .build();
+        }
+        // CPU sampling is delta-based: sample once per export cycle and share the
+        // snapshot between the CPU and memory callbacks so neither skews the other.
+        let process_cache: Arc<Mutex<Option<(Instant, ProcessMetricsSnapshot)>>> =
+            Arc::new(Mutex::new(None));
+        {
+            let stats = Arc::clone(self);
+            let cache = Arc::clone(&process_cache);
+            meter
+                .f64_observable_gauge("proxysss.process.cpu")
+                .with_description("Process CPU utilization")
+                .with_unit("%")
+                .with_callback(move |observer| {
+                    if let Some(value) = stats.cached_process_snapshot(&cache).cpu_percent {
+                        observer.observe(value, &[]);
+                    }
+                })
+                .build();
+        }
+        {
+            let stats = Arc::clone(self);
+            meter
+                .u64_observable_gauge("proxysss.process.memory")
+                .with_description("Process resident memory")
+                .with_unit("By")
+                .with_callback(move |observer| {
+                    if let Some(value) = stats.cached_process_snapshot(&process_cache).memory_bytes
+                    {
+                        observer.observe(value, &[]);
+                    }
+                })
+                .build();
+        }
+    }
+
+    fn cached_process_snapshot(
+        &self,
+        cache: &Mutex<Option<(Instant, ProcessMetricsSnapshot)>>,
+    ) -> ProcessMetricsSnapshot {
+        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((taken, snapshot)) = *guard {
+            if taken.elapsed() < std::time::Duration::from_millis(500) {
+                return snapshot;
+            }
+        }
+        let snapshot = self.process_snapshot();
+        *guard = Some((Instant::now(), snapshot));
+        snapshot
     }
 
     fn snapshot_json(&self) -> serde_json::Value {
