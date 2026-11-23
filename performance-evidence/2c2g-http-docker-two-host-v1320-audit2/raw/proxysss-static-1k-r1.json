@@ -1,0 +1,15 @@
+{
+  "label": "proxysss-static-1k-r1",
+  "url": "http://proxysss-bench-server-proxysss:19080/small.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 449069,
+  "errors": 0,
+  "rps": 89813.8,
+  "mib_per_sec": 87.7087890625,
+  "p50_ms": 0.589,
+  "p95_ms": 1.739,
+  "p99_ms": 2.365,
+  "avg_ms": 0.7122205429455162
+}

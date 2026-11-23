@@ -93,7 +93,16 @@ pub async fn accept_strip(
             return Ok(None);
         }
         let mut head = vec![0u8; total];
-        let pn = stream.peek(&mut head).await?;
+        let mut pn = stream.peek(&mut head).await?;
+        let mut tries = 0;
+        while pn < total && tries < 8 {
+            stream.readable().await?;
+            pn = stream.peek(&mut head).await?;
+            if pn == 0 {
+                break;
+            }
+            tries += 1;
+        }
         if pn < total {
             return Ok(None);
         }
@@ -120,9 +129,20 @@ pub fn real_ip(peer: IpAddr, headers: &HeaderMap, cfg: &RealIpConfig) -> IpAddr 
     let Ok(value) = value.to_str() else {
         return peer;
     };
-    for token in value.split(',') {
-        let token = token.trim();
-        if let Ok(ip) = token.parse::<IpAddr>() {
+    let mut chain: Vec<IpAddr> = value
+        .split(',')
+        .filter_map(|token| token.trim().parse::<IpAddr>().ok())
+        .collect();
+    if chain.is_empty() {
+        return peer;
+    }
+    // nginx real_ip default: the last (right-most) address in the header.
+    if !cfg.recursive {
+        return chain.pop().unwrap();
+    }
+    // real_ip_recursive: right-most address not inside the trusted set.
+    while let Some(ip) = chain.pop() {
+        if !crate::static_security::peer_allowed(ip, &cfg.trusted) {
             return ip;
         }
     }
@@ -162,13 +182,20 @@ mod tests {
 
     #[test]
     fn real_ip_only_from_trusted_peer() {
-        let cfg = RealIpConfig {
+        let mut cfg = RealIpConfig {
             enabled: true,
             trusted: vec!["10.0.0.0/8".into()],
             header: "x-forwarded-for".into(),
+            recursive: false,
         };
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
+        // nginx default takes the right-most address.
+        assert_eq!(
+            real_ip("10.0.0.1".parse().unwrap(), &h, &cfg),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        cfg.recursive = true;
         assert_eq!(
             real_ip("10.0.0.1".parse().unwrap(), &h, &cfg),
             "9.9.9.9".parse::<IpAddr>().unwrap()

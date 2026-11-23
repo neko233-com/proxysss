@@ -32,6 +32,7 @@ fn script_only_sites_never_match_native_or_h2_cache_keys() {
     config.admin.enabled = false;
     config.services.static_sites = vec![protected.clone()];
     assert!(!static_site_matches(
+        &config,
         &protected,
         "fixture.example.com",
         "/index.html"

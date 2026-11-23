@@ -13,6 +13,7 @@ mod http_basic_auth;
 mod install;
 mod limit_rate;
 mod mirror;
+mod ocsp;
 mod proxy_protocol;
 mod try_files;
 #[cfg(target_os = "linux")]
@@ -835,19 +836,19 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
     NginxParityItem {
         capability: "real_ip / set_real_ip_from",
         status: ParityStatus::Supported,
-        evidence: "http.real_ip trusted CIDRs recover the left-most forwarded client IP; untrusted peers keep the TCP peer",
+        evidence: "http.real_ip trusted CIDRs recover the right-most forwarded IP (nginx parity), recursive picks the right-most untrusted hop; untrusted peers keep the TCP peer; enabling disables policy-free fast paths",
         next_gap: "",
     },
     NginxParityItem {
         capability: "ssl_stapling",
         status: ParityStatus::Supported,
-        evidence: "http.tls.ocsp_stapling + ocsp_stapling_file staples a DER OCSP response onto the rustls CertifiedKey",
+        evidence: "http.tls.ocsp_stapling auto-fetches from the certificate AIA responder and refreshes at nextUpdate/2 via graceful reload; ocsp_stapling_file remains an operator override",
         next_gap: "",
     },
     NginxParityItem {
         capability: "ssl_early_data",
         status: ParityStatus::Supported,
-        evidence: "http.tls.early_data enables TLS 1.3 0-RTT (max_early_data_size) with early-data drain at accept; default off",
+        evidence: "http.tls.early_data enables TLS 1.3 0-RTT with stateful session tickets; accepted early data is processed as the request prefix, never dropped; default off",
         next_gap: "",
     },
     NginxParityItem {

@@ -958,10 +958,10 @@ http.error_pages.enabled=false 完全保留原错误响应正文及头，不应�
 | `services.static_sites[]` | `try_files: ["$uri", "$uri/", "=404"]` | 有序根内候选，`$uri` 展开，`=status` 终止回退 |
 | 同上三类路由 | `error_pages: [{status: 404, file_path: /abs/404.html}]` | 覆盖全局 `http.error_pages`，保留状态码与 no-store |
 | 同上三类路由 | `limit_rate: 1048576` | 单响应字节/秒限速，0 为不限 |
-| `reverse_proxy.routes[]` / `domain_routes[]` | `mirror: {enabled, upstream, timeout_ms}` | fire-and-forget 影子请求，有界并发，不影响主响应 |
+| `reverse_proxy.routes[]` / `domain_routes[]` | `mirror: {enabled, upstream, timeout_ms}` | fire-and-forget 影子请求，全局 1024 在途上限、超出丢弃，逐请求 timeout_ms（默认 5000），不影响主响应 |
 | `http` / `tcp.listeners[]` | `proxy_protocol: true` | accept 时解析并剥离 HAProxy PROXY v1/v2 |
-| `http` | `real_ip: {trusted_cidrs[], header}` | 仅信任 CIDR 内对端，取最左转发 IP；否则保持 TCP peer |
-| `http.tls` | `ocsp_stapling: true` + `ocsp_stapling_file` | 装订 DER OCSP 响应到 CertifiedKey（file 子集） |
-| `http.tls` | `early_data: true` | TLS1.3 0-RTT（max_early_data_size），accept 后 drain；默认关闭 |
+| `http` | `real_ip: {enabled, trusted[], header, recursive}` | 仅信任 CIDR 内对端；默认取转发链最右 IP（nginx 口径），`recursive: true` 取最右非信任 IP；否则保持 TCP peer。启用时禁用免策略快路径 |
+| `http.tls` | `ocsp_stapling: true` (+`ocsp_stapling_file` 覆盖) | 自动从证书 AIA responder fetch OCSP 并按 nextUpdate/2 刷新（钳制 5min–24h），经正常 reload 优雅换装订；file 提供时优先 file |
+| `http.tls` | `early_data: true` | TLS1.3 0-RTT（max_early_data_size）；early data 作为请求前缀真正处理（非丢弃）；开启时改用有状态 session ticket（rustls 不允许 stateless ticketer 提供 0-RTT）；默认关闭（重放风险由操作者承担） |
 
 带上述策略的站点/路由会禁用免策略快路径，保证逐请求语义。PROXY 头部仅解析成功才消费；real_ip 不信任访客伪造的转发头。

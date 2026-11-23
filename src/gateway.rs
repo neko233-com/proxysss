@@ -175,6 +175,7 @@ pub struct Gateway {
     monitor_auth_guard: AdminAuthGuard,
     auth_requests: crate::auth_request::AuthRequestExecutor,
     buffered_request_bodies: crate::body_budget::BufferedBodyBudget,
+    http_basic_auth_enabled: Arc<AtomicBool>,
 }
 
 struct DynamicState {
@@ -2983,6 +2984,7 @@ impl Gateway {
 
         let dynamic_state = build_dynamic_state(config.clone()).await?;
         let bootstrap_fast_lane = dynamic_state.fast_lane.clone();
+        let http_basic_auth = bootstrap_fast_lane.any_http_basic_auth;
         let dynamic = Arc::new(dynamic_state);
         let (on_demand_trigger, on_demand_rx) = tokio::sync::mpsc::unbounded_channel();
         let dynamic_blacklist =
@@ -3024,15 +3026,102 @@ impl Gateway {
             monitor_auth_guard: AdminAuthGuard::default(),
             auth_requests: crate::auth_request::AuthRequestExecutor::new()?,
             buffered_request_bodies: body_budget,
+            http_basic_auth_enabled: Arc::new(AtomicBool::new(http_basic_auth)),
         });
         gateway
             .stats
             .configure_domain_stats(&gateway.bootstrap_config.domain_stats_hosts());
         gateway.stats.register_otel_metrics();
         gateway.spawn_on_demand_tls_worker(on_demand_rx);
+        {
+            let gateway = gateway.clone();
+            tokio::spawn(async move { gateway.ocsp_refresh_loop().await });
+        }
         gateway.load_persisted_manual_upstream_state(&gateway.bootstrap_config)?;
         gateway.warm_up(&gateway.bootstrap_config).await;
         Ok(gateway)
+    }
+
+    /// nginx ssl_stapling auto-fetch: refresh the OCSP staple at nextUpdate/2
+    /// and republish TLS material through the normal reload path (graceful
+    /// listener fingerprint swap). `ocsp_stapling_file` overrides auto fetch.
+    async fn ocsp_refresh_loop(self: Arc<Self>) {
+        loop {
+            let config = {
+                let state = self.current_state().await;
+                state.config.clone()
+            };
+            let tls = &config.http.tls;
+            let auto = tls.ocsp_stapling
+                && tls.ocsp_stapling_file.as_os_str().is_empty()
+                && !tls.cert_path.as_os_str().is_empty();
+            if !auto {
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                continue;
+            }
+            let interval = match self.refresh_ocsp_staples(&config).await {
+                Ok(interval) => interval,
+                Err(error) => {
+                    tracing::warn!(%error, "ocsp stapling auto-fetch failed; retrying");
+                    Duration::from_secs(300)
+                }
+            };
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    async fn refresh_ocsp_staples(&self, config: &GatewayConfig) -> Result<Duration> {
+        let mut paths: Vec<PathBuf> = vec![config.http.tls.cert_path.clone()];
+        for certificate in &config.http.tls.certificates {
+            if !paths.iter().any(|p| p == &certificate.cert_path) {
+                paths.push(certificate.cert_path.clone());
+            }
+        }
+        let mut interval = Duration::from_secs(12 * 3600);
+        let mut fetched = 0usize;
+        for path in paths {
+            let pem = match tokio::fs::read(&path).await {
+                Ok(pem) => pem,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "ocsp: certificate unreadable");
+                    continue;
+                }
+            };
+            let (leaf, issuer) = {
+                let mut pem_slice = pem.as_slice();
+                let mut certs = rustls_pemfile::certs(&mut pem_slice);
+                let leaf = match certs.next() {
+                    Some(Ok(leaf)) => leaf,
+                    _ => continue,
+                };
+                let issuer = match certs.next() {
+                    Some(Ok(issuer)) => issuer,
+                    _ => {
+                        tracing::warn!(path = %path.display(), "ocsp: chain lacks issuer PEM; auto-fetch skipped");
+                        continue;
+                    }
+                };
+                (leaf, issuer)
+            };
+            match crate::ocsp::fetch(leaf.as_ref(), issuer.as_ref()).await {
+                Ok(staple) => {
+                    interval = interval.min(crate::ocsp::refresh_interval(&staple, SystemTime::now()));
+                    ocsp_staple_cache().insert(path.display().to_string(), staple.der);
+                    fetched += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "ocsp auto-fetch failed");
+                }
+            }
+        }
+        if fetched == 0 {
+            anyhow::bail!("no OCSP staple fetched");
+        }
+        self.reload_config(config.clone())
+            .await
+            .context("publish refreshed OCSP staples")?;
+        tracing::info!(staples = fetched, next_refresh_secs = interval.as_secs(), "ocsp staples refreshed");
+        Ok(interval)
     }
 
     /// Startup/reload self-optimization: preload hot static files into the
@@ -5527,6 +5616,8 @@ impl Gateway {
         self.h2_static_route_cache.clear();
         self.buffered_request_bodies
             .set_limit(new_config.http.max_buffered_request_body_bytes);
+        self.http_basic_auth_enabled
+            .store(new_state.fast_lane.any_http_basic_auth, Ordering::Release);
         self.dynamic.store(new_state);
         self.stats
             .configure_domain_stats(&new_config.domain_stats_hosts());
@@ -7228,23 +7319,29 @@ impl Gateway {
             }
         };
 
+        let mut early_prefix = BytesMut::new();
         if self.bootstrap_config.http.tls.early_data {
             if let Some(mut early_data) = tls_stream.get_mut().1.early_data() {
                 let mut early = [0u8; 4096];
                 loop {
                     match std::io::Read::read(&mut early_data, &mut early) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) => continue,
+                        Ok(n) => early_prefix.extend_from_slice(&early[..n]),
                     }
                 }
             }
         }
         let is_http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
-        let prefix = if is_http2 {
-            Bytes::new()
+        let prefix = if is_http2 || early_prefix.windows(4).any(|w| w == b"\r\n\r\n") {
+            // 0-RTT already carried a complete request head; reading the
+            // post-handshake stream here would block until the client closes.
+            early_prefix.freeze()
         } else {
             match read_tls_fast_lane_http_prefix(&mut tls_stream).await {
-                Ok(prefix) => prefix,
+                Ok(prefix) => {
+                    early_prefix.extend_from_slice(&prefix);
+                    early_prefix.freeze()
+                }
                 Err(error) => {
                     tracing::debug!(?error, %remote_addr, "failed reading TLS HTTP request head");
                     return;
@@ -8912,8 +9009,8 @@ impl Gateway {
         self.stats
             .record_hyper_domain_request(request.headers(), request.uri());
 
-        let auth_state = self.current_state().await;
-        if auth_state.fast_lane.any_http_basic_auth {
+        if self.http_basic_auth_enabled.load(Ordering::Relaxed) {
+            let auth_state = self.current_state().await;
             let host = request_host(request.headers(), request.uri());
             if let Some(challenge) = basic_auth_challenge_for(
                 &auth_state.config,
@@ -9027,7 +9124,7 @@ impl Gateway {
                         Some(query) => format!("{}?{}", uri.path(), query),
                         None => uri.path().to_string(),
                     };
-                    crate::mirror::spawn(&mirror.upstream, &method, &path_and_query, &headers, body.clone());
+                    crate::mirror::spawn(&mirror.upstream, &method, &path_and_query, &headers, body.clone(), mirror.timeout_ms);
                 }
             }
         }
@@ -9307,6 +9404,7 @@ impl Gateway {
 
         let Some(site) = config.services.static_sites.iter().find(|site| {
             static_site_matches(
+                config,
                 site,
                 static_request_host(request.headers(), request.uri()),
                 request.uri().path(),
@@ -9826,7 +9924,7 @@ impl Gateway {
 
         if let Some(site) =
             state.config.services.static_sites.iter().find(|site| {
-                static_site_matches(site, static_request_host(&headers, &uri), uri.path())
+                static_site_matches(&state.config, site, static_request_host(&headers, &uri), uri.path())
             })
         {
             if !crate::static_security::site_peer_allowed(site, remote_addr.ip()) {
@@ -12379,7 +12477,7 @@ fn managed_renewal_due(expires: i64, now: i64, before_days: u32) -> bool {
 fn managed_certificate_needs_renewal(tls: &crate::config::TlsConfig) -> bool {
     use x509_parser::extensions::GeneralName;
     let usable = || -> Result<bool> {
-        build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls))?;
+        build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls, &tls.cert_path))?;
         let certs = load_certs(&tls.cert_path)?;
         let cert = certs
             .first()
@@ -13387,6 +13485,7 @@ fn plain_static_fast_path_allowed(config: &GatewayConfig) -> bool {
         && !config.services.access_control.http.enabled
         && !config.services.rate_limit.http.enabled
         && !config.services.response_policy.compression.enabled
+        && !config.http.real_ip.enabled
         && config
             .services
             .static_sites
@@ -13851,7 +13950,7 @@ async fn resolve_large_static_fast_path_candidate(
             .services
             .static_sites
             .iter()
-            .find(|site| static_site_matches(site, request.host.unwrap_or(""), request.path))
+            .find(|site| static_site_matches(config, site, request.host.unwrap_or(""), request.path))
         else {
             return Ok(None);
         };
@@ -15490,7 +15589,7 @@ struct RoutePolicies<'a> {
 fn route_policies_for<'a>(config: &'a GatewayConfig, host: &str, uri: &Uri) -> RoutePolicies<'a> {
     let path = uri.path();
     for site in &config.services.static_sites {
-        if static_site_request_matches(site, host, path) {
+        if static_site_matches(config, site, host, path) {
             return RoutePolicies { limit_rate: site.limit_rate, error_pages: &site.error_pages, mirror: None };
         }
     }
@@ -15523,7 +15622,7 @@ fn throttle_http_response(mut response: GatewayHttpResponse, rate: u64) -> Gatew
         )));
     } else if !response.body.is_empty() {
         let body = std::mem::take(&mut response.body);
-        let full = http_body_util::Full::new(body).map_err(|e| anyhow::anyhow!(e));
+        let full = http_body_util::Full::new(body).map_err(|e| match e {});
         response.stream_body = Some(GatewayBody::Stream(UnsyncBoxBody::new(
             crate::limit_rate::RateLimited::new(full, rate),
         )));
@@ -16025,14 +16124,14 @@ fn prepare_certified_material(config: &GatewayConfig) -> Result<PreparedTlsMater
     let default = Arc::new(build_certified_key(
         &config.http.tls.cert_path,
         &config.http.tls.key_path,
-        load_ocsp_response(&config.http.tls),
+        load_ocsp_response(&config.http.tls, &config.http.tls.cert_path),
     )?);
     let mut by_name = BTreeMap::new();
     for certificate in &config.http.tls.certificates {
         let certified = Arc::new(build_certified_key(
             &certificate.cert_path,
             &certificate.key_path,
-            load_ocsp_response(&config.http.tls),
+            load_ocsp_response(&config.http.tls, &certificate.cert_path),
         )?);
         insert_certificate_domains(&mut by_name, certified, certificate);
     }
@@ -16042,11 +16141,13 @@ fn prepare_certified_material(config: &GatewayConfig) -> Result<PreparedTlsMater
     for cert in &default.cert {
         cert.as_ref().hash(&mut hash);
     }
+    default.ocsp.hash(&mut hash);
     for (name, key) in &by_name {
         name.hash(&mut hash);
         for cert in &key.cert {
             cert.as_ref().hash(&mut hash);
         }
+        key.ocsp.hash(&mut hash);
     }
     Ok(PreparedTlsMaterial {
         default,
@@ -16165,11 +16266,15 @@ fn build_rustls_server_config_with_material(
     // clients resume across every SO_REUSEPORT accept worker without a shared
     // hot-path lock or a cache sized in proportion to connection cardinality.
     // This also matches production nginx's default TLS ticket behavior.
-    server_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
-        .context("failed initializing rotating TLS session tickets")?;
     server_config.alpn_protocols = alpn_protocols;
     if config.http.tls.early_data {
+        // rustls only offers 0-RTT with its stateful ticket service; a custom
+        // stateless ticketer silently disables early data. Opting into 0-RTT
+        // therefore keeps the default stateful resumption cache.
         server_config.max_early_data_size = u32::MAX;
+    } else {
+        server_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+            .context("failed initializing rotating TLS session tickets")?;
     }
     Ok(server_config)
 }
@@ -16210,17 +16315,27 @@ fn build_tls_resolver(
     }))
 }
 
-fn load_ocsp_response(tls: &crate::config::TlsConfig) -> Option<Vec<u8>> {
-    if !tls.ocsp_stapling || tls.ocsp_stapling_file.as_os_str().is_empty() {
+fn ocsp_staple_cache() -> &'static DashMap<String, Vec<u8>> {
+    static CACHE: std::sync::OnceLock<DashMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+fn load_ocsp_response(tls: &crate::config::TlsConfig, cert_path: &Path) -> Option<Vec<u8>> {
+    if !tls.ocsp_stapling {
         return None;
     }
-    match fs::read(&tls.ocsp_stapling_file) {
-        Ok(bytes) if !bytes.is_empty() => Some(bytes),
-        _ => {
-            tracing::warn!(path = %tls.ocsp_stapling_file.display(), "ocsp_stapling_file unreadable; stapling disabled");
-            None
-        }
+    if !tls.ocsp_stapling_file.as_os_str().is_empty() {
+        return match fs::read(&tls.ocsp_stapling_file) {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => {
+                tracing::warn!(path = %tls.ocsp_stapling_file.display(), "ocsp_stapling_file unreadable; stapling disabled");
+                None
+            }
+        };
     }
+    ocsp_staple_cache()
+        .get(&cert_path.display().to_string())
+        .map(|entry| entry.value().clone())
 }
 
 fn build_certified_key(cert_path: &Path, key_path: &Path, ocsp: Option<Vec<u8>>) -> Result<CertifiedKey> {
@@ -16588,7 +16703,7 @@ async fn issue_on_demand_managed_certificate(
     tls.cert_path = cert_path;
     tls.key_path = key_path;
     issue_managed_acme_certificate(&tls, challenges, tls_alpn_certs).await?;
-    let certified = Arc::new(build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls))?);
+    let certified = Arc::new(build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls, &tls.cert_path))?);
     on_demand_certs.insert(domain.to_ascii_lowercase(), certified);
     Ok(())
 }
@@ -20494,6 +20609,7 @@ fn hyper_static_success_fast_path_globally_allowed(config: &GatewayConfig) -> bo
         || config.services.access_control.http.enabled
         || config.services.rate_limit.http.enabled
         || config.services.response_policy.compression.enabled
+        || config.http.real_ip.enabled
         || config.services.filecloud.enabled
         || config.services.webdav.enabled
         || !config
@@ -20544,6 +20660,7 @@ fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
         && !config.services.access_control.http.enabled
         && !config.services.response_policy.compression.enabled
         && !config.services.response_policy.cache.enabled
+        && !config.http.real_ip.enabled
         && !config.services.rate_limit.http.enabled
         && !config.load_balance.retries.enabled
         && !config.load_balance.active_health.enabled
@@ -20570,7 +20687,7 @@ fn basic_auth_challenge_for(
 ) -> Option<HeaderValue> {
     let path = uri.path();
     for site in &config.services.static_sites {
-        if static_site_request_matches(site, host, path) {
+        if static_site_matches(config, site, host, path) {
             return crate::http_basic_auth::challenge(&site.auth_basic, headers);
         }
     }
@@ -20899,6 +21016,11 @@ fn write_access_log_if_enabled<B>(
         return;
     }
 
+    // nginx logs the realip-adjusted client address, not the trusted proxy peer.
+    let remote_addr = SocketAddr::new(
+        crate::proxy_protocol::real_ip(remote_addr.ip(), request.headers(), &config.http.real_ip),
+        remote_addr.port(),
+    );
     let request_id = Uuid::new_v4().to_string();
     if !should_sample(config.logging.access_sample_rate, &request_id) {
         return;
@@ -21820,7 +21942,7 @@ async fn dispatch_static_site_authorized(
     let mut response = if let Some(status) = validators.status(headers) {
         GatewayHttpResponse::bytes(
             status,
-            static_content_type(&target),
+            original_content_type,
             Bytes::new(),
             "proxysss://static",
         )
@@ -22679,12 +22801,37 @@ fn static_route_cache_key<'a>(
         .services
         .static_sites
         .iter()
-        .position(|site| static_site_matches(site, host, path))?;
+        .position(|site| static_site_matches(config, site, host, path))?;
     Some(static_cache_key(Some(index), path))
 }
 
-fn static_site_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
-    !site.script_only && static_site_request_matches(site, host, path)
+fn static_site_matches(config: &GatewayConfig, site: &StaticSiteConfig, host: &str, path: &str) -> bool {
+    !site.script_only
+        && static_site_request_matches(site, host, path)
+        && !proxy_route_more_specific(config, site.path_prefix.len(), host, path)
+}
+
+/// nginx location precedence: a longer matching proxy/domain/AI prefix wins over
+/// a catch-all static site, so route policies (mirror/limit_rate/error_pages)
+/// and the upstream itself stay reachable. Length filter keeps the hot path
+/// cheap when no proxy route can outrank the site.
+fn proxy_route_more_specific(config: &GatewayConfig, site_prefix_len: usize, host: &str, path: &str) -> bool {
+    let host_ok = |hosts: &[String]| {
+        hosts.is_empty() || hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+    };
+    config.services.reverse_proxy.routes.iter().any(|route| {
+        route.path_prefix.len() > site_prefix_len
+            && path.starts_with(&route.path_prefix)
+            && host_ok(&route.hosts)
+    }) || config.services.domain_routes.iter().any(|route| {
+        route.path_prefix.len() > site_prefix_len
+            && path.starts_with(&route.path_prefix)
+            && route.domains.iter().any(|h| h.eq_ignore_ascii_case(host))
+    }) || (config.services.ai_proxy.enabled
+        && config.services.ai_proxy.routes.iter().any(|route| {
+            route.path_prefix.len() > site_prefix_len
+                && crate::ai_proxy::route_matches(route, host, path)
+        }))
 }
 
 fn static_site_request_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
@@ -26170,6 +26317,7 @@ mod tests {
             monitor_auth_guard: AdminAuthGuard::default(),
             auth_requests: crate::auth_request::AuthRequestExecutor::new().unwrap(),
             buffered_request_bodies: crate::body_budget::BufferedBodyBudget::new(0),
+            http_basic_auth_enabled: Arc::new(AtomicBool::new(false)),
         };
         let remote_addr = "203.0.113.10:443".parse().expect("remote address");
         gateway
@@ -27400,6 +27548,28 @@ mod tests {
     }
 
     #[test]
+    fn longer_proxy_prefix_outranks_catch_all_static_site() {
+        let mut config = GatewayConfig::default();
+        config.services.static_sites.push(StaticSiteConfig {
+            name: "catchall".to_string(),
+            root: "/tmp".into(),
+            path_prefix: "/".to_string(),
+            ..Default::default()
+        });
+        config.services.reverse_proxy.routes.push(ReverseProxyRouteConfig {
+            name: "api".to_string(),
+            path_prefix: "/api/".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        });
+        let site = &config.services.static_sites[0];
+        assert!(static_site_matches(&config, site, "example.test", "/index.html"));
+        assert!(!static_site_matches(&config, site, "example.test", "/api/x"));
+        assert!(proxy_route_more_specific(&config, 1, "example.test", "/api/x"));
+        assert!(!proxy_route_more_specific(&config, 1, "example.test", "/other"));
+    }
+
+    #[test]
     fn build_upstream_headers_appends_forwarding_chain() {
         let route = RouteDecision {
             upstream: "http://127.0.0.1:8080".to_string(),
@@ -27573,6 +27743,7 @@ mod tests {
             monitor_auth_guard: AdminAuthGuard::default(),
             auth_requests: crate::auth_request::AuthRequestExecutor::new().unwrap(),
             buffered_request_bodies: crate::body_budget::BufferedBodyBudget::new(0),
+            http_basic_auth_enabled: Arc::new(AtomicBool::new(false)),
         };
         let mut weights = BTreeMap::new();
         weights.insert("http://127.0.0.1:9000".to_string(), 1);

@@ -1,0 +1,15 @@
+{
+  "label": "nginx-static-64k-r2",
+  "url": "http://proxysss-bench-server-nginx:19080/large.bin",
+  "workers": 64,
+  "warmup_secs": 2,
+  "duration_secs": 5,
+  "success": 235631,
+  "errors": 0,
+  "rps": 47126.2,
+  "mib_per_sec": 2945.3875,
+  "p50_ms": 1.177,
+  "p95_ms": 3.106,
+  "p99_ms": 3.964,
+  "avg_ms": 1.3575520198955147
+}

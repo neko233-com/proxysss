@@ -1443,6 +1443,11 @@ pub struct MirrorConfig {
     pub enabled: bool,
     #[serde(default)]
     pub upstream: String,
+    #[serde(default = "default_mirror_timeout_ms")]
+    pub timeout_ms: u64,
+}
+fn default_mirror_timeout_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1454,6 +1459,8 @@ pub struct RealIpConfig {
     pub trusted: Vec<String>,
     #[serde(default = "default_real_ip_header")]
     pub header: String,
+    #[serde(default)]
+    pub recursive: bool,
 }
 fn default_real_ip_header() -> String {
     "x-forwarded-for".to_string()

@@ -26,8 +26,12 @@ if (-not (Test-Path -LiteralPath $Binary)) { throw "binary not found: $Binary" }
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $started = Get-Date
 
-$tmp = Join-Path $env:TEMP 'proxysss-2c2g-two-host'
-if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+# Docker Desktop refuses docker cp sources under the system TEMP profile;
+# keep the staging tree on the project drive (outside clean-test-cache scope).
+$tmp = Join-Path $repo '.bench-two-host'
+if (Test-Path -LiteralPath $tmp) {
+    try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction Stop } catch { Write-Host "temp cleanup partial (locked handles): $($_.Exception.Message)" }
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $tmp 'www\rp'), (Join-Path $tmp 'bin'), (Join-Path $tmp 'results') | Out-Null
 
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -104,9 +108,18 @@ logging:
 admin:
   enabled: false
 runtime:
+  hot_reload:
+    enabled: false
   performance:
     enabled: true
     traffic_profile: small
+load_balance:
+  active_health:
+    enabled: false
+  passive_health:
+    enabled: false
+  retries:
+    enabled: false
 services:
   static_sites:
     - name: bench
@@ -166,21 +179,31 @@ $client = 'proxysss-bench-client'
 $prep = 'proxysss-bench-prep'
 docker rm -f $serverNginx $serverProxysss $client $prep 2>$null | Out-Null
 
+# Docker Desktop occasionally returns a transient "Access is denied." for
+# exec/cp right after container start; retry without touching measurement.
+function Invoke-DockerRetry([scriptblock]$Op, [string]$What) {
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        & $Op | Out-Null
+        if ($LASTEXITCODE -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw "failed after retries: $What"
+}
+
 # Populate a named volume through a short-lived helper container. Docker cp
 # cannot create the parent directory inside a never-started container.
 docker create --name $prep --network $network --restart no -v "${volume}:/bench" alpine:3.21 sleep infinity | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to create benchmark prep container' }
 docker start $prep | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to start benchmark prep container' }
-docker exec $prep sh -c 'mkdir -p /bench/www /bench/logs /bench/results' | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'failed to prepare benchmark volume' }
-docker cp $Binary "${prep}:/bench/proxysss" | Out-Null
-docker cp (Join-Path $tmp 'backend.conf') "${prep}:/bench/backend.conf" | Out-Null
-docker cp (Join-Path $tmp 'nginx.conf') "${prep}:/bench/nginx.conf" | Out-Null
-docker cp (Join-Path $tmp 'proxysss.yaml') "${prep}:/bench/proxysss.yaml" | Out-Null
-docker cp (Join-Path $tmp 'run.sh') "${prep}:/bench/run.sh" | Out-Null
-docker cp (Join-Path $tmp 'www\.') "${prep}:/bench/www" | Out-Null
-docker exec $prep sh -c 'chmod +x /bench/proxysss' | Out-Null
+Invoke-DockerRetry { docker exec $prep sh -c 'mkdir -p /bench/www /bench/logs /bench/results' } 'prepare benchmark volume'
+Invoke-DockerRetry { docker cp $Binary "${prep}:/bench/proxysss" } 'copy gateway binary'
+Invoke-DockerRetry { docker cp (Join-Path $tmp 'backend.conf') "${prep}:/bench/backend.conf" } 'copy backend.conf'
+Invoke-DockerRetry { docker cp (Join-Path $tmp 'nginx.conf') "${prep}:/bench/nginx.conf" } 'copy nginx.conf'
+Invoke-DockerRetry { docker cp (Join-Path $tmp 'proxysss.yaml') "${prep}:/bench/proxysss.yaml" } 'copy proxysss.yaml'
+Invoke-DockerRetry { docker cp (Join-Path $tmp 'run.sh') "${prep}:/bench/run.sh" } 'copy run.sh'
+Invoke-DockerRetry { docker cp (Join-Path $tmp 'www\.') "${prep}:/bench/www" } 'copy www'
+Invoke-DockerRetry { docker exec $prep sh -c 'chmod +x /bench/proxysss' } 'chmod benchmark binary'
 docker stop $prep | Out-Null
 docker rm $prep | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to populate benchmark volume' }
@@ -196,20 +219,29 @@ if ($LASTEXITCODE -ne 0) { throw 'failed to create client container' }
 
 docker start $client | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to start client container' }
-docker exec $client sh -c 'mkdir -p /bench/results' | Out-Null
-docker cp $loader "${client}:/bench/bench-fast-http" | Out-Null
-docker exec $client sh -c 'chmod +x /bench/bench-fast-http' | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'failed to prepare client container' }
+Invoke-DockerRetry { docker exec $client sh -c 'mkdir -p /bench/results' } 'client results dir'
+Invoke-DockerRetry { docker cp $loader "${client}:/bench/bench-fast-http" } 'copy loader'
+Invoke-DockerRetry { docker exec $client sh -c 'chmod +x /bench/bench-fast-http' } 'chmod loader'
 
 $evidence = Join-Path $repo ("performance-evidence\2c2g-http-docker-two-host-{0}" -f $Tag)
 New-Item -ItemType Directory -Force -Path (Join-Path $evidence 'raw') | Out-Null
 
 function Get-CgroupValue([string]$Name, [string]$Path) {
-    return (docker exec $Name sh -c "cat $Path" 2>$null | Out-String).Trim()
+    for ($i = 0; $i -lt 3; $i++) {
+        $value = (docker exec $Name sh -c "cat $Path" 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $value) { return $value }
+        Start-Sleep -Milliseconds 500
+    }
+    return ''
 }
 
 function Get-ExecValue([string]$Name, [string]$Command) {
-    return (docker exec $Name sh -c $Command 2>$null | Out-String).Trim()
+    for ($i = 0; $i -lt 3; $i++) {
+        $value = (docker exec $Name sh -c $Command 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $value) { return $value }
+        Start-Sleep -Milliseconds 500
+    }
+    return ''
 }
 
 function Get-ContainerInfo([string]$Name) {

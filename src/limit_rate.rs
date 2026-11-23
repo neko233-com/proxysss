@@ -55,6 +55,7 @@ impl<B: Body<Data = Bytes> + Unpin> Body for RateLimited<B> {
                     let allowed = Duration::from_secs_f64(total as f64 / self.rate as f64);
                     let elapsed = self.start.elapsed();
                     if elapsed < allowed {
+                        self.sent = total;
                         self.held = Some(frame);
                         let mut delay = Box::pin(tokio::time::sleep(allowed - elapsed));
                         // Register the waker now; otherwise the timer never wakes us.

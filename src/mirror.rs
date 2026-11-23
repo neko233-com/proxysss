@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 static CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
+static IN_FLIGHT: Semaphore = Semaphore::const_new(1024);
 
 async fn client() -> &'static reqwest::Client {
     CLIENT
@@ -39,16 +40,31 @@ pub fn mirror_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-pub fn spawn(upstream: &str, method: &Method, path_and_query: &str, headers: &HeaderMap, body: Bytes) {
+pub fn spawn(
+    upstream: &str,
+    method: &Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    timeout_ms: u64,
+) {
     if upstream.trim().is_empty() {
         return;
     }
+    // Bounded shadow concurrency: drop mirrors instead of unbounded task growth.
+    let Ok(permit) = IN_FLIGHT.try_acquire() else {
+        return;
+    };
     let url = mirror_url(upstream, path_and_query);
     let method = method.clone();
     let headers = mirror_headers(headers);
     tokio::spawn(async move {
+        let _permit = permit;
         let client = client().await;
-        let mut request = client.request(method, url).body(body);
+        let mut request = client
+            .request(method, url)
+            .timeout(Duration::from_millis(timeout_ms.max(1)))
+            .body(body);
         for (name, value) in &headers {
             request = request.header(name.clone(), value.clone());
         }
