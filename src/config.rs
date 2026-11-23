@@ -181,6 +181,10 @@ pub struct HttpConfig {
     #[serde(default)]
     pub error_pages: HttpErrorPagesConfig,
     #[serde(default)]
+    pub proxy_protocol: bool,
+    #[serde(default)]
+    pub real_ip: RealIpConfig,
+    #[serde(default)]
     pub tls: TlsConfig,
 }
 
@@ -247,6 +251,12 @@ pub struct TlsConfig {
     pub server_name: String,
     #[serde(default)]
     pub acme: AcmeExternalConfig,
+    #[serde(default)]
+    pub ocsp_stapling: bool,
+    #[serde(default)]
+    pub early_data: bool,
+    #[serde(default)]
+    pub ocsp_stapling_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +440,8 @@ pub struct TcpListenerConfig {
     pub nodelay: bool,
     #[serde(default = "default_stream_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1268,6 +1280,14 @@ pub struct ReverseProxyRouteConfig {
     pub rate_limit: HttpRateLimitConfig,
     #[serde(default)]
     pub active_health: ActiveHealthOverrideConfig,
+    #[serde(default)]
+    pub auth_basic: HttpBasicAuthConfig,
+    #[serde(default)]
+    pub error_pages: Vec<HttpErrorPageConfig>,
+    #[serde(default)]
+    pub limit_rate: u64,
+    #[serde(default)]
+    pub mirror: MirrorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1301,6 +1321,14 @@ pub struct DomainRouteConfig {
     pub rate_limit: HttpRateLimitConfig,
     #[serde(default)]
     pub active_health: ActiveHealthOverrideConfig,
+    #[serde(default)]
+    pub auth_basic: HttpBasicAuthConfig,
+    #[serde(default)]
+    pub error_pages: Vec<HttpErrorPageConfig>,
+    #[serde(default)]
+    pub limit_rate: u64,
+    #[serde(default)]
+    pub mirror: MirrorConfig,
     #[serde(default)]
     pub ssl: DomainTlsConfig,
 }
@@ -1408,6 +1436,55 @@ pub enum DomainTlsMode {
     Manual,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub upstream: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RealIpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub trusted: Vec<String>,
+    #[serde(default = "default_real_ip_header")]
+    pub header: String,
+}
+fn default_real_ip_header() -> String {
+    "x-forwarded-for".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HttpBasicAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_basic_auth_realm")]
+    pub realm: String,
+}
+fn default_basic_auth_realm() -> String {
+    "proxysss".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StaticPrecompressedConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Empty means the built-in preference order: brotli then gzip.
+    #[serde(default)]
+    pub algorithms: Vec<CompressionAlgorithm>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticSiteConfig {
@@ -1436,6 +1513,16 @@ pub struct StaticSiteConfig {
     pub security: StaticSecurityConfig,
     #[serde(default)]
     pub rate_limit: HttpRateLimitConfig,
+    #[serde(default)]
+    pub precompressed: StaticPrecompressedConfig,
+    #[serde(default)]
+    pub auth_basic: HttpBasicAuthConfig,
+    #[serde(default)]
+    pub error_pages: Vec<HttpErrorPageConfig>,
+    #[serde(default)]
+    pub try_files: Vec<String>,
+    #[serde(default)]
+    pub limit_rate: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3029,6 +3116,8 @@ impl Default for HttpConfig {
             max_buffered_request_body_bytes: 0,
             allow_insecure_upstreams: false,
             error_pages: HttpErrorPagesConfig::default(),
+            proxy_protocol: false,
+            real_ip: RealIpConfig::default(),
             tls: TlsConfig::default(),
         }
     }
@@ -3080,6 +3169,9 @@ impl Default for TlsConfig {
             generate_self_signed_if_missing: default_true(),
             server_name: default_server_name(),
             acme: AcmeExternalConfig::default(),
+            ocsp_stapling: false,
+            early_data: false,
+            ocsp_stapling_file: PathBuf::new(),
         }
     }
 }
@@ -3467,6 +3559,11 @@ impl Default for StaticSiteConfig {
             cache_control: String::new(),
             security: StaticSecurityConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
+            precompressed: StaticPrecompressedConfig::default(),
+            auth_basic: HttpBasicAuthConfig::default(),
+            error_pages: Vec::new(),
+            try_files: Vec::new(),
+            limit_rate: 0,
         }
     }
 }
@@ -3489,6 +3586,10 @@ impl Default for ReverseProxyRouteConfig {
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
             active_health: ActiveHealthOverrideConfig::default(),
+            auth_basic: HttpBasicAuthConfig::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: MirrorConfig::default(),
         }
     }
 }
@@ -3511,6 +3612,10 @@ impl Default for DomainRouteConfig {
             cache: ResponseCacheConfig::default(),
             rate_limit: HttpRateLimitConfig::default(),
             active_health: ActiveHealthOverrideConfig::default(),
+            auth_basic: HttpBasicAuthConfig::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: MirrorConfig::default(),
             ssl: DomainTlsConfig::default(),
         }
     }
@@ -5280,6 +5385,10 @@ mod tests {
             .reverse_proxy
             .routes
             .push(ReverseProxyRouteConfig {
+                auth_basic: Default::default(),
+                error_pages: Vec::new(),
+                limit_rate: 0,
+                mirror: Default::default(),
                 auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/api".to_string(),
@@ -5361,6 +5470,7 @@ mod tests {
     fn validate_rejects_stream_listener_without_yaml_or_script_route() {
         let mut config = GatewayConfig::default();
         config.tcp.listeners.push(TcpListenerConfig {
+            proxy_protocol: false,
             name: "game".to_string(),
             bind: "0.0.0.0:7000".to_string(),
             upstream: String::new(),
@@ -5405,6 +5515,7 @@ udp:
     fn validate_rejects_invalid_stream_listener_tuning() {
         let mut config = GatewayConfig::default();
         config.tcp.listeners.push(TcpListenerConfig {
+            proxy_protocol: false,
             name: "game-tcp".to_string(),
             bind: "127.0.0.1:7000".to_string(),
             upstream: "127.0.0.1:9000".to_string(),

@@ -195,12 +195,29 @@ struct FastLaneState {
     raw_sse_proxy: bool,
     raw_reverse_proxy: bool,
     raw_websocket_proxy: bool,
+    any_http_basic_auth: bool,
 }
 
 impl FastLaneState {
     fn compile(config: &GatewayConfig) -> Self {
         let performance_enabled = config.runtime.performance.enabled;
         let simple_http_proxy = performance_enabled && simple_http_proxy_fast_path_allowed(config);
+        let any_http_basic_auth = config
+            .services
+            .static_sites
+            .iter()
+            .any(|site| site.auth_basic.enabled)
+            || config
+                .services
+                .reverse_proxy
+                .routes
+                .iter()
+                .any(|route| route.auth_basic.enabled)
+            || config
+                .services
+                .domain_routes
+                .iter()
+                .any(|route| route.auth_basic.enabled);
         Self {
             plain_http_static_sendfile: performance_enabled
                 && cfg!(target_os = "linux")
@@ -211,6 +228,7 @@ impl FastLaneState {
             raw_sse_proxy: simple_http_proxy,
             raw_reverse_proxy: simple_http_proxy,
             raw_websocket_proxy: simple_http_proxy,
+            any_http_basic_auth,
         }
     }
 }
@@ -6214,6 +6232,15 @@ impl Gateway {
         initial_prefix: Bytes,
     ) {
         let _active_plain_http = ActivePlainHttpConnectionGuard::enter();
+        let mut stream = stream;
+        let mut remote_addr = remote_addr;
+        if let Some(ip) = crate::proxy_protocol::accept_strip(&mut stream, self.bootstrap_config.http.proxy_protocol)
+            .await
+            .ok()
+            .flatten()
+        {
+            remote_addr = SocketAddr::new(ip, remote_addr.port());
+        }
         let (stream, prefix) = if self.plain_http_data_fast_lane_enabled().await {
             match self
                 .try_plain_http_large_static_fast_path(stream, remote_addr, initial_prefix)
@@ -7182,6 +7209,15 @@ impl Gateway {
         remote_addr: SocketAddr,
         worker_index: usize,
     ) {
+        let mut stream = stream;
+        let mut remote_addr = remote_addr;
+        if let Some(ip) = crate::proxy_protocol::accept_strip(&mut stream, self.bootstrap_config.http.proxy_protocol)
+            .await
+            .ok()
+            .flatten()
+        {
+            remote_addr = SocketAddr::new(ip, remote_addr.port());
+        }
         let mut tls_stream = match acceptor.accept(stream).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -7190,6 +7226,17 @@ impl Gateway {
             }
         };
 
+        if self.bootstrap_config.http.tls.early_data {
+            if let Some(mut early_data) = tls_stream.get_mut().1.early_data() {
+                let mut early = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut early_data, &mut early) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        }
         let is_http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
         let prefix = if is_http2 {
             Bytes::new()
@@ -7672,7 +7719,10 @@ impl Gateway {
         worker_index: usize,
     ) -> Result<()> {
         loop {
-            let (inbound, remote_addr) = listener.accept().await.context("tcp accept failed")?;
+            let (mut inbound, mut remote_addr) = listener.accept().await.context("tcp accept failed")?;
+            if let Some(ip) = crate::proxy_protocol::accept_strip(&mut inbound, listener_config.proxy_protocol).await? {
+                remote_addr = SocketAddr::new(ip, remote_addr.port());
+            }
             let connection_worker = worker_index;
             let accept_state = self.current_state().await;
             let accepted_listener =
@@ -8833,6 +8883,33 @@ impl Gateway {
         self.stats
             .record_hyper_domain_request(request.headers(), request.uri());
 
+        let auth_state = self.current_state().await;
+        if auth_state.fast_lane.any_http_basic_auth {
+            let host = request_host(request.headers(), request.uri());
+            if let Some(challenge) = basic_auth_challenge_for(
+                &auth_state.config,
+                &host,
+                request.uri(),
+                request.headers(),
+            ) {
+                let mut response = GatewayHttpResponse::bytes(
+                    StatusCode::UNAUTHORIZED,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"401 Unauthorized"),
+                    "proxysss://auth-basic",
+                );
+                response
+                    .headers
+                    .push((http::header::WWW_AUTHENTICATE, challenge));
+                response
+                    .headers
+                    .push((CACHE_CONTROL, HeaderValue::from_static("private, no-store")));
+                self.stats
+                    .record_http_response_status(StatusCode::UNAUTHORIZED);
+                return Ok(response.into_hyper());
+            }
+        }
+
         match self
             .try_http_static_success_fast_path(&request, scheme, h2_static_route_cache)
             .await
@@ -8913,6 +8990,19 @@ impl Gateway {
             }
         };
 
+        {
+            let host = request_host(&headers, &uri);
+            if let Some(mirror) = route_mirror_for(&body_config.config, &host, &uri) {
+                if mirror.enabled {
+                    let path_and_query = match uri.query() {
+                        Some(query) => format!("{}?{}", uri.path(), query),
+                        None => uri.path().to_string(),
+                    };
+                    crate::mirror::spawn(&mirror.upstream, &method, &path_and_query, &headers, body.clone());
+                }
+            }
+        }
+
         let response = match self
             .dispatch_http(
                 method,
@@ -8949,18 +9039,21 @@ impl Gateway {
         let elapsed = started.elapsed();
         self.stats.record_http_response_status(response.status);
 
+        let state = self.current_state().await;
+        let host = request_host(request.headers(), request.uri());
+        let policies = route_policies_for(&state.config, &host, request.uri());
         let mut response = response;
         if response.status.is_client_error() || response.status.is_server_error() {
-            let state = self.current_state().await;
-            response = decorate_error_response(&state.config, request.headers(), response);
+            response = decorate_error_response(&state.config, request.headers(), response, policies.error_pages);
             write_access_log_if_enabled(&state.config, request, &response, remote_addr, elapsed);
         } else if self.bootstrap_config.logging.access_log
             || self.bootstrap_config.runtime.hot_reload.enabled
         {
-            let state = self.current_state().await;
             write_access_log_if_enabled(&state.config, request, &response, remote_addr, elapsed);
         }
-
+        if policies.limit_rate > 0 {
+            response = throttle_http_response(response, policies.limit_rate);
+        }
         response
     }
 
@@ -9487,6 +9580,10 @@ impl Gateway {
         on_upgrade: Option<OnUpgrade>,
     ) -> Result<GatewayHttpResponse> {
         let state = self.current_state().await;
+        let remote_addr = SocketAddr::new(
+            crate::proxy_protocol::real_ip(remote_addr.ip(), &headers, &state.config.http.real_ip),
+            remote_addr.port(),
+        );
 
         if !security::request_uri_is_safe(&uri) {
             return Ok(GatewayHttpResponse::bytes(
@@ -9842,6 +9939,22 @@ impl Gateway {
                 Ok(lease) => lease,
                 Err(response) => return Ok(*response),
             };
+
+        if let Some(challenge) = basic_auth_challenge_for(&state.config, &host, &uri, &headers) {
+            let mut response = GatewayHttpResponse::bytes(
+                StatusCode::UNAUTHORIZED,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"401 Unauthorized"),
+                "proxysss://auth-basic",
+            );
+            response
+                .headers
+                .push((http::header::WWW_AUTHENTICATE, challenge));
+            response
+                .headers
+                .push((CACHE_CONTROL, HeaderValue::from_static("private, no-store")));
+            return Ok(response);
+        }
 
         if let Some(policy) = &route.decision.auth_request {
             if let crate::auth_request::AuthRequestOutcome::Denied {
@@ -12237,7 +12350,7 @@ fn managed_renewal_due(expires: i64, now: i64, before_days: u32) -> bool {
 fn managed_certificate_needs_renewal(tls: &crate::config::TlsConfig) -> bool {
     use x509_parser::extensions::GeneralName;
     let usable = || -> Result<bool> {
-        build_certified_key(&tls.cert_path, &tls.key_path)?;
+        build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls))?;
         let certs = load_certs(&tls.cert_path)?;
         let cert = certs
             .first()
@@ -15196,13 +15309,63 @@ fn total_system_memory_bytes() -> Option<u64> {
     None
 }
 
+struct RoutePolicies<'a> {
+    limit_rate: u64,
+    error_pages: &'a [crate::config::HttpErrorPageConfig],
+    mirror: Option<&'a crate::config::MirrorConfig>,
+}
+
+fn route_policies_for<'a>(config: &'a GatewayConfig, host: &str, uri: &Uri) -> RoutePolicies<'a> {
+    let path = uri.path();
+    for site in &config.services.static_sites {
+        if static_site_request_matches(site, host, path) {
+            return RoutePolicies { limit_rate: site.limit_rate, error_pages: &site.error_pages, mirror: None };
+        }
+    }
+    for route in &config.services.reverse_proxy.routes {
+        let host_ok = route.hosts.is_empty() || route.hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
+        if host_ok && path.starts_with(&route.path_prefix) {
+            return RoutePolicies { limit_rate: route.limit_rate, error_pages: &route.error_pages, mirror: Some(&route.mirror) };
+        }
+    }
+    for route in &config.services.domain_routes {
+        let host_ok = route.domains.iter().any(|h| h.eq_ignore_ascii_case(host));
+        if host_ok && path.starts_with(&route.path_prefix) {
+            return RoutePolicies { limit_rate: route.limit_rate, error_pages: &route.error_pages, mirror: Some(&route.mirror) };
+        }
+    }
+    RoutePolicies { limit_rate: 0, error_pages: &[], mirror: None }
+}
+
+fn route_mirror_for<'a>(config: &'a GatewayConfig, host: &str, uri: &Uri) -> Option<&'a crate::config::MirrorConfig> {
+    route_policies_for(config, host, uri).mirror
+}
+
+fn throttle_http_response(mut response: GatewayHttpResponse, rate: u64) -> GatewayHttpResponse {
+    if rate == 0 {
+        return response;
+    }
+    if let Some(stream) = response.stream_body.take() {
+        response.stream_body = Some(GatewayBody::Stream(UnsyncBoxBody::new(
+            crate::limit_rate::RateLimited::new(stream, rate),
+        )));
+    } else if !response.body.is_empty() {
+        let body = std::mem::take(&mut response.body);
+        let full = http_body_util::Full::new(body).map_err(|e| anyhow::anyhow!(e));
+        response.stream_body = Some(GatewayBody::Stream(UnsyncBoxBody::new(
+            crate::limit_rate::RateLimited::new(full, rate),
+        )));
+    }
+    response
+}
+
 fn decorate_error_response(
     config: &GatewayConfig,
     request_headers: &HeaderMap,
     response: GatewayHttpResponse,
+    route_pages: &[crate::config::HttpErrorPageConfig],
 ) -> GatewayHttpResponse {
-    if !config.http.error_pages.enabled
-        || response.stream_body.is_some()
+    if response.stream_body.is_some()
         || response.upstream == "proxysss://response"
         || response
             .upstream
@@ -15215,13 +15378,17 @@ fn decorate_error_response(
         return response;
     }
 
-    if let Some(page) = config
-        .http
-        .error_pages
-        .pages
+    let page = route_pages
         .iter()
         .find(|page| page.status == response.status.as_u16())
-    {
+        .or_else(|| {
+            if config.http.error_pages.enabled {
+                config.http.error_pages.pages.iter().find(|page| page.status == response.status.as_u16())
+            } else {
+                None
+            }
+        });
+    if let Some(page) = page {
         if let Some(body) = load_configured_error_page(
             page,
             response.status,
@@ -15242,7 +15409,7 @@ fn decorate_error_response(
         }
     }
 
-    if wants_html_response(request_headers) {
+    if config.http.error_pages.enabled && wants_html_response(request_headers) {
         let detail = if config.http.error_pages.show_details {
             String::from_utf8_lossy(&response.body).to_string()
         } else {
@@ -15564,6 +15731,7 @@ fn listener_specs_with_tls_fingerprint(
 
     if config.services.ftp.enabled {
         specs.push(ListenerSpec::Tcp(TcpListenerConfig {
+            proxy_protocol: false,
             name: "ftp".to_string(),
             bind: config.services.ftp.bind.clone(),
             upstream: config.services.ftp.upstream.clone(),
@@ -15583,6 +15751,7 @@ fn listener_specs_with_tls_fingerprint(
             .map(|route| route.upstream.clone())
             .unwrap_or_default();
         specs.push(ListenerSpec::Tcp(TcpListenerConfig {
+            proxy_protocol: false,
             name: format!("stream|{bind}"),
             bind: bind.to_string(),
             upstream: default_upstream,
@@ -15684,12 +15853,14 @@ fn prepare_certified_material(config: &GatewayConfig) -> Result<PreparedTlsMater
     let default = Arc::new(build_certified_key(
         &config.http.tls.cert_path,
         &config.http.tls.key_path,
+        load_ocsp_response(&config.http.tls),
     )?);
     let mut by_name = BTreeMap::new();
     for certificate in &config.http.tls.certificates {
         let certified = Arc::new(build_certified_key(
             &certificate.cert_path,
             &certificate.key_path,
+            load_ocsp_response(&config.http.tls),
         )?);
         insert_certificate_domains(&mut by_name, certified, certificate);
     }
@@ -15825,6 +15996,9 @@ fn build_rustls_server_config_with_material(
     server_config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
         .context("failed initializing rotating TLS session tickets")?;
     server_config.alpn_protocols = alpn_protocols;
+    if config.http.tls.early_data {
+        server_config.max_early_data_size = u32::MAX;
+    }
     Ok(server_config)
 }
 
@@ -15864,7 +16038,20 @@ fn build_tls_resolver(
     }))
 }
 
-fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
+fn load_ocsp_response(tls: &crate::config::TlsConfig) -> Option<Vec<u8>> {
+    if !tls.ocsp_stapling || tls.ocsp_stapling_file.as_os_str().is_empty() {
+        return None;
+    }
+    match fs::read(&tls.ocsp_stapling_file) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        _ => {
+            tracing::warn!(path = %tls.ocsp_stapling_file.display(), "ocsp_stapling_file unreadable; stapling disabled");
+            None
+        }
+    }
+}
+
+fn build_certified_key(cert_path: &Path, key_path: &Path, ocsp: Option<Vec<u8>>) -> Result<CertifiedKey> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     let provider = rustls::crypto::aws_lc_rs::default_provider();
@@ -15872,7 +16059,8 @@ fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey
         .key_provider
         .load_private_key(key)
         .map_err(|error| anyhow!("failed loading private key {}: {error}", key_path.display()))?;
-    let certified = CertifiedKey::new(certs, signing_key);
+    let mut certified = CertifiedKey::new(certs, signing_key);
+    certified.ocsp = ocsp;
     certified
         .keys_match()
         .context("TLS certificate and private key do not match")?;
@@ -16228,7 +16416,7 @@ async fn issue_on_demand_managed_certificate(
     tls.cert_path = cert_path;
     tls.key_path = key_path;
     issue_managed_acme_certificate(&tls, challenges, tls_alpn_certs).await?;
-    let certified = Arc::new(build_certified_key(&tls.cert_path, &tls.key_path)?);
+    let certified = Arc::new(build_certified_key(&tls.cert_path, &tls.key_path, load_ocsp_response(&tls))?);
     on_demand_certs.insert(domain.to_ascii_lowercase(), certified);
     Ok(())
 }
@@ -20194,12 +20382,40 @@ fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
             .reverse_proxy
             .routes
             .iter()
-            .all(|route| route.auth_request.is_none())
+            .all(|route| route.auth_request.is_none() && !route.auth_basic.enabled && route.limit_rate == 0 && route.error_pages.is_empty() && !route.mirror.enabled)
         && config
             .services
             .domain_routes
             .iter()
-            .all(|route| route.auth_request.is_none())
+            .all(|route| route.auth_request.is_none() && !route.auth_basic.enabled && route.limit_rate == 0 && route.error_pages.is_empty() && !route.mirror.enabled)
+}
+
+fn basic_auth_challenge_for(
+    config: &GatewayConfig,
+    host: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<HeaderValue> {
+    let path = uri.path();
+    for site in &config.services.static_sites {
+        if static_site_request_matches(site, host, path) {
+            return crate::http_basic_auth::challenge(&site.auth_basic, headers);
+        }
+    }
+    for route in &config.services.reverse_proxy.routes {
+        let host_ok =
+            route.hosts.is_empty() || route.hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
+        if host_ok && path.starts_with(&route.path_prefix) {
+            return crate::http_basic_auth::challenge(&route.auth_basic, headers);
+        }
+    }
+    for route in &config.services.domain_routes {
+        let host_ok = route.domains.iter().any(|h| h.eq_ignore_ascii_case(host));
+        if host_ok && path.starts_with(&route.path_prefix) {
+            return crate::http_basic_auth::challenge(&route.auth_basic, headers);
+        }
+    }
+    None
 }
 
 fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Cow<'a, str> {
@@ -20216,6 +20432,10 @@ fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Cow<'a, str> {
 
 fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
     route.auth_request.is_none()
+        && !route.auth_basic.enabled
+        && route.limit_rate == 0
+        && route.error_pages.is_empty()
+        && !route.mirror.enabled
         && route.upstreams.is_empty()
         && route.upstream_weights.is_empty()
         && route.set_headers.is_empty()
@@ -20227,6 +20447,10 @@ fn reverse_proxy_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bo
 
 fn websocket_route_fast_path_eligible(route: &ReverseProxyRouteConfig) -> bool {
     route.auth_request.is_none()
+        && !route.auth_basic.enabled
+        && route.limit_rate == 0
+        && route.error_pages.is_empty()
+        && !route.mirror.enabled
         && route.set_headers.is_empty()
         && route.strip_headers.is_empty()
         && !route.compression.enabled
@@ -21305,12 +21529,27 @@ async fn dispatch_static_site_authorized(
         ));
     }
 
-    let Some(target) = static_site_filesystem_path(site, uri.path())? else {
+    let Some(mut target) = static_site_filesystem_path(site, uri.path())? else {
         return Ok(GatewayHttpResponse::error(
             StatusCode::NOT_FOUND,
             "static path not found",
         ));
     };
+
+    if !site.try_files.is_empty() {
+        let prefix = site.path_prefix.trim_end_matches('/');
+        let relative = uri.path().strip_prefix(prefix).unwrap_or(uri.path()).trim_start_matches('/');
+        match crate::try_files::resolve(&site.root, relative, &site.try_files, site.hide_dotfiles).await {
+            crate::try_files::Outcome::File(path) => target = path,
+            crate::try_files::Outcome::Status(code) => {
+                return Ok(GatewayHttpResponse::error(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND),
+                    "try_files terminal status",
+                ));
+            }
+            crate::try_files::Outcome::None => {}
+        }
+    }
 
     let Some(mut target) = resolve_static_site_target(site, &target).await else {
         return Ok(GatewayHttpResponse::error(
@@ -21329,7 +21568,7 @@ async fn dispatch_static_site_authorized(
         Err(error) => return Err(error).context("failed reading static metadata"),
     };
 
-    let metadata = if metadata.is_dir() {
+    let mut metadata = if metadata.is_dir() {
         if !uri.path().ends_with('/') && !crate::static_security::signed_url_enabled(site) {
             let mut response = GatewayHttpResponse::bytes(
                 StatusCode::MOVED_PERMANENTLY,
@@ -21390,6 +21629,21 @@ async fn dispatch_static_site_authorized(
             "static path not found",
         ));
     }
+    let original_content_type = static_content_type(&target);
+    let mut precompressed_encoding: Option<&'static str> = None;
+    if site.precompressed.enabled {
+        if let Some((compressed, encoding)) =
+            crate::precompressed::select(&site.root, &target, headers, &site.precompressed).await
+        {
+            if let Ok(compressed_meta) = tokio::fs::metadata(&compressed).await {
+                if compressed_meta.is_file() {
+                    target = compressed;
+                    metadata = compressed_meta;
+                    precompressed_encoding = Some(encoding);
+                }
+            }
+        }
+    }
     let validators = file_download::Validators::new(&metadata);
     let mut response = if let Some(status) = validators.status(headers) {
         GatewayHttpResponse::bytes(
@@ -21422,6 +21676,25 @@ async fn dispatch_static_site_authorized(
         .await?
     };
     validators.append(&mut response)?;
+    if site.precompressed.enabled {
+        response.headers.push((
+            http::header::VARY,
+            HeaderValue::from_static("accept-encoding"),
+        ));
+    }
+    if let Some(encoding) = precompressed_encoding {
+        response
+            .headers
+            .retain(|(name, _)| name != http::header::CONTENT_TYPE);
+        response.headers.push((
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static(original_content_type),
+        ));
+        response.headers.push((
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static(encoding),
+        ));
+    }
     Ok(response)
 }
 
@@ -25991,6 +26264,10 @@ mod tests {
         let updated = render_config_with_upserted_domain_route(
             "http:\n  plain_bind: 0.0.0.0:80\nservices:\n  domain_routes: []\n",
             &DomainRouteConfig {
+                auth_basic: Default::default(),
+                error_pages: Vec::new(),
+                limit_rate: 0,
+                mirror: Default::default(),
                 auth_request: None,
                 name: "app".to_string(),
                 domains: vec!["example.com".to_string()],
@@ -26021,6 +26298,10 @@ mod tests {
         let updated = render_config_with_upserted_domain_route(
             "services:\n  domain_routes:\n    - name: app\n      domains: [old.example.com]\n      path_prefix: /\n      upstream: http://127.0.0.1:8000\n",
             &DomainRouteConfig {
+                auth_basic: Default::default(),
+                error_pages: Vec::new(),
+                limit_rate: 0,
+                mirror: Default::default(),
                 auth_request: None,
                 name: "app".to_string(),
                 domains: vec!["new.example.com".to_string()],
@@ -26052,6 +26333,10 @@ mod tests {
         let updated = render_config_with_upserted_reverse_proxy_route(
             "services:\n  reverse_proxy:\n    routes:\n      - name: api\n        path_prefix: /api\n        hosts: [api.old.example.com]\n        upstream: http://127.0.0.1:8000\n",
             &ReverseProxyRouteConfig {
+                auth_basic: Default::default(),
+                error_pages: Vec::new(),
+                limit_rate: 0,
+                mirror: Default::default(),
                 auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/v2".to_string(),
@@ -26081,6 +26366,7 @@ mod tests {
         let updated = render_config_with_upserted_tcp_listener(
             "tcp:\n  listeners:\n    - name: game\n      bind: 0.0.0.0:7000\n      upstream: 127.0.0.1:9000\n",
             &TcpListenerConfig {
+                proxy_protocol: false,
                 name: "game".to_string(),
                 bind: "0.0.0.0:7001".to_string(),
                 upstream: "127.0.0.1:9100".to_string(),
@@ -26181,6 +26467,10 @@ mod tests {
     #[test]
     fn reverse_proxy_route_matches_wildcard_host_and_strips_prefix() {
         let route = ReverseProxyRouteConfig {
+            auth_basic: Default::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: Default::default(),
             auth_request: None,
             name: "api".to_string(),
             path_prefix: "/api".to_string(),
@@ -26214,6 +26504,10 @@ mod tests {
         config.services.reverse_proxy = ReverseProxyConfig {
             routes: vec![
                 ReverseProxyRouteConfig {
+                    auth_basic: Default::default(),
+                    error_pages: Vec::new(),
+                    limit_rate: 0,
+                    mirror: Default::default(),
                     auth_request: None,
                     name: "root-api".to_string(),
                     path_prefix: "/api".to_string(),
@@ -26231,6 +26525,10 @@ mod tests {
                     active_health: ActiveHealthOverrideConfig::default(),
                 },
                 ReverseProxyRouteConfig {
+                    auth_basic: Default::default(),
+                    error_pages: Vec::new(),
+                    limit_rate: 0,
+                    mirror: Default::default(),
                     auth_request: None,
                     name: "admin-api".to_string(),
                     path_prefix: "/api/admin".to_string(),
@@ -26260,6 +26558,10 @@ mod tests {
     fn configured_domain_route_matches_host_and_enables_features() {
         let mut config = GatewayConfig::default();
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_basic: Default::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: Default::default(),
             auth_request: None,
             name: "app".to_string(),
             domains: vec!["example.com".to_string()],
@@ -26302,6 +26604,10 @@ mod tests {
     fn configured_domain_route_uses_domain_as_primary_service_group() {
         let mut config = GatewayConfig::default();
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_basic: Default::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: Default::default(),
             auth_request: None,
             name: "example-site".to_string(),
             domains: vec!["example.com".to_string()],
@@ -26320,6 +26626,10 @@ mod tests {
             ssl: crate::config::DomainTlsConfig::default(),
         });
         config.services.domain_routes.push(DomainRouteConfig {
+            auth_basic: Default::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: Default::default(),
             auth_request: None,
             name: "store".to_string(),
             domains: vec!["neko233.store".to_string()],
@@ -26525,6 +26835,7 @@ mod tests {
         let mut config = GatewayConfig::default();
         config.runtime.performance.enabled = true;
         let listener = TcpListenerConfig {
+            proxy_protocol: false,
             name: "tcp-echo".to_string(),
             bind: "127.0.0.1:7000".to_string(),
             upstream: "127.0.0.1:7001".to_string(),
@@ -26836,6 +27147,7 @@ mod tests {
         config.load_balance.active_health.enabled = false;
         config.load_balance.passive_health.enabled = false;
         config.tcp.listeners.push(TcpListenerConfig {
+            proxy_protocol: false,
             name: "direct".to_string(),
             bind: "127.0.0.1:7000".to_string(),
             upstream: "127.0.0.1:7001".to_string(),
@@ -27805,6 +28117,7 @@ mod tests {
     fn configured_stream_listener_route_uses_yaml_upstreams() {
         let mut config = GatewayConfig::default();
         config.tcp.listeners.push(TcpListenerConfig {
+            proxy_protocol: false,
             name: "game-tcp".to_string(),
             bind: "0.0.0.0:7000".to_string(),
             upstream: "127.0.0.1:9000".to_string(),

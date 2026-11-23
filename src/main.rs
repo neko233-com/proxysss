@@ -9,12 +9,18 @@ mod demo;
 mod filecloud;
 mod filesystem_boundary;
 mod gateway;
+mod http_basic_auth;
 mod install;
+mod limit_rate;
+mod mirror;
+mod proxy_protocol;
+mod try_files;
 #[cfg(target_os = "linux")]
 mod linux_cpu;
 mod linux_tune;
 mod notifications;
 mod observability;
+mod precompressed;
 mod runtime_tuning;
 mod script;
 mod security;
@@ -782,6 +788,66 @@ const NGINX_PARITY_MATRIX: &[NginxParityItem] = &[
         capability: "default HTTP port 80",
         status: ParityStatus::Supported,
         evidence: "GatewayConfig default http.plain_bind=0.0.0.0:80",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "gzip_static / brotli_static",
+        status: ParityStatus::Supported,
+        evidence: "services.static_sites[].precompressed serves root-confined .br/.gz siblings with original Content-Type, Content-Encoding and Vary: Accept-Encoding",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "auth_basic",
+        status: ParityStatus::Supported,
+        evidence: "auth_basic on static/reverse/domain routes; constant-time Basic verification, fails closed, precedes cache and body",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "try_files",
+        status: ParityStatus::Supported,
+        evidence: "static try_files ordered root-contained candidates with $uri expansion and =status terminal fallback",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "error_page",
+        status: ParityStatus::Supported,
+        evidence: "global http.error_pages plus per-route error_pages override on static/reverse/domain routes",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "limit_rate",
+        status: ParityStatus::Supported,
+        evidence: "per-response byte pacing via limit_rate on static/reverse/domain with bounded single-timer token scheduling",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "mirror",
+        status: ParityStatus::Supported,
+        evidence: "route mirror spawns bounded fire-and-forget shadow requests without blocking or altering the primary response",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "proxy_protocol",
+        status: ParityStatus::Supported,
+        evidence: "http.proxy_protocol and tcp.listeners[].proxy_protocol parse HAProxy PROXY v1/v2 at accept before HTTP/TLS/relay",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "real_ip / set_real_ip_from",
+        status: ParityStatus::Supported,
+        evidence: "http.real_ip trusted CIDRs recover the left-most forwarded client IP; untrusted peers keep the TCP peer",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "ssl_stapling",
+        status: ParityStatus::Supported,
+        evidence: "http.tls.ocsp_stapling + ocsp_stapling_file staples a DER OCSP response onto the rustls CertifiedKey",
+        next_gap: "",
+    },
+    NginxParityItem {
+        capability: "ssl_early_data",
+        status: ParityStatus::Supported,
+        evidence: "http.tls.early_data enables TLS 1.3 0-RTT (max_early_data_size) with early-data drain at accept; default off",
         next_gap: "",
     },
     NginxParityItem {
@@ -2792,6 +2858,10 @@ mod tests {
             .reverse_proxy
             .routes
             .push(crate::config::ReverseProxyRouteConfig {
+                auth_basic: Default::default(),
+                error_pages: Vec::new(),
+                limit_rate: 0,
+                mirror: Default::default(),
                 auth_request: None,
                 name: "api".to_string(),
                 path_prefix: "/api".to_string(),
@@ -2829,6 +2899,7 @@ mod tests {
             .deny
             .push("203.0.113.0/24".to_string());
         config.tcp.listeners.push(crate::config::TcpListenerConfig {
+            proxy_protocol: false,
             name: "chat".to_string(),
             bind: "0.0.0.0:7000".to_string(),
             upstream: "127.0.0.1:9000".to_string(),

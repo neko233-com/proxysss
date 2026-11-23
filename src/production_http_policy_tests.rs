@@ -539,13 +539,13 @@ async fn actual_http_error_pages_disabled_and_explicit_script_static_bodies_are_
     }];
     let original = GatewayHttpResponse::error(StatusCode::FORBIDDEN, "original native error");
     assert_eq!(
-        decorate_error_response(&config, &HeaderMap::new(), original).body,
+        decorate_error_response(&config, &HeaderMap::new(), original, &[]).body,
         Bytes::from_static(b"original native error")
     );
     config.http.error_pages.enabled = true;
     let original = GatewayHttpResponse::error(StatusCode::FORBIDDEN, "original native error");
     assert_eq!(
-        decorate_error_response(&config, &HeaderMap::new(), original).body,
+        decorate_error_response(&config, &HeaderMap::new(), original, &[]).body,
         Bytes::from_static(b"configured replacement")
     );
 }

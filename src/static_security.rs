@@ -45,7 +45,14 @@ pub fn site_peer_allowed(site: &StaticSiteConfig, peer: IpAddr) -> bool {
 }
 
 pub fn fast_lane_eligible(site: &StaticSiteConfig) -> bool {
-    !requires_authorization(site) && site.cache_control.is_empty() && !site.rate_limit.enabled
+    !requires_authorization(site)
+        && site.cache_control.is_empty()
+        && !site.rate_limit.enabled
+        && !site.precompressed.enabled
+        && !site.auth_basic.enabled
+        && site.try_files.is_empty()
+        && site.limit_rate == 0
+        && site.error_pages.is_empty()
 }
 
 fn parse_peer(rule: &str) -> Option<(IpAddr, u8)> {

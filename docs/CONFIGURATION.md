@@ -946,3 +946,22 @@ http:
 
 http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。
 
+
+## v1.3.18 nginx parity 补全面（默认关闭）
+
+以下能力均为 config-gated，默认不启用，不改变现有默认行为；不做 FastCGI/PHP。
+
+| 配置面 | 字段 | 语义 |
+| --- | --- | --- |
+| `services.static_sites[]` | `precompressed: {enabled, algorithms}` | 按 Accept-Encoding 服务根内 `.br`/`.gz` 兄弟文件，保留原 Content-Type，写 Content-Encoding 与 Vary |
+| `services.static_sites[]` / `reverse_proxy.routes[]` / `domain_routes[]` | `auth_basic: {enabled, realm, username, password}` | HTTP Basic，恒定时间比较，空表 fail-closed，先于缓存/请求体 |
+| `services.static_sites[]` | `try_files: ["$uri", "$uri/", "=404"]` | 有序根内候选，`$uri` 展开，`=status` 终止回退 |
+| 同上三类路由 | `error_pages: [{status: 404, file_path: /abs/404.html}]` | 覆盖全局 `http.error_pages`，保留状态码与 no-store |
+| 同上三类路由 | `limit_rate: 1048576` | 单响应字节/秒限速，0 为不限 |
+| `reverse_proxy.routes[]` / `domain_routes[]` | `mirror: {enabled, upstream, timeout_ms}` | fire-and-forget 影子请求，有界并发，不影响主响应 |
+| `http` / `tcp.listeners[]` | `proxy_protocol: true` | accept 时解析并剥离 HAProxy PROXY v1/v2 |
+| `http` | `real_ip: {trusted_cidrs[], header}` | 仅信任 CIDR 内对端，取最左转发 IP；否则保持 TCP peer |
+| `http.tls` | `ocsp_stapling: true` + `ocsp_stapling_file` | 装订 DER OCSP 响应到 CertifiedKey（file 子集） |
+| `http.tls` | `early_data: true` | TLS1.3 0-RTT（max_early_data_size），accept 后 drain；默认关闭 |
+
+带上述策略的站点/路由会禁用免策略快路径，保证逐请求语义。PROXY 头部仅解析成功才消费；real_ip 不信任访客伪造的转发头。

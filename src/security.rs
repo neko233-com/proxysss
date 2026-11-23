@@ -891,6 +891,10 @@ pub fn apply_kubernetes_routes(
             port
         );
         let route = DomainRouteConfig {
+            auth_basic: Default::default(),
+            error_pages: Vec::new(),
+            limit_rate: 0,
+            mirror: Default::default(),
             auth_request: None,
             name: mapping.name.clone(),
             domains: mapping.domains.clone(),

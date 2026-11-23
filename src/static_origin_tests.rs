@@ -494,7 +494,7 @@ async fn static_symlinks_cannot_leave_root_in_dispatch_preload_or_listing() {
 fn static_html_errors_preserve_cache_rejection_headers() {
     let mut headers = HeaderMap::new();
     headers.insert(http::header::ACCEPT, HeaderValue::from_static("text/html"));
-    let response = decorate_error_response(&GatewayConfig::default(), &headers, static_denied());
+    let response = decorate_error_response(&GatewayConfig::default(), &headers, static_denied(), &[]);
     assert_eq!(response.status, StatusCode::FORBIDDEN);
     assert!(response
         .headers

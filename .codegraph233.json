@@ -1,0 +1,5 @@
+{
+  "profile": "code",
+  "languages": ["rust", "typescript"],
+  "exclude": ["target", ".git", "node_modules", "performance-evidence", ".benchmark", ".tmp", "dist", ".cache", "docs"]
+}
