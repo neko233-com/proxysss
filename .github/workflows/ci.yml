@@ -12,6 +12,45 @@ on:
   pull_request:
 
 jobs:
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test-windows-msvc
+
+      - name: Run Windows tests
+        run: cargo test --locked
+
+  test-linux-musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Run Linux musl tests
+        run: cargo test --locked --target x86_64-unknown-linux-musl
+
   package:
     strategy:
       fail-fast: false

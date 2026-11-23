@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Binary,
     [int]$Rounds = 3,
-    [int]$Workers = 64,
+    # 0 selects the CPU-scaled default: 64 connections at <=2 CPUs, 32 per CPU above.
+    [int]$Workers = 0,
     [int]$WarmupSecs = 2,
     [int]$DurationSecs = 5,
     [string]$ServerImage = 'nginx:1.28',
@@ -18,6 +19,9 @@ $ErrorActionPreference = 'Stop'
 # Native stderr from Docker/load generator must not terminate PowerShell 7
 # before the exit code is checked.
 $PSNativeCommandUseErrorActionPreference = $false
+if ($Cpus -lt 1) { throw '-Cpus must be >= 1' }
+if ($Workers -lt 1) { $Workers = $Cpus * 32 }
+if ($Workers -lt 16) { $Workers = 16 }
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $SkipClean) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\clean-test-cache.ps1')
@@ -310,7 +314,7 @@ function Wait-Ready([string]$HostName) {
         Start-Sleep -Milliseconds 500
         $oldEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        $probe = & docker exec $client /bench/bench-fast-http `
+        $probe = & docker exec -e ("GOMAXPROCS={0}" -f $Cpus) $client timeout --kill-after=2 10 /bench/bench-fast-http `
             -url ("http://{0}:19080/small.bin" -f $HostName) `
             -workers 1 -warmup 0 -duration 1 -expected-bytes 1024 `
             -prewarm-timeout-ms 500 -out '/tmp/probe.json' 2>$null
@@ -342,12 +346,17 @@ try {
             foreach ($scenario in $scenarios) {
                 $file = "{0}-{1}-r{2}.json" -f $candidate, $scenario.name, $round
                 $containerPath = "/bench/results/$file"
-                & docker exec -e GOMAXPROCS=2 $client /bench/bench-fast-http `
+                # Hard wall-clock guard: a wedged client must fail the round
+                # instead of blocking the whole matrix forever. The loader's
+                # default prewarm deadline is 30 s, so the guard covers that
+                # plus warm-up, measurement and process startup.
+                $execBudget = $WarmupSecs + $DurationSecs + 45
+                & docker exec -e ("GOMAXPROCS={0}" -f $Cpus) $client timeout --kill-after=5 $execBudget /bench/bench-fast-http `
                     -label ("{0}-{1}-r{2}" -f $candidate, $scenario.name, $round) `
                     -url ("http://{0}:19080{1}" -f $hostName, $scenario.path) `
                     -workers $Workers -warmup $WarmupSecs -duration $DurationSecs `
                     -expected-bytes $scenario.bytes -out $containerPath
-                if ($LASTEXITCODE -ne 0) { throw ("{0} {1} failed" -f $candidate, $scenario.name) }
+                if ($LASTEXITCODE -ne 0) { throw ("{0} {1} r{2} failed with exit {3}" -f $candidate, $scenario.name, $round, $LASTEXITCODE) }
                 docker cp "${client}:$containerPath" (Join-Path $evidence ("raw\" + $file)) | Out-Null
                 $results += Get-Content -LiteralPath (Join-Path $evidence ("raw\" + $file)) -Raw | ConvertFrom-Json
             }

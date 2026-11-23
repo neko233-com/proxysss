@@ -6402,12 +6402,19 @@ impl Gateway {
         remote_addr: SocketAddr,
         initial_prefix: Bytes,
     ) -> Result<PlainHttpFastLaneAttempt> {
-        let dynamic_state;
-        let (config, fast_lane) = if self.bootstrap_config.runtime.hot_reload.enabled
+        let dynamic_state: Option<Arc<DynamicState>> = if self
+            .bootstrap_config
+            .runtime
+            .hot_reload
+            .enabled
             || self.bootstrap_config.admin.enabled
         {
-            dynamic_state = self.current_state().await;
-            (&dynamic_state.config, &dynamic_state.fast_lane)
+            Some(self.current_state().await)
+        } else {
+            None
+        };
+        let (config, fast_lane) = if let Some(state) = dynamic_state.as_ref() {
+            (&state.config, &state.fast_lane)
         } else {
             (&self.bootstrap_config, &self.bootstrap_fast_lane)
         };
@@ -6458,6 +6465,16 @@ impl Gateway {
                 tracing::debug!(%remote_addr, bytes = prefix.len(), "plain http fast path header incomplete");
                 break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
             };
+            // Admin/hot-reload deployments swap the dynamic state in place.
+            // Re-check after the request has arrived: an idle keep-alive
+            // connection can block in the read above while a reload publishes
+            // a new route table. Hand the untouched bytes to Hyper, which
+            // resolves the current state.
+            if let Some(state) = dynamic_state.as_ref() {
+                if !Arc::ptr_eq(state, &self.dynamic.load_full()) {
+                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                }
+            }
             let request_head = &prefix[..head_end];
             let leftover = &prefix[head_end..];
             let static_cache_hit = static_response_cache

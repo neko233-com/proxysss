@@ -125,11 +125,11 @@ mod tests {
 
         let (path, enc) = select(root, &original, &headers("gzip, br"), &cfg).await.unwrap();
         assert_eq!(enc, "br");
-        assert_eq!(path, root.join("a.js.br"));
+        assert_eq!(path, tokio::fs::canonicalize(root.join("a.js.br")).await.unwrap());
 
         let (path, enc) = select(root, &original, &headers("gzip"), &cfg).await.unwrap();
         assert_eq!(enc, "gzip");
-        assert_eq!(path, root.join("a.js.gz"));
+        assert_eq!(path, tokio::fs::canonicalize(root.join("a.js.gz")).await.unwrap());
 
         assert!(select(root, &original, &headers("identity"), &cfg).await.is_none());
         assert!(select(root, &root.join("missing.js"), &headers("br"), &cfg).await.is_none());

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.22 - 2026-11-23
+
+- Windows 本机原生测试落地：修复 `precompressed` / `try_files` 测试对 `canonicalize()` 返回 `\\?\` 前缀的错误断言；新增 `scripts/test-windows.ps1`，自动定位 Visual Studio Build Tools / Windows SDK、加载 `vcvars64.bat`、校验 `cl.exe` 与 MSVC `link.exe`，默认清缓存后运行 `cargo test --locked`。Windows 全量 457 passed / 0 failed / 1 ignored。
+- CI 新增 `test-windows` 与 `test-linux-musl` 全量测试任务；发布打包矩阵不再替代功能测试。
+- 修复 admin/hot-reload 配置代际切换时 keep-alive raw 车道继续使用旧路由：在读到下一请求后比较当前 `DynamicState`，代际变化即把已读字节交还 Hyper 按新配置解析；新增同连接改路由回归测试。检查必须在阻塞读之后，否则空闲 keep-alive 连接会在重载后继续命中旧快照。
+- 压测 harness：`-Workers 0` 默认按 `Cpus*32`（最小 16），客户端 `GOMAXPROCS` 跟随 `-Cpus`；每轮与 readiness 探针增加硬墙钟 `timeout`，客户端卡死不再拖死整个矩阵。本机 Docker Desktop 仅暴露 2 CPU，4 CPU 入口未产出数据，不宣称多核成绩。
+- 验证：Windows 本机原生全量 457 passed / 0 failed / 1 ignored；Linux musl 全量 486 passed / 0 failed / 1 ignored；Linux release 为 `static-pie`、0 `NEEDED` / 0 `INTERP`，25,242,448 B，`proxysss 1.3.22`；Debian 12 / Ubuntu 24.04 / Rocky Linux 9 / AlmaLinux 9 / Alpine 3.21 真实启动并完成 HTTP/HTTPS/Range/healthz 冒烟。
+
 ## v1.3.21 - 2026-11-23
 
 - 反向代理热路径默认回到原生 raw 车道：`load_balance.active_health`/`passive_health`/`retries` 与 `affinity` 不再整体禁用免策略 HTTP 快车道（单上游路由下它们不改变选择结果），`admin` 与访问日志也不再阻塞。快车道内自行写 access 行并逐请求复查内存黑名单与 monitoring 路径；DDoS、HTTP access control、限流、real_ip、压缩、缓存、脚本/插件或热重载任一启用时仍强制回落策略路径。

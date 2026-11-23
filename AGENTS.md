@@ -31,7 +31,7 @@ Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 1
 
 安全状态过期回收独立于热重载和健康探测；保留活动窗口/封禁，黑名单读取不得删除并发续封的新状态。外部封禁秒数必须避免 Instant 加法溢出，相关实现及后台循环同时维护真实管理 API、并发和时间边界测试，见架构与配置指南。
 
-Linux 功能夹具使用独占匿名 Docker volume，避免把 Windows 共享 v9fs 的替换语义当作本地 Linux；严格断言不能忽略瞬时 ENOENT。黑名单持久化要求支持同目录原子替换的状态目录，保存原始 UTC 起点和 TTL，重启不得统一续成一小时；启用的损坏快照须明确报错。管理写入先完整同步临时文件并原子替换，再更新内存/DDoS；错误不能返回成功。写入顺序和取消责任留在控制面，普通准入与自动封禁不得等待磁盘锁。热重载开启时仍禁用 HTTP 免策略快车道；admin 开启时 raw 反代/SSE/WS 车道保留，但必须逐请求复查内存黑名单与 monitoring 路径（动态封禁可随时变化），任何 DDoS/HTTP access/限流/real_ip 策略仍整体禁用车道；已有 WS/TCP relay 不因新准入封禁被强行切断。
+Linux 功能夹具使用独占匿名 Docker volume，避免把 Windows 共享 v9fs 的替换语义当作本地 Linux；严格断言不能忽略瞬时 ENOENT。黑名单持久化要求支持同目录原子替换的状态目录，保存原始 UTC 起点和 TTL，重启不得统一续成一小时；启用的损坏快照须明确报错。管理写入先完整同步临时文件并原子替换，再更新内存/DDoS；错误不能返回成功。写入顺序和取消责任留在控制面，普通准入与自动封禁不得等待磁盘锁。热重载开启时仍禁用 HTTP 免策略快车道；admin 开启时 raw 反代/SSE/WS 车道保留，但必须逐请求复查内存黑名单与 monitoring 路径（动态封禁可随时变化），任何 DDoS/HTTP access/限流/real_ip 策略仍整体禁用车道；配置代际变化后 keep-alive 车道必须交还 Hyper 重新解析，不能继续使用旧路由/旧上游；已有 WS/TCP relay 不因新准入封禁被强行切断。
 
 proxysss exists to **fully replace nginx** as a same-level general-purpose gateway. It is **not** a business gateway. Business-aware behavior belongs in optional scripts/plugins, similar to using Lua modules with nginx.
 
@@ -198,6 +198,7 @@ bash scripts/clean-test-cache.sh
 ```
 
 - 清理范围是项目本地的 `target/`、`.benchmark/`、`.cache/`、`.tmp/`、`dist/`、根目录 `tmp-*` / `.tmp-*` 测试产物、benchmark 日志，以及本项目自建的 Docker 验证容器和卷；不得保留上一轮 100 GB 级 `target`/`.benchmark` 再开测。
+- 使用 `scripts/test-windows.ps1` 跑本机 Windows 全量测试：它自动定位 `vcvars64.bat`、校验 MSVC `cl.exe`/`link.exe` 并默认先清理缓存，再执行 `cargo test --locked`。CI 的 `test-windows` 与 `test-linux-musl` 也必须跑全量测试；打包矩阵通过不代表功能测试通过。
 - `scripts/verify-local.ps1`、`verify-deep.ps1`、`verify-e2e.ps1`、`verify-docker-scenarios.ps1`、`run-all-verify.ps1`、`benchmark-gateways.ps1` 已内置开始前清理；直接 `cargo test` 或手动 `cargo build` 时必须先显式执行清理脚本。
 - 每次测试或基准结束后，`target/` 与 `.benchmark/` 合计必须低于 5 GB；超过即视为本轮验证失败，必须立即清理后再继续。不得让项目缓存接近 100 GB。
 - `KEEP_BENCH_ARTIFACTS=1` 只能为一次明确需要保留的发布证据使用；证据收集完成立即清理，不得长期堆积在 `.benchmark/`。

@@ -6,6 +6,10 @@
 
 Linux 发布必须兼容 Ubuntu 与 Debian，分别在 Ubuntu 24.04 和 Debian 12 运行真实二进制功能验证；静态发行包还须覆盖 Rocky Linux 9 / AlmaLinux 9 与 Alpine 最小容器。记录发行版、版本、架构、二进制摘要、`readelf`/`file` 结果及命令输出；某环境的成功不能外推其他版本或架构。生产目标另做实际验收。
 
+## 0.0 Windows 本机完整测试
+
+Windows 本机不再依赖手工打开 Developer Command Prompt：`pwsh -NoProfile -File scripts/test-windows.ps1` 自动定位 Visual Studio Build Tools/Windows SDK 的 `vcvars64.bat`，校验 `cl.exe` 与 MSVC `link.exe`（拒绝 coreutils 的同名 shadow），默认先执行缓存清理，再运行 `cargo test --locked`；可追加 cargo test 过滤参数或使用 `-Release`。CI 的 `test-windows` 与 `test-linux-musl` 同步跑全量测试，发布打包矩阵不替代功能测试。
+
 ## 0. 测试前缓存清理（强制）
 
 任何功能测试、Docker 验证、基准测试或打包前，必须先清空项目历史构建与测试缓存：

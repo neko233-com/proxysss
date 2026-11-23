@@ -1,12 +1,60 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::config::{GatewayConfig, TlsMode};
 use crate::verify::harness::{
     cleanup, reserve_port, spawn_gateway, spawn_json_echo_upstream, spawn_sse_hold_upstream,
-    temp_root, wait_http_ok, write_config,
+    temp_root, wait_http_ok, wait_tcp_ready, write_config,
 };
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn read_http_response(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Result<(u16, serde_json::Value)> {
+    let deadline = Duration::from_secs(3);
+    loop {
+        if let Some(head_end) = find_header_end(buffer) {
+            let head = std::str::from_utf8(&buffer[..head_end])?.to_string();
+            let status = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .context("missing HTTP status")?;
+            let content_length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .context("missing content-length")?;
+            let total = head_end + 4 + content_length;
+            while buffer.len() < total {
+                let mut chunk = [0_u8; 4096];
+                let read = tokio::time::timeout(deadline, stream.read(&mut chunk)).await??;
+                if read == 0 {
+                    anyhow::bail!("connection closed before full response body");
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::from_slice(&buffer[head_end + 4..total])?;
+            buffer.drain(..total);
+            return Ok((status, body));
+        }
+        let mut chunk = [0_u8; 4096];
+        let read = tokio::time::timeout(deadline, stream.read(&mut chunk)).await??;
+        if read == 0 {
+            anyhow::bail!("connection closed before response headers");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
 
 #[tokio::test]
 async fn integration_e2e_http_reverse_proxy_roundtrip() -> Result<()> {
@@ -355,6 +403,119 @@ services:
     let payload: serde_json::Value = response.json().await?;
     assert_eq!(payload["path"], "/ping");
     assert_eq!(payload["x_forwarded_proto"], "https");
+
+    cleanup(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_e2e_admin_route_upsert_refreshes_plain_lane_keepalive() -> Result<()> {
+    let root = temp_root("proxysss-e2e-admin-route-refresh");
+    let upstream_port = reserve_port().await?;
+    let gateway_port = reserve_port().await?;
+    let admin_port = reserve_port().await?;
+    let _upstream = spawn_json_echo_upstream(upstream_port).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let token = "e2e-admin-route-refresh-token-123";
+
+    let config_path = write_config(
+        &root,
+        &format!(
+            r#"config_version: 1
+logging:
+  access_log: false
+http:
+  plain_bind: 127.0.0.1:{gateway_port}
+  tls_bind: ''
+  h3_bind: ''
+script:
+  enabled: false
+plugins:
+  enabled: false
+admin:
+  enabled: true
+  bind: 127.0.0.1:{admin_port}
+  enable_write_ops: true
+  bearer_token: "{token}"
+security:
+  block_ssrf_targets: false
+runtime:
+  hot_reload:
+    enabled: false
+load_balance:
+  active_health:
+    enabled: false
+services:
+  reverse_proxy:
+    routes:
+      - name: lane
+        path_prefix: /proxy
+        upstream: http://127.0.0.1:{upstream_port}
+"#
+        ),
+    )?;
+    let (_gateway, _runner) = spawn_gateway(config_path).await?;
+    wait_tcp_ready(&format!("127.0.0.1:{admin_port}")).await?;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gateway_port)).await?;
+    let mut buffer = Vec::new();
+    let host = format!("127.0.0.1:{gateway_port}");
+
+    stream
+        .write_all(
+            format!(
+                "GET /proxy/echo HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let (status, body) = read_http_response(&mut stream, &mut buffer).await?;
+    assert_eq!(status, 200);
+    assert_eq!(body["path"], "/proxy/echo");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/v1/reverse-proxy-routes/upsert"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "name": "lane",
+            "path_prefix": "/proxy",
+            "strip_prefix": true,
+            "upstream": format!("http://127.0.0.1:{upstream_port}"),
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "admin upsert failed: {body}");
+
+    // A fresh connection must already see the new route; this separates a
+    // reload failure from a stale keep-alive lane.
+    let fresh: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{gateway_port}/proxy/echo"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        fresh["path"], "/echo",
+        "fresh request after admin upsert: {fresh}"
+    );
+
+    // The same keep-alive connection was served by the raw lane before the
+    // write. It must not keep the retired route snapshot.
+    stream
+        .write_all(
+            format!(
+                "GET /proxy/echo HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let (status, body) = read_http_response(&mut stream, &mut buffer).await?;
+    assert_eq!(status, 200);
+    assert_eq!(body["path"], "/echo");
 
     cleanup(&root);
     Ok(())

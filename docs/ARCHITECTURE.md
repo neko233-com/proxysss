@@ -40,7 +40,7 @@ Go 报告器聚合原始重复样本时，吞吐/延迟使用中位数，错误�
 6. 发送正文；WebSocket upgrade 后保持双向转发，SSE/AI 响应保留背压，gRPC 使用 HTTP/2。动态压缩受类型/大小限制，206 不进行整对象压缩。
 7. 更新分片指标，按配置记录访问/错误日志；流式正文发送后遇到文件截断则终止传输，不补成成功短正文。
 
-快路径只在语义等价时启用。raw reverse/SSE 保留默认转发头并复用请求/响应缓冲与上游 lane。条件请求和 Range 进入完整静态处理。启用 admin 或热重载时，HTTP/AI/WS 反代与静态响应都经过当前策略链，不进入绕过准入的免策略快路径；黑名单磁盘持久化关闭不代表内存封禁关闭。HTTP keep-alive 的后续请求和新 WS 握手受更新后的封禁约束，已建立 WS/TCP relay 沿用既有连接生命周期。不可变无策略 H2 使用连接 OnceLock 和只读 ArcSwap/FxHashMap 响应快照。
+快路径只在语义等价时启用。raw reverse/SSE 保留默认转发头并复用请求/响应缓冲与上游 lane。条件请求和 Range 进入完整静态处理。热重载开启时禁用免策略快路径；admin 开启时 raw 反代/SSE/WS 车道保留，但逐请求复查内存黑名单与 monitoring 路径（动态封禁可随时变化），已配置的 DDoS/HTTP access/限流/real_ip 策略仍整体禁用车道。管理面或热重载交换配置代际时，已建立的 keep-alive 车道在下一请求前比较当前 `DynamicState`，代际变化即把未消费字节交还 Hyper，避免继续命中旧路由或旧上游；静态连接级缓存仍只在非可变配置下使用。黑名单磁盘持久化关闭不代表内存封禁关闭。HTTP keep-alive 的后续请求和新 WS 握手受更新后的封禁约束，已建立 WS/TCP relay 沿用既有连接生命周期。不可变无策略 H2 使用连接 OnceLock 和只读 ArcSwap/FxHashMap 响应快照。
 
 原始 SSE 转换为 TLS/HTTP2 下游响应前先按 HTTP/1 消息边界解码：chunked 去除大小行、扩展与终止分隔符，消费并丢弃 trailer；Content-Length 精确计数，无长度响应才以 EOF 结束。大小/元数据行最多 16 KiB，trailer 总量最多 64 KiB；长度冲突、未支持的 transfer coding、分块错误或正文提前 EOF 会终止响应。每次仍按下游需求借用池缓冲并返回 Bytes 切片，不积累完整 chunk 或 SSE 事件，完成或取消释放上游。SSE 不再压缩，但保留上游已有 Content-Encoding；移除编码头而保留压缩字节会破坏正文。
 

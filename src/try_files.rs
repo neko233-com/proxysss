@@ -57,11 +57,17 @@ mod tests {
 
         let cands = vec!["$uri".to_string(), "/app.html".to_string(), "=404".to_string()];
         match resolve(root, "missing.html", &cands, true).await {
-            Outcome::File(p) => assert_eq!(p, root.join("app.html")),
+            Outcome::File(p) => assert_eq!(
+                p,
+                tokio::fs::canonicalize(root.join("app.html")).await.unwrap()
+            ),
             _ => panic!("expected fallback file"),
         }
         match resolve(root, "index.html", &cands, true).await {
-            Outcome::File(p) => assert_eq!(p, root.join("index.html")),
+            Outcome::File(p) => assert_eq!(
+                p,
+                tokio::fs::canonicalize(root.join("index.html")).await.unwrap()
+            ),
             _ => panic!("expected uri file"),
         }
         let only_status = vec!["=503".to_string()];
