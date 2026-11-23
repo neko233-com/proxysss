@@ -450,6 +450,7 @@ services:
 - `respect_origin` 尊重源站是否允许缓存；边缘存储时长使用 `ttl_secs`，并非自动采用源站 max-age。仅为可共享响应启用缓存。
 - `stale_*` 让缓存层在后端抖动时更稳。
 - `rate_limit` 用于削峰，不是代替鉴权。
+- 单上游路由不会因为 `active_health` / `passive_health` / `retries` / `affinity` 默认开启而失去免策略 raw 反代快车道：这些开关只在多候选上游或注册中心接入时改变选择结果。任一 DDoS、HTTP access control、real_ip、HTTP 限流、压缩、缓存、脚本/插件或热重载启用时仍回落策略路径；`admin` 与访问日志不再阻塞车道，车道会自行写 access 行并逐请求复查内存黑名单。车道按路由 `forward_headers` 发出 `X-Real-IP`/`X-Forwarded-For`/`X-Forwarded-Host`/`X-Forwarded-Proto`/`Forwarded`；AI/SSE 车道对定长非流式响应保持下游 keep-alive。
 
 ### 3.2 Wildcard TLS + DNS-01
 

@@ -110,6 +110,7 @@ fn octet(bytes: &[u8]) -> Vec<u8> {
     der(0x04, bytes)
 }
 
+#[cfg(test)]
 fn integer_be(bytes: &[u8]) -> Vec<u8> {
     let mut trimmed = bytes;
     while trimmed.len() > 1 && trimmed[0] == 0 {

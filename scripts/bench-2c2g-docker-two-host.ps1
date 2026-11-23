@@ -9,6 +9,7 @@ param(
     [string]$ClientImage = 'debian:bookworm-slim',
     [string]$Tag = 'two-host',
     [string]$TrafficProfile = 'small',
+    [int]$Cpus = 2,
     [switch]$SkipClean,
     [switch]$KeepContainers
 )
@@ -93,6 +94,7 @@ http {
     }
 }
 '@
+$nginxConfig = $nginxConfig.Replace('worker_processes 2;', "worker_processes $Cpus;")
 [IO.File]::WriteAllText((Join-Path $tmp 'nginx.conf'), $nginxConfig)
 
 $proxysssConfig = @'
@@ -209,12 +211,12 @@ docker rm $prep | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to populate benchmark volume' }
 
 # Both server candidates share the same populated volume but always use their
-# own 2 CPU / 2 GiB cgroup. Only one server is running at a time.
-docker create --name $serverNginx --network $network --cpus=2 --memory=2g --restart no -v "${volume}:/bench" $ServerImage sh /bench/run.sh nginx | Out-Null
+# own $Cpus CPU / 2 GiB cgroup. Only one server is running at a time.
+docker create --name $serverNginx --network $network --cpus=$Cpus --memory=2g --restart no -v "${volume}:/bench" $ServerImage sh /bench/run.sh nginx | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to create nginx server container' }
-docker create --name $serverProxysss --network $network --cpus=2 --memory=2g --restart no -v "${volume}:/bench" $ServerImage sh /bench/run.sh proxysss | Out-Null
+docker create --name $serverProxysss --network $network --cpus=$Cpus --memory=2g --restart no -v "${volume}:/bench" $ServerImage sh /bench/run.sh proxysss | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to create proxysss server container' }
-docker create --name $client --network $network --cpus=2 --memory=2g --restart no $ClientImage sleep infinity | Out-Null
+docker create --name $client --network $network --cpus=$Cpus --memory=2g --restart no $ClientImage sleep infinity | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'failed to create client container' }
 
 docker start $client | Out-Null
@@ -354,12 +356,12 @@ try {
     }
 
     $summary = @(
-        '# 2C2G Docker two-host HTTP benchmark',
+        ('# Docker two-host HTTP benchmark ({0} CPU per container)' -f $Cpus),
         '',
         ('- Date: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')),
         ('- Candidate: {0}' -f $Binary),
-        ('- Server: Docker container `{0}`, 2 CPU / 2 GiB cgroup; backend nginx runs in the same server container' -f $ServerImage),
-        ('- Client: separate Docker container `{0}`, 2 CPU / 2 GiB cgroup, Go HTTP/1.1 keep-alive, {1} preconnected connections' -f $ClientImage, $Workers),
+        ('- Server: Docker container `{0}`, {1} CPU / 2 GiB cgroup; backend nginx runs in the same server container' -f $ServerImage, $Cpus),
+        ('- Client: separate Docker container `{0}`, {2} CPU / 2 GiB cgroup, Go HTTP/1.1 keep-alive, {1} preconnected connections' -f $ClientImage, $Workers, $Cpus),
         ('- Network: Docker bridge `{0}`; client connects to the server container DNS name, no published port and no Windows host client' -f $network),
         ('- Server cgroup: cpu.max={0}, memory.max={1}' -f $serverProxysssInfo.cpu_max, $serverProxysssInfo.memory_max),
         ('- Client cgroup: cpu.max={0}, memory.max={1}' -f $clientInfo.cpu_max, $clientInfo.memory_max),

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.21 - 2026-11-23
+
+- 反向代理热路径默认回到原生 raw 车道：`load_balance.active_health`/`passive_health`/`retries` 与 `affinity` 不再整体禁用免策略 HTTP 快车道（单上游路由下它们不改变选择结果），`admin` 与访问日志也不再阻塞。快车道内自行写 access 行并逐请求复查内存黑名单与 monitoring 路径；DDoS、HTTP access control、限流、real_ip、压缩、缓存、脚本/插件或热重载任一启用时仍强制回落策略路径。
+- raw 反代/SSE/WS 车道失败语义生产化：checkout/write/read 失败按 2–3 次有界重试后回落策略路径（由 Hyper 负责健康记账、重试与 502/504），成功读到响应头前不计请求/域名/状态，避免双计和直接断连；WS/SSE 握手失败同样回退。
+- 快车道转发语义补齐：hyper 简单回源与 raw 反代/SSE 车道按路由 `forward_headers` 写入 `X-Real-IP`/`X-Forwarded-For`/`X-Forwarded-Host`/`X-Forwarded-Proto`/`Forwarded`（此前快车道会丢 `X-Forwarded-Proto`），raw SSE 车道对定长非流式响应写完后交还 keep-alive 循环，只有流式响应独占连接。
+- 快车道前缀优先级与 nginx `location` 对齐：更长 reverse/domain/AI 前缀优先于 catch-all 静态站，静态车道关闭时不得借道服务静态。
+- 压测脚本 `bench-2c2g-docker-two-host.ps1` 新增 `-Cpus`，同时设置服务端/客户端 cgroup 与 nginx worker 数，并补充 4 CPU 多核证据入口；2 CPU 双容器对照见 `performance-evidence/2c2g-http-docker-two-host-v1321-final2/`（static-1k 1.242x、static-64k 1.392x、proxy-1k 1.025x，0 错误；4 CPU 入口本轮在 harness 侧挂死，无数据）。
+
 ## v1.3.20 - 2026-11-23
 
 - 生产级审计修复 v1.3.19 全部新增面：`real_ip` 改为 nginx 口径（从右向左跳过 trusted CIDR，`recursive` 控制是否继续递归），PROXY v2 分段到达重试有界，三条免策略快路径在 `real_ip` 启用时强制关闭，access 日志统一记录还原后的客户端地址。

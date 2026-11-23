@@ -521,7 +521,10 @@ async fn websocket_and_wss_count_handshake_before_messages_and_fallback_once() -
         )
         .await;
         assert!(failed.is_err());
-        assert_counts(&gateway, 3, if tls || hyper_only { 2 } else { 1 });
+        // A plain raw lane that cannot reach its upstream now declines and the
+        // policy path records the failed attempt, so every transport reports the
+        // same error count.
+        assert_counts(&gateway, 3, 2);
         assert_eq!(
             gateway
                 .stats

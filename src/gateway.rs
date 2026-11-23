@@ -3865,6 +3865,22 @@ impl Gateway {
         stream_access_is_denied(&config.services.access_control.stream, remote_addr.ip()).is_some()
     }
 
+    /// Per-request admission for the raw plain-HTTP lanes. Dynamic blacklist
+    /// entries and the monitoring surface can change while a keep-alive
+    /// connection lives (`admin` / DDoS), so lanes re-check them per request
+    /// instead of trusting the accept-time decision. Any configured edge policy
+    /// (DDoS, HTTP access control, rate limit, real_ip) disables the lane
+    /// entirely and is therefore already covered.
+    fn plain_fast_lane_request_denied(
+        &self,
+        config: &GatewayConfig,
+        remote_addr: SocketAddr,
+        path: &str,
+    ) -> bool {
+        self.dynamic_blacklist.is_blocked(remote_addr.ip())
+            || monitoring_path_matches(&config.monitoring, path)
+    }
+
     fn is_http_connection_blocked(&self, config: &GatewayConfig, remote_addr: SocketAddr) -> bool {
         if self.dynamic_blacklist.is_blocked(remote_addr.ip()) {
             return true;
@@ -6482,11 +6498,8 @@ impl Gateway {
                 .as_ref()
                 .is_some_and(|cached| cached.request_head.as_ref() == request_head);
             let static_prefix_hit = !raw_reverse_exact_head_hit
-                && config
-                    .services
-                    .static_sites
-                    .iter()
-                    .any(|site| !site.script_only && static_site_path_matches(site, path_hint));
+                && fast_lane.plain_http_static_sendfile
+                && static_prefix_hit_for_plain_fast_lane(config, path_hint);
             let raw_sse_prefix_hit = !raw_reverse_exact_head_hit
                 && fast_lane.raw_sse_proxy
                 && ai_proxy_fast_lane_path_matches(config, path_hint);
@@ -6585,7 +6598,7 @@ impl Gateway {
                     if !leftover.is_empty() {
                         break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                     }
-                    if self
+                    match self
                         .try_serve_plain_raw_sse_fast_lane(
                             config,
                             &mut stream,
@@ -6594,9 +6607,22 @@ impl Gateway {
                         )
                         .await?
                     {
-                        break 'fast_lane PlainHttpFastLaneDecision::Served;
+                        RawSseFastLaneOutcome::Declined => {
+                            break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
+                        }
+                        RawSseFastLaneOutcome::Complete => {
+                            // A bounded non-streaming answer (for example an AI
+                            // route replying with JSON) keeps the downstream
+                            // connection reusable.
+                            served_any = true;
+                            discard_fast_lane_http_head(&mut prefix, head_end);
+                            served_since_yield = 0;
+                            continue;
+                        }
+                        RawSseFastLaneOutcome::Owned => {
+                            break 'fast_lane PlainHttpFastLaneDecision::Served;
+                        }
                     }
-                    break PlainHttpFastLaneDecision::Fallback(prefix.freeze());
                 }
                 if raw_reverse_prefix_hit {
                     let mut serialized_upstream_request = None;
@@ -9206,6 +9232,11 @@ impl Gateway {
         if !state.fast_lane.simple_http_proxy {
             return Ok(None);
         }
+        // Admin/monitoring decisions change at runtime, so the hyper fast
+        // lane re-checks the shared admission state per request.
+        if self.plain_fast_lane_request_denied(&state.config, remote_addr, uri.path()) {
+            return Ok(None);
+        }
 
         if !security::request_uri_is_safe(uri) {
             return Ok(Some(HyperFastPathResponse::Gateway(
@@ -9263,6 +9294,7 @@ impl Gateway {
                         &host,
                         &route.upstream,
                         rewrite_path.as_deref(),
+                        route.forward_headers,
                     )
                     .await
                     .map(|response| Some(HyperFastPathResponse::Gateway(response)));
@@ -9281,6 +9313,7 @@ impl Gateway {
                     &host,
                     &route.upstream,
                     rewrite_path.as_deref(),
+                    route.forward_headers,
                 )
                 .await
                 .map(|response| Some(HyperFastPathResponse::Gateway(response)));
@@ -9313,6 +9346,7 @@ impl Gateway {
                     &host,
                     &route.upstream,
                     rewrite_path.as_deref(),
+                    route.forward_headers,
                 )
                 .await
                 .map(Some);
@@ -10438,6 +10472,9 @@ impl Gateway {
         {
             return Ok(None);
         }
+        if self.plain_fast_lane_request_denied(config, remote_addr, uri.path()) {
+            return Ok(None);
+        }
 
         if let Some(route) = config
             .services
@@ -10464,6 +10501,7 @@ impl Gateway {
                             host,
                             &route.upstream,
                             rewrite_path.as_deref(),
+                            route.forward_headers,
                         )
                         .await
                         .map(Some);
@@ -10481,6 +10519,7 @@ impl Gateway {
                         host,
                         &route.upstream,
                         rewrite_path.as_deref(),
+                        route.forward_headers,
                     )
                     .await
                     .map(Some);
@@ -10511,6 +10550,7 @@ impl Gateway {
                         host,
                         &route.upstream,
                         rewrite_path.as_deref(),
+                        route.forward_headers,
                     )
                     .await
                     .map(Some);
@@ -10534,10 +10574,11 @@ impl Gateway {
         host: &str,
         upstream: &str,
         rewrite_path: Option<&str>,
+        forward_headers: bool,
     ) -> Result<GatewayHttpResponse> {
         let upstream_target = build_upstream_http_target_with_rewrite(upstream, rewrite_path, uri)?;
         let upstream_headers =
-            build_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+            build_simple_upstream_headers(headers, host, remote_addr, scheme, forward_headers)?;
         let upstream_response = state
             .dispatch_upstream_http(
                 method.clone(),
@@ -10596,6 +10637,7 @@ impl Gateway {
         host: &str,
         upstream: &str,
         rewrite_path: Option<&str>,
+        forward_headers: bool,
     ) -> Result<HyperFastPathResponse> {
         let upstream_target = build_upstream_http_target_with_rewrite(upstream, rewrite_path, uri)?;
         let UpstreamHttpTarget::Hyper(upstream_uri) = upstream_target else {
@@ -10612,13 +10654,14 @@ impl Gateway {
                     host,
                     upstream,
                     rewrite_path,
+                    forward_headers,
                 )
                 .await
                 .map(HyperFastPathResponse::Gateway);
         };
 
         let upstream_headers =
-            build_empty_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+            build_empty_simple_upstream_headers(headers, host, remote_addr, scheme, forward_headers)?;
         let retry_transport = body.is_empty() && matches!(*method, Method::GET | Method::HEAD);
         let mut attempt = 0_u8;
         let upstream_response = loop {
@@ -10739,10 +10782,11 @@ impl Gateway {
         host: &str,
         upstream: &str,
         rewrite_path: Option<&str>,
+        forward_headers: bool,
     ) -> Result<GatewayHttpResponse> {
         let upstream_url = build_upstream_url_with_rewrite(upstream, rewrite_path, uri)?;
         let mut upstream_headers =
-            build_simple_upstream_headers(headers, host, remote_addr, scheme, false)?;
+            build_simple_upstream_headers(headers, host, remote_addr, scheme, forward_headers)?;
         if !body.is_empty() && !upstream_headers.contains_key(CONTENT_LENGTH) {
             upstream_headers.insert(
                 CONTENT_LENGTH,
@@ -10798,12 +10842,15 @@ impl Gateway {
         downstream: &mut TcpStream,
         request: &PlainFastLaneRequest,
         remote_addr: SocketAddr,
-    ) -> Result<bool> {
+    ) -> Result<RawSseFastLaneOutcome> {
         let timeout = Duration::from_millis(config.http.request_timeout_ms);
         if !request.accepts_sse {
-            return Ok(false);
+            return Ok(RawSseFastLaneOutcome::Declined);
         }
         let host = request.host.as_deref().unwrap_or("localhost");
+        if self.plain_fast_lane_request_denied(config, remote_addr, &request.path) {
+            return Ok(RawSseFastLaneOutcome::Declined);
+        }
         let Some(route) = config
             .services
             .ai_proxy
@@ -10814,28 +10861,35 @@ impl Gateway {
             .filter(|route| crate::ai_proxy::route_matches(route, host, &request.path))
             .max_by_key(|route| route.path_prefix.len())
         else {
-            return Ok(false);
+            return Ok(RawSseFastLaneOutcome::Declined);
         };
         if !ai_proxy_route_fast_path_eligible(route) {
-            return Ok(false);
+            return Ok(RawSseFastLaneOutcome::Declined);
         }
 
         let rewrite_path = ai_proxy_raw_rewrite_path(route, &request.target, &request.path);
         let Some((_, pool)) = self.raw_http_pool_for_upstream(&route.upstream)? else {
-            return Ok(false);
+            return Ok(RawSseFastLaneOutcome::Declined);
         };
-        self.stats.record_http_request();
-        self.stats.record_domain_request(request.host.as_deref());
         let path_and_query = rewrite_path.as_deref().unwrap_or(&request.target);
-        let mut upstream_io = tokio::time::timeout(timeout, pool.checkout())
-            .await
-            .context("raw SSE upstream connect timed out")?
-            .with_context(|| {
-                format!(
-                    "failed connecting plain raw SSE upstream {}",
-                    route.upstream
-                )
-            })?;
+        let mut upstream_io = match tokio::time::timeout(timeout, pool.checkout()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %route.upstream,
+                    "plain raw SSE upstream connect declined"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %route.upstream,
+                    "plain raw SSE upstream connect timed out"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+        };
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_latency(&upstream_io);
         let request_bytes = if route.emit_metadata_headers {
@@ -10884,25 +10938,50 @@ impl Gateway {
                 },
             )
         };
-        tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, &request_bytes))
-            .await
-            .context("raw SSE upstream write timed out")?
-            .with_context(|| {
-                format!("failed sending plain raw SSE request to {}", route.upstream)
-            })?;
+        match tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, &request_bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %route.upstream,
+                    "plain raw SSE request write declined"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %route.upstream,
+                    "plain raw SSE request write timed out"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+        }
 
-        let response_head = tokio::time::timeout(
+        let response_head = match tokio::time::timeout(
             timeout,
             read_raw_fast_http_response_head(&mut upstream_io, true),
         )
         .await
-        .context("raw SSE upstream response headers timed out")?
-        .with_context(|| {
-            format!(
-                "failed reading plain raw SSE response from {}",
-                route.upstream
-            )
-        })?;
+        {
+            Ok(Ok(head)) => head,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %route.upstream,
+                    "plain raw SSE response declined"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %route.upstream,
+                    "plain raw SSE response timed out"
+                );
+                return Ok(RawSseFastLaneOutcome::Declined);
+            }
+        };
+        self.stats.record_http_request();
+        self.stats.record_domain_request(request.host.as_deref());
         self.stats.record_http_response_status(response_head.status);
         let upstream_keep_alive = !response_head.connection_close;
         let content_length = response_head.content_length;
@@ -10982,7 +11061,16 @@ impl Gateway {
             .await
             .context("plain raw SSE stream relay failed")?;
         }
-        Ok(true)
+        let bounded = (request.method == Method::HEAD
+            || status_has_no_body(response_head.status)
+            || content_length.is_some())
+            && request.keep_alive
+            && upstream_keep_alive;
+        Ok(if bounded {
+            RawSseFastLaneOutcome::Complete
+        } else {
+            RawSseFastLaneOutcome::Owned
+        })
     }
 
     async fn try_serve_plain_raw_reverse_fast_lane(
@@ -11004,6 +11092,9 @@ impl Gateway {
             lane_upstream,
         } = options;
         let host = request.host.as_deref().unwrap_or("localhost");
+        if self.plain_fast_lane_request_denied(config, remote_addr, &request.path) {
+            return Ok(false);
+        }
         let mut route_for_serialization = None;
         let prepared = if let Some(cached) = cached_prepared_route {
             cached
@@ -11036,28 +11127,42 @@ impl Gateway {
         let pool_key = &prepared.pool_key;
         let pool = &prepared.pool;
         let upstream = &prepared.upstream;
-        self.stats.record_http_request();
-        self.stats.record_domain_request(request.host.as_deref());
-        let mut upstream_io = if lane_upstream
-            .as_ref()
-            .map(|upstream| upstream.key.as_str() == pool_key.as_str())
-            .unwrap_or(false)
-        {
-            lane_upstream
-                .take()
-                .map(|upstream| upstream.stream)
-                .expect("checked lane upstream exists")
-        } else {
-            if let Some(previous) = lane_upstream.take() {
-                previous.pool.checkin(previous.stream);
-            }
-            tokio::time::timeout(timeout, pool.checkout())
-                .await
-                .context("raw reverse upstream connect timed out")?
-                .with_context(|| {
-                    format!("failed checking out plain raw reverse upstream {upstream}")
-                })?
-        };
+        // Count only after an upstream answered: a declined attempt falls back
+        // to the policy path, which owns its own accounting.
+        let max_attempts = raw_reverse_attempt_limit(config);
+        let mut attempt = 0_u8;
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut served = None;
+        while attempt < max_attempts {
+            attempt = attempt.saturating_add(1);
+            let mut upstream_io = if lane_upstream
+                .as_ref()
+                .map(|upstream| upstream.key.as_str() == pool_key.as_str())
+                .unwrap_or(false)
+            {
+                lane_upstream
+                    .take()
+                    .map(|upstream| upstream.stream)
+                    .expect("checked lane upstream exists")
+            } else {
+                if let Some(previous) = lane_upstream.take() {
+                    previous.pool.checkin(previous.stream);
+                }
+                match tokio::time::timeout(timeout, pool.checkout()).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        last_error = Some(anyhow::anyhow!(error).context(format!(
+                            "failed checking out plain raw reverse upstream {upstream}"
+                        )));
+                        break;
+                    }
+                    Err(_) => {
+                        last_error =
+                            Some(anyhow::anyhow!("raw reverse upstream connect timed out"));
+                        break;
+                    }
+                }
+            };
         let request_bytes = if let Some(cached) = cached_upstream_request {
             cached
         } else {
@@ -11081,22 +11186,58 @@ impl Gateway {
                 .as_ref()
                 .expect("raw reverse request serialized")
         };
-        tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, request_bytes))
-            .await
-            .context("raw reverse upstream write timed out")?
-            .with_context(|| format!("failed sending plain raw reverse request to {upstream}"))?;
-
-        let response = tokio::time::timeout(
-            timeout,
-            read_raw_reverse_http_response_into(
-                &mut upstream_io,
-                upstream_response_buffer,
-                response_cache,
-            ),
-        )
-        .await
-        .context("raw reverse upstream response headers timed out")?
-        .with_context(|| format!("failed reading plain raw reverse response from {upstream}"))?;
+            let write_outcome =
+                tokio::time::timeout(timeout, write_all_plain_fast(&upstream_io, request_bytes))
+                    .await;
+            let read_outcome = match write_outcome {
+                Ok(Ok(())) => {
+                    tokio::time::timeout(
+                        timeout,
+                        read_raw_reverse_http_response_into(
+                            &mut upstream_io,
+                            upstream_response_buffer,
+                            response_cache,
+                        ),
+                    )
+                    .await
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(anyhow::anyhow!(error).context(format!(
+                        "failed sending plain raw reverse request to {upstream}"
+                    )));
+                    continue;
+                }
+                Err(_) => {
+                    last_error = Some(anyhow::anyhow!("raw reverse upstream write timed out"));
+                    continue;
+                }
+            };
+            match read_outcome {
+                Ok(Ok(response)) => {
+                    served = Some((upstream_io, response));
+                    break;
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(error.context(format!(
+                        "failed reading plain raw reverse response from {upstream}"
+                    )));
+                }
+                Err(_) => {
+                    last_error =
+                        Some(anyhow::anyhow!("raw reverse upstream response headers timed out"));
+                }
+            }
+        }
+        let Some((mut upstream_io, response)) = served else {
+            if let Some(error) = last_error {
+                tracing::debug!(?error, %upstream, "plain raw reverse attempt declined");
+            }
+            // Nothing reached the client yet: let the policy path own retries,
+            // health accounting and the final 502/504 answer.
+            return Ok(false);
+        };
+        self.stats.record_http_request();
+        self.stats.record_domain_request(request.host.as_deref());
         self.stats.record_http_response_status(response.status);
         let upstream_keep_alive = !response.connection_close;
         let buffered_body_len = upstream_response_buffer.len() - response.head_end;
@@ -11167,6 +11308,17 @@ impl Gateway {
                 .context("failed writing raw HTTP response head")?;
             relay_raw_http_body(&mut upstream_io, downstream, leftover, timeout).await?;
         }
+        if config.logging.access_log {
+            tracing::info!(
+                target: "access",
+                method = %request.method,
+                path = %request.path,
+                status = %response.status,
+                upstream = %upstream,
+                remote_addr = %remote_addr,
+                "access"
+            );
+        }
         Ok(true)
     }
 
@@ -11192,6 +11344,9 @@ impl Gateway {
         #[cfg(not(target_os = "linux"))]
         let _ = downstream_detached;
         let host = request.host.as_deref().unwrap_or("localhost");
+        if self.plain_fast_lane_request_denied(config, remote_addr, &request.path) {
+            return Ok(false);
+        }
         let Some(route) = config
             .services
             .reverse_proxy
@@ -11236,18 +11391,29 @@ impl Gateway {
         let path_and_query =
             reverse_proxy_raw_path_and_query(route, &request.target, &request.path);
         let timeout = Duration::from_millis(config.http.request_timeout_ms);
-        let mut upstream_io = tokio::time::timeout(
+        let mut upstream_io = match tokio::time::timeout(
             timeout,
             TcpStream::connect((upstream_host.as_str(), upstream_port)),
         )
         .await
-        .context("WebSocket upstream connect timed out")?
-        .with_context(|| {
-            format!(
-                "failed connecting plain raw websocket upstream {}",
-                selected_upstream
-            )
-        })?;
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %selected_upstream,
+                    "plain raw websocket upstream connect declined"
+                );
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %selected_upstream,
+                    "plain raw websocket upstream connect timed out"
+                );
+                return Ok(false);
+            }
+        };
         let _ = upstream_io.set_nodelay(true);
         tune_tcp_stream_for_latency(&upstream_io);
 
@@ -11259,34 +11425,65 @@ impl Gateway {
             scheme,
             route.forward_headers,
         );
-        tokio::time::timeout(timeout, upstream_io.write_all(&request_bytes))
-            .await
-            .context("WebSocket upstream handshake write timed out")?
-            .with_context(|| {
-                format!(
-                    "failed sending plain raw websocket handshake to {}",
-                    selected_upstream
-                )
-            })?;
+        match tokio::time::timeout(timeout, upstream_io.write_all(&request_bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %selected_upstream,
+                    "plain raw websocket handshake write declined"
+                );
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %selected_upstream,
+                    "plain raw websocket handshake write timed out"
+                );
+                return Ok(false);
+            }
+        }
 
-        let response_head = tokio::time::timeout(
+        let response_head = match tokio::time::timeout(
             timeout,
             read_raw_fast_http_response_head(&mut upstream_io, false),
         )
         .await
-        .context("WebSocket upstream handshake timed out")?
-        .with_context(|| {
-            format!(
-                "failed reading plain raw websocket response from {}",
-                selected_upstream
-            )
-        })?;
+        {
+            Ok(Ok(head)) => head,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    upstream = %selected_upstream,
+                    "plain raw websocket handshake response declined"
+                );
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    upstream = %selected_upstream,
+                    "plain raw websocket handshake timed out"
+                );
+                return Ok(false);
+            }
+        };
         *downstream_started = true;
         // A failed WSS probe may fall back to Hyper before any response. Count
         // only once this path commits; the fallback owns its own accounting.
         self.stats.record_http_request();
         self.stats.record_domain_request(request.host.as_deref());
         self.stats.record_http_response_status(response_head.status);
+        if config.logging.access_log {
+            tracing::info!(
+                target: "access",
+                method = "GET",
+                path = %request.path,
+                status = response_head.status.as_u16(),
+                upstream = %selected_upstream,
+                remote_addr = %remote_addr,
+                "access"
+            );
+        }
         downstream
             .write_all(&response_head.raw_head)
             .await
@@ -13457,6 +13654,17 @@ struct RawReversePreparedRoute {
     upstream: String,
 }
 
+/// Result of the plain raw SSE lane.
+///
+/// `Complete` means a bounded response was fully written and the downstream
+/// connection can serve another keep-alive request; `Owned` means the lane
+/// took over the connection (streaming body, close, or no reuse).
+enum RawSseFastLaneOutcome {
+    Declined,
+    Complete,
+    Owned,
+}
+
 struct RawReverseFastLaneOptions<'a> {
     remote_addr: SocketAddr,
     cached_upstream_request: Option<&'a Bytes>,
@@ -14795,11 +15003,64 @@ fn direct_tcp_route_upstream(config: &GatewayConfig, route: &RouteDecision) -> O
     single_direct_tcp_upstream(&route.upstream, &route.upstreams)
 }
 
+/// TCP/UDP listeners with one candidate do not need affinity or health-aware
+/// selection: the only candidate wins even when probes fail. Registry-fed or
+/// multi-candidate listeners keep the conservative policy path. Admission
+/// (stream rate limit, DDoS/blacklist and allow/deny) already runs in the
+/// accept loop before this lane is chosen.
 fn direct_tcp_fast_path_allowed(config: &GatewayConfig) -> bool {
-    config.runtime.performance.enabled
-        && !config.affinity.enabled
-        && !config.load_balance.active_health.enabled
-        && !config.load_balance.passive_health.enabled
+    config.runtime.performance.enabled && !stream_affinity_can_change_routing(config)
+}
+
+/// Affinity only changes which candidate an upstream pool picks. With no pool
+/// (one upstream per route) and no service registry, it is a no-op, so a
+/// default-enabled affinity must not disable the policy-free fast lanes.
+fn http_affinity_can_change_routing(config: &GatewayConfig) -> bool {
+    config.affinity.enabled
+        && (config.services.service_discovery.enabled
+            || config
+                .services
+                .reverse_proxy
+                .routes
+                .iter()
+                .any(|route| !route.upstreams.is_empty())
+            || config
+                .services
+                .domain_routes
+                .iter()
+                .any(|route| !route.upstreams.is_empty()))
+}
+
+fn stream_affinity_can_change_routing(config: &GatewayConfig) -> bool {
+    config.affinity.enabled
+        && (config.services.service_discovery.enabled
+            || config
+                .tcp
+                .listeners
+                .iter()
+                .any(|listener| !listener.upstreams.is_empty())
+            || config
+                .udp
+                .listeners
+                .iter()
+                .any(|listener| !listener.upstreams.is_empty())
+            || config
+                .tcp
+                .stream_routes
+                .iter()
+                .any(|route| !route.upstreams.is_empty()))
+}
+
+/// Bounded attempts for the raw reverse lane. Even with load-balancer retries
+/// disabled a stale keepalive socket earns one retry on a fresh connection;
+/// `load_balance.retries` extends that for idempotent, body-less requests only.
+fn raw_reverse_attempt_limit(config: &GatewayConfig) -> u8 {
+    let retry_budget = if config.load_balance.retries.enabled {
+        config.load_balance.retries.max_retries.min(1)
+    } else {
+        0
+    };
+    (2 + retry_budget).min(3) as u8
 }
 
 fn single_direct_tcp_upstream(upstream: &str, upstreams: &[String]) -> Option<String> {
@@ -20649,10 +20910,13 @@ fn http_to_https_redirect_can_apply(config: &GatewayConfig) -> bool {
             .any(|route| route.ssl.effective_mode() != DomainTlsMode::Disabled)
 }
 
+/// Per-route eligibility guarantees one upstream and no edge policies. With a
+/// single candidate, active/passive health, affinity and retries cannot change
+/// the upstream choice (`select_upstream_plan` returns that candidate even when
+/// every probe fails), so they must not disable the raw fast lanes by default.
+/// `raw_reverse_attempt_limit` keeps one bounded transport retry instead.
 fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
     !config.runtime.hot_reload.enabled
-        && !config.admin.enabled
-        && !config.logging.access_log
         && !config.script.enabled
         && !config.plugins.enabled
         && !config.security.ddos.enabled
@@ -20662,10 +20926,7 @@ fn simple_http_proxy_fast_path_allowed(config: &GatewayConfig) -> bool {
         && !config.services.response_policy.cache.enabled
         && !config.http.real_ip.enabled
         && !config.services.rate_limit.http.enabled
-        && !config.load_balance.retries.enabled
-        && !config.load_balance.active_health.enabled
-        && !config.load_balance.passive_health.enabled
-        && !config.affinity.enabled
+        && !http_affinity_can_change_routing(config)
         && config
             .services
             .reverse_proxy
@@ -22832,6 +23093,18 @@ fn proxy_route_more_specific(config: &GatewayConfig, site_prefix_len: usize, hos
             route.path_prefix.len() > site_prefix_len
                 && crate::ai_proxy::route_matches(route, host, path)
         }))
+}
+
+/// The plain HTTP fast lane must not send a longer proxy/domain/AI prefix into
+/// the static branch of a catch-all site (nginx `location` precedence). The
+/// empty host keeps this host-agnostic; a host-scoped proxy that loses here
+/// still fails its own host re-check and falls back to the policy path.
+fn static_prefix_hit_for_plain_fast_lane(config: &GatewayConfig, path: &str) -> bool {
+    config.services.static_sites.iter().any(|site| {
+        !site.script_only
+            && static_site_path_matches(site, path)
+            && !proxy_route_more_specific(config, site.path_prefix.len(), "", path)
+    })
 }
 
 fn static_site_request_matches(site: &StaticSiteConfig, host: &str, path: &str) -> bool {
@@ -26144,28 +26417,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_proxy_fast_lane_never_bypasses_observability_or_policy_hooks() {
+    fn raw_proxy_fast_lane_keeps_observability_and_policy_hooks() {
         let mut config = GatewayConfig::default();
-        config.admin.enabled = false;
-        config.runtime.hot_reload.enabled = false;
-        config.logging.access_log = false;
-        config.script.enabled = false;
-        config.plugins.enabled = false;
-        config.load_balance.retries.enabled = false;
-        config.load_balance.active_health.enabled = false;
-        config.load_balance.passive_health.enabled = false;
-        config.affinity.enabled = false;
+        // Admin (a loopback control plane on its own socket) and access logging
+        // are out-of-band: the raw lanes emit their own access line, so neither
+        // may disable them by default.
+        assert!(config.admin.enabled);
+        assert!(config.logging.access_log);
         assert!(simple_http_proxy_fast_path_allowed(&config));
 
-        config.admin.enabled = true;
-        assert!(!simple_http_proxy_fast_path_allowed(&config));
-        config.admin.enabled = false;
         config.runtime.hot_reload.enabled = true;
         assert!(!simple_http_proxy_fast_path_allowed(&config));
         config.runtime.hot_reload.enabled = false;
-        config.logging.access_log = true;
-        assert!(!simple_http_proxy_fast_path_allowed(&config));
-        config.logging.access_log = false;
         config.script.enabled = true;
         assert!(!simple_http_proxy_fast_path_allowed(&config));
         config.script.enabled = false;
@@ -26174,6 +26437,75 @@ mod tests {
         config.plugins.enabled = false;
         config.security.ddos.enabled = true;
         assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.security.ddos.enabled = false;
+        config.security.dynamic_blacklist.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.security.dynamic_blacklist.enabled = false;
+        config.services.access_control.http.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.services.access_control.http.enabled = false;
+        config.services.response_policy.compression.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.services.response_policy.compression.enabled = false;
+        config.services.response_policy.cache.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.services.response_policy.cache.enabled = false;
+        config.http.real_ip.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        config.http.real_ip.enabled = false;
+        config.services.rate_limit.http.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+    }
+
+    #[test]
+    fn default_health_and_affinity_keep_single_upstream_fast_lanes() {
+        let mut config = GatewayConfig::default();
+        config.services.reverse_proxy.routes.push(ReverseProxyRouteConfig {
+            name: "rp".to_string(),
+            path_prefix: "/rp".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            ..Default::default()
+        });
+        assert!(simple_http_proxy_fast_path_allowed(&config));
+        assert!(direct_tcp_fast_path_allowed(&config));
+
+        config.services.reverse_proxy.routes[0].upstreams =
+            vec!["127.0.0.1:9001".to_string()];
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+
+        config.services.reverse_proxy.routes[0].upstreams.clear();
+        config.services.service_discovery.enabled = true;
+        assert!(!simple_http_proxy_fast_path_allowed(&config));
+        assert!(!direct_tcp_fast_path_allowed(&config));
+    }
+
+    #[test]
+    fn catch_all_static_site_does_not_shadow_reverse_prefix_in_plain_fast_lane() {
+        let mut config = GatewayConfig::default();
+        config.services.static_sites.push(StaticSiteConfig {
+            name: "root".to_string(),
+            path_prefix: "/".to_string(),
+            ..Default::default()
+        });
+        assert!(static_prefix_hit_for_plain_fast_lane(&config, "/index.html"));
+
+        config.services.reverse_proxy.routes.push(ReverseProxyRouteConfig {
+            name: "rp".to_string(),
+            path_prefix: "/rp".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            ..Default::default()
+        });
+        assert!(!static_prefix_hit_for_plain_fast_lane(&config, "/rp/small.bin"));
+        assert!(static_prefix_hit_for_plain_fast_lane(&config, "/index.html"));
+    }
+
+    #[test]
+    fn raw_reverse_attempt_limit_bounds_retries() {
+        let config = GatewayConfig::default();
+        assert_eq!(raw_reverse_attempt_limit(&config), 3);
+        let mut no_retries = GatewayConfig::default();
+        no_retries.load_balance.retries.enabled = false;
+        assert_eq!(raw_reverse_attempt_limit(&no_retries), 2);
     }
 
     #[test]
@@ -27488,8 +27820,16 @@ mod tests {
             .push("127.0.0.1:7002".to_string());
         assert!(direct_tcp_listener_upstream(&config, "direct").is_none());
 
+        // Health/affinity defaults cannot change a single-upstream choice, so
+        // they stay on the direct lane; a service-discovery pool can.
         config.tcp.listeners[0].upstreams.clear();
         config.load_balance.active_health.enabled = true;
+        config.affinity.enabled = true;
+        assert_eq!(
+            direct_tcp_listener_upstream(&config, "direct").as_deref(),
+            Some("127.0.0.1:7001")
+        );
+        config.services.service_discovery.enabled = true;
         assert!(direct_tcp_listener_upstream(&config, "direct").is_none());
     }
 
@@ -27523,6 +27863,12 @@ mod tests {
 
         config.udp.listeners[0].upstreams.clear();
         config.load_balance.passive_health.enabled = true;
+        config.affinity.enabled = true;
+        assert_eq!(
+            direct_udp_listener_upstream(&config, "direct-udp").as_deref(),
+            Some("127.0.0.1:7001")
+        );
+        config.services.service_discovery.enabled = true;
         assert!(direct_udp_listener_upstream(&config, "direct-udp").is_none());
     }
 

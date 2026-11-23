@@ -35,6 +35,8 @@ proxy-key.pem
 
 # Local benchmark, verification, and one-off scratch artifacts.
 /.benchmark/
+/.bench-tmp-bin/
+/.bench-two-host/
 /.browser-qa/
 /.tmp-*/
 /.tmp-*.exe
