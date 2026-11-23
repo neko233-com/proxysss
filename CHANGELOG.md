@@ -1,9 +1,11 @@
-## v1.3.18 - 2026-11-23
+# Changelog
+
+## v1.3.19 - 2026-11-23
 
 nginx parity 补全面：预压缩静态、auth_basic、try_files、路由级 error_page、limit_rate、mirror、PROXY protocol v1/v2 + real_ip、OCSP stapling、TLS 0-RTT。全部默认关闭，不改变现有默认行为；明确不做 FastCGI/PHP。
 
 - 预压缩静态 `services.static_sites[].precompressed`（`src/precompressed.rs`）：按 Accept-Encoding 协商 brotli/gzip，服务根内 `.br`/`.gz` 兄弟文件，保留原 Content-Type、写 Content-Encoding 与 Vary，符号链接越界拒绝。
-- HTTP Basic 认证 `auth_basic`（`src/http_basic_auth.rs`）：静态/反代/域名路由共用，恒定时间比较、空用户表 fail-closed、先于缓存与请求体，401 带 WWW-Authenticate。
+- HTTP Basic 认证 `auth_basic`（`src/http_basic_auth.rs`）：静态/反代/域名路由共用，恒定时间比较、空凭据 fail-closed、先于缓存与请求体，401 带 WWW-Authenticate。
 - 通用 `try_files`（`src/try_files.rs`）：静态有序候选、`$uri` 展开、`=status` 终止回退，全部根内 confinement。
 - 路由级 `error_pages`：静态/反代/域名路由覆盖全局 `http.error_pages`，保留状态码与 no-store。
 - 单响应限速 `limit_rate`（`src/limit_rate.rs`）：有界单定时器令牌调度，避免逐 chunk 定时器开销与睡眠 waker 死锁。
@@ -11,9 +13,8 @@ nginx parity 补全面：预压缩静态、auth_basic、try_files、路由级 er
 - PROXY protocol v1/v2 + real_ip（`src/proxy_protocol.rs`）：`http.proxy_protocol` 与 `tcp.listeners[].proxy_protocol` 在 accept 时 peek 剥离头部；`http.real_ip` 信任 CIDR 还原最左转发客户端 IP，不可信对端保持 TCP peer。
 - OCSP stapling：`http.tls.ocsp_stapling` + `ocsp_stapling_file` 将 DER OCSP 响应装订到 rustls CertifiedKey（file 子集，自动 fetch 后续）。
 - TLS 0-RTT：`http.tls.early_data` 开启 TLS1.3 max_early_data_size 并在 accept 后 drain early data；默认关闭（重放风险）。
+- 安全修复：auth_basic 在 hyper 静态快路径入口前置校验（FastLane 编译期开关，关闭时零开销），杜绝免认证快路径绕过；真实二进制冒烟确认无凭据 401、凭据正确 200。
 - 验证：WSL Alpine musl 全量 `cargo test --locked` 通过（含新增模块单元测试）；Windows 本机因缺 MSVC 链接环境未跑编译/测试，如实披露，Windows 由 CI 六平台打包覆盖。
-# Changelog
-
 ## v1.3.18 - 2026-11-23
 
 OTel 生产级业务指标版本：性能监控从"仅 traces"补全为指标 + 链路完整对外导出。

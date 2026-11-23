@@ -947,7 +947,7 @@ http:
 http.error_pages.enabled=false 完全保留原错误响应正文及头，不应用内置或配置错误页。脚本 proxysss://response 和显式 script static error-page 的正文由路由定义，即使默认错误页开启也不被二次包装；普通原生错误继续按已启用的 error_pages 策略处理。
 
 
-## v1.3.18 nginx parity 补全面（默认关闭）
+## v1.3.19 nginx parity 补全面（默认关闭）
 
 以下能力均为 config-gated，默认不启用，不改变现有默认行为；不做 FastCGI/PHP。
 
